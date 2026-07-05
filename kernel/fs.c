@@ -1198,6 +1198,8 @@ static int build_active_root_dirents(const char* path, struct orth_dirent* diren
 void fs_init(void) {
     storage_init();
     spinlock_init(&g_fifo_lock);
+    /* g_exec_cache_lock は static ゼロ初期化 (locked=0) で初期化済み。
+     * 定義がこの関数より後方にあるためここでは初期化しない。 */
     wait_queue_init(&g_fifo_open_wait);
     for (int i = 0; i < FIFO_MAX; i++) {
         g_fifo_table[i].in_use = 0;
@@ -1545,6 +1547,131 @@ static int fs_open_install_chardev(int fd, const char* path, int flags,
     return fd;
 }
 
+/* ------------------------------------------------------------------ */
+/* exec イメージキャッシュ                                              */
+/*                                                                     */
+/* fs_get_file_data は exec 専用 (task_exec が実行イメージと ELF        */
+/* インタプリタを読むためだけに呼ぶ)。cc1 は 1 ビルドで ~70 回 exec さ  */
+/* れ、毎回 13MB をディスクから読み返す (計 ~900MB)。パス+サイズをキー  */
+/* に読み込んだイメージを RAM に保持し、同一ファイルの再 exec を無 I/O  */
+/* にする。                                                             */
+/*                                                                     */
+/* 所有権: キャッシュ済みバッファは cache が所有し、fs_free_exec_buffer  */
+/* では解放せず in_use 参照数だけ減らす。get→elf_load→free は BKL 下で   */
+/* 同期完結するため、利用中バッファが別 exec に追い出される事はない。    */
+/* ファイル書換 (write / truncate / unlink / rename) で該当エントリを   */
+/* 無効化する (使用中なら stale 化し、最後の利用者の free で解放)。      */
+/* ------------------------------------------------------------------ */
+
+#define EXEC_CACHE_MAX     12
+#define EXEC_CACHE_BUDGET  (128UL * 1024UL * 1024UL)   /* 合計上限 128MB */
+
+struct exec_cache_entry {
+    int      valid;      /* スロット占有 (buf 確保済み) */
+    int      in_use;     /* elf_load 中の利用者数 (get - free) */
+    int      stale;      /* 無効化済み。ヒットさせず、in_use==0 で解放 */
+    size_t   size;
+    size_t   npages;
+    void*    buf;        /* pmm バッファ (virt) */
+    uint64_t lru;        /* 最終使用時刻 */
+    char     path[256];
+};
+
+static struct exec_cache_entry g_exec_cache[EXEC_CACHE_MAX];
+static spinlock_t g_exec_cache_lock;
+static uint64_t   g_exec_cache_clock;
+static size_t     g_exec_cache_bytes;
+
+static void exec_cache_set_path(char* dst, const char* src) {
+    int i = 0;
+    for (; i < 255 && src[i]; i++) dst[i] = src[i];
+    dst[i] = '\0';
+}
+
+/* lock 保持で呼ぶ。エントリを解放してスロットを空ける。 */
+static void exec_cache_drop_locked(struct exec_cache_entry* e) {
+    if (e->buf && e->npages) {
+        pmm_free((void*)VIRT_TO_PHYS((uint64_t)e->buf), (int)e->npages);
+        if (g_exec_cache_bytes >= e->npages * PAGE_SIZE)
+            g_exec_cache_bytes -= e->npages * PAGE_SIZE;
+    }
+    e->valid = 0; e->stale = 0; e->in_use = 0; e->buf = 0;
+    e->size = 0; e->npages = 0; e->lru = 0; e->path[0] = '\0';
+}
+
+/* path+size 一致の有効エントリがあれば in_use++ して buf を返す。無ければ 0。 */
+static void* exec_cache_lookup(const char* norm, size_t size) {
+    void* ret = 0;
+    uint64_t flags = spin_lock_irqsave(&g_exec_cache_lock);
+    for (int i = 0; i < EXEC_CACHE_MAX; i++) {
+        struct exec_cache_entry* e = &g_exec_cache[i];
+        if (e->valid && !e->stale && e->size == size &&
+            strcmp_exact(e->path, norm)) {
+            e->in_use++;
+            e->lru = ++g_exec_cache_clock;
+            ret = e->buf;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&g_exec_cache_lock, flags);
+    return ret;
+}
+
+/* buf をキャッシュに登録し in_use=1 にする。載れば 1 (以後 cache 所有)、
+ * 予算/本数を確保できなければ 0 (呼び出し側が従来どおり所有・解放)。 */
+static int exec_cache_insert(const char* norm, void* buf, size_t size, size_t npages) {
+    size_t need = npages * PAGE_SIZE;
+    if (need > EXEC_CACHE_BUDGET) return 0;
+    uint64_t flags = spin_lock_irqsave(&g_exec_cache_lock);
+    for (;;) {
+        int slot = -1;
+        for (int i = 0; i < EXEC_CACHE_MAX; i++)
+            if (!g_exec_cache[i].valid) { slot = i; break; }
+        if (slot >= 0 && g_exec_cache_bytes + need <= EXEC_CACHE_BUDGET) {
+            struct exec_cache_entry* e = &g_exec_cache[slot];
+            e->valid = 1; e->stale = 0; e->in_use = 1;
+            e->buf = buf; e->size = size; e->npages = npages;
+            e->lru = ++g_exec_cache_clock;
+            exec_cache_set_path(e->path, norm);
+            g_exec_cache_bytes += need;
+            spin_unlock_irqrestore(&g_exec_cache_lock, flags);
+            return 1;
+        }
+        /* 空き無し or 予算超過 → in_use==0 の LRU を追い出す */
+        int victim = -1; uint64_t oldest = ~0ULL;
+        for (int i = 0; i < EXEC_CACHE_MAX; i++) {
+            struct exec_cache_entry* e = &g_exec_cache[i];
+            if (e->valid && e->in_use == 0 && e->lru < oldest) {
+                oldest = e->lru; victim = i;
+            }
+        }
+        if (victim < 0) {   /* 全て使用中 → 諦める (呼び出し側所有のまま) */
+            spin_unlock_irqrestore(&g_exec_cache_lock, flags);
+            return 0;
+        }
+        exec_cache_drop_locked(&g_exec_cache[victim]);
+    }
+}
+
+/* raw_path のキャッシュを無効化する (ファイル書換時に呼ぶ)。使用中なら
+ * stale 化して最後の利用者の free に解放を委ねる。 */
+static void exec_cache_invalidate(const char* raw_path) {
+    if (!raw_path || !raw_path[0]) return;
+    if (g_exec_cache_bytes == 0) return;   /* 未投入なら即 return (BKL 下) */
+    char resolved[256];
+    resolve_task_path(raw_path, resolved, sizeof(resolved));
+    const char* norm = normalize_fs_path(resolved);
+    uint64_t flags = spin_lock_irqsave(&g_exec_cache_lock);
+    for (int i = 0; i < EXEC_CACHE_MAX; i++) {
+        struct exec_cache_entry* e = &g_exec_cache[i];
+        if (e->valid && !e->stale && strcmp_exact(e->path, norm)) {
+            if (e->in_use == 0) exec_cache_drop_locked(e);
+            else e->stale = 1;
+        }
+    }
+    spin_unlock_irqrestore(&g_exec_cache_lock, flags);
+}
+
 int fs_open(const char* path, int flags, int mode) {
     struct task* current = get_current_task();
     int want_dir = (flags & (O_DIRECTORY | ORTH_LEGACY_O_DIRECTORY)) != 0;
@@ -1568,6 +1695,10 @@ int fs_open(const char* path, int flags, int mode) {
 
     resolve_task_path(path, resolved_path, sizeof(resolved_path));
     path = normalize_fs_path(resolved_path);
+    /* 書き込み目的の open は exec キャッシュを無効化 (内容が変わり得る)。 */
+    if (((flags & ORTH_O_ACCMODE) != O_RDONLY) || want_creat || want_trunc) {
+        exec_cache_invalidate(path);
+    }
     mount = vfs_find_mountpoint(path, &mount_subpath);
 
     if (want_dir) {
@@ -2053,6 +2184,7 @@ int fs_ftruncate(int fd, uint64_t length) {
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -EBADF;
     f = &current->fds[fd];
     fs_assert_open_file_consistent(f);
+    exec_cache_invalidate(fs_fd_name(f));
 
     if (fs_fd_type(f) == FT_RAMFS) {
         struct ramfs_file* rf = find_ramfs(fs_fd_name(f));
@@ -2087,6 +2219,7 @@ int fs_truncate(const char* path, uint64_t length) {
     if (!path) return -EINVAL;
     resolve_task_path(path, resolved_path, sizeof(resolved_path));
     norm = normalize_fs_path(resolved_path);
+    exec_cache_invalidate(norm);
 
     rf = find_ramfs(norm);
     if (rf) {
@@ -2794,6 +2927,7 @@ int fs_unlink(const char* path) {
     resolve_task_path(path, resolved_path, sizeof(resolved_path));
     path = normalize_fs_path(resolved_path);
     
+    exec_cache_invalidate(path);
     if (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
         if (xv6fs_unlink_path(path) == 0) return 0;
     }
@@ -2832,6 +2966,8 @@ int fs_rename(const char* oldpath, const char* newpath) {
     const char* new_norm;
     struct ramfs_file* rf;
     if (!oldpath || !newpath) return -1;
+    exec_cache_invalidate(oldpath);
+    exec_cache_invalidate(newpath);
     resolve_task_path(oldpath, old_resolved, sizeof(old_resolved));
     resolve_task_path(newpath, new_resolved, sizeof(new_resolved));
     old_norm = normalize_fs_path(old_resolved);
@@ -3031,6 +3167,13 @@ int fs_get_file_data(const char* path, void** data, size_t* size) {
         if (xv6fs_stat_path(path, &xv6_mode, &xv6_size, 0, 0) < 0) goto try_module;
         if ((xv6_mode & 0170000U) != KSTAT_MODE_FILE) return -1;
         if (data) {
+            /* exec キャッシュヒット: ディスク I/O を回避 */
+            void* cached = exec_cache_lookup(path, (size_t)xv6_size);
+            if (cached) {
+                *data = cached;
+                if (size) *size = (size_t)xv6_size;
+                return 0;
+            }
             size_t npages = (xv6_size + PAGE_SIZE - 1U) / PAGE_SIZE;
             if (npages == 0) npages = 1;
             void* buf = PHYS_TO_VIRT(pmm_alloc((int)npages));
@@ -3041,6 +3184,9 @@ int fs_get_file_data(const char* path, void** data, size_t* size) {
             xv6fs_readi(ip, buf, 0, (uint32_t)xv6_size);
             xv6fs_iunlock(ip);
             xv6fs_iput(ip);
+            /* 登録できれば cache 所有 (in_use=1)。載らなければ buf は呼び出し側
+             * 所有のまま (fs_free_exec_buffer が pmm_free する)。 */
+            exec_cache_insert(path, buf, (size_t)xv6_size, npages);
             *data = buf;
         }
         if (size) *size = (size_t)xv6_size;
@@ -3067,6 +3213,21 @@ try_module:
  * xv6fs content buffers (pmm-allocated by fs_get_file_data) are freed here. */
 void fs_free_exec_buffer(const char* path, void* data, size_t size) {
     if (!data || size == 0) return;
+    /* exec キャッシュ所有のバッファは解放しない。in_use を減らし、
+     * 無効化済み (stale) かつ最後の利用者ならここで解放する。 */
+    {
+        uint64_t cflags = spin_lock_irqsave(&g_exec_cache_lock);
+        for (int i = 0; i < EXEC_CACHE_MAX; i++) {
+            struct exec_cache_entry* e = &g_exec_cache[i];
+            if (e->valid && e->buf == data) {
+                if (e->in_use > 0) e->in_use--;
+                if (e->stale && e->in_use == 0) exec_cache_drop_locked(e);
+                spin_unlock_irqrestore(&g_exec_cache_lock, cflags);
+                return;
+            }
+        }
+        spin_unlock_irqrestore(&g_exec_cache_lock, cflags);
+    }
     char resolved[256];
     resolve_task_path(path, resolved, sizeof(resolved));
     const char* norm = normalize_fs_path(resolved);
