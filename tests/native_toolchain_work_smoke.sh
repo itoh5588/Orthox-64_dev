@@ -66,7 +66,7 @@ rm -f "${SERIAL_LOG}" "${QEMU_OUT}"
 qemu-system-x86_64 \
     -machine pc \
     -cpu qemu64 \
-    -m 1G \
+    -m 2G \
     -cdrom "${ISO}" \
     -boot d \
     -display none \
