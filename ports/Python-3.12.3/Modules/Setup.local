@@ -1,0 +1,85 @@
+# Orthox-64 用の静的リンク設定
+*static*
+
+array arraymodule.c
+_asyncio _asynciomodule.c
+_bisect _bisectmodule.c
+_contextvars _contextvarsmodule.c
+_csv _csv.c
+_datetime _datetimemodule.c
+_heapq _heapqmodule.c
+_json _json.c
+_lsprof _lsprof.c rotatingtree.c
+_multiprocessing _multiprocessing/multiprocessing.c _multiprocessing/semaphore.c
+_opcode _opcode.c
+_pickle _pickle.c
+_queue _queuemodule.c
+_random _randommodule.c
+_socket socketmodule.c
+_statistics _statisticsmodule.c
+_struct _struct.c
+_typing _typingmodule.c
+_zoneinfo _zoneinfo.c
+_md5 md5module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_MD5.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+_sha1 sha1module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA1.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+_sha2 sha2module.c -I$(srcdir)/Modules/_hacl/include Modules/_hacl/libHacl_Hash_SHA2.a
+_sha3 sha3module.c -I$(srcdir)/Modules/_hacl/include _hacl/Hacl_Hash_SHA3.c -D_BSD_SOURCE -D_DEFAULT_SOURCE
+_blake2 _blake2/blake2module.c _blake2/blake2b_impl.c _blake2/blake2s_impl.c
+binascii binascii.c -I../gcc-4.7.4/zlib
+cmath cmathmodule.c
+math mathmodule.c
+select selectmodule.c
+unicodedata unicodedata.c
+zlib zlibmodule.c -I../gcc-4.7.4/zlib ../zlib-pie/libz.a
+
+# SSLやReadlineなどはライブラリ依存があるため、一旦保留
+# _ssl _ssl.c
+# readline readline.c
+
+*disabled*
+_xxsubinterpreters
+_xxinterpchannels
+_testcapi
+_testclinic
+_testinternalcapi
+_testbuffer
+_testimportmultiple
+_testmultiphase
+_xxtestfuzz
+_ctypes_test
+xxlimited
+xxlimited_35
+xxsubtype
+audioop
+_uuid
+_posixshmem
+_scproxy
+pyexpat
+_elementtree
+_crypt
+_ctypes
+_decimal
+_lzma
+_bz2
+_sqlite3
+_curses
+_curses_panel
+_dbm
+_gdbm
+readline
+_multibytecodec
+_codecs_cn
+_codecs_hk
+_codecs_iso2022
+_codecs_jp
+_codecs_kr
+_codecs_tw
+fcntl
+grp
+mmap
+_posixsubprocess
+resource
+spwd
+syslog
+termios
+_testsinglephase

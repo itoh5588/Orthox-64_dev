@@ -1,0 +1,108 @@
+diff -urN /tmp/make-patchgen/make-4.4.1/src/dir.c /tmp/make-patchgen/make-4.4.1-mod/src/dir.c
+--- /tmp/make-patchgen/make-4.4.1/src/dir.c	2023-01-12 09:53:26.000000000 +0900
++++ /tmp/make-patchgen/make-4.4.1-mod/src/dir.c	2026-04-24 21:06:01.376082833 +0900
+@@ -1355,6 +1355,7 @@
+ }
+ #endif
+ 
++#ifdef GLOB_ALTDIRFUNC
+ void
+ dir_setup_glob (glob_t *gl)
+ {
+@@ -1365,6 +1366,7 @@
+   gl->gl_lstat = local_lstat;
+   gl->gl_stat = local_stat;
+ }
++#endif
+ 
+ void
+ hash_init_directories (void)
+diff -urN /tmp/make-patchgen/make-4.4.1/src/makeint.h /tmp/make-patchgen/make-4.4.1-mod/src/makeint.h
+--- /tmp/make-patchgen/make-4.4.1/src/makeint.h	2023-02-19 22:51:55.000000000 +0900
++++ /tmp/make-patchgen/make-4.4.1-mod/src/makeint.h	2026-04-24 21:06:01.254975107 +0900
+@@ -629,7 +629,9 @@
+ void file_impossible (const char *);
+ const char *dir_name (const char *);
+ void print_dir_data_base (void);
++#ifdef GLOB_ALTDIRFUNC
+ void dir_setup_glob (glob_t *);
++#endif
+ void hash_init_directories (void);
+ 
+ void define_default_variables (void);
+diff -urN /tmp/make-patchgen/make-4.4.1/src/read.c /tmp/make-patchgen/make-4.4.1-mod/src/read.c
+--- /tmp/make-patchgen/make-4.4.1/src/read.c	2023-01-02 00:06:01.000000000 +0900
++++ /tmp/make-patchgen/make-4.4.1-mod/src/read.c	2026-04-24 21:06:01.497190560 +0900
+@@ -3220,7 +3220,11 @@
+     size = sizeof (struct nameseq);
+ 
+   if (NONE_SET (flags, PARSEFS_NOGLOB))
++#ifdef GLOB_ALTDIRFUNC
+     dir_setup_glob (&gl);
++#else
++    gl.gl_offs = 0;
++#endif
+ 
+   /* Get enough temporary space to construct the largest possible target.  */
+   {
+@@ -3469,31 +3473,37 @@
+           nlist = &name;
+         }
+       else
+-        switch (glob (name, GLOB_ALTDIRFUNC, NULL, &gl))
+-          {
+-          case GLOB_NOSPACE:
+-            out_of_memory ();
++        {
++          int glob_flags = 0;
++#ifdef GLOB_ALTDIRFUNC
++          glob_flags |= GLOB_ALTDIRFUNC;
++#endif
++          switch (glob (name, glob_flags, NULL, &gl))
++            {
++            case GLOB_NOSPACE:
++              out_of_memory ();
+ 
+-          case 0:
+-            /* Success.  */
+-            tot = gl.gl_pathc;
+-            nlist = (const char **)gl.gl_pathv;
+-            break;
+-
+-          case GLOB_NOMATCH:
+-            /* If we want only existing items, skip this one.  */
+-            if (ANY_SET (flags, PARSEFS_EXISTS))
+-              {
+-                tot = 0;
+-                break;
+-              }
+-            /* FALLTHROUGH */
++            case 0:
++              /* Success.  */
++              tot = gl.gl_pathc;
++              nlist = (const char **)gl.gl_pathv;
++              break;
++
++            case GLOB_NOMATCH:
++              /* If we want only existing items, skip this one.  */
++              if (ANY_SET (flags, PARSEFS_EXISTS))
++                {
++                  tot = 0;
++                  break;
++                }
++              /* FALLTHROUGH */
+ 
+-          default:
+-            /* By default keep this name.  */
+-            tot = 1;
+-            nlist = &name;
+-            break;
++            default:
++              /* By default keep this name.  */
++              tot = 1;
++              nlist = &name;
++                break;
++            }
+           }
+ 
+       /* For each matched element, add it to the list.  */

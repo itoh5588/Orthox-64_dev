@@ -1,0 +1,118 @@
+# Build artifacts
+*.o
+*.elf
+user/*.so
+*.iso
+*.img
+*.dmg
+iso_root/
+build/
+rootfs.tar
+rootfs/bin/
+rootfs/doom1.wad
+
+# Dependency files
+**/.deps/
+**/*.Po
+
+# macOS files
+.DS_Store
+
+# Logs and reports
+xorriso_log.txt
+iso_report.txt
+*.log
+serial.log
+qemu.log
+
+# Images (Screenshots)
+*.png
+スクリーンショット*.png
+!assets/*.png
+
+# Temporary files
+test1.iso
+test2.iso
+test_dir/
+
+# Ports (External software)
+# Ignore extracted sources and build directories
+ports/gcc-*/
+ports/binutils-*/
+ports/gmp-*/
+ports/mpfr-*/
+ports/mpc-*/
+ports/busybox/
+ports/musl/
+ports/musl-install/
+
+# Ignore tarballs and pre-built binaries
+ports/*.tar.gz
+ports/*.tar.bz2
+ports/*.a
+ports/a.out
+ports/conftest.c
+ports/test.c
+ports/test.cpp
+**/*.a
+**/*.tar.gz
+**/*.tar.bz2
+**/*.tgz
+**/*.tbz2
+**/*.tar
+**/*.zip
+#Docs/
+tests/binutils_test/README.md
+user/doomgeneric/
+rootfs/src/kernel-build/
+rootfs/tmp/kbuild/
+native-kernel.elf
+native-kernel-boot.iso
+native-kernel-boot-serial.log
+native-kernel-boot-build.log
+kernel-output.img
+
+# Private / internal files (root-level only; book-reader/ keeps its own CLAUDE.md)
+/CLAUDE.md
+RISCV-virt-Porting-Plan.md
+SMP-Design.md
+future.md
+send_keys.py
+
+# Local workspace artifacts
+Docs/
+LOGs/
+logs/
+/.claude/
+.codex
+.vscode/
+DOOM_Script/
+GEMINI.md
+WORKFLOW_APPROVAL.md
+NewOS/
+OLD_limine/
+Web/
+ac97.wav
+final_log.txt
+retrofs-musl-serial.txt
+saba_check.jpg
+send_command.py
+test_input.txt
+scripts/__pycache__/
+scripts/build_rootfs_fat.sh
+run_doom_musl_linux.sh.bak
+run_qemu_saba.sh.bak
+rootfs/lib/
+rootfs/src/
+rootfs/usr/
+ports/Python-3.12.3/
+ports/bin_temp/
+ports/cmake/
+ports/make-4.4.1/
+ports/musl-build-riscv64-linux-musl/
+ports/musl-install-riscv64/
+ports/ninja/
+ports/python-install/
+ports/rust/
+ports/rust_stubs.c.bak
+ports/rust_stubs.c.bak2

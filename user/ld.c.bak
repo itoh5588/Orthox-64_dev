@@ -1,0 +1,15 @@
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+int main(int argc, char** argv) {
+    if (argc < 4) return 1;
+    printf("  [ld] Linking %s to %s...\n", argv[1], argv[3]);
+    int fd = open(argv[3], 0x41);
+    if (fd >= 0) {
+        const char* exe = "\x7f\x45\x4c\x46 final executable";
+        write(fd, exe, 20);
+        close(fd);
+    }
+    return 0;
+}

@@ -1,0 +1,124 @@
+#include "idt.h"
+#include "gdt.h"
+#include "lapic.h"
+#include "task.h"
+#include <stdint.h>
+#include <stddef.h>
+
+void puts(const char *s);
+void puthex(uint64_t v);
+
+struct interrupt_frame {
+    uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
+    uint64_t rdi, rsi, rbp, rbx, rdx, rcx, rax;
+    uint64_t int_no, error_code;
+    uint64_t rip, cs, rflags, rsp, ss;
+};
+
+static struct idt_entry idt[256];
+static struct idt_ptr idtr;
+
+static uint8_t exception_stack[8192] __attribute__((aligned(16)));
+
+extern void isr0();  extern void isr1();  extern void isr2();  extern void isr3();
+extern void isr4();  extern void isr5();  extern void isr6();  extern void isr7();
+extern void isr8();  extern void isr9();  extern void isr10(); extern void isr11();
+extern void isr12(); extern void isr13(); extern void isr14(); extern void isr15();
+extern void isr16(); extern void isr17(); extern void isr18(); extern void isr19();
+extern void isr20(); extern void isr21();
+extern void isr32();
+extern void isr33();
+extern void isr36();
+
+void idt_set_gate(uint8_t num, void* handler, uint8_t ist, uint8_t type) {
+    uint64_t addr = (uint64_t)handler;
+    idt[num].offset_low = addr & 0xFFFF;
+    idt[num].selector = GDT_KERNEL_CODE;
+    idt[num].ist = ist;
+    idt[num].type_attributes = type;
+    idt[num].offset_mid = (addr >> 16) & 0xFFFF;
+    idt[num].offset_high = (addr >> 32) & 0xFFFFFFFF;
+    idt[num].reserved = 0;
+}
+
+void idt_init(void) {
+    idtr.limit = (sizeof(struct idt_entry) * 256) - 1;
+    idtr.base = (uint64_t)&idt;
+
+    tss_set_ist(1, (uint64_t)&exception_stack[sizeof(exception_stack)]);
+
+    for (int i = 0; i < 256; i++) {
+        idt_set_gate(i, 0, 0, 0);
+    }
+
+    idt_set_gate(0,  isr0,  1, IDT_GATE_INTERRUPT);
+    idt_set_gate(1,  isr1,  1, IDT_GATE_INTERRUPT);
+    idt_set_gate(2,  isr2,  1, IDT_GATE_INTERRUPT);
+    idt_set_gate(3,  isr3,  1, IDT_GATE_INTERRUPT);
+    idt_set_gate(4,  isr4,  1, IDT_GATE_INTERRUPT);
+    idt_set_gate(5,  isr5,  1, IDT_GATE_INTERRUPT);
+    idt_set_gate(6,  isr6,  1, IDT_GATE_INTERRUPT);
+    idt_set_gate(7,  isr7,  1, IDT_GATE_INTERRUPT);
+    idt_set_gate(8,  isr8,  1, IDT_GATE_INTERRUPT);
+    idt_set_gate(9,  isr9,  1, IDT_GATE_INTERRUPT);
+    idt_set_gate(10, isr10, 1, IDT_GATE_INTERRUPT);
+    idt_set_gate(11, isr11, 1, IDT_GATE_INTERRUPT);
+    idt_set_gate(12, isr12, 1, IDT_GATE_INTERRUPT);
+    idt_set_gate(13, isr13, 1, IDT_GATE_INTERRUPT);
+    idt_set_gate(14, isr14, 1, IDT_GATE_INTERRUPT);
+    idt_set_gate(15, isr15, 1, IDT_GATE_INTERRUPT);
+    idt_set_gate(16, isr16, 1, IDT_GATE_INTERRUPT);
+    idt_set_gate(17, isr17, 1, IDT_GATE_INTERRUPT);
+    idt_set_gate(18, isr18, 1, IDT_GATE_INTERRUPT);
+    idt_set_gate(19, isr19, 1, IDT_GATE_INTERRUPT);
+    idt_set_gate(20, isr20, 1, IDT_GATE_INTERRUPT);
+    idt_set_gate(21, isr21, 1, IDT_GATE_INTERRUPT);
+
+    idt_set_gate(INT_VECTOR_TIMER,    isr32, 0, IDT_GATE_INTERRUPT);
+    idt_set_gate(INT_VECTOR_KEYBOARD, isr33, 0, IDT_GATE_INTERRUPT);
+    idt_set_gate(INT_VECTOR_SERIAL,   isr36, 0, IDT_GATE_INTERRUPT);
+
+    __asm__ volatile("lidt %0" : : "m"(idtr));
+}
+
+void interrupt_dispatch(struct interrupt_frame* frame) {
+    if (frame->int_no == INT_VECTOR_PAGE_FAULT) {
+        extern void vmm_page_fault_handler(struct interrupt_frame* frame);
+        vmm_page_fault_handler(frame);
+        return;
+    }
+
+    if (frame->int_no == INT_VECTOR_TIMER) {
+        lapic_timer_tick();
+        lapic_eoi();
+        task_request_resched();
+        return;
+    }
+    
+    if (frame->int_no == INT_VECTOR_KEYBOARD) {
+        extern void keyboard_handler(void);
+        keyboard_handler();
+        extern void pic_eoi(int irq);
+        pic_eoi(1);
+        return;
+    }
+
+    if (frame->int_no == INT_VECTOR_SERIAL) {
+        extern void serial_handler(void);
+        serial_handler();
+        extern void pic_eoi(int irq);
+        pic_eoi(4);
+        return;
+    }
+
+    puts("\r\n*** EXCEPTION OCCURRED ***\r\n");
+    puts("Vector: "); puthex(frame->int_no);
+    puts(", Error Code: "); puthex(frame->error_code);
+    puts("\r\nRIP: 0x"); puthex(frame->rip);
+    puts(", CS: 0x"); puthex(frame->cs);
+    puts("\r\nRSP: 0x"); puthex(frame->rsp);
+    puts(", SS: 0x"); puthex(frame->ss);
+    puts("\r\nHALTING...\r\n");
+
+    for (;;) __asm__("hlt");
+}

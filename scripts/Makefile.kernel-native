@@ -1,0 +1,103 @@
+# Orthox-64 カーネル ネイティブビルド Makefile
+# Orthox-64 上で実行: make -f /src/kernel-build/Makefile
+
+SRCDIR  ?= /src/kernel-build
+BUILD   ?= /kbuild
+OUTPUT  ?= /kernel.elf
+
+# /bin/sh は user/sh.elf（カスタム最小シェル）のため for ループが使えない。
+# busybox ash を明示的に指定する。
+SHELL = /bin/ash
+
+CC1 = /bin/cc1
+AS  = /bin/as
+LD  = /bin/ld
+
+# -DLWIP_NOASSERT: abort() 依存を除去（カーネル環境では assert 不要）
+CC1FLAGS = \
+    -quiet -nostdinc \
+    -std=c11 -ffreestanding -fno-stack-protector -fno-stack-check \
+    -fno-lto -fno-PIE -mno-80387 -mno-mmx -mno-sse -mno-sse2 \
+    -mno-red-zone -mcmodel=kernel -O2 \
+    -DLWIP_NOASSERT \
+    -I$(SRCDIR)/include \
+    -I$(SRCDIR)/ports/lwip/src/include \
+    -I/usr/include
+
+KERNEL_LDFLAGS = -nostdlib -static -T $(SRCDIR)/scripts/kernel.ld
+
+KERNEL_C_SRCS = \
+    kernel/init.c kernel/kassert.c kernel/pmm.c kernel/elf.c kernel/gdt.c \
+    kernel/vmm.c kernel/idt.c kernel/lapic.c kernel/sound.c \
+    kernel/syscall.c kernel/sys_trace.c kernel/sys_time.c kernel/sys_signal.c kernel/sys_vm.c \
+    kernel/sys_proc.c kernel/sys_fs.c kernel/sys_device.c kernel/sys_random.c kernel/sys_net.c \
+    kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c \
+    kernel/wait.c kernel/bottom_half.c kernel/irq.c \
+    kernel/fs.c kernel/vfs.c kernel/storage.c kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c \
+    kernel/pic.c kernel/keyboard.c kernel/pci.c kernel/net.c \
+    kernel/net_socket.c kernel/virtio.c kernel/virtio_net.c \
+    kernel/virtio_blk.c kernel/lwip_port.c kernel/cstring.c \
+    kernel/cstdio.c kernel/cstdlib.c kernel/usb.c kernel/smp.c kernel/spinlock.c
+
+KERNEL_S_SRCS = \
+    kernel/gdt_flush.S \
+    kernel/interrupt.S \
+    kernel/syscall_entry.S \
+    kernel/task_switch.S
+
+LWIP_SRCS = \
+    ports/lwip/src/core/def.c \
+    ports/lwip/src/core/dns.c \
+    ports/lwip/src/core/inet_chksum.c \
+    ports/lwip/src/core/init.c \
+    ports/lwip/src/core/ip.c \
+    ports/lwip/src/core/mem.c \
+    ports/lwip/src/core/memp.c \
+    ports/lwip/src/core/netif.c \
+    ports/lwip/src/core/pbuf.c \
+    ports/lwip/src/core/raw.c \
+    ports/lwip/src/core/stats.c \
+    ports/lwip/src/core/sys.c \
+    ports/lwip/src/core/tcp.c \
+    ports/lwip/src/core/tcp_in.c \
+    ports/lwip/src/core/tcp_out.c \
+    ports/lwip/src/core/timeouts.c \
+    ports/lwip/src/core/udp.c \
+    ports/lwip/src/core/ipv4/dhcp.c \
+    ports/lwip/src/core/ipv4/etharp.c \
+    ports/lwip/src/core/ipv4/icmp.c \
+    ports/lwip/src/core/ipv4/ip4.c \
+    ports/lwip/src/core/ipv4/ip4_addr.c \
+    ports/lwip/src/netif/ethernet.c
+
+KERNEL_OBJS = \
+    $(patsubst kernel/%.c,   $(BUILD)/kernel/%.o, $(KERNEL_C_SRCS)) \
+    $(patsubst kernel/%.S,   $(BUILD)/kernel/%.o, $(KERNEL_S_SRCS)) \
+    $(patsubst ports/lwip/src/%.c, $(BUILD)/lwip/%.o, $(LWIP_SRCS))
+
+# ビルドディレクトリ (/kbuild/**) はホスト側 rootfs ビルド時に事前作成済み（rootfs/kbuild/）。
+# xv6fs 上に永続化することで2回目以降はインクリメンタルビルドになる。
+
+.PHONY: all clean
+
+all: $(OUTPUT)
+	@echo kernel-native-build: PASS
+
+$(OUTPUT): $(KERNEL_OBJS)
+	$(LD) $(KERNEL_LDFLAGS) $(KERNEL_OBJS) -o $@
+
+$(BUILD)/kernel/%.o: $(SRCDIR)/kernel/%.c
+	$(CC1) $(CC1FLAGS) $< -o $(BUILD)/kernel/$*.s
+	$(AS) $(BUILD)/kernel/$*.s -o $@
+	@rm -f $(BUILD)/kernel/$*.s
+
+$(BUILD)/kernel/%.o: $(SRCDIR)/kernel/%.S
+	$(AS) $< -o $@
+
+$(BUILD)/lwip/%.o: $(SRCDIR)/ports/lwip/src/%.c
+	$(CC1) $(CC1FLAGS) $< -o $(BUILD)/lwip/$*.s
+	$(AS) $(BUILD)/lwip/$*.s -o $@
+	@rm -f $(BUILD)/lwip/$*.s
+
+clean:
+	rm -rf $(BUILD) $(OUTPUT)
