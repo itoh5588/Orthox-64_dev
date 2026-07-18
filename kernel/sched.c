@@ -7,7 +7,7 @@
 #include "bottom_half.h"
 
 extern struct task* task_list;
-extern void switch_context(struct task_context* next_ctx, struct task_context* prev_ctx);
+extern void arch_context_switch(struct arch_task_context* next_ctx, struct arch_task_context* prev_ctx);
 
 static int g_fork_spread_enabled = 1;
 
@@ -76,12 +76,10 @@ void schedule(void) {
     next->on_runq = 0;
     next->state = TASK_RUNNING;
     if (next->timeslice_ticks <= 0) next->timeslice_ticks = TASK_TIMESLICE_TICKS;
-    tss_set_stack_for_cpu(cpu->cpu_id, next->kstack_top);
     cpu->kernel_stack = next->kstack_top;
-    task_refresh_cpu_local_msrs_internal(cpu);
-    task_write_user_fs_base_internal(next->user_fs_base);
+    arch_task_prepare_schedule_switch(cpu->cpu_id, next->kstack_top, cpu, next->user_fs_base);
     task_unlock_irqrestore(flags);
-    switch_context(&next->ctx, &prev->ctx);
+    arch_context_switch(&next->ctx, &prev->ctx);
 }
 
 void task_on_timer_tick(void) {

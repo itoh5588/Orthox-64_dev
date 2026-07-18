@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 #include "fs.h"
+#include "arch_task.h"
+#include "arch_syscall.h"
 
 struct elf_info;
 struct orth_runq_stat;
@@ -36,13 +38,10 @@ struct cpu_local {
     uint32_t kernel_lock_depth;
 };
 
-struct task_context {
-    uint64_t cr3, rip, rflags, reserved1; // 0, 8, 16, 24
-    uint64_t cs, ss, fs, gs;             // 32, 40, 48, 56
-    uint64_t rax, rbx, rcx, rdx, rdi, rsi, rsp, rbp; // 64, 72, 80, 88, 96, 104, 112, 120
-    uint64_t r8, r9, r10, r11, r12, r13, r14, r15;   // 128, 136, 144, 152, 160, 168, 176, 184
-    uint8_t fxsave_area[512] __attribute__((aligned(16))); // 192
-} __attribute__((packed));
+/* task_context is now provided by the arch layer (arch_task_context). */
+/* main-side code uses `struct task_context` and `task_context_t`; both alias to arch_task_context. */
+typedef struct arch_task_context task_context_t;
+#define task_context arch_task_context
 
 struct task {
     uint64_t kstack_top;

@@ -1,13 +1,10 @@
 .section .text
-.global switch_context
+.global arch_context_switch
 .global restore_context
-.global call_app
-.global arch_context_switch   # alias of switch_context (arch hook)
-.global arch_enter_user         # alias of call_app (arch hook)
-.global arch_fork_child_return  # alias of fork_child_entry (arch hook)
+.global arch_enter_user
 
-# void switch_context(struct task_context* next_ctx, struct task_context* prev_ctx)
-switch_context:
+# void arch_context_switch(struct arch_task_context* next_ctx, struct arch_task_context* prev_ctx)
+arch_context_switch:
     pushfq
     push %rbp
     push %rbx
@@ -36,8 +33,8 @@ switch_context:
     popfq
     ret
 
-# int call_app(int argc, char** argv, uint16_t ss, uint64_t rip, uint64_t rsp, uint64_t* os_stack_ptr)
-call_app:
+# int arch_enter_user(int argc, char** argv, uint16_t ss, uint64_t rip, uint64_t rsp, uint64_t* os_stack_ptr)
+arch_enter_user:
     cli
     push %rbx
     push %rbp
@@ -78,8 +75,8 @@ call_app:
     swapgs
     iretq
 
-.global fork_child_entry
-fork_child_entry:
+.global arch_fork_child_return
+arch_fork_child_return:
     pop %r15
     pop %r14
     pop %r13
@@ -103,8 +100,3 @@ fork_child_entry:
     # must restore the user GS base here as well.
     swapgs
     iretq
-
-# arch hook aliases (x86_64): equivalent to the legacy symbols above.
-.set arch_context_switch, switch_context
-.set arch_enter_user, call_app
-.set arch_fork_child_return, fork_child_entry
