@@ -40,7 +40,7 @@ exec "$QEMU_BIN" \
     -bios "$FW_PATH" \
     -kernel "$KERNEL_PATH" \
     -display none \
-    -serial stdio \
+    -serial mon:stdio \
     -monitor none \
     "${DRIVE_ARGS[@]}" \
     "$@"
