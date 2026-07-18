@@ -27,12 +27,6 @@ extern void puthex(uint64_t v);
 extern int fs_get_file_data(const char* path, void** data, size_t* size);
 extern void fs_free_exec_buffer(const char* path, void* data, size_t size);
 
-static inline void wrmsr(uint32_t msr, uint64_t val) {
-    uint32_t low = val & 0xFFFFFFFF;
-    uint32_t high = val >> 32;
-    __asm__ volatile("wrmsr" : : "c"(msr), "a"(low), "d"(high));
-}
-
 static void* kernel_memset(void* s, int c, size_t n) {
     unsigned char* p = s;
     while (n--) *p++ = (unsigned char)c;
@@ -447,11 +441,7 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
     t->tls_filesz = info.tls_filesz;
     t->tls_memsz = info.tls_memsz;
     t->tls_align = info.tls_align;
-    for (int i = 0; i < 512; i++) t->ctx.fxsave_area[i] = 0;
-    t->ctx.fxsave_area[0] = 0x7f;
-    t->ctx.fxsave_area[1] = 0x03;
-    t->ctx.fxsave_area[24] = 0x80;
-    t->ctx.fxsave_area[25] = 0x1f;
+    arch_task_context_init_fp_state(&t->ctx);
     fs_close_cloexec_descriptors(t);
     frame->r15 = 0;
     frame->r14 = 0;
@@ -471,8 +461,7 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
     frame->rdi = t->user_argc;
     frame->rsi = t->user_argv;
     frame->rdx = t->user_envp;
-    __asm__ volatile("mov %0, %%cr3" : : "r"(t->ctx.cr3) : "memory");
-    wrmsr(MSR_FS_BASE, t->user_fs_base);
+    arch_task_activate_user_context(&t->ctx, t->user_fs_base);
     __asm__ volatile("fninit");
     if (old_cr3 && old_cr3 != t->ctx.cr3 && old_cr3 != vmm_get_kernel_pml4_phys()) {
         t->deferred_cr3 = old_cr3;

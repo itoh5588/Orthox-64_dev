@@ -7,7 +7,7 @@
 #include "fs.h"
 
 extern struct task* task_list;
-extern void fork_child_entry(void);
+extern void arch_fork_child_return(void);
 
 static void kernel_strcpy(char* dst, const char* src, size_t size) {
     size_t i = 0;
@@ -85,15 +85,15 @@ int task_fork(struct syscall_frame* frame) {
     child_frame->rax = 0;
     child_frame->rflags &= ~0x400ULL;
     uint64_t* sp = (uint64_t*)child_frame;
-    *(--sp) = (uint64_t)fork_child_entry;
+    *(--sp) = (uint64_t)arch_fork_child_return;
     *(--sp) = 0x202;
     *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
-    child->ctx.rip = (uint64_t)fork_child_entry;
+    child->ctx.rip = (uint64_t)arch_fork_child_return;
     child->ctx.rsp = (uint64_t)sp;
     child->ctx.rflags = 0x202;
     child->ctx.cs = 0x08;
     child->ctx.ss = 0x10;
-    for (int i = 0; i < 512; i++) child->ctx.fxsave_area[i] = parent->ctx.fxsave_area[i];
+    arch_task_context_copy_fp_state(&child->ctx, &parent->ctx);
     for (int i = 0; i < MAX_FDS; i++) {
         if (fs_clone_fd(&child->fds[i], &parent->fds[i]) < 0) {
             for (int j = 0; j < i; j++) {

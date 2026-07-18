@@ -21,18 +21,6 @@ static spinlock_t g_task_lock;
 
 extern volatile struct limine_module_request module_request;
 
-static inline void wrmsr(uint32_t msr, uint64_t val) {
-    uint32_t low = val & 0xFFFFFFFF;
-    uint32_t high = val >> 32;
-    __asm__ volatile("wrmsr" : : "c"(msr), "a"(low), "d"(high));
-}
-
-static inline uint64_t rdmsr(uint32_t msr) {
-    uint32_t low, high;
-    __asm__ volatile("rdmsr" : "=a"(low), "=d"(high) : "c"(msr));
-    return ((uint64_t)high << 32) | low;
-}
-
 extern void puts(const char* s);
 extern void puthex(uint64_t v);
 
@@ -154,18 +142,12 @@ static void task_init_idle_context(struct task* t) {
     t->ctx.rflags = 0;
 }
 
-static inline struct cpu_local* this_cpu(void) {
-    struct cpu_local* cpu = (struct cpu_local*)(uintptr_t)rdmsr(MSR_GS_BASE);
-    if (cpu) return cpu;
-    return (struct cpu_local*)(uintptr_t)rdmsr(MSR_KERNEL_GS_BASE);
-}
-
 struct cpu_local* task_this_cpu(void) {
-    return this_cpu();
+    return arch_task_get_cpu_local();
 }
 
 struct cpu_local* get_cpu_local(void) {
-    return this_cpu();
+    return arch_task_get_cpu_local();
 }
 
 struct cpu_local* get_cpu_local_by_id(uint32_t cpu_id) {
@@ -252,12 +234,12 @@ int task_get_runq_stats(struct orth_runq_stat* out, uint32_t max_count) {
 }
 
 static inline struct task* get_current_task_raw(void) {
-    struct cpu_local* cpu = this_cpu();
+    struct cpu_local* cpu = arch_task_get_cpu_local();
     return cpu ? cpu->current_task : NULL;
 }
 
 static int default_task_cpu_affinity(void) {
-    struct cpu_local* cpu = this_cpu();
+    struct cpu_local* cpu = arch_task_get_cpu_local();
     return cpu ? (int)cpu->cpu_id : 0;
 }
 
@@ -379,8 +361,7 @@ static void init_cpu_local(struct cpu_local* cpu, uint32_t cpu_id,
 
 static void task_refresh_cpu_local_msrs(struct cpu_local* cpu) {
     if (!cpu) return;
-    wrmsr(MSR_GS_BASE, (uintptr_t)cpu);
-    wrmsr(MSR_KERNEL_GS_BASE, (uintptr_t)cpu);
+    arch_task_set_cpu_local(cpu);
 }
 
 static struct cpu_local* task_get_ready_cpu_locked(uint32_t cpu_id) {
@@ -460,7 +441,7 @@ void task_refresh_cpu_local_msrs_internal(struct cpu_local* cpu) {
 }
 
 void task_write_user_fs_base_internal(uint64_t fs_base) {
-    wrmsr(MSR_FS_BASE, fs_base);
+    arch_task_apply_user_tls(fs_base);
 }
 
 static int task_set_affinity_locked(struct task* t, uint32_t cpu_id) {
@@ -637,8 +618,7 @@ int task_free_struct(struct task* t) {
 
 void task_main(void) {
     struct task* t = get_current_task();
-    extern int call_app(int argc, char** argv, uint16_t ss, uint64_t rip, uint64_t rsp, uint64_t* os_stack_ptr);
-    call_app((int)t->user_argc, (char**)t->user_argv, 0x1B, t->user_entry, t->user_stack, &t->os_stack_ptr);
+    arch_enter_user((int)t->user_argc, (char**)t->user_argv, 0x1B, t->user_entry, t->user_stack, &t->os_stack_ptr);
     (void)task_mark_zombie(t, 0);
     while(1) schedule();
 }
