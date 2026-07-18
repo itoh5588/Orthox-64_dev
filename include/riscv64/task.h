@@ -77,7 +77,10 @@ static inline void arch_task_activate_user_context(const struct arch_task_contex
 }
 
 static inline void arch_task_idle_wait_once(void) {
+    // x86 の sti;hlt 相当: 割り込みを許可して wfi し、復帰後に禁止へ戻す
+    __asm__ volatile("csrsi sstatus, 0x2");
     __asm__ volatile("wfi");
+    __asm__ volatile("csrci sstatus, 0x2");
 }
 
 static inline uint64_t arch_task_read_current_stack_pointer(void) {

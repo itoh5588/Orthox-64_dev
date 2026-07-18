@@ -36,6 +36,23 @@ KERNEL_LDFLAGS = -nostdlib -static -T scripts/kernel.ld
 RISCV64_CFLAGS = --target=riscv64-none-elf -march=rv64gc -mabi=lp64 -ffreestanding \
 	-fno-stack-protector -fno-stack-check -fno-lto -fno-PIE -mcmodel=medany -O2 -Wall -Wextra \
 	-Iinclude -MMD -MP
+# ブート時に /bootstrap-user へ渡す argv (例: make riscv64-ash-run は sh を渡す)
+RISCV64_BOOTSTRAP_ARG0_VALUE ?=
+RISCV64_BOOTSTRAP_ARG1_VALUE ?=
+RISCV64_BOOTSTRAP_ARG2_VALUE ?=
+RISCV64_BOOTSTRAP_ARG3_VALUE ?=
+ifneq ($(RISCV64_BOOTSTRAP_ARG0_VALUE),)
+RISCV64_CFLAGS += '-DRISCV64_BOOTSTRAP_ARG0="$(RISCV64_BOOTSTRAP_ARG0_VALUE)"'
+endif
+ifneq ($(RISCV64_BOOTSTRAP_ARG1_VALUE),)
+RISCV64_CFLAGS += '-DRISCV64_BOOTSTRAP_ARG1="$(RISCV64_BOOTSTRAP_ARG1_VALUE)"'
+endif
+ifneq ($(RISCV64_BOOTSTRAP_ARG2_VALUE),)
+RISCV64_CFLAGS += '-DRISCV64_BOOTSTRAP_ARG2="$(RISCV64_BOOTSTRAP_ARG2_VALUE)"'
+endif
+ifneq ($(RISCV64_BOOTSTRAP_ARG3_VALUE),)
+RISCV64_CFLAGS += '-DRISCV64_BOOTSTRAP_ARG3="$(RISCV64_BOOTSTRAP_ARG3_VALUE)"'
+endif
 RISCV64_CFLAGS += $(RISCV64_CFLAGS_EXTRA)
 RISCV64_LDFLAGS = -nostdlib -static -m elf64lriscv -T scripts/kernel-riscv64.ld
 RISCV64_USER_CFLAGS = --target=riscv64-none-elf -march=rv64gc -mabi=lp64 -ffreestanding \
@@ -217,7 +234,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: all clean run riscv64-kernel riscv64-run riscv64-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-busybox-musl ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: all clean run riscv64-kernel riscv64-run riscv64-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -291,6 +308,14 @@ $(BUILD_DIR)/riscv64/bootstrap_user_src.stamp: FORCE
 	@echo "$(RISCV64_BOOTSTRAP_USER_SRC_ELF)" > $@.tmp; \
 	if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
 
+# bootstrap argv が変わったら boot.o を再コンパイルする
+$(BUILD_DIR)/riscv64/bootstrap_args.stamp: FORCE
+	@mkdir -p $(@D)
+	@echo "$(RISCV64_BOOTSTRAP_ARG0_VALUE)|$(RISCV64_BOOTSTRAP_ARG1_VALUE)|$(RISCV64_BOOTSTRAP_ARG2_VALUE)|$(RISCV64_BOOTSTRAP_ARG3_VALUE)" > $@.tmp; \
+	if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+$(BUILD_DIR)/riscv64/kernel/boot.o: $(BUILD_DIR)/riscv64/bootstrap_args.stamp
+
 $(BUILD_DIR)/riscv64/kernel/bootstrap_user_blob.o: $(RISCV64_BOOTSTRAP_USER_SRC_ELF) $(BUILD_DIR)/riscv64/bootstrap_user_src.stamp
 	@mkdir -p $(@D)
 	@if [ "$<" != "$(RISCV64_BOOTSTRAP_USER_EMBED_ELF)" ]; then cp "$<" "$(RISCV64_BOOTSTRAP_USER_EMBED_ELF)"; fi
@@ -340,6 +365,15 @@ riscv64-smoke: $(RISCV64_KERNEL_ELF)
 riscv64-musl-smoke: $(RISCV64_MUSL_PROBE_ELF)
 	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_MUSL_PROBE_ELF)
 	bash ./tests/riscv64_musl_smoke.sh
+
+# busybox ash を対話シェルとして起動 (stdin/stdout = シリアルコンソール)
+riscv64-ash-run: riscv64-busybox-musl
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_BUSYBOX_ASH_MUSL_ELF) RISCV64_BOOTSTRAP_ARG0_VALUE=sh
+	bash ./run_qemu_riscv64.sh
+
+riscv64-ash-smoke: riscv64-busybox-musl
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_BUSYBOX_ASH_MUSL_ELF) RISCV64_BOOTSTRAP_ARG0_VALUE=sh
+	bash ./tests/riscv64_ash_smoke.sh
 
 $(BUILD_DIR)/lwip/%.o: ports/lwip/src/%.c
 	@mkdir -p $(@D)

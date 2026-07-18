@@ -27,8 +27,10 @@ static int g_riscv64_logged_timer_after_user_handoff;
 
 static void riscv64_trap_rearm_current_kernel_stack(void) {
     struct cpu_local* cpu = get_cpu_local();
-    if (!cpu) return;
-    riscv64_trap_set_kernel_stack(cpu->kernel_stack);
+    if (!cpu || !cpu->kernel_stack) return;
+    // カーネル実行中は sscratch=0 を保つため kernel_sp フィールドのみ更新する。
+    // sscratch への書き戻しは trap 出口 (ユーザー復帰時) が行う
+    g_riscv64_trap_scratch.kernel_sp = cpu->kernel_stack;
 }
 
 static void riscv64_timer_arm_next(void) {
@@ -87,6 +89,7 @@ void riscv64_trap_set_kernel_stack(uint64_t kernel_sp) {
 }
 
 void riscv64_timer_init(void) {
+    riscv64_write_sie(riscv64_read_sie() | RISCV64_SIE_STIE);
     riscv64_timer_arm_next();
     riscv64_uart_puts("  sbi timer armed\n");
     if (g_riscv64_last_timer_error != 0) {

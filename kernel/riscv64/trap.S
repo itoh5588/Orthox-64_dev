@@ -24,10 +24,13 @@ riscv64_trap_entry:
     sd t1,  40(sp)
     ld t1,  16(t0)
     sd t1,  48(sp)
+    # カーネル実行中は sscratch=0 (ネスト trap は fallback 経路で現 sp を使う)
+    csrw sscratch, zero
     j .Ltrap_common
 
 .Ltrap_fallback:
     csrr t0, sscratch
+    csrw sscratch, zero
     addi sp, sp, -288
 
     sd ra,   0(sp)
@@ -112,9 +115,14 @@ riscv64_trap_entry:
     ld t4, 224(sp)
     ld t5, 232(sp)
     ld t6, 240(sp)
-    # sscratch を必ず scratch 領域へ戻す (入口の csrrw でユーザー t0 が残るため)
+    # ユーザーモードへ戻る場合 (SPP=0) のみ sscratch に scratch 領域を設定する。
+    # カーネルへ戻る場合は 0 のまま (ネスト trap は fallback 経路)
+    ld t0, 256(sp)
+    andi t0, t0, 0x100
+    bnez t0, 1f
     la t0, g_riscv64_trap_scratch
     csrw sscratch, t0
+1:
     ld t0,  32(sp)
     ld sp,   8(sp)
     sret
