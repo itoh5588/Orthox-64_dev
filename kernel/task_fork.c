@@ -64,7 +64,7 @@ int task_fork(struct syscall_frame* frame) {
     child->tls_memsz = parent->tls_memsz;
     child->tls_align = parent->tls_align;
     child->timeslice_ticks = TASK_TIMESLICE_TICKS;
-    child->ctx.cr3 = vmm_copy_pml4((uint64_t*)PHYS_TO_VIRT(parent->ctx.cr3));
+    child->ctx.cr3 = arch_vm_clone_address_space(parent->ctx.cr3);
     if (!child->ctx.cr3) {
         task_free_struct(child);
         return -1;
@@ -72,7 +72,7 @@ int task_fork(struct syscall_frame* frame) {
     kernel_strcpy(child->cwd, parent->cwd, sizeof(child->cwd));
     kstack_phys = pmm_alloc(4);
     if (!kstack_phys) {
-        vmm_free_user_pml4(child->ctx.cr3);
+        arch_vm_destroy_user_address_space(child->ctx.cr3);
         task_free_struct(child);
         return -1;
     }
@@ -99,8 +99,8 @@ int task_fork(struct syscall_frame* frame) {
             for (int j = 0; j < i; j++) {
                 fs_release_fd(&child->fds[j]);
             }
-            if (child->ctx.cr3 && child->ctx.cr3 != vmm_get_kernel_pml4_phys()) {
-                vmm_free_user_pml4(child->ctx.cr3);
+            if (child->ctx.cr3 && child->ctx.cr3 != arch_vm_kernel_address_space()) {
+                arch_vm_destroy_user_address_space(child->ctx.cr3);
             }
             pmm_free((void*)VIRT_TO_PHYS(child->kstack_top - 4 * PAGE_SIZE), 4);
             task_free_struct(child);

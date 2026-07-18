@@ -320,8 +320,8 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
     uint64_t old_cr3 = 0;
     struct task* t = get_current_task();
     if (t && t->deferred_cr3 && t->deferred_cr3 != t->ctx.cr3 &&
-        t->deferred_cr3 != vmm_get_kernel_pml4_phys()) {
-        vmm_free_user_pml4(t->deferred_cr3);
+        t->deferred_cr3 != arch_vm_kernel_address_space()) {
+        arch_vm_destroy_user_address_space(t->deferred_cr3);
         t->deferred_cr3 = 0;
     }
     exec_copy_phys = pmm_alloc(EXEC_COPY_PAGES);
@@ -394,7 +394,7 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
     task_set_comm_from_path(t, exec_copy->path);
 #if ORTHOX_MEM_PROGRESS
     t->trace_progress = task_comm_is_name(t, "cc1");
-    t->trace_started_ms = lapic_get_ticks_ms();
+    t->trace_started_ms = arch_time_now_ms();
     t->trace_last_ms = 0;
     t->trace_syscalls = 0;
     t->trace_brk_calls = 0;
@@ -463,7 +463,7 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
     frame->rdx = t->user_envp;
     arch_task_activate_user_context(&t->ctx, t->user_fs_base);
     __asm__ volatile("fninit");
-    if (old_cr3 && old_cr3 != t->ctx.cr3 && old_cr3 != vmm_get_kernel_pml4_phys()) {
+    if (old_cr3 && old_cr3 != t->ctx.cr3 && old_cr3 != arch_vm_kernel_address_space()) {
         t->deferred_cr3 = old_cr3;
     }
     pmm_free(exec_copy_phys, EXEC_COPY_PAGES);

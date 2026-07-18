@@ -5,6 +5,8 @@
 #include "fs.h"
 #include "arch_task.h"
 #include "arch_syscall.h"
+#include "arch_vm.h"
+#include "arch_time.h"
 
 struct elf_info;
 struct orth_runq_stat;

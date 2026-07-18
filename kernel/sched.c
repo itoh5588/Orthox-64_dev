@@ -87,7 +87,7 @@ void task_on_timer_tick(void) {
     struct cpu_local* cpu = task_this_cpu();
     uint64_t now = 0;
     if (cpu && cpu->cpu_id == 0) {
-        now = lapic_get_ticks_ms();
+        now = arch_time_now_ms();
         uint64_t flags = task_lock_irqsave();
         struct task* t = task_list;
         while (t) {
@@ -102,7 +102,7 @@ void task_on_timer_tick(void) {
     }
     if (!current_task || current_task->state != TASK_RUNNING) return;
 #if ORTHOX_MEM_PROGRESS
-    if (now == 0) now = lapic_get_ticks_ms();
+    if (now == 0) now = arch_time_now_ms();
     task_trace_progress_tick_internal(current_task, now);
 #endif
     if (current_task->timeslice_ticks > 1) {

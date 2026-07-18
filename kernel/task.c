@@ -526,13 +526,13 @@ static int task_reap_locked(struct task* t) {
 
     t->state = TASK_DEAD;
 
-    if (t->deferred_cr3 && t->deferred_cr3 != vmm_get_kernel_pml4_phys()) {
-        vmm_free_user_pml4(t->deferred_cr3);
+    if (t->deferred_cr3 && t->deferred_cr3 != arch_vm_kernel_address_space()) {
+        arch_vm_destroy_user_address_space(t->deferred_cr3);
         t->deferred_cr3 = 0;
     }
 
-    if (t->ctx.cr3 && t->ctx.cr3 != vmm_get_kernel_pml4_phys()) {
-        vmm_free_user_pml4(t->ctx.cr3);
+    if (t->ctx.cr3 && t->ctx.cr3 != arch_vm_kernel_address_space()) {
+        arch_vm_destroy_user_address_space(t->ctx.cr3);
         t->ctx.cr3 = 0;
     }
 
@@ -636,7 +636,7 @@ void task_init(void) {
     t->sid = t->pid;
     t->state = TASK_RUNNING;
     t->cpu_affinity = default_task_cpu_affinity();
-    t->ctx.cr3 = vmm_get_kernel_pml4_phys();
+    t->ctx.cr3 = arch_vm_kernel_address_space();
     uint64_t sp; __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
     t->kstack_top = (sp & ~(PAGE_SIZE - 1)) + PAGE_SIZE; 
     t->os_stack_ptr = t->kstack_top;
@@ -800,7 +800,7 @@ struct task* task_create_idle(uint32_t cpu_id) {
     t->pid = 0;
     t->state = TASK_RUNNING;
     t->cpu_affinity = (int)cpu_id;
-    t->ctx.cr3 = vmm_get_kernel_pml4_phys();
+    t->ctx.cr3 = arch_vm_kernel_address_space();
     t->mmap_end = 0x4000000000ULL;
     t->timeslice_ticks = TASK_TIMESLICE_TICKS;
     kernel_strcpy(t->cwd, "/", sizeof(t->cwd));
