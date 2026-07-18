@@ -45,9 +45,9 @@ find_tool() {
   return 1
 }
 
-export AR="$(find_tool x86_64-elf-ar x86_64-linux-gnu-ar ar)"
-export RANLIB="$(find_tool x86_64-elf-ranlib x86_64-linux-gnu-ranlib ranlib)"
-export STRIP="$(find_tool x86_64-elf-strip x86_64-linux-gnu-strip strip)"
+export AR="${ORTHOS_AR:-$(find_tool x86_64-elf-ar x86_64-linux-gnu-ar ar)}"
+export RANLIB="${ORTHOS_RANLIB:-$(find_tool x86_64-elf-ranlib x86_64-linux-gnu-ranlib ranlib)}"
+export STRIP="${ORTHOS_STRIP:-$(find_tool x86_64-elf-strip x86_64-linux-gnu-strip strip)}"
 INCLUDEDIR="${ORTHOS_INCLUDEDIR:-$ROOT/user/include}"
 if [ "$BUILD_DYNAMIC" = "1" ]; then
   export CFLAGS=""
@@ -55,7 +55,7 @@ if [ "$BUILD_DYNAMIC" = "1" ]; then
   BUSYBOX_EXTRA_LDFLAGS=""
 else
   export CFLAGS=""
-  BUSYBOX_EXTRA_CFLAGS="-O2 -I$INCLUDEDIR -Wno-format-security -Wno-stringop-overflow -Wno-unused-but-set-variable"
+  BUSYBOX_EXTRA_CFLAGS="-O2 -I$INCLUDEDIR ${ORTHOS_EXTRA_CFLAGS:-} -Wno-format-security -Wno-stringop-overflow -Wno-unused-but-set-variable"
   BUSYBOX_EXTRA_LDFLAGS="-static -nostartfiles"
 fi
 export LDFLAGS="$BUSYBOX_EXTRA_LDFLAGS"

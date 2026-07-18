@@ -1,0 +1,123 @@
+diff --git a/applets/usage_pod.c b/applets/usage_pod.c
+index ccc166aed..9e6d3f0ee 100644
+--- a/applets/usage_pod.c
++++ b/applets/usage_pod.c
+@@ -71,7 +71,7 @@ int main(void)
+ 		} else {
+ 			printf(", ");
+ 		}
+-		printf(usage_array[i].aname);
++		printf("%s", usage_array[i].aname);
+ 		col += len2;
+ 	}
+ 	printf("\n\n");
+diff --git a/coreutils/test.c b/coreutils/test.c
+index edc625f57..b406842e3 100644
+--- a/coreutils/test.c
++++ b/coreutils/test.c
+@@ -397,8 +397,16 @@ struct test_statics {
+ 	jmp_buf leaving;
+ };
+ 
++#ifndef ORTHOX_BUSYBOX_TEST_PTR_HACK
++#define ORTHOX_BUSYBOX_TEST_PTR_HACK 0
++#endif
++
+ /* See test_ptr_hack.c */
++#if ORTHOX_BUSYBOX_TEST_PTR_HACK
++extern struct test_statics *test_ptr_to_statics;
++#else
+ extern struct test_statics *const test_ptr_to_statics;
++#endif
+ 
+ #define S (*test_ptr_to_statics)
+ #define args            (S.args         )
+diff --git a/coreutils/test_ptr_hack.c b/coreutils/test_ptr_hack.c
+index 5ba9dcc68..3f84f0209 100644
+--- a/coreutils/test_ptr_hack.c
++++ b/coreutils/test_ptr_hack.c
+@@ -7,7 +7,7 @@
+ 
+ struct test_statics;
+ 
+-#ifndef GCC_COMBINE
++#if !defined(GCC_COMBINE) || ORTHOX_BUSYBOX_TEST_PTR_HACK
+ 
+ /* We cheat here. It is declared as const ptr in libbb.h,
+  * but here we make it live in R/W memory */
+diff --git a/include/libbb.h b/include/libbb.h
+index 87f89c76d..2832e5799 100644
+--- a/include/libbb.h
++++ b/include/libbb.h
+@@ -889,6 +889,11 @@ char *safe_gethostname(void) FAST_FUNC;
+ /* Convert each alpha char in str to lower-case */
+ char* str_tolower(char *str) FAST_FUNC;
+ 
++#ifdef __ORTHOS__
++#define utoa bb_utoa
++#define itoa bb_itoa
++#endif
++
+ char *utoa(unsigned n) FAST_FUNC;
+ char *itoa(int n) FAST_FUNC;
+ /* Returns a pointer past the formatted number, does NOT null-terminate */
+diff --git a/shell/ash.c b/shell/ash.c
+index d8f41327b..5cf6b9ae4 100644
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -377,7 +377,13 @@ struct globals_misc {
+ #endif
+ 	pid_t backgndpid;        /* pid of last background process */
+ };
++/* Orthox BusyBox build uses a writable pointer here to avoid Clang/RISC-V
++ * miscompiling the cast-based initialization hack used by upstream ash. */
++#if ORTHOX_BUSYBOX_ASH_PTR_HACK
++extern struct globals_misc *ash_ptr_to_globals_misc;
++#else
+ extern struct globals_misc *const ash_ptr_to_globals_misc;
++#endif
+ #define G_misc (*ash_ptr_to_globals_misc)
+ #define exitstatus        (G_misc.exitstatus )
+ #define back_exitstatus   (G_misc.back_exitstatus )
+@@ -1430,7 +1436,11 @@ struct globals_memstack {
+ 	size_t g_stacknleft; // = MINSIZE;
+ 	struct stack_block stackbase;
+ };
++#if ORTHOX_BUSYBOX_ASH_PTR_HACK
++extern struct globals_memstack *ash_ptr_to_globals_memstack;
++#else
+ extern struct globals_memstack *const ash_ptr_to_globals_memstack;
++#endif
+ #define G_memstack (*ash_ptr_to_globals_memstack)
+ #define g_stackp     (G_memstack.g_stackp    )
+ #define g_stacknxt   (G_memstack.g_stacknxt  )
+@@ -1982,7 +1992,11 @@ struct globals_var {
+ 	struct var *vartab[VTABSIZE];
+ 	struct var varinit[ARRAY_SIZE(varinit_data)];
+ };
++#if ORTHOX_BUSYBOX_ASH_PTR_HACK
++extern struct globals_var *ash_ptr_to_globals_var;
++#else
+ extern struct globals_var *const ash_ptr_to_globals_var;
++#endif
+ #define G_var (*ash_ptr_to_globals_var)
+ #define shellparam    (G_var.shellparam   )
+ //#define redirlist     (G_var.redirlist    )
+@@ -8796,10 +8810,17 @@ evaltree(union node *n, int flags)
+ 	return exitstatus;
+ }
+ 
++#if ORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS
++/* Clang は alias の __noreturn__ を alias 先 (evaltree 本体) に伝播させるため、
++ * 通常の evaltree 呼び出しの後続コードが到達不能として削除される。
++ * Orthox の Clang/RISC-V ビルドでは noreturn エイリアスを使わない。 */
++#define evaltreenr evaltree
++#else
+ #if !defined(__alpha__) || (defined(__GNUC__) && __GNUC__ >= 3)
+ static
+ #endif
+ int evaltreenr(union node *, int) __attribute__ ((alias("evaltree"),__noreturn__));
++#endif
+ 
+ static int
+ skiploop(void)

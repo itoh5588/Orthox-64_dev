@@ -217,7 +217,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: all clean run riscv64-kernel riscv64-run riscv64-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: all clean run riscv64-kernel riscv64-run riscv64-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-busybox-musl ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -316,6 +316,18 @@ $(RISCV64_MUSL_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/ri
 	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_musl_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
 
 riscv64-musl-probe: $(RISCV64_MUSL_PROBE_ELF)
+
+RISCV64_BUSYBOX_ASH_MUSL_ELF = out/busybox-riscv64-musl.elf
+
+riscv64-busybox-musl: $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p out
+	ORTHOS_CC=$(abspath ports/orthos-riscv64-musl-gcc.sh) \
+	ORTHOS_SYSROOT=$(abspath $(RISCV64_MUSL_SYSROOT)) \
+	ORTHOS_INCLUDEDIR=$(abspath $(RISCV64_MUSL_SYSROOT))/include \
+	ORTHOS_EXTRA_CFLAGS="-DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS=1" \
+	ORTHOS_AR="$(RISCV64_LLVM_AR)" ORTHOS_RANLIB="$(RISCV64_LLVM_RANLIB)" \
+	ORTHOS_STRIP="$(shell if [ -x /opt/homebrew/opt/llvm/bin/llvm-strip ]; then printf /opt/homebrew/opt/llvm/bin/llvm-strip; else printf llvm-strip; fi)" \
+	./ports/build_busybox_ash.sh $(abspath ports/busybox) $(abspath $(RISCV64_BUSYBOX_ASH_MUSL_ELF))
 
 riscv64-kernel: $(RISCV64_KERNEL_ELF)
 
