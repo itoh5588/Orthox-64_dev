@@ -7,7 +7,6 @@
 #include "fs.h"
 
 extern struct task* task_list;
-extern void arch_fork_child_return(void);
 
 static void kernel_strcpy(char* dst, const char* src, size_t size) {
     size_t i = 0;
@@ -23,7 +22,7 @@ static void kernel_strcpy(char* dst, const char* src, size_t size) {
     dst[i] = '\0';
 }
 
-int task_fork(struct syscall_frame* frame) {
+int task_fork(arch_syscall_frame_t* frame) {
     struct task* parent = get_current_task();
     struct task* child;
     uint32_t spawn_cpu;
@@ -79,22 +78,7 @@ int task_fork(struct syscall_frame* frame) {
     }
     child->kstack_top = (uint64_t)PHYS_TO_VIRT(kstack_phys) + 4 * PAGE_SIZE;
     child->os_stack_ptr = child->kstack_top;
-    struct syscall_frame* child_frame = (struct syscall_frame*)(child->kstack_top - sizeof(struct syscall_frame));
-    for (size_t i = 0; i < sizeof(struct syscall_frame); i++) {
-        ((uint8_t*)child_frame)[i] = ((uint8_t*)frame)[i];
-    }
-    child_frame->rax = 0;
-    child_frame->rflags &= ~0x400ULL;
-    uint64_t* sp = (uint64_t*)child_frame;
-    *(--sp) = (uint64_t)arch_fork_child_return;
-    *(--sp) = 0x202;
-    *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
-    child->ctx.rip = (uint64_t)arch_fork_child_return;
-    child->ctx.rsp = (uint64_t)sp;
-    child->ctx.rflags = 0x202;
-    child->ctx.cs = 0x08;
-    child->ctx.ss = 0x10;
-    arch_task_context_copy_fp_state(&child->ctx, &parent->ctx);
+    arch_task_commit_fork_child(&child->ctx, child->kstack_top, &parent->ctx, frame);
     for (int i = 0; i < MAX_FDS; i++) {
         if (fs_clone_fd(&child->fds[i], &parent->fds[i]) < 0) {
             for (int j = 0; j < i; j++) {

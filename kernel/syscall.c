@@ -39,7 +39,7 @@ void syscall_init(void) {
     syscall_init_cpu();
 }
 
-void syscall_dispatch(struct syscall_frame* frame) {
+void syscall_dispatch(arch_syscall_frame_t* frame) {
     uint64_t syscall_no = frame->rax;
     struct task* current = get_current_task();
     (void)current;

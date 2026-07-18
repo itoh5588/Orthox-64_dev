@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "task.h"
+#include "arch_syscall.h"
 
 #define TASK_TIMESLICE_TICKS 5
 
@@ -14,13 +15,8 @@
 #define MSR_GS_BASE        0xC0000101
 #define MSR_KERNEL_GS_BASE 0xC0000102
 
-struct syscall_frame {
-    uint64_t r15, r14, r13, r12, rbp, rbx, r9, r8, r10, rdx, rsi, rdi, rax;
-    uint64_t rip, cs, rflags, rsp, ss;
-};
-
-int task_fork(struct syscall_frame* frame);
-int task_execve(struct syscall_frame* frame, const char* path, char* const argv[], char* const envp[]);
+int task_fork(arch_syscall_frame_t* frame);
+int task_execve(arch_syscall_frame_t* frame, const char* path, char* const argv[], char* const envp[]);
 void task_set_comm_from_path(struct task* t, const char* path);
 uint64_t task_lock_irqsave(void);
 void task_unlock_irqrestore(uint64_t flags);

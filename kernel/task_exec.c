@@ -312,7 +312,7 @@ int task_prepare_initial_user_stack(arch_address_space_t address_space, struct t
     return 0;
 }
 
-int task_execve(struct syscall_frame* frame, const char* path, char* const argv[], char* const envp[]) {
+int task_execve(arch_syscall_frame_t* frame, const char* path, char* const argv[], char* const envp[]) {
     void* file_addr = NULL;
     size_t file_size = 0;
     void* exec_copy_phys = 0;
@@ -438,26 +438,13 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
     t->tls_align = info.tls_align;
     arch_task_context_init_fp_state(&t->ctx);
     fs_close_cloexec_descriptors(t);
-    frame->r15 = 0;
-    frame->r14 = 0;
-    frame->r13 = 0;
-    frame->r12 = 0;
-    frame->rbp = 0;
-    frame->rbx = 0;
-    frame->r9 = 0;
-    frame->r8 = 0;
-    frame->r10 = 0;
-    frame->rax = 0;
-    frame->rip = t->user_entry;
-    frame->cs = 0x23;
-    frame->ss = 0x1B;
-    frame->rsp = t->user_stack;
-    frame->rflags = 0x202ULL;
-    frame->rdi = t->user_argc;
-    frame->rsi = t->user_argv;
-    frame->rdx = t->user_envp;
-    arch_task_activate_user_context(&t->ctx, t->user_fs_base);
-    __asm__ volatile("fninit");
+    struct arch_task_user_state user_state;
+    user_state.entry_pc = t->user_entry;
+    user_state.user_sp = t->user_stack;
+    user_state.arg0 = t->user_argc;
+    user_state.arg1 = t->user_argv;
+    user_state.arg2 = t->user_envp;
+    arch_task_commit_execve(&t->ctx, frame, &user_state, t->user_fs_base);
     if (old_cr3 && old_cr3 != arch_task_context_get_address_space(&t->ctx) && old_cr3 != arch_vm_kernel_address_space()) {
         t->deferred_cr3 = old_cr3;
     }

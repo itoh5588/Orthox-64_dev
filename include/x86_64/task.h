@@ -9,6 +9,7 @@
 
 #define ARCH_TASK_KERNEL_CS 0x08U
 #define ARCH_TASK_KERNEL_SS 0x10U
+#define ARCH_TASK_USER_CS   0x23U
 #define ARCH_TASK_USER_SS   0x1BU
 #define ARCH_TASK_MSR_FS_BASE 0xC0000100U
 
@@ -158,6 +159,9 @@ static inline void arch_task_prepare_execve_frame(arch_task_exec_frame_t* frame,
     arch_syscall_set_return(frame, 0);
     arch_syscall_set_program_counter(frame, state ? state->entry_pc : 0);
     arch_syscall_set_stack_pointer(frame, state ? state->user_sp : 0);
+    frame->cs = ARCH_TASK_USER_CS;
+    frame->ss = ARCH_TASK_USER_SS;
+    frame->rflags = 0x202ULL;
     arch_syscall_set_arg0(frame, state ? state->arg0 : 0);
     arch_syscall_set_arg1(frame, state ? state->arg1 : 0);
     arch_syscall_set_arg2(frame, state ? state->arg2 : 0);
@@ -169,6 +173,7 @@ static inline void arch_task_commit_execve(struct arch_task_context* ctx,
                                            uint64_t tls_base) {
     arch_task_prepare_execve_frame(frame, state);
     arch_task_activate_user_context(ctx, tls_base);
+    __asm__ volatile("fninit");
 }
 
 static inline void arch_task_prepare_fork_child_context(struct arch_task_context* ctx,
@@ -182,6 +187,7 @@ static inline void arch_task_prepare_fork_child_context(struct arch_task_context
         for (uint64_t i = 0; i < sizeof(*child_frame); i++) dst[i] = src[i];
     }
     arch_syscall_set_return(child_frame, 0);
+    child_frame->rflags &= ~0x400ULL;
     sp = (uint64_t*)child_frame;
     *(--sp) = (uint64_t)arch_fork_child_return;
     *(--sp) = 0x202;

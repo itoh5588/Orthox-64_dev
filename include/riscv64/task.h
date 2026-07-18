@@ -190,6 +190,7 @@ static inline void arch_task_commit_fork_child(struct arch_task_context* child_c
                                                const struct arch_task_context* parent_ctx,
                                                const arch_task_exec_frame_t* parent_frame) {
     arch_task_exec_frame_t* child_frame = arch_task_exec_frame_on_kstack(child_kstack_top);
+    if (child_ctx) child_ctx->kernel_sp = child_kstack_top;
     arch_task_prepare_fork_child_context(child_ctx, child_frame, parent_frame);
     arch_task_context_copy_fp_state(child_ctx, parent_ctx);
 }
