@@ -31,7 +31,7 @@ int task_fork(struct syscall_frame* frame) {
     uint64_t flags;
     KASSERT(parent != 0);
     KASSERT(frame != 0);
-    KASSERT(parent->ctx.cr3 != 0);
+    KASSERT(arch_task_context_get_address_space(&parent->ctx) != 0);
     // The heavy setup below (address-space copy, kernel stack, fd clone) runs
     // outside g_task_lock: the parent is blocked here and the big kernel lock
     // already serializes it against other syscalls. Holding g_task_lock with
@@ -64,15 +64,16 @@ int task_fork(struct syscall_frame* frame) {
     child->tls_memsz = parent->tls_memsz;
     child->tls_align = parent->tls_align;
     child->timeslice_ticks = TASK_TIMESLICE_TICKS;
-    child->ctx.cr3 = arch_vm_clone_address_space(parent->ctx.cr3);
-    if (!child->ctx.cr3) {
+    arch_address_space_t child_as = arch_vm_clone_address_space(arch_task_context_get_address_space(&parent->ctx));
+    arch_task_context_set_address_space(&child->ctx, child_as);
+    if (!child_as) {
         task_free_struct(child);
         return -1;
     }
     kernel_strcpy(child->cwd, parent->cwd, sizeof(child->cwd));
     kstack_phys = pmm_alloc(4);
     if (!kstack_phys) {
-        arch_vm_destroy_user_address_space(child->ctx.cr3);
+        arch_vm_destroy_user_address_space(child_as);
         task_free_struct(child);
         return -1;
     }
@@ -99,8 +100,8 @@ int task_fork(struct syscall_frame* frame) {
             for (int j = 0; j < i; j++) {
                 fs_release_fd(&child->fds[j]);
             }
-            if (child->ctx.cr3 && child->ctx.cr3 != arch_vm_kernel_address_space()) {
-                arch_vm_destroy_user_address_space(child->ctx.cr3);
+            if (arch_task_context_get_address_space(&child->ctx) && arch_task_context_get_address_space(&child->ctx) != arch_vm_kernel_address_space()) {
+                arch_vm_destroy_user_address_space(child_as);
             }
             pmm_free((void*)VIRT_TO_PHYS(child->kstack_top - 4 * PAGE_SIZE), 4);
             task_free_struct(child);
@@ -108,7 +109,7 @@ int task_fork(struct syscall_frame* frame) {
         }
     }
     KASSERT(child->kstack_top != 0);
-    KASSERT(child->ctx.cr3 != 0);
+    KASSERT(arch_task_context_get_address_space(&child->ctx) != 0);
     flags = task_lock_irqsave();
     child->pid = task_next_pid_locked();
     spawn_cpu = task_choose_fork_cpu_locked((uint32_t)parent->cpu_affinity);

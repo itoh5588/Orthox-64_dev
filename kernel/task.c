@@ -45,8 +45,9 @@ static void task_assert_stack_aligned(uint64_t kstack_top) {
 
 static void task_assert_address_space_owned(struct task* t) {
     if (!t || task_is_idle_task(t)) return;
-    KASSERT(t->ctx.cr3 != 0);
-    KASSERT((t->ctx.cr3 & (PAGE_SIZE - 1)) == 0);
+    uint64_t _as = arch_task_context_get_address_space(&t->ctx);
+    KASSERT(_as != 0);
+    KASSERT((_as & (PAGE_SIZE - 1)) == 0);
 }
 
 void task_set_comm_from_path(struct task* t, const char* path) {
@@ -135,11 +136,7 @@ static void task_init_idle_context(struct task* t) {
     *(--sp) = 0;
     *(--sp) = 0;
     *(--sp) = 0;
-    t->ctx.rsp = (uint64_t)sp;
-    t->ctx.rip = (uint64_t)idle_task_entry;
-    t->ctx.cs = 0x08;
-    t->ctx.ss = 0x10;
-    t->ctx.rflags = 0;
+    arch_task_context_init_kernel_entry(&t->ctx, (uint64_t)idle_task_entry, (uint64_t)sp, arch_task_context_get_address_space(&t->ctx));
 }
 
 struct cpu_local* task_this_cpu(void) {
@@ -531,9 +528,10 @@ static int task_reap_locked(struct task* t) {
         t->deferred_cr3 = 0;
     }
 
-    if (t->ctx.cr3 && t->ctx.cr3 != arch_vm_kernel_address_space()) {
-        arch_vm_destroy_user_address_space(t->ctx.cr3);
-        t->ctx.cr3 = 0;
+    uint64_t _free_as = arch_task_context_get_address_space(&t->ctx);
+    if (_free_as && _free_as != arch_vm_kernel_address_space()) {
+        arch_vm_destroy_user_address_space(_free_as);
+        arch_task_context_set_address_space(&t->ctx, 0);
     }
 
     if (t->kstack_top) {
@@ -616,9 +614,21 @@ int task_free_struct(struct task* t) {
     return free_task_struct(t);
 }
 
+static struct arch_task_user_state task_user_state(const struct task* t) {
+    struct arch_task_user_state state;
+    state.entry_pc = t ? t->user_entry : 0;
+    state.user_sp = t ? t->user_stack : 0;
+    state.arg0 = t ? t->user_argc : 0;
+    state.arg1 = t ? t->user_argv : 0;
+    state.arg2 = t ? t->user_envp : 0;
+    return state;
+}
+
 void task_main(void) {
     struct task* t = get_current_task();
-    arch_enter_user((int)t->user_argc, (char**)t->user_argv, 0x1B, t->user_entry, t->user_stack, &t->os_stack_ptr);
+    struct arch_task_user_state state = task_user_state(t);
+    arch_task_sync_user_state(&t->ctx, &state);
+    arch_task_enter_initial_user(&state, &t->ctx, &t->os_stack_ptr);
     (void)task_mark_zombie(t, 0);
     while(1) schedule();
 }
@@ -636,8 +646,8 @@ void task_init(void) {
     t->sid = t->pid;
     t->state = TASK_RUNNING;
     t->cpu_affinity = default_task_cpu_affinity();
-    t->ctx.cr3 = arch_vm_kernel_address_space();
-    uint64_t sp; __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
+    arch_task_context_set_address_space(&t->ctx, arch_vm_kernel_address_space());
+    uint64_t sp = arch_task_read_current_stack_pointer();
     t->kstack_top = (sp & ~(PAGE_SIZE - 1)) + PAGE_SIZE; 
     t->os_stack_ptr = t->kstack_top;
     t->mmap_end = 0x4000000000ULL;
@@ -767,24 +777,17 @@ struct task* task_create_on_cpu(uint64_t entry, uint64_t user_rsp, uint32_t cpu_
     void* kstack_phys = pmm_alloc(4);
     t->kstack_top = (uint64_t)PHYS_TO_VIRT(kstack_phys) + 4 * PAGE_SIZE;
     t->os_stack_ptr = t->kstack_top;
-    void* pml4_phys = pmm_alloc(1);
-    arch_address_space_t user_as = (arch_address_space_t)(uint64_t)pml4_phys;
-    uint64_t* user_root = arch_vm_address_space_root(user_as);
-    uint64_t* kernel_root = arch_vm_address_space_root(arch_vm_kernel_address_space());
-    for (int i = 0; i < 512; i++) {
-        user_root[i] = (i >= 256) ? kernel_root[i] : 0;
+    arch_address_space_t user_as = arch_vm_create_user_address_space();
+    if (!user_as) {
+        spin_unlock_irqrestore(&g_task_lock, flags);
+        return NULL;
     }
-    t->ctx.cr3 = (uint64_t)pml4_phys;
-    t->ctx.rip = (uint64_t)task_main;
+    arch_task_context_set_address_space(&t->ctx, user_as);
     uint64_t* sp = (uint64_t*)(t->kstack_top - 8);
-    *sp = t->ctx.rip;
+    *sp = (uint64_t)task_main;
     *(--sp) = 0;
     *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0;
-    t->ctx.rsp = (uint64_t)sp;
-    t->ctx.cs = 0x08;
-    t->ctx.ss = 0x10;
-    t->ctx.fxsave_area[0] = 0x7f; t->ctx.fxsave_area[1] = 0x03;
-    t->ctx.fxsave_area[24] = 0x80; t->ctx.fxsave_area[25] = 0x1f;
+    arch_task_context_init_kernel_entry(&t->ctx, (uint64_t)task_main, (uint64_t)sp, user_as);
     t->next = task_list;
     task_list = t;
     spin_unlock_irqrestore(&g_task_lock, flags);
@@ -801,7 +804,7 @@ struct task* task_create_idle(uint32_t cpu_id) {
     t->pid = 0;
     t->state = TASK_RUNNING;
     t->cpu_affinity = (int)cpu_id;
-    t->ctx.cr3 = arch_vm_kernel_address_space();
+    arch_task_context_set_address_space(&t->ctx, arch_vm_kernel_address_space());
     t->mmap_end = 0x4000000000ULL;
     t->timeslice_ticks = TASK_TIMESLICE_TICKS;
     kernel_strcpy(t->cwd, "/", sizeof(t->cwd));
@@ -810,10 +813,7 @@ struct task* task_create_idle(uint32_t cpu_id) {
     t->kstack_top = (uint64_t)PHYS_TO_VIRT(kstack_phys) + 4 * PAGE_SIZE;
     t->os_stack_ptr = t->kstack_top;
     task_init_idle_context(t);
-    t->ctx.fxsave_area[0] = 0x7f;
-    t->ctx.fxsave_area[1] = 0x03;
-    t->ctx.fxsave_area[24] = 0x80;
-    t->ctx.fxsave_area[25] = 0x1f;
+    arch_task_context_init_fp_state(&t->ctx);
     (void)cpu_id;
     return t;
 }

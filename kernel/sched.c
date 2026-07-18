@@ -114,13 +114,12 @@ void task_on_timer_tick(void) {
 }
 
 void task_idle_loop(int poll_network) {
-    __asm__ volatile("sti");
     for (;;) {
         bottom_half_run();
         if (poll_network && net_needs_poll_fallback()) {
             net_poll();
         }
-        __asm__ volatile("hlt");
+        arch_task_idle_wait_once();
         bottom_half_run();
         if (task_consume_resched()) {
             kernel_yield();

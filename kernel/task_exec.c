@@ -319,7 +319,7 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
     struct exec_copy_buf* exec_copy = 0;
     uint64_t old_cr3 = 0;
     struct task* t = get_current_task();
-    if (t && t->deferred_cr3 && t->deferred_cr3 != t->ctx.cr3 &&
+    if (t && t->deferred_cr3 && t->deferred_cr3 != arch_task_context_get_address_space(&t->ctx) &&
         t->deferred_cr3 != arch_vm_kernel_address_space()) {
         arch_vm_destroy_user_address_space(t->deferred_cr3);
         t->deferred_cr3 = 0;
@@ -341,17 +341,11 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
         pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
         return -1;
     }
-    void* pml4_phys = pmm_alloc(1);
-    if (!pml4_phys) {
-        puts("Exec: pml4 alloc failed\r\n");
+    arch_address_space_t address_space = arch_vm_create_user_address_space();
+    if (!address_space) {
+        puts("Exec: address space alloc failed\r\n");
         pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
         return -1;
-    }
-    arch_address_space_t address_space = (arch_address_space_t)(uint64_t)pml4_phys;
-    uint64_t* user_root = arch_vm_address_space_root(address_space);
-    uint64_t* kernel_root = arch_vm_address_space_root(arch_vm_kernel_address_space());
-    for (int i = 0; i < 512; i++) {
-        user_root[i] = (i >= 256) ? kernel_root[i] : 0;
     }
     Elf64_Ehdr* ehdr = (Elf64_Ehdr*)file_addr;
     uint64_t exec_load_bias = (ehdr->e_type == ET_DYN) ? EXEC_ET_DYN_LOAD_BASE : 0;
@@ -386,12 +380,12 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
 
     if (task_prepare_initial_user_stack(address_space, t, &info, &interp_info, exec_copy->argv, exec_copy->envp) < 0) {
         pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
-        pmm_free(pml4_phys, 1);
+        arch_vm_destroy_user_address_space(address_space);
         return -1;
     }
 
-    old_cr3 = t->ctx.cr3;
-    t->ctx.cr3 = (uint64_t)pml4_phys;
+    old_cr3 = arch_task_context_get_address_space(&t->ctx);
+    arch_task_context_set_address_space(&t->ctx, address_space);
     task_set_comm_from_path(t, exec_copy->path);
 #if ORTHOX_MEM_PROGRESS
     t->trace_progress = task_comm_is_name(t, "cc1");
@@ -464,7 +458,7 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
     frame->rdx = t->user_envp;
     arch_task_activate_user_context(&t->ctx, t->user_fs_base);
     __asm__ volatile("fninit");
-    if (old_cr3 && old_cr3 != t->ctx.cr3 && old_cr3 != arch_vm_kernel_address_space()) {
+    if (old_cr3 && old_cr3 != arch_task_context_get_address_space(&t->ctx) && old_cr3 != arch_vm_kernel_address_space()) {
         t->deferred_cr3 = old_cr3;
     }
     pmm_free(exec_copy_phys, EXEC_COPY_PAGES);

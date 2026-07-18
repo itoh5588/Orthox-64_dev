@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include "vmm.h"
+#include "pmm.h"
 
 typedef uint64_t arch_address_space_t;
 
@@ -21,9 +22,17 @@ static inline uint64_t* arch_vm_address_space_root(arch_address_space_t address_
 }
 
 static inline arch_address_space_t arch_vm_create_user_address_space(void) {
-    /* Userspace address spaces are created via clone of the kernel root by the
-     * task creation path; no standalone allocator is needed here. */
-    return 0;
+    /* Allocate a fresh PML4 and copy the kernel half (upper 256 entries) from
+     * the kernel PML4 so kernel mappings are inherited by the new user space.
+     * The lower 256 entries (user space) are zeroed. */
+    void* pml4_phys = pmm_alloc(1);
+    if (!pml4_phys) return 0;
+    uint64_t* new_root = (uint64_t*)PHYS_TO_VIRT(pml4_phys);
+    uint64_t* kernel_root = arch_vm_address_space_root(arch_vm_kernel_address_space());
+    for (int i = 0; i < 512; i++) {
+        new_root[i] = (i >= 256) ? kernel_root[i] : 0;
+    }
+    return (arch_address_space_t)(uint64_t)pml4_phys;
 }
 
 static inline arch_address_space_t arch_vm_clone_address_space(arch_address_space_t address_space) {

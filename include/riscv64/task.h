@@ -90,6 +90,30 @@ static inline void arch_task_context_init_fp_state(struct arch_task_context* ctx
     (void)ctx;
 }
 
+static inline void arch_task_context_init_kernel_entry(struct arch_task_context* ctx,
+                                                       uint64_t entry,
+                                                       uint64_t stack_ptr,
+                                                       uint64_t address_space) {
+    if (!ctx) return;
+    ctx->kernel_sp = stack_ptr;
+    ctx->sched_ra = entry;
+    ctx->sched_sp = stack_ptr;
+    ctx->sched_s0 = 0;
+    ctx->sched_s1 = 0;
+    ctx->sched_s2 = 0;
+    ctx->sched_s3 = 0;
+    ctx->sched_s4 = 0;
+    ctx->sched_s5 = 0;
+    ctx->sched_s6 = 0;
+    ctx->sched_s7 = 0;
+    ctx->sched_s8 = 0;
+    ctx->sched_s9 = 0;
+    ctx->sched_s10 = 0;
+    ctx->sched_s11 = 0;
+    arch_task_context_set_address_space(ctx, address_space);
+    arch_task_context_init_fp_state(ctx);
+}
+
 static inline void arch_task_context_copy_fp_state(struct arch_task_context* dst,
                                                    const struct arch_task_context* src) {
     (void)dst;
