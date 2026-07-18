@@ -305,7 +305,7 @@ void _start(void) {
             if (module) {
                 // 最初は1つのタスクだけ作成
                 struct task* user_task = task_create(0, 0);
-                uint64_t* user_pml4 = (uint64_t*)PHYS_TO_VIRT(user_task->ctx.cr3);
+                arch_address_space_t user_pml4 = (arch_address_space_t)user_task->ctx.cr3;
 
                 struct elf_info info = elf_load(user_pml4, module->address, 0);
                 if (info.entry) {

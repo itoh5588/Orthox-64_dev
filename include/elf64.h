@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "arch_vm.h"
 
 typedef uint64_t Elf64_Addr;
 typedef uint64_t Elf64_Off;
@@ -81,6 +82,6 @@ struct elf_info {
 };
 
 // elf_load の返り値を構造体に
-struct elf_info elf_load(uint64_t* pml4, void* elf_data, uint64_t load_bias);
+struct elf_info elf_load(arch_address_space_t address_space, void* elf_data, uint64_t load_bias);
 
 #endif

@@ -119,8 +119,8 @@ static int resolve_interp_file(const char* interp_path, void** file_addr, size_t
     return -1;
 }
 
-static int alloc_user_stack(uint64_t* pml4_virt, struct task* t, int stack_pages, uint8_t* stack_pages_out[]) {
-    if (!pml4_virt || !t || stack_pages <= USER_STACK_GUARD_PAGES) return -1;
+static int alloc_user_stack(arch_address_space_t address_space, struct task* t, int stack_pages, uint8_t* stack_pages_out[]) {
+    if (!address_space || !t || stack_pages <= USER_STACK_GUARD_PAGES) return -1;
     uint64_t stack_bottom_vaddr = USER_STACK_TOP_VADDR - (uint64_t)stack_pages * PAGE_SIZE;
     uint64_t mapped_bottom_vaddr = stack_bottom_vaddr + USER_STACK_GUARD_PAGES * PAGE_SIZE;
     for (int i = 0; i < stack_pages - USER_STACK_GUARD_PAGES; i++) {
@@ -128,10 +128,10 @@ static int alloc_user_stack(uint64_t* pml4_virt, struct task* t, int stack_pages
         if (!stack_phys) return -1;
         uint8_t* stack_mem = (uint8_t*)PHYS_TO_VIRT(stack_phys);
         kernel_memset(stack_mem, 0, PAGE_SIZE);
-        vmm_map_page(pml4_virt,
+        arch_vm_map_page(address_space,
                      mapped_bottom_vaddr + (uint64_t)i * PAGE_SIZE,
                      (uint64_t)stack_phys,
-                     PTE_PRESENT | PTE_WRITABLE | PTE_USER);
+                     arch_vm_user_page_flags(1, 0));
         if (stack_pages_out) stack_pages_out[i] = stack_mem;
     }
     t->user_stack_top = USER_STACK_TOP_VADDR;
@@ -207,13 +207,13 @@ enum {
     AT_RANDOM = 25,
 };
 
-int task_prepare_initial_user_stack(uint64_t* pml4_virt, struct task* t,
+int task_prepare_initial_user_stack(arch_address_space_t address_space, struct task* t,
                                     const struct elf_info* info,
                                     const struct elf_info* interp_info,
                                     char* const argv[], char* const envp[]) {
     uint8_t* stack_pages[USER_STACK_PAGES];
     for (int i = 0; i < USER_STACK_PAGES; i++) stack_pages[i] = 0;
-    if (alloc_user_stack(pml4_virt, t, USER_STACK_PAGES, stack_pages) < 0) {
+    if (alloc_user_stack(address_space, t, USER_STACK_PAGES, stack_pages) < 0) {
         puts("Exec: alloc_user_stack failed\r\n");
         return -1;
     }
@@ -347,14 +347,15 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
         pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
         return -1;
     }
-    uint64_t* pml4_virt = (uint64_t*)PHYS_TO_VIRT(pml4_phys);
-    uint64_t* kernel_pml4 = vmm_get_kernel_pml4();
+    arch_address_space_t address_space = (arch_address_space_t)(uint64_t)pml4_phys;
+    uint64_t* user_root = arch_vm_address_space_root(address_space);
+    uint64_t* kernel_root = arch_vm_address_space_root(arch_vm_kernel_address_space());
     for (int i = 0; i < 512; i++) {
-        pml4_virt[i] = (i >= 256) ? kernel_pml4[i] : 0;
+        user_root[i] = (i >= 256) ? kernel_root[i] : 0;
     }
     Elf64_Ehdr* ehdr = (Elf64_Ehdr*)file_addr;
     uint64_t exec_load_bias = (ehdr->e_type == ET_DYN) ? EXEC_ET_DYN_LOAD_BASE : 0;
-    struct elf_info info = elf_load(pml4_virt, file_addr, exec_load_bias);
+    struct elf_info info = elf_load(address_space, file_addr, exec_load_bias);
     fs_free_exec_buffer(exec_copy->path, file_addr, file_size);
     file_addr = NULL;
     if (!info.entry) {
@@ -373,7 +374,7 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
             pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
             return -1;
         }
-        interp_info = elf_load(pml4_virt, interp_file_addr, EXEC_INTERP_LOAD_BASE);
+        interp_info = elf_load(address_space, interp_file_addr, EXEC_INTERP_LOAD_BASE);
         fs_free_exec_buffer(info.interp_path, interp_file_addr, interp_file_size);
         interp_file_addr = NULL;
         if (!interp_info.entry) {
@@ -383,7 +384,7 @@ int task_execve(struct syscall_frame* frame, const char* path, char* const argv[
         }
     }
 
-    if (task_prepare_initial_user_stack(pml4_virt, t, &info, &interp_info, exec_copy->argv, exec_copy->envp) < 0) {
+    if (task_prepare_initial_user_stack(address_space, t, &info, &interp_info, exec_copy->argv, exec_copy->envp) < 0) {
         pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
         pmm_free(pml4_phys, 1);
         return -1;

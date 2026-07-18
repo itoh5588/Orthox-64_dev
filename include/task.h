@@ -140,7 +140,7 @@ void task_request_resched(void);
 void task_request_resched_cpu(uint32_t cpu_id);
 int task_consume_resched(void);
 void task_on_timer_tick(void);
-int task_prepare_initial_user_stack(uint64_t* pml4_virt, struct task* t,
+int task_prepare_initial_user_stack(arch_address_space_t address_space, struct task* t,
                                     const struct elf_info* info,
                                     const struct elf_info* interp_info,
                                     char* const argv[], char* const envp[]);

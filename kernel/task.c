@@ -768,10 +768,11 @@ struct task* task_create_on_cpu(uint64_t entry, uint64_t user_rsp, uint32_t cpu_
     t->kstack_top = (uint64_t)PHYS_TO_VIRT(kstack_phys) + 4 * PAGE_SIZE;
     t->os_stack_ptr = t->kstack_top;
     void* pml4_phys = pmm_alloc(1);
-    uint64_t* pml4_virt = (uint64_t*)PHYS_TO_VIRT(pml4_phys);
-    uint64_t* kernel_pml4 = vmm_get_kernel_pml4();
+    arch_address_space_t user_as = (arch_address_space_t)(uint64_t)pml4_phys;
+    uint64_t* user_root = arch_vm_address_space_root(user_as);
+    uint64_t* kernel_root = arch_vm_address_space_root(arch_vm_kernel_address_space());
     for (int i = 0; i < 512; i++) {
-        pml4_virt[i] = (i >= 256) ? kernel_pml4[i] : 0;
+        user_root[i] = (i >= 256) ? kernel_root[i] : 0;
     }
     t->ctx.cr3 = (uint64_t)pml4_phys;
     t->ctx.rip = (uint64_t)task_main;
