@@ -12,6 +12,8 @@
 
 static task_context_t* g_riscv64_fallback_current_context;
 extern int task_fork(arch_task_exec_frame_t* frame);
+extern int task_execve(arch_task_exec_frame_t* frame, const char* path,
+                       char* const argv[], char* const envp[]);
 extern struct task* task_list;
 static int64_t riscv64_bootstrap_sys_wait4(int pid, int* wstatus, int options);
 
@@ -41,6 +43,8 @@ static int64_t riscv64_bootstrap_sys_wait4(int pid, int* wstatus, int options);
 #define RISCV64_LINUX_SYS_BRK              214
 #define RISCV64_LINUX_SYS_MUNMAP           215
 #define RISCV64_LINUX_SYS_CLONE            220
+#define RISCV64_LINUX_SYS_EXECVE           221
+#define RISCV64_LINUX_SYS_FACCESSAT        48
 #define RISCV64_LINUX_SYS_MMAP             222
 #define RISCV64_LINUX_SYS_WAIT4            260
 #define RISCV64_LINUX_SYS_GETRANDOM        278
@@ -91,6 +95,76 @@ struct riscv64_linux_termios {
     uint32_t c_ispeed;
     uint32_t c_ospeed;
 };
+
+// riscv64 (asm-generic) の struct stat。x86_64 レイアウトの struct kstat とは
+// フィールド順が異なるため、ユーザーへ返す際に変換する
+struct riscv64_linux_stat {
+    uint64_t st_dev;
+    uint64_t st_ino;
+    uint32_t st_mode;
+    uint32_t st_nlink;
+    uint32_t st_uid;
+    uint32_t st_gid;
+    uint64_t st_rdev;
+    uint64_t __pad1;
+    int64_t st_size;
+    int32_t st_blksize;
+    int32_t __pad2;
+    int64_t st_blocks;
+    int64_t st_atime_sec;
+    int64_t st_atime_nsec;
+    int64_t st_mtime_sec;
+    int64_t st_mtime_nsec;
+    int64_t st_ctime_sec;
+    int64_t st_ctime_nsec;
+    uint32_t __unused4;
+    uint32_t __unused5;
+};
+
+static void riscv64_stat_from_kstat(struct riscv64_linux_stat* out, const struct kstat* st) {
+    if (!out || !st) return;
+    out->st_dev = st->dev;
+    out->st_ino = st->ino;
+    out->st_mode = st->mode;
+    out->st_nlink = (uint32_t)st->nlink;
+    out->st_uid = st->uid;
+    out->st_gid = st->gid;
+    out->st_rdev = st->rdev;
+    out->__pad1 = 0;
+    out->st_size = st->size;
+    out->st_blksize = 512;
+    out->__pad2 = 0;
+    out->st_blocks = (st->size + 511) / 512;
+    out->st_atime_sec = st->atime_sec;
+    out->st_atime_nsec = 0;
+    out->st_mtime_sec = st->mtime_sec;
+    out->st_mtime_nsec = 0;
+    out->st_ctime_sec = st->ctime_sec;
+    out->st_ctime_nsec = 0;
+    out->__unused4 = 0;
+    out->__unused5 = 0;
+}
+
+static int riscv64_sys_fstat_user(int fd, struct riscv64_linux_stat* user_st) {
+    struct kstat st;
+    int rc = sys_fstat(fd, &st);
+    if (rc == 0 && user_st) riscv64_stat_from_kstat(user_st, &st);
+    return rc;
+}
+
+static int riscv64_sys_stat_user(const char* path, struct riscv64_linux_stat* user_st) {
+    struct kstat st;
+    int rc = sys_stat(path, &st);
+    if (rc == 0 && user_st) riscv64_stat_from_kstat(user_st, &st);
+    return rc;
+}
+
+static int riscv64_sys_fstatat_user(int dirfd, const char* path, struct riscv64_linux_stat* user_st, int flags) {
+    struct kstat st;
+    int rc = sys_fstatat(dirfd, path, &st, flags);
+    if (rc == 0 && user_st) riscv64_stat_from_kstat(user_st, &st);
+    return rc;
+}
 
 struct riscv64_linux_winsize {
     uint16_t ws_row;
@@ -468,13 +542,13 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
     if (syscall_no == RISCV64_LINUX_SYS_NEWFSTATAT && arg0_s >= -4096 && arg0_s <= 4096) {
         int dirfd = (int)arch_syscall_arg0(frame);
         const char* path = (const char*)(uintptr_t)arch_syscall_arg1(frame);
-        struct kstat* st = (struct kstat*)(uintptr_t)arch_syscall_arg2(frame);
+        struct riscv64_linux_stat* st = (struct riscv64_linux_stat*)(uintptr_t)arch_syscall_arg2(frame);
         int flags = (int)arch_syscall_arg3(frame);
         int rc;
         if (path && path[0] == '\0' && (flags & RISCV64_LINUX_AT_EMPTY_PATH) != 0) {
-            rc = sys_fstat(dirfd, st);
+            rc = riscv64_sys_fstat_user(dirfd, st);
         } else {
-            rc = sys_fstatat(dirfd, path, st, flags);
+            rc = riscv64_sys_fstatat_user(dirfd, path, st, flags);
         }
         arch_syscall_set_return(frame, (uint64_t)(int64_t)rc);
         return;
@@ -482,8 +556,8 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
 
     if (syscall_no == RISCV64_LINUX_SYS_FSTAT && arg0_s >= -4096 && arg0_s <= 4096) {
         arch_syscall_set_return(frame,
-                                (uint64_t)(int64_t)sys_fstat((int)arch_syscall_arg0(frame),
-                                                             (struct kstat*)(uintptr_t)arch_syscall_arg1(frame)));
+                                (uint64_t)(int64_t)riscv64_sys_fstat_user((int)arch_syscall_arg0(frame),
+                                                                          (struct riscv64_linux_stat*)(uintptr_t)arch_syscall_arg1(frame)));
         return;
     }
 
@@ -570,25 +644,25 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case SYS_FSTAT:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)sys_fstat((int)arch_syscall_arg0(frame),
-                                                                 (struct kstat*)(uintptr_t)arch_syscall_arg1(frame)));
+                                    (uint64_t)(int64_t)riscv64_sys_fstat_user((int)arch_syscall_arg0(frame),
+                                                                              (struct riscv64_linux_stat*)(uintptr_t)arch_syscall_arg1(frame)));
             return;
         case SYS_STAT:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)sys_stat((const char*)(uintptr_t)arch_syscall_arg0(frame),
-                                                                (struct kstat*)(uintptr_t)arch_syscall_arg1(frame)));
+                                    (uint64_t)(int64_t)riscv64_sys_stat_user((const char*)(uintptr_t)arch_syscall_arg0(frame),
+                                                                             (struct riscv64_linux_stat*)(uintptr_t)arch_syscall_arg1(frame)));
             return;
         case SYS_FSTATAT:
             {
                 int dirfd = (int)arch_syscall_arg0(frame);
                 const char* path = (const char*)(uintptr_t)arch_syscall_arg1(frame);
-                struct kstat* st = (struct kstat*)(uintptr_t)arch_syscall_arg2(frame);
+                struct riscv64_linux_stat* st = (struct riscv64_linux_stat*)(uintptr_t)arch_syscall_arg2(frame);
                 int flags = (int)arch_syscall_arg3(frame);
                 int rc;
                 if (path && path[0] == '\0' && (flags & RISCV64_LINUX_AT_EMPTY_PATH) != 0) {
-                    rc = sys_fstat(dirfd, st);
+                    rc = riscv64_sys_fstat_user(dirfd, st);
                 } else {
-                    rc = sys_fstatat(dirfd, path, st, flags);
+                    rc = riscv64_sys_fstatat_user(dirfd, path, st, flags);
                 }
                 arch_syscall_set_return(frame, (uint64_t)(int64_t)rc);
             }
@@ -692,6 +766,28 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                     (uint64_t)(int64_t)riscv64_bootstrap_sys_ioctl((int)arch_syscall_arg0(frame),
                                                                                    (unsigned long)arch_syscall_arg1(frame),
                                                                                    arch_syscall_arg2(frame)));
+            return;
+        case SYS_EXECVE:
+        case RISCV64_LINUX_SYS_EXECVE:
+            {
+                int rc = task_execve(frame,
+                                     (const char*)(uintptr_t)arch_syscall_arg0(frame),
+                                     (char* const*)(uintptr_t)arch_syscall_arg1(frame),
+                                     (char* const*)(uintptr_t)arch_syscall_arg2(frame));
+                if (rc < 0) {
+                    arch_syscall_set_return(frame, (uint64_t)(int64_t)-2); /* -ENOENT */
+                }
+                /* 成功時は frame が新プロセスの初期状態に書き換わっている */
+            }
+            return;
+        case RISCV64_LINUX_SYS_FACCESSAT:
+            {
+                struct kstat st;
+                int dirfd = (int)arch_syscall_arg0(frame);
+                const char* path = (const char*)(uintptr_t)arch_syscall_arg1(frame);
+                int rc = sys_fstatat(dirfd, path, &st, 0);
+                arch_syscall_set_return(frame, (uint64_t)(int64_t)(rc == 0 ? 0 : -2));
+            }
             return;
         case SYS_EXIT:
         case RISCV64_LINUX_SYS_EXIT:

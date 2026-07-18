@@ -172,9 +172,10 @@ SRCS = kernel/init.c kernel/kassert.c kernel/pmm.c kernel/elf.c kernel/gdt.c ker
 RISCV64_C_SRCS = kernel/riscv64/boot.c kernel/riscv64/bootstrap_user.c kernel/riscv64/elf.c \
 	kernel/riscv64/entry.c kernel/riscv64/fs.c kernel/riscv64/net_socket.c kernel/riscv64/pmm.c \
 	kernel/riscv64/runtime.c kernel/riscv64/task.c kernel/riscv64/trap.c kernel/riscv64/syscall.c \
-	kernel/riscv64/vm.c
+	kernel/riscv64/virtio_blk_mmio.c kernel/riscv64/vm.c
 RISCV64_SHARED_C_SRCS = kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c \
-	kernel/wait.c kernel/elf.c kernel/cstring.c
+	kernel/wait.c kernel/elf.c kernel/cstring.c kernel/cstdio.c \
+	kernel/storage.c kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c
 RISCV64_ASM_SRCS = kernel/riscv64/start.S kernel/riscv64/trap.S kernel/riscv64/entry.S
 
 LWIP_CORE_SRCS = \
@@ -366,12 +367,23 @@ riscv64-musl-smoke: $(RISCV64_MUSL_PROBE_ELF)
 	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_MUSL_PROBE_ELF)
 	bash ./tests/riscv64_musl_smoke.sh
 
+RISCV64_ROOTFS_IMG = out/rootfs-riscv64-xv6.img
+RISCV64_ROOTFS_APPLETS = ash sh busybox cat chmod cp echo env false head ls mkdir mv printenv printf pwd rm rmdir stat tail test touch true wc
+
+# riscv64 用 xv6fs rootfs イメージ (busybox applet を /bin にコピー配置)
+riscv64-rootfs: riscv64-busybox-musl
+	rm -rf $(BUILD_DIR)/riscv64-rootfs
+	mkdir -p $(BUILD_DIR)/riscv64-rootfs/bin $(BUILD_DIR)/riscv64-rootfs/etc $(BUILD_DIR)/riscv64-rootfs/tmp
+	for a in $(RISCV64_ROOTFS_APPLETS); do cp $(RISCV64_BUSYBOX_ASH_MUSL_ELF) $(BUILD_DIR)/riscv64-rootfs/bin/$$a; done
+	printf 'hello from riscv64 xv6fs rootfs\n' > $(BUILD_DIR)/riscv64-rootfs/etc/motd
+	python3 scripts/build_rootfs_xv6fs.py $(BUILD_DIR)/riscv64-rootfs $(RISCV64_ROOTFS_IMG) | tail -4
+
 # busybox ash を対話シェルとして起動 (stdin/stdout = シリアルコンソール)
-riscv64-ash-run: riscv64-busybox-musl
+riscv64-ash-run: riscv64-busybox-musl riscv64-rootfs
 	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_BUSYBOX_ASH_MUSL_ELF) RISCV64_BOOTSTRAP_ARG0_VALUE=sh
 	bash ./run_qemu_riscv64.sh
 
-riscv64-ash-smoke: riscv64-busybox-musl
+riscv64-ash-smoke: riscv64-busybox-musl riscv64-rootfs
 	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_BUSYBOX_ASH_MUSL_ELF) RISCV64_BOOTSTRAP_ARG0_VALUE=sh
 	bash ./tests/riscv64_ash_smoke.sh
 

@@ -76,6 +76,7 @@ struct virtio_queue {
 };
 
 /* I/O Port Helper Functions (x86) */
+#if defined(__x86_64__)
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
 }
@@ -105,6 +106,7 @@ static inline uint32_t inl(uint16_t port) {
     __asm__ volatile("inl %1, %0" : "=a"(ret) : "Nd"(port));
     return ret;
 }
+#endif /* __x86_64__ */
 
 /* Common VirtIO Functions (to be implemented in kernel/virtio.c) */
 int virtio_virtq_init(uint16_t iobase, uint16_t queue_index, struct virtio_queue* q);

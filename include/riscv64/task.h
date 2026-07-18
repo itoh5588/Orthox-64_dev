@@ -178,6 +178,9 @@ static inline void arch_task_commit_execve(struct arch_task_context* ctx,
     (void)tls_base;
     arch_task_prepare_execve_frame(frame, state);
     riscv64_task_store_user_frame(ctx, frame);
+    // syscall 経由の execve では trap 出口がそのまま sret するため、
+    // ここで新しいアドレス空間へ切り替えておく (カーネルはグローバルマップ)
+    arch_task_context_activate_address_space(ctx);
 }
 
 static inline void arch_task_prepare_fork_child_context(struct arch_task_context* ctx,

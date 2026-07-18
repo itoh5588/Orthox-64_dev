@@ -396,13 +396,12 @@ void riscv64_vm_init(void) {
                              RISCV64_VM_PAGE_R | RISCV64_VM_PAGE_G);
     }
 
-    if (boot && boot->first_virtio_mmio_base) {
-        riscv64_vm_map_range(g_riscv64_kernel_root_pa,
-                             boot->first_virtio_mmio_base,
-                             boot->first_virtio_mmio_base,
-                             RISCV64_PAGE_SIZE,
-                             RISCV64_VM_PAGE_R | RISCV64_VM_PAGE_W | RISCV64_VM_PAGE_G);
-    }
+    // QEMU virt の virtio-mmio スロット全域 (0x10001000..0x10009000, 8 slots)
+    riscv64_vm_map_range(g_riscv64_kernel_root_pa,
+                         0x10001000ULL,
+                         0x10001000ULL,
+                         0x8000ULL,
+                         RISCV64_VM_PAGE_R | RISCV64_VM_PAGE_W | RISCV64_VM_PAGE_G);
 
     riscv64_vm_activate_address_space(g_riscv64_kernel_root_pa);
 

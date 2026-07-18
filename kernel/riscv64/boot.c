@@ -7,8 +7,11 @@
 #include "riscv64/syscall.h"
 #include "riscv64/task.h"
 #include "riscv64/trap.h"
+#include "riscv64/virtio_blk_mmio.h"
 #include "riscv64/vm.h"
 #include "elf64.h"
+#include "storage.h"
+#include "xv6fs.h"
 #include "pmm.h"
 #include "syscall.h"
 #include "task.h"
@@ -998,6 +1001,33 @@ cleanup_child:
     (void)riscv64_test_user_unmap_page(base, "  fork selftest");
 }
 
+// virtio-blk (mmio) を storage 層に登録し xv6fs rootfs をマウントする。
+// sleeplock (wait_queue) を使うため task_init 後に呼ぶこと。
+static void riscv64_storage_bootstrap(void) {
+    uint64_t capacity;
+
+    storage_init();
+    if (riscv64_virtio_blk_mmio_init() < 0) {
+        riscv64_uart_puts("  virtio-blk (mmio): not found\n");
+        return;
+    }
+    capacity = riscv64_virtio_blk_mmio_capacity();
+    riscv64_uart_puts("  virtio-blk (mmio): capacity 0x");
+    riscv64_uart_puthex64(capacity);
+    riscv64_uart_puts(" sectors\n");
+    if (storage_register_device("vblk0", 512, capacity,
+                                riscv64_virtio_blk_mmio_storage_read,
+                                riscv64_virtio_blk_mmio_storage_write, 0, 0) < 0) {
+        riscv64_uart_puts("  vblk0 register failed\n");
+        return;
+    }
+    if (xv6fs_mount_storage("vblk0") == 0) {
+        riscv64_uart_puts("  xv6fs mounted on vblk0\n");
+    } else {
+        riscv64_uart_puts("  vblk0 is not xv6fs\n");
+    }
+}
+
 static void riscv64_first_user_task_bootstrap_continue(void) {
     arch_task_exec_frame_t frame;
 
@@ -1005,6 +1035,7 @@ static void riscv64_first_user_task_bootstrap_continue(void) {
         riscv64_uart_puts("  first user task bootstrap failed: no current task\n");
         riscv64_wait_forever();
     }
+    riscv64_storage_bootstrap();
     riscv64_syscall_dispatch_selftest();
     riscv64_fs_syscall_selftest();
     if (task_execve(&frame, g_riscv64_bootstrap_path, g_riscv64_bootstrap_argv, g_riscv64_bootstrap_envp) < 0) {

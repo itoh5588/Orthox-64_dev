@@ -35,6 +35,12 @@ fi
 SERIAL_LOG=LOGs/riscv64-ash-serial.log
 rm -f "$SERIAL_LOG"
 
+ROOTFS_IMG=out/rootfs-riscv64-xv6.img
+DRIVE_ARGS=()
+if [ -f "$ROOTFS_IMG" ]; then
+    DRIVE_ARGS=(-drive "file=$ROOTFS_IMG,if=none,format=raw,id=vblk0" -device virtio-blk-device,drive=vblk0)
+fi
+
 (
     sleep 8
     printf 'echo interactive-ok\n'
@@ -43,6 +49,12 @@ rm -f "$SERIAL_LOG"
     sleep 2
     printf 'x=42; echo val=$x\n'
     sleep 2
+    printf 'ls /bin\n'
+    sleep 2
+    printf 'cat /etc/motd\n'
+    sleep 2
+    printf '/bin/echo external-exec-ok\n'
+    sleep 3
     printf 'exit\n'
     sleep 3
 ) | "$QEMU_BIN" \
@@ -54,7 +66,7 @@ rm -f "$SERIAL_LOG"
     -kernel out/kernel-riscv64.elf \
     -display none \
     -serial stdio \
-    -monitor none > "$SERIAL_LOG" 2>&1 &
+    -monitor none "${DRIVE_ARGS[@]}" > "$SERIAL_LOG" 2>&1 &
 QEMU_PID=$!
 
 cleanup() {
@@ -80,6 +92,12 @@ grep -q "riscv64 supervisor timer interrupt" "$SERIAL_LOG"
 grep -q "interactive-ok" "$SERIAL_LOG"
 grep -q "^/" "$SERIAL_LOG"
 grep -q "val=42" "$SERIAL_LOG"
+if [ -f "$ROOTFS_IMG" ]; then
+    grep -q "xv6fs mounted on vblk0" "$SERIAL_LOG"
+    grep -q "busybox" "$SERIAL_LOG"
+    grep -q "hello from riscv64 xv6fs rootfs" "$SERIAL_LOG"
+    grep -q "external-exec-ok" "$SERIAL_LOG"
+fi
 grep -q "bootstrap user exit" "$SERIAL_LOG"
 
 echo "riscv64 ash smoke test: PASS"

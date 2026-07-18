@@ -7,6 +7,7 @@
 #include "sys_internal.h"
 #include "task.h"
 #include "vmm.h"
+#include "xv6fs.h"
 
 struct riscv64_linux_dirent64 {
     uint64_t d_ino;
@@ -81,6 +82,9 @@ static int riscv64_fs_append_dirent(struct orth_dirent* dirents, size_t max_coun
 static int riscv64_fs_build_dirents(const char* resolved, struct orth_dirent* dirents, size_t max_count, size_t* out_count) {
     size_t count = 0;
     if (!resolved || !dirents || !out_count) return -1;
+    if (xv6fs_is_mounted()) {
+        return xv6fs_list_dir(resolved, dirents, max_count, out_count);
+    }
     if (!riscv64_fs_path_eq(resolved, "/")) return -1;
     if (riscv64_fs_append_dirent(dirents, max_count, &count, ".", KSTAT_MODE_DIR | 0755U, 0) < 0) return -1;
     if (riscv64_fs_append_dirent(dirents, max_count, &count, "..", KSTAT_MODE_DIR | 0755U, 0) < 0) return -1;
@@ -130,6 +134,35 @@ static int riscv64_fs_resolve_dirfd_path(int dirfd, const char* path, char* out,
 
 int fs_get_file_data(const char* path, void** data, size_t* size) {
     if (riscv64_bootstrap_user_file_data(path, data, size) == 0) return 0;
+    if (xv6fs_is_mounted()) {
+        uint32_t xv6_mode = 0;
+        uint64_t xv6_size = 0;
+        char resolved[256];
+        if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) goto notfound;
+        if (xv6fs_stat_path(resolved, &xv6_mode, &xv6_size, 0, 0) < 0) goto notfound;
+        if ((xv6_mode & 0170000U) != KSTAT_MODE_FILE) goto notfound;
+        if (data) {
+            size_t npages = ((size_t)xv6_size + PAGE_SIZE - 1U) / PAGE_SIZE;
+            struct xv6fs_inode* ip;
+            void* buf;
+            if (npages == 0) npages = 1;
+            buf = PHYS_TO_VIRT(pmm_alloc((int)npages));
+            if (!buf) goto notfound;
+            ip = xv6fs_namei(resolved);
+            if (!ip) {
+                pmm_free((void*)VIRT_TO_PHYS((uint64_t)buf), (int)npages);
+                goto notfound;
+            }
+            xv6fs_ilock(ip);
+            xv6fs_readi(ip, buf, 0, (uint32_t)xv6_size);
+            xv6fs_iunlock(ip);
+            xv6fs_iput(ip);
+            *data = buf;
+        }
+        if (size) *size = (size_t)xv6_size;
+        return 0;
+    }
+notfound:
     if (data) *data = 0;
     if (size) *size = 0;
     return -1;
@@ -154,31 +187,57 @@ int sys_open(const char* path, int flags, int mode) {
     }
     if (fd < 0) return -1;
 
-    if ((flags & O_DIRECTORY) != 0) {
-        if (!riscv64_fs_path_eq(resolved, "/")) return -1;
-        {
-            void* dir_page = pmm_alloc(1);
+    {
+        // ディレクトリ判定: O_DIRECTORY 指定、または xv6fs 上のディレクトリ
+        int is_dir = (flags & O_DIRECTORY) != 0;
+        uint32_t xv6_mode = 0;
+        uint64_t xv6_size = 0;
+        int have_xv6 = 0;
+        if (xv6fs_is_mounted() && xv6fs_stat_path(resolved, &xv6_mode, &xv6_size, 0, 0) == 0) {
+            have_xv6 = 1;
+            if ((xv6_mode & 0170000U) == KSTAT_MODE_DIR) is_dir = 1;
+        }
+        if (!xv6fs_is_mounted() && riscv64_fs_path_eq(resolved, "/")) is_dir = 1;
+
+        if (is_dir) {
+            // 4 ページ = 約60エントリまで列挙可能
+            void* dir_page = pmm_alloc(4);
             struct orth_dirent* dirents;
             size_t count = 0;
             if (!dir_page) return -1;
             dirents = (struct orth_dirent*)PHYS_TO_VIRT(dir_page);
-            for (size_t i = 0; i < PAGE_SIZE; i++) ((uint8_t*)dirents)[i] = 0;
-            if (riscv64_fs_build_dirents(resolved, dirents, PAGE_SIZE / sizeof(struct orth_dirent), &count) < 0) {
-                pmm_free(dir_page, 1);
+            for (size_t i = 0; i < 4 * PAGE_SIZE; i++) ((uint8_t*)dirents)[i] = 0;
+            if (riscv64_fs_build_dirents(resolved, dirents, 4 * PAGE_SIZE / sizeof(struct orth_dirent), &count) < 0) {
+                pmm_free(dir_page, 4);
                 return -1;
             }
             current->fds[fd].data = dirents;
             current->fds[fd].size = count * sizeof(struct orth_dirent);
-            current->fds[fd].aux0 = 1;
+            current->fds[fd].aux0 = 4;
+            current->fds[fd].type = FT_DIR;
+            current->fds[fd].offset = 0;
+            current->fds[fd].in_use = 1;
+            current->fds[fd].flags = flags;
+            current->fds[fd].fd_flags = 0;
+            current->fds[fd].aux1 = 0;
+            riscv64_fs_strcpy(current->fds[fd].name, resolved, sizeof(current->fds[fd].name));
+            return fd;
         }
-        current->fds[fd].type = FT_DIR;
-        current->fds[fd].offset = 0;
-        current->fds[fd].in_use = 1;
-        current->fds[fd].flags = flags;
-        current->fds[fd].aux1 = 0;
-        current->fds[fd].name[0] = '/';
-        current->fds[fd].name[1] = '\0';
-        return fd;
+
+        if (have_xv6) {
+            if ((xv6_mode & 0170000U) != KSTAT_MODE_FILE) return -1;
+            current->fds[fd].type = FT_XV6FS;
+            current->fds[fd].data = 0;
+            current->fds[fd].size = (size_t)xv6_size;
+            current->fds[fd].offset = 0;
+            current->fds[fd].in_use = 1;
+            current->fds[fd].flags = flags;
+            current->fds[fd].fd_flags = 0;
+            current->fds[fd].aux0 = 0;
+            current->fds[fd].aux1 = 0;
+            riscv64_fs_strcpy(current->fds[fd].name, resolved, sizeof(current->fds[fd].name));
+            return fd;
+        }
     }
 
     if (fs_get_file_data(resolved, &file_data, &file_size) < 0) return -1;
@@ -256,6 +315,22 @@ int64_t sys_read(int fd, void* buf, size_t count) {
         return (int64_t)read_count;
     }
     if (f->type == FT_DIR) return -1;
+    if (f->type == FT_XV6FS) {
+        struct xv6fs_inode* ip;
+        int got;
+        if (f->offset >= f->size) return 0;
+        remaining = f->size - f->offset;
+        to_read = (count > remaining) ? remaining : count;
+        ip = xv6fs_namei(f->name);
+        if (!ip) return -1;
+        xv6fs_ilock(ip);
+        got = xv6fs_readi(ip, buf, (uint32_t)f->offset, (uint32_t)to_read);
+        xv6fs_iunlock(ip);
+        xv6fs_iput(ip);
+        if (got < 0) return -1;
+        f->offset += (size_t)got;
+        return (int64_t)got;
+    }
     if (f->type != FT_MODULE) return -1;
     if (f->offset >= f->size) return 0;
 
@@ -275,6 +350,19 @@ int sys_stat(const char* path, struct kstat* st) {
 
     if (!path || !st) return -1;
     if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
+
+    if (xv6fs_is_mounted()) {
+        uint32_t xv6_mode = 0;
+        uint64_t xv6_size = 0;
+        uint32_t xv6_rdev = 0;
+        if (xv6fs_stat_path(resolved, &xv6_mode, &xv6_size, 0, &xv6_rdev) == 0) {
+            riscv64_fs_kstat_defaults(st, xv6_mode, (int64_t)xv6_size);
+            st->rdev = xv6_rdev;
+            st->ino = 2;
+            return 0;
+        }
+        // xv6fs に無くても埋め込み /bootstrap-user は見せる
+    }
 
     if (riscv64_fs_path_eq(resolved, "/")) {
         riscv64_fs_kstat_defaults(st, KSTAT_MODE_DIR | 0755U, 0);
@@ -315,7 +403,7 @@ int sys_fstat(int fd, struct kstat* st) {
         st->ino = 1;
         return 0;
     }
-    if (f->type == FT_MODULE && f->name[0] != '\0') {
+    if ((f->type == FT_MODULE || f->type == FT_XV6FS) && f->name[0] != '\0') {
         return sys_stat(f->name, st);
     }
     return -1;
@@ -436,11 +524,21 @@ int fs_init_console_fd(file_descriptor_t* fd, int flags) {
     return 0;
 }
 
-// riscv64 の exec イメージは埋め込み静的領域なので解放は不要
+// 埋め込み ELF は静的領域なので解放不要。xv6fs から読んだバッファは pmm 返却
 void fs_free_exec_buffer(const char* path, void* data, size_t size) {
+    void* embedded = 0;
+    size_t embedded_size = 0;
     (void)path;
-    (void)data;
-    (void)size;
+    if (!data || size == 0) return;
+    if (riscv64_bootstrap_user_file_data("/bootstrap-user", &embedded, &embedded_size) == 0 &&
+        data == embedded) {
+        return;
+    }
+    {
+        size_t npages = (size + PAGE_SIZE - 1U) / PAGE_SIZE;
+        if (npages == 0) npages = 1;
+        pmm_free((void*)VIRT_TO_PHYS((uint64_t)data), (int)npages);
+    }
 }
 
 int sys_getdents(int fd, struct orth_dirent* dirp, size_t count) {

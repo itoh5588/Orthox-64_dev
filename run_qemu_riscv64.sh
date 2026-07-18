@@ -26,6 +26,12 @@ else
     exit 1
 fi
 
+ROOTFS_IMG="$SCRIPT_DIR/out/rootfs-riscv64-xv6.img"
+DRIVE_ARGS=()
+if [ -f "$ROOTFS_IMG" ]; then
+    DRIVE_ARGS=(-drive "file=$ROOTFS_IMG,if=none,format=raw,id=vblk0" -device virtio-blk-device,drive=vblk0)
+fi
+
 exec "$QEMU_BIN" \
     -machine virt \
     -cpu rv64 \
@@ -36,4 +42,5 @@ exec "$QEMU_BIN" \
     -display none \
     -serial stdio \
     -monitor none \
+    "${DRIVE_ARGS[@]}" \
     "$@"

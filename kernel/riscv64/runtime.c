@@ -194,3 +194,11 @@ void kernel_panic(const char* file, int line, const char* func, const char* expr
         __asm__ volatile("wfi" ::: "memory");
     }
 }
+
+int64_t sys_write_serial(const char* buf, size_t count) {
+    if (!buf) return -1;
+    for (size_t i = 0; i < count; i++) {
+        riscv64_uart_putchar(buf[i]);
+    }
+    return (int64_t)count;
+}
