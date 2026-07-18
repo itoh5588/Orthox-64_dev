@@ -76,8 +76,19 @@ static int riscv64_bootstrap_user_streq(const char* a, const char* b) {
     return *a == '\0' && *b == '\0';
 }
 
+// Makefile が objcopy で埋め込む外部ユーザー ELF (未リンク時は weak で 0)
+extern const uint8_t _binary_out_bootstrap_user_riscv64_elf_start[] __attribute__((weak));
+extern const uint8_t _binary_out_bootstrap_user_riscv64_elf_end[] __attribute__((weak));
+
 int riscv64_bootstrap_user_file_data(const char* path, void** data, size_t* size) {
     if (!riscv64_bootstrap_user_streq(path, "/bootstrap-user")) return -1;
+    if (_binary_out_bootstrap_user_riscv64_elf_start &&
+        _binary_out_bootstrap_user_riscv64_elf_end > _binary_out_bootstrap_user_riscv64_elf_start) {
+        if (data) *data = (void*)_binary_out_bootstrap_user_riscv64_elf_start;
+        if (size) *size = (size_t)(_binary_out_bootstrap_user_riscv64_elf_end -
+                                   _binary_out_bootstrap_user_riscv64_elf_start);
+        return 0;
+    }
     if (data) *data = (void*)&g_riscv64_bootstrap_user_elf;
     if (size) *size = sizeof(g_riscv64_bootstrap_user_elf);
     return 0;

@@ -12,6 +12,9 @@ XAR = x86_64-elf-ar
 RISCV64_CC = $(shell if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then printf /opt/homebrew/opt/llvm/bin/clang; \
 	elif [ -x /usr/local/opt/llvm/bin/clang ]; then printf /usr/local/opt/llvm/bin/clang; \
 	else printf clang; fi)
+RISCV64_OBJCOPY = $(shell if [ -x /opt/homebrew/opt/llvm/bin/llvm-objcopy ]; then printf /opt/homebrew/opt/llvm/bin/llvm-objcopy; \
+	elif [ -x /usr/local/opt/llvm/bin/llvm-objcopy ]; then printf /usr/local/opt/llvm/bin/llvm-objcopy; \
+	else printf llvm-objcopy; fi)
 
 BUILD_DIR = build
 USER_BUILD_DIR = $(BUILD_DIR)/musl/user
@@ -29,6 +32,9 @@ RISCV64_CFLAGS = --target=riscv64-none-elf -march=rv64gc -mabi=lp64 -ffreestandi
 	-Iinclude -MMD -MP
 RISCV64_CFLAGS += $(RISCV64_CFLAGS_EXTRA)
 RISCV64_LDFLAGS = -nostdlib -static -m elf64lriscv -T scripts/kernel-riscv64.ld
+RISCV64_USER_CFLAGS = --target=riscv64-none-elf -march=rv64gc -mabi=lp64 -ffreestanding \
+	-fno-stack-protector -fno-lto -fno-PIE -O2 -Wall -Wextra -Iinclude -MMD -MP
+RISCV64_USER_LDFLAGS = -nostdlib -static -m elf64lriscv --entry=_start -Ttext 0x400000
 
 # libc / sysroot 設定
 LIBC_IMPL = musl
@@ -51,6 +57,11 @@ LIBGCC =
 # 出力ファイル名
 KERNEL_ELF = kernel.elf
 RISCV64_KERNEL_ELF = out/kernel-riscv64.elf
+RISCV64_BOOTSTRAP_USER_BUILD_ELF = out/bootstrap-user-riscv64-default.elf
+# 埋め込み対象の外部ユーザー ELF (差し替え可能)
+RISCV64_BOOTSTRAP_USER_SRC_ELF ?= $(RISCV64_BOOTSTRAP_USER_BUILD_ELF)
+# objcopy のシンボル名を安定させるため固定パスへコピーしてから埋め込む
+RISCV64_BOOTSTRAP_USER_EMBED_ELF = out/bootstrap-user-riscv64.elf
 PIPE_TEST_ELF = user/pipetest.elf
 PIPE_STRESS_ELF = user/pipestress.elf
 SMP_STRESS_ELF = user/smpstress.elf
@@ -174,7 +185,8 @@ OBJS = $(patsubst kernel/%.c, $(BUILD_DIR)/kernel/%.o, $(filter %.c, $(SRCS))) \
 
 RISCV64_OBJS = $(patsubst kernel/riscv64/%.c, $(BUILD_DIR)/riscv64/kernel/%.o, $(RISCV64_C_SRCS)) \
 	$(patsubst kernel/%.c, $(BUILD_DIR)/riscv64/kernel/shared/%.o, $(RISCV64_SHARED_C_SRCS)) \
-	$(patsubst kernel/riscv64/%.S, $(BUILD_DIR)/riscv64/kernel/%_asm.o, $(RISCV64_ASM_SRCS))
+	$(patsubst kernel/riscv64/%.S, $(BUILD_DIR)/riscv64/kernel/%_asm.o, $(RISCV64_ASM_SRCS)) \
+	$(BUILD_DIR)/riscv64/kernel/bootstrap_user_blob.o
 
 DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/crt0.d $(USER_BUILD_DIR)/syscalls.d $(USER_BUILD_DIR)/syscall_wrap.d \
@@ -252,6 +264,19 @@ $(BUILD_DIR)/riscv64/kernel/shared/%.o: kernel/%.c
 $(BUILD_DIR)/riscv64/kernel/%_asm.o: kernel/riscv64/%.S
 	@mkdir -p $(@D)
 	$(RISCV64_CC) $(RISCV64_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/riscv64/user/%.o: user/%.c
+	@mkdir -p $(@D)
+	$(RISCV64_CC) $(RISCV64_USER_CFLAGS) -c $< -o $@
+
+$(RISCV64_BOOTSTRAP_USER_BUILD_ELF): $(BUILD_DIR)/riscv64/user/riscv64_hello.o
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_USER_LDFLAGS) $< -o $@
+
+$(BUILD_DIR)/riscv64/kernel/bootstrap_user_blob.o: $(RISCV64_BOOTSTRAP_USER_SRC_ELF)
+	@mkdir -p $(@D)
+	@if [ "$<" != "$(RISCV64_BOOTSTRAP_USER_EMBED_ELF)" ]; then cp "$<" "$(RISCV64_BOOTSTRAP_USER_EMBED_ELF)"; fi
+	$(RISCV64_OBJCOPY) -I binary -O elf64-littleriscv $(RISCV64_BOOTSTRAP_USER_EMBED_ELF) $@
 
 riscv64-kernel: $(RISCV64_KERNEL_ELF)
 
