@@ -563,6 +563,11 @@ struct task* get_current_task(void) {
     return get_current_task_raw();
 }
 
+task_context_t* task_current_context(void) {
+    struct task* t = get_current_task_raw();
+    return t ? &t->ctx : 0;
+}
+
 static void* kernel_memset(void* s, int c, size_t n) {
     unsigned char* p = s;
     while (n--) *p++ = (unsigned char)c;

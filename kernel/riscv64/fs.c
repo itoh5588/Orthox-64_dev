@@ -4,6 +4,7 @@
 #include "pmm.h"
 #include "riscv64/boot.h"
 #include "riscv64/bootstrap_user.h"
+#include "sys_internal.h"
 #include "task.h"
 #include "vmm.h"
 
@@ -255,7 +256,7 @@ int64_t sys_read(int fd, void* buf, size_t count) {
         return (int64_t)read_count;
     }
     if (f->type == FT_DIR) return -1;
-    if (f->type != FT_MODULE && f->type != FT_TAR) return -1;
+    if (f->type != FT_MODULE) return -1;
     if (f->offset >= f->size) return 0;
 
     remaining = f->size - f->offset;
@@ -314,7 +315,7 @@ int sys_fstat(int fd, struct kstat* st) {
         st->ino = 1;
         return 0;
     }
-    if ((f->type == FT_MODULE || f->type == FT_TAR) && f->name[0] != '\0') {
+    if (f->type == FT_MODULE && f->name[0] != '\0') {
         return sys_stat(f->name, st);
     }
     return -1;
@@ -351,17 +352,12 @@ int sys_fchdir(int fd) {
     return sys_chdir(f->name);
 }
 
-int sys_close(int fd) {
-    struct task* current = get_current_task();
-    file_descriptor_t* desc;
+void fs_release_fd(file_descriptor_t* desc) {
     struct task* read_waiter = 0;
     struct task* write_waiter = 0;
     int free_pipe = 0;
 
-    if (!current) return -1;
-    if (fd < 0 || fd >= MAX_FDS) return -1;
-    desc = &current->fds[fd];
-    if (!desc->in_use) return -1;
+    if (!desc || !desc->in_use) return;
 
     if (desc->type == FT_PIPE) {
         pipe_t* pipe = (pipe_t*)desc->data;
@@ -390,8 +386,61 @@ int sys_close(int fd) {
     desc->data = 0;
     desc->size = 0;
     desc->offset = 0;
+    desc->fd_flags = 0;
     desc->name[0] = '\0';
+}
+
+int sys_close(int fd) {
+    struct task* current = get_current_task();
+
+    if (!current) return -1;
+    if (fd < 0 || fd >= MAX_FDS) return -1;
+    if (!current->fds[fd].in_use) return -1;
+    fs_release_fd(&current->fds[fd]);
     return 0;
+}
+
+int fs_clone_fd(file_descriptor_t* dst, const file_descriptor_t* src) {
+    if (!dst || !src) return -1;
+    *dst = *src;
+    if (src->in_use && src->type == FT_PIPE && src->data) {
+        pipe_t* pipe = (pipe_t*)src->data;
+        uint64_t flags = spin_lock_irqsave(&pipe->lock);
+        pipe->ref_count++;
+        spin_unlock_irqrestore(&pipe->lock, flags);
+    }
+    return 0;
+}
+
+void fs_close_cloexec_descriptors(struct task* task) {
+    if (!task) return;
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (task->fds[i].in_use && (task->fds[i].fd_flags & FD_CLOEXEC)) {
+            fs_release_fd(&task->fds[i]);
+        }
+    }
+}
+
+int fs_init_console_fd(file_descriptor_t* fd, int flags) {
+    if (!fd) return -1;
+    fd->type = FT_CONSOLE;
+    fd->data = 0;
+    fd->size = 0;
+    fd->offset = 0;
+    fd->in_use = 1;
+    fd->flags = flags;
+    fd->fd_flags = 0;
+    fd->aux0 = 0;
+    fd->aux1 = 0;
+    fd->name[0] = '\0';
+    return 0;
+}
+
+// riscv64 の exec イメージは埋め込み静的領域なので解放は不要
+void fs_free_exec_buffer(const char* path, void* data, size_t size) {
+    (void)path;
+    (void)data;
+    (void)size;
 }
 
 int sys_getdents(int fd, struct orth_dirent* dirp, size_t count) {

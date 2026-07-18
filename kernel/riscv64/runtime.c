@@ -170,3 +170,27 @@ uint32_t smp_get_started_cpu_count(void) {
 void smp_send_resched_ipi(uint32_t cpu_id) {
     (void)cpu_id;
 }
+
+int bottom_half_run(void) {
+    return 0;
+}
+
+int net_needs_poll_fallback(void) {
+    return 0;
+}
+
+void kernel_panic(const char* file, int line, const char* func, const char* expr) {
+    puts("\r\n*** KERNEL PANIC ***\r\n");
+    puts("expr: ");
+    puts(expr ? expr : "(null)");
+    puts("\r\nfunc: ");
+    puts(func ? func : "(null)");
+    puts("\r\nfile: ");
+    puts(file ? file : "(null)");
+    puts(":0x");
+    puthex((uint64_t)(uint32_t)line);
+    puts("\r\nHALTING...\r\n");
+    for (;;) {
+        __asm__ volatile("wfi" ::: "memory");
+    }
+}

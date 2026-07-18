@@ -1,5 +1,5 @@
 #include "wait.h"
-#include "lapic.h"
+#include "arch_time.h"
 
 static int wait_queue_contains_locked(struct wait_queue* q, struct task* t) {
     struct task* it = q ? q->head : 0;
@@ -85,7 +85,7 @@ int wait_event_timeout(struct wait_queue* q, wait_condition_t condition, void* a
     if (!q || !condition) return -1;
     current = get_current_task();
     if (!current) return -1;
-    deadline = lapic_get_ticks_ms() + timeout_ms;
+    deadline = arch_time_now_ms() + timeout_ms;
 
     for (;;) {
         uint64_t now;
@@ -95,7 +95,7 @@ int wait_event_timeout(struct wait_queue* q, wait_condition_t condition, void* a
             spin_unlock_irqrestore(&q->lock, flags);
             return 1;
         }
-        now = lapic_get_ticks_ms();
+        now = arch_time_now_ms();
         if (timeout_ms == 0 || now >= deadline) {
             wait_queue_remove_locked(q, current);
             spin_unlock_irqrestore(&q->lock, flags);

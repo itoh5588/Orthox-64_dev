@@ -465,13 +465,14 @@ static void riscv64_user_stack_selftest(void) {
         return;
     }
     for (uint64_t i = 0; i < sizeof(temp_task); i++) ((uint8_t*)&temp_task)[i] = 0;
+    for (uint64_t i = 0; i < sizeof(info); i++) ((uint8_t*)&info)[i] = 0;
     info.entry = (void*)(uintptr_t)0x0000000000400000ULL;
     info.max_vaddr = 0x0000000000401000ULL;
     info.phdr_vaddr = 0x0000000000400040ULL;
     info.phent = sizeof(Elf64_Phdr);
     info.phnum = 1;
 
-    if (task_prepare_initial_user_stack((arch_address_space_t)aspace, &temp_task, &info, argv, envp) < 0) {
+    if (task_prepare_initial_user_stack((arch_address_space_t)aspace, &temp_task, &info, 0, argv, envp) < 0) {
         riscv64_uart_puts("  user stack selftest: prepare failed\n");
         riscv64_vm_destroy_address_space(aspace);
         return;

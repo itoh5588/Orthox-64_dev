@@ -8,6 +8,11 @@ TARGET = x86_64-elf
 XGCC = x86_64-elf-gcc
 XAR = x86_64-elf-ar
 
+# RISC-V 64 ツールチェーン (homebrew LLVM clang を優先)
+RISCV64_CC = $(shell if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then printf /opt/homebrew/opt/llvm/bin/clang; \
+	elif [ -x /usr/local/opt/llvm/bin/clang ]; then printf /usr/local/opt/llvm/bin/clang; \
+	else printf clang; fi)
+
 BUILD_DIR = build
 USER_BUILD_DIR = $(BUILD_DIR)/musl/user
 
@@ -18,6 +23,12 @@ KERNEL_CFLAGS = -target $(TARGET) -std=c11 -ffreestanding -fno-stack-protector -
 KERNEL_CFLAGS += $(KERNEL_CFLAGS_EXTRA)
 
 KERNEL_LDFLAGS = -nostdlib -static -T scripts/kernel.ld
+
+RISCV64_CFLAGS = --target=riscv64-none-elf -march=rv64gc -mabi=lp64 -ffreestanding \
+	-fno-stack-protector -fno-stack-check -fno-lto -fno-PIE -mcmodel=medany -O2 -Wall -Wextra \
+	-Iinclude -MMD -MP
+RISCV64_CFLAGS += $(RISCV64_CFLAGS_EXTRA)
+RISCV64_LDFLAGS = -nostdlib -static -m elf64lriscv -T scripts/kernel-riscv64.ld
 
 # libc / sysroot 設定
 LIBC_IMPL = musl
@@ -39,6 +50,7 @@ LIBGCC =
 
 # 出力ファイル名
 KERNEL_ELF = kernel.elf
+RISCV64_KERNEL_ELF = out/kernel-riscv64.elf
 PIPE_TEST_ELF = user/pipetest.elf
 PIPE_STRESS_ELF = user/pipestress.elf
 SMP_STRESS_ELF = user/smpstress.elf
@@ -117,6 +129,14 @@ SRCS = kernel/init.c kernel/kassert.c kernel/pmm.c kernel/elf.c kernel/gdt.c ker
        kernel/vmm.c kernel/idt.c kernel/interrupt.S kernel/lapic.c kernel/sound.c kernel/syscall.c kernel/sys_trace.c kernel/sys_time.c kernel/sys_signal.c kernel/sys_vm.c kernel/sys_proc.c kernel/sys_fs.c kernel/sys_device.c kernel/sys_random.c kernel/sys_net.c kernel/syscall_entry.S \
        kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c kernel/wait.c kernel/bottom_half.c kernel/irq.c kernel/task_switch.S kernel/fs.c kernel/vfs.c kernel/storage.c kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c kernel/pic.c kernel/keyboard.c kernel/pci.c kernel/net.c kernel/net_socket.c kernel/virtio.c kernel/virtio_net.c kernel/virtio_blk.c kernel/lwip_port.c kernel/cstring.c kernel/cstdio.c kernel/cstdlib.c kernel/usb.c kernel/smp.c kernel/spinlock.c
 
+RISCV64_C_SRCS = kernel/riscv64/boot.c kernel/riscv64/bootstrap_user.c kernel/riscv64/elf.c \
+	kernel/riscv64/entry.c kernel/riscv64/fs.c kernel/riscv64/net_socket.c kernel/riscv64/pmm.c \
+	kernel/riscv64/runtime.c kernel/riscv64/task.c kernel/riscv64/trap.c kernel/riscv64/syscall.c \
+	kernel/riscv64/vm.c
+RISCV64_SHARED_C_SRCS = kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c \
+	kernel/wait.c kernel/elf.c kernel/cstring.c
+RISCV64_ASM_SRCS = kernel/riscv64/start.S kernel/riscv64/trap.S kernel/riscv64/entry.S
+
 LWIP_CORE_SRCS = \
 	ports/lwip/src/core/def.c \
 	ports/lwip/src/core/dns.c \
@@ -152,6 +172,10 @@ OBJS = $(patsubst kernel/%.c, $(BUILD_DIR)/kernel/%.o, $(filter %.c, $(SRCS))) \
        $(patsubst kernel/%.S, $(BUILD_DIR)/kernel/%.o, $(filter %.S, $(SRCS))) \
        $(patsubst ports/lwip/src/%.c, $(BUILD_DIR)/lwip/%.o, $(LWIP_SRCS))
 
+RISCV64_OBJS = $(patsubst kernel/riscv64/%.c, $(BUILD_DIR)/riscv64/kernel/%.o, $(RISCV64_C_SRCS)) \
+	$(patsubst kernel/%.c, $(BUILD_DIR)/riscv64/kernel/shared/%.o, $(RISCV64_SHARED_C_SRCS)) \
+	$(patsubst kernel/riscv64/%.S, $(BUILD_DIR)/riscv64/kernel/%_asm.o, $(RISCV64_ASM_SRCS))
+
 DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/crt0.d $(USER_BUILD_DIR)/syscalls.d $(USER_BUILD_DIR)/syscall_wrap.d \
        $(USER_BUILD_DIR)/user_test.d $(USER_BUILD_DIR)/exec_test.d $(USER_BUILD_DIR)/pipe_test.d $(USER_BUILD_DIR)/pipestress.d $(USER_BUILD_DIR)/smpstress.d $(USER_BUILD_DIR)/schedmix.d \
@@ -169,7 +193,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: all clean run ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: all clean run riscv64-kernel riscv64-run riscv64-smoke ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -212,6 +236,30 @@ $(BUILD_DIR)/kernel/%.o: kernel/%.c
 $(BUILD_DIR)/kernel/%.o: kernel/%.S
 	@mkdir -p $(@D)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(RISCV64_KERNEL_ELF): $(RISCV64_OBJS)
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_LDFLAGS) $(RISCV64_OBJS) -o $@
+
+$(BUILD_DIR)/riscv64/kernel/%.o: kernel/riscv64/%.c
+	@mkdir -p $(@D)
+	$(RISCV64_CC) $(RISCV64_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/riscv64/kernel/shared/%.o: kernel/%.c
+	@mkdir -p $(@D)
+	$(RISCV64_CC) $(RISCV64_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/riscv64/kernel/%_asm.o: kernel/riscv64/%.S
+	@mkdir -p $(@D)
+	$(RISCV64_CC) $(RISCV64_CFLAGS) -c $< -o $@
+
+riscv64-kernel: $(RISCV64_KERNEL_ELF)
+
+riscv64-run: $(RISCV64_KERNEL_ELF)
+	bash ./run_qemu_riscv64.sh
+
+riscv64-smoke: $(RISCV64_KERNEL_ELF)
+	bash ./tests/riscv64_smoke.sh
 
 $(BUILD_DIR)/lwip/%.o: ports/lwip/src/%.c
 	@mkdir -p $(@D)

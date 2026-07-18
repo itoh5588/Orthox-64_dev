@@ -136,6 +136,7 @@ int task_get_fork_spread(void);
 void schedule(void);
 struct cpu_local* get_cpu_local(void);
 struct task* get_current_task(void);
+task_context_t* task_current_context(void);
 void task_request_resched(void);
 void task_request_resched_cpu(uint32_t cpu_id);
 int task_consume_resched(void);
