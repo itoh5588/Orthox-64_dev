@@ -55,10 +55,11 @@ static char* g_riscv64_bootstrap_envp[] = { g_riscv64_bootstrap_env0, g_riscv64_
 
 extern struct task* task_list;
 
+// ブートスタックは 64KB/hart (start.S) なので 64KB 境界へ切り上げて実トップを得る
 static uint64_t riscv64_boot_stack_top(void) {
     uint64_t sp;
     __asm__ volatile("mv %0, sp" : "=r"(sp));
-    return (sp & ~(4096ULL - 1ULL)) + 4096ULL;
+    return (sp & ~(65536ULL - 1ULL)) + 65536ULL;
 }
 
 #define RISCV64_UART_RHR 0
@@ -450,7 +451,8 @@ static void riscv64_vm_clone_selftest(void) {
 }
 
 static void riscv64_user_stack_selftest(void) {
-    struct task temp_task;
+    // struct task は shared 化で巨大 (数十KB) になったためスタックに置かない
+    static struct task temp_task;
     struct elf_info info;
     char arg0[] = "bootstrap";
     char* argv[] = { arg0, 0 };

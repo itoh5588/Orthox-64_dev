@@ -106,6 +106,11 @@ void riscv64_task_enter_initial_user_context(const struct arch_task_context* ctx
     }
     root_pa = ctx->root_pa;
     kernel_sp = ctx->kernel_sp;
+    if (!kernel_sp) {
+        // boot タスクの execve 経路では ctx->kernel_sp が未設定のことがある
+        struct task* cur = get_current_task();
+        if (cur) kernel_sp = cur->kstack_top;
+    }
     riscv64_task_copy_frame((arch_task_exec_frame_t*)&initial_frame, &ctx->user_frame);
     riscv64_uart_puts("  enter user ctx root: 0x");
     riscv64_uart_puthex64(root_pa);

@@ -112,5 +112,9 @@ riscv64_trap_entry:
     ld t4, 224(sp)
     ld t5, 232(sp)
     ld t6, 240(sp)
+    # sscratch を必ず scratch 領域へ戻す (入口の csrrw でユーザー t0 が残るため)
+    la t0, g_riscv64_trap_scratch
+    csrw sscratch, t0
+    ld t0,  32(sp)
     ld sp,   8(sp)
     sret

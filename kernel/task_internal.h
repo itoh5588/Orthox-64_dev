@@ -7,7 +7,12 @@
 
 #define TASK_TIMESLICE_TICKS 5
 
+// Sv39 (riscv64) は 39bit VA のためユーザースタックを 2^38 未満に置く
+#if defined(__riscv)
+#define USER_STACK_TOP_VADDR   0x0000003FFFFFF000ULL
+#else
 #define USER_STACK_TOP_VADDR   0x7FFFFFFFF000ULL
+#endif
 #define USER_STACK_PAGES       64
 #define USER_STACK_GUARD_PAGES 1
 

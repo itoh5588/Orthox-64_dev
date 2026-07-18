@@ -50,9 +50,6 @@ void pmm_init(void) {
     mem_base = riscv64_align_up_page(boot->memory_base);
     mem_end = boot->memory_base + boot->memory_size;
     free_base = riscv64_align_up_page((uint64_t)(uintptr_t)__kernel_end);
-    if (boot->dtb_pa + boot->dtb_size > free_base) {
-        free_base = riscv64_align_up_page(boot->dtb_pa + boot->dtb_size);
-    }
     if (free_base < mem_base) free_base = mem_base;
     if (free_base >= mem_end) return;
 
@@ -64,6 +61,17 @@ void pmm_init(void) {
 
     for (uint64_t page = 0; page < g_riscv64_pmm_pages; page++) {
         riscv64_pmm_clear(page);
+    }
+
+    // DTB が管理領域内にある場合はそのページを予約扱いにする
+    if (boot->dtb_size != 0 && boot->dtb_pa + boot->dtb_size > free_base && boot->dtb_pa < mem_end) {
+        uint64_t dtb_start = boot->dtb_pa & ~(PAGE_SIZE - 1ULL);
+        uint64_t dtb_end = riscv64_align_up_page(boot->dtb_pa + boot->dtb_size);
+        if (dtb_start < free_base) dtb_start = free_base;
+        for (uint64_t pa = dtb_start; pa < dtb_end && pa < mem_end; pa += PAGE_SIZE) {
+            uint64_t page = (pa - free_base) / PAGE_SIZE;
+            if (page < g_riscv64_pmm_pages) riscv64_pmm_set(page);
+        }
     }
 }
 

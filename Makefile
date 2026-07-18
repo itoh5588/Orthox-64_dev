@@ -569,3 +569,4 @@ clean:
 	$(MAKE) -C Limine clean
 
 -include $(DEPS)
+-include $(RISCV64_OBJS:.o=.d)

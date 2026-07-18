@@ -65,7 +65,6 @@ riscv64_enter_user_from_frame:
     ld sp,   8(a0)
     ld gp,  16(a0)
     ld tp,  24(a0)
-    ld t0,  32(a0)
     ld t1,  40(a0)
     ld t2,  48(a0)
     ld s0,  56(a0)
@@ -95,5 +94,6 @@ riscv64_enter_user_from_frame:
     csrw sepc, t0
     ld t0, 256(a0)
     csrw sstatus, t0
+    ld t0,  32(a0)
     ld a0,  72(a0)
     sret
