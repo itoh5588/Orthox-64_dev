@@ -422,7 +422,7 @@ int task_execve(arch_syscall_frame_t* frame, const char* path, char* const argv[
     (void)file_size;
 #endif
     t->heap_break = info.max_vaddr;
-    t->mmap_end = 0x4000000000ULL;
+    t->mmap_end = USER_MMAP_BASE_VADDR;
     t->user_entry = info.has_interp ? (uint64_t)interp_info.entry : (uint64_t)info.entry;
     t->sig_pending = 0;
     t->sig_mask = 0;

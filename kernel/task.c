@@ -655,7 +655,7 @@ void task_init(void) {
     uint64_t sp = arch_task_read_current_stack_pointer();
     t->kstack_top = (sp & ~(PAGE_SIZE - 1)) + PAGE_SIZE; 
     t->os_stack_ptr = t->kstack_top;
-    t->mmap_end = 0x4000000000ULL;
+    t->mmap_end = USER_MMAP_BASE_VADDR;
     t->user_fs_base = 0;
     t->timeslice_ticks = TASK_TIMESLICE_TICKS;
     kernel_strcpy(t->cwd, "/", sizeof(t->cwd));
@@ -774,7 +774,7 @@ struct task* task_create_on_cpu(uint64_t entry, uint64_t user_rsp, uint32_t cpu_
     t->user_stack_top = USER_STACK_TOP_VADDR;
     t->user_stack_bottom = 0;
     t->user_stack_guard = 0;
-    t->mmap_end = 0x4000000000ULL;
+    t->mmap_end = USER_MMAP_BASE_VADDR;
     t->user_fs_base = 0;
     t->timeslice_ticks = TASK_TIMESLICE_TICKS;
     kernel_strcpy(t->cwd, "/", sizeof(t->cwd));
@@ -810,7 +810,7 @@ struct task* task_create_idle(uint32_t cpu_id) {
     t->state = TASK_RUNNING;
     t->cpu_affinity = (int)cpu_id;
     arch_task_context_set_address_space(&t->ctx, arch_vm_kernel_address_space());
-    t->mmap_end = 0x4000000000ULL;
+    t->mmap_end = USER_MMAP_BASE_VADDR;
     t->timeslice_ticks = TASK_TIMESLICE_TICKS;
     kernel_strcpy(t->cwd, "/", sizeof(t->cwd));
     void* kstack_phys = pmm_alloc(4);

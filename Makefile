@@ -15,6 +15,12 @@ RISCV64_CC = $(shell if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then printf /op
 RISCV64_OBJCOPY = $(shell if [ -x /opt/homebrew/opt/llvm/bin/llvm-objcopy ]; then printf /opt/homebrew/opt/llvm/bin/llvm-objcopy; \
 	elif [ -x /usr/local/opt/llvm/bin/llvm-objcopy ]; then printf /usr/local/opt/llvm/bin/llvm-objcopy; \
 	else printf llvm-objcopy; fi)
+RISCV64_LLVM_AR = $(shell if [ -x /opt/homebrew/opt/llvm/bin/llvm-ar ]; then printf /opt/homebrew/opt/llvm/bin/llvm-ar; \
+	elif [ -x /usr/local/opt/llvm/bin/llvm-ar ]; then printf /usr/local/opt/llvm/bin/llvm-ar; \
+	else printf llvm-ar; fi)
+RISCV64_LLVM_RANLIB = $(shell if [ -x /opt/homebrew/opt/llvm/bin/llvm-ranlib ]; then printf /opt/homebrew/opt/llvm/bin/llvm-ranlib; \
+	elif [ -x /usr/local/opt/llvm/bin/llvm-ranlib ]; then printf /usr/local/opt/llvm/bin/llvm-ranlib; \
+	else printf llvm-ranlib; fi)
 
 BUILD_DIR = build
 USER_BUILD_DIR = $(BUILD_DIR)/musl/user
@@ -35,6 +41,11 @@ RISCV64_LDFLAGS = -nostdlib -static -m elf64lriscv -T scripts/kernel-riscv64.ld
 RISCV64_USER_CFLAGS = --target=riscv64-none-elf -march=rv64gc -mabi=lp64 -ffreestanding \
 	-fno-stack-protector -fno-lto -fno-PIE -O2 -Wall -Wextra -Iinclude -MMD -MP
 RISCV64_USER_LDFLAGS = -nostdlib -static -m elf64lriscv --entry=_start -Ttext 0x400000
+
+RISCV64_MUSL_SYSROOT = ports/musl-install-riscv64
+RISCV64_MUSL_CFLAGS = --target=riscv64-linux-musl -march=rv64gc -mabi=lp64d -ffreestanding \
+	-fno-PIE -O2 -I$(RISCV64_MUSL_SYSROOT)/include -MMD -MP
+RISCV64_MUSL_LDFLAGS = -nostdlib -static -m elf64lriscv --entry=_start -Ttext 0x400000
 
 # libc / sysroot 設定
 LIBC_IMPL = musl
@@ -57,6 +68,7 @@ LIBGCC =
 # 出力ファイル名
 KERNEL_ELF = kernel.elf
 RISCV64_KERNEL_ELF = out/kernel-riscv64.elf
+RISCV64_MUSL_PROBE_ELF = out/riscv64-musl-probe.elf
 RISCV64_BOOTSTRAP_USER_BUILD_ELF = out/bootstrap-user-riscv64-default.elf
 # 埋め込み対象の外部ユーザー ELF (差し替え可能)
 RISCV64_BOOTSTRAP_USER_SRC_ELF ?= $(RISCV64_BOOTSTRAP_USER_BUILD_ELF)
@@ -205,7 +217,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: all clean run riscv64-kernel riscv64-run riscv64-smoke ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: all clean run riscv64-kernel riscv64-run riscv64-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -273,10 +285,37 @@ $(RISCV64_BOOTSTRAP_USER_BUILD_ELF): $(BUILD_DIR)/riscv64/user/riscv64_hello.o
 	@mkdir -p $(@D)
 	$(LD) $(RISCV64_USER_LDFLAGS) $< -o $@
 
-$(BUILD_DIR)/riscv64/kernel/bootstrap_user_blob.o: $(RISCV64_BOOTSTRAP_USER_SRC_ELF)
+# 埋め込み元 ELF のパスが変わったら blob を再生成する (stale 防止スタンプ)
+$(BUILD_DIR)/riscv64/bootstrap_user_src.stamp: FORCE
+	@mkdir -p $(@D)
+	@echo "$(RISCV64_BOOTSTRAP_USER_SRC_ELF)" > $@.tmp; \
+	if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+$(BUILD_DIR)/riscv64/kernel/bootstrap_user_blob.o: $(RISCV64_BOOTSTRAP_USER_SRC_ELF) $(BUILD_DIR)/riscv64/bootstrap_user_src.stamp
 	@mkdir -p $(@D)
 	@if [ "$<" != "$(RISCV64_BOOTSTRAP_USER_EMBED_ELF)" ]; then cp "$<" "$(RISCV64_BOOTSTRAP_USER_EMBED_ELF)"; fi
 	$(RISCV64_OBJCOPY) -I binary -O elf64-littleriscv $(RISCV64_BOOTSTRAP_USER_EMBED_ELF) $@
+
+$(RISCV64_MUSL_SYSROOT)/lib/libc.a:
+	MUSL_CC="$(RISCV64_CC)" MUSL_AR="$(RISCV64_LLVM_AR)" MUSL_RANLIB="$(RISCV64_LLVM_RANLIB)" \
+	MUSL_EXTRA_CFLAGS="-march=rv64gc -mabi=lp64d" MUSL_CONFIGURE_EXTRA="--disable-shared" \
+	./ports/build_musl.sh $(abspath ports/musl) $(abspath $(RISCV64_MUSL_SYSROOT)) riscv64-linux-musl $(abspath $(BUILD_DIR)/musl-riscv64-build)
+
+riscv64-musl-sysroot: $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+
+$(BUILD_DIR)/riscv64-musl/user/crt0.o: user/crt0_musl_riscv64.S $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(RISCV64_CC) $(RISCV64_MUSL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/riscv64-musl/user/%.o: user/%.c $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(RISCV64_CC) $(RISCV64_MUSL_CFLAGS) -c $< -o $@
+
+$(RISCV64_MUSL_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_musl_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_musl_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+riscv64-musl-probe: $(RISCV64_MUSL_PROBE_ELF)
 
 riscv64-kernel: $(RISCV64_KERNEL_ELF)
 
@@ -285,6 +324,10 @@ riscv64-run: $(RISCV64_KERNEL_ELF)
 
 riscv64-smoke: $(RISCV64_KERNEL_ELF)
 	bash ./tests/riscv64_smoke.sh
+
+riscv64-musl-smoke: $(RISCV64_MUSL_PROBE_ELF)
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_MUSL_PROBE_ELF)
+	bash ./tests/riscv64_musl_smoke.sh
 
 $(BUILD_DIR)/lwip/%.o: ports/lwip/src/%.c
 	@mkdir -p $(@D)

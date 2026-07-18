@@ -366,7 +366,8 @@ static void* riscv64_bootstrap_sys_mmap(void* addr, size_t length, int prot, int
     struct task* current = get_current_task();
     arch_address_space_t address_space;
     uint64_t base;
-    uint64_t limit = 0x00007F0000000000ULL;
+    // Sv39 のユーザー VA 上限 (2^38)。スタック領域 (0x3FFFFxxxxx) 手前まで
+    uint64_t limit = 0x0000003F00000000ULL;
     uint64_t size;
     uint64_t map_flags;
 
@@ -709,8 +710,11 @@ void riscv64_syscall_dispatch(riscv64_trap_frame_t* frame) {
 
     if ((frame->a7 == SYS_FORK && frame->a0 == 0 && frame->a1 == 0 && frame->a2 == 0) ||
         (frame->a7 == RISCV64_LINUX_SYS_CLONE && frame->a0 == 17 && frame->a1 == 0 && frame->a2 == 0)) {
+        // 子は親フレームのコピーで復帰するため、先に sepc を進めて
+        // 子が ecall を再実行しないようにする (親子とも次命令から再開)
+        frame->sepc += 4;
         int ret = task_fork(frame);
-        riscv64_trap_set_user_return(frame, frame->sepc + 4, frame->sp, (uint64_t)(int64_t)ret, frame->a1, frame->a2);
+        riscv64_trap_set_user_return(frame, frame->sepc, frame->sp, (uint64_t)(int64_t)ret, frame->a1, frame->a2);
         riscv64_syscall_sync_current_user_frame(frame);
         return;
     }

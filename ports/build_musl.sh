@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="${1:-$ROOT/ports/musl}"
 OUT="${2:-$ROOT/ports/musl-install}"
-TARGET="x86_64-linux-musl"
+TARGET="${3:-x86_64-linux-musl}"
+# 第4引数でビルドディレクトリを指定すると out-of-tree ビルド (ソースツリーを汚さない)
+BUILD="${4:-$SRC}"
 
 if [ ! -d "$SRC" ]; then
   echo "musl source not found: $SRC" >&2
@@ -12,19 +14,20 @@ if [ ! -d "$SRC" ]; then
   exit 1
 fi
 
-mkdir -p "$OUT"
-cd "$SRC"
+mkdir -p "$OUT" "$BUILD"
+cd "$BUILD"
 
-CC="clang -target $TARGET -ffreestanding -fno-PIE -fuse-ld=lld"
-AR="$(command -v x86_64-elf-ar || echo ar)"
-RANLIB="$(command -v x86_64-elf-ranlib || echo ranlib)"
+MUSL_CC_BIN="${MUSL_CC:-clang}"
+CC="$MUSL_CC_BIN -target $TARGET ${MUSL_EXTRA_CFLAGS:-} -ffreestanding -fno-PIE -fuse-ld=lld"
+AR="${MUSL_AR:-$(command -v x86_64-elf-ar || echo ar)}"
+RANLIB="${MUSL_RANLIB:-$(command -v x86_64-elf-ranlib || echo ranlib)}"
 
-./configure \
+"$SRC/configure" \
   --target="$TARGET" \
   --prefix="$OUT" \
   --syslibdir="$OUT/lib" \
-  --enable-shared \
+  ${MUSL_CONFIGURE_EXTRA:---enable-shared} \
   CC="$CC" AR="$AR" RANLIB="$RANLIB"
 
-make -j"$(nproc 2>/dev/null || echo 1)"
+make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)"
 make install
