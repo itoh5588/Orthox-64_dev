@@ -266,6 +266,46 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
 
     if (!current || !buf) return -1;
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
+    if (current->fds[fd].type == FT_PIPE) {
+        pipe_t* pipe = (pipe_t*)current->fds[fd].data;
+        size_t written = 0;
+        if (!pipe) return -1;
+        while (written < count) {
+            size_t space;
+            size_t chunk;
+            struct task* reader_to_wake = 0;
+            uint64_t irqf = spin_lock_irqsave(&pipe->lock);
+            if (pipe->ref_count < 2) {
+                spin_unlock_irqrestore(&pipe->lock, irqf);
+                /* 読み手が閉じた: EPIPE 相当 */
+                return written > 0 ? (int64_t)written : -32;
+            }
+            space = PIPE_BUF_SIZE - pipe->count;
+            if (space == 0) {
+                task_mark_sleeping(current);
+                pipe->write_waiter = current;
+                spin_unlock_irqrestore(&pipe->lock, irqf);
+                kernel_yield();
+                irqf = spin_lock_irqsave(&pipe->lock);
+                if (pipe->write_waiter == current) pipe->write_waiter = 0;
+                spin_unlock_irqrestore(&pipe->lock, irqf);
+                continue;
+            }
+            chunk = count - written;
+            if (chunk > space) chunk = space;
+            for (size_t i = 0; i < chunk; i++) {
+                pipe->buffer[pipe->write_pos] = (char)src[written + i];
+                pipe->write_pos = (pipe->write_pos + 1) % PIPE_BUF_SIZE;
+                pipe->count++;
+            }
+            written += chunk;
+            reader_to_wake = pipe->read_waiter;
+            pipe->read_waiter = 0;
+            spin_unlock_irqrestore(&pipe->lock, irqf);
+            if (reader_to_wake && reader_to_wake->state == TASK_SLEEPING) task_wake(reader_to_wake);
+        }
+        return (int64_t)written;
+    }
     if (current->fds[fd].type != FT_CONSOLE) return -1;
 
     for (size_t i = 0; i < count; i++) {
@@ -315,6 +355,40 @@ int64_t sys_read(int fd, void* buf, size_t count) {
         return (int64_t)read_count;
     }
     if (f->type == FT_DIR) return -1;
+    if (f->type == FT_PIPE) {
+        pipe_t* pipe = (pipe_t*)f->data;
+        if (!pipe) return -1;
+        for (;;) {
+            size_t to_read;
+            struct task* writer_to_wake = 0;
+            uint64_t irqf = spin_lock_irqsave(&pipe->lock);
+            if (pipe->count == 0 && pipe->ref_count < 2) {
+                spin_unlock_irqrestore(&pipe->lock, irqf);
+                return 0; /* 書き込み側クローズ → EOF */
+            }
+            if (pipe->count == 0) {
+                task_mark_sleeping(current);
+                pipe->read_waiter = current;
+                spin_unlock_irqrestore(&pipe->lock, irqf);
+                kernel_yield();
+                irqf = spin_lock_irqsave(&pipe->lock);
+                if (pipe->read_waiter == current) pipe->read_waiter = 0;
+                spin_unlock_irqrestore(&pipe->lock, irqf);
+                continue;
+            }
+            to_read = (count > pipe->count) ? pipe->count : count;
+            for (size_t i = 0; i < to_read; i++) {
+                ((char*)buf)[i] = pipe->buffer[pipe->read_pos];
+                pipe->read_pos = (pipe->read_pos + 1) % PIPE_BUF_SIZE;
+                pipe->count--;
+            }
+            writer_to_wake = pipe->write_waiter;
+            pipe->write_waiter = 0;
+            spin_unlock_irqrestore(&pipe->lock, irqf);
+            if (writer_to_wake && writer_to_wake->state == TASK_SLEEPING) task_wake(writer_to_wake);
+            return (int64_t)to_read;
+        }
+    }
     if (f->type == FT_XV6FS) {
         struct xv6fs_inode* ip;
         int got;
@@ -486,6 +560,80 @@ int sys_close(int fd) {
     if (!current->fds[fd].in_use) return -1;
     fs_release_fd(&current->fds[fd]);
     return 0;
+}
+
+int sys_pipe2(int* pipefd, int flags) {
+    struct task* current = get_current_task();
+    void* phys;
+    pipe_t* pipe;
+    int fd1 = -1;
+    int fd2 = -1;
+
+    if (!current || !pipefd) return -1;
+    /* O_CLOEXEC(0x80000)/O_NONBLOCK(0x800) 以外は未対応 */
+    if (flags & ~(0x80000 | 0x800)) return -1;
+
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (!current->fds[i].in_use) {
+            if (fd1 == -1) fd1 = i;
+            else { fd2 = i; break; }
+        }
+    }
+    if (fd1 == -1 || fd2 == -1) return -1;
+
+    phys = pmm_alloc(1);
+    if (!phys) return -1;
+    pipe = (pipe_t*)PHYS_TO_VIRT(phys);
+    pipe->read_pos = 0;
+    pipe->write_pos = 0;
+    pipe->count = 0;
+    pipe->ref_count = 2;
+    pipe->read_waiter = 0;
+    pipe->write_waiter = 0;
+    spinlock_init(&pipe->lock);
+
+    for (int end = 0; end < 2; end++) {
+        int fd = end == 0 ? fd1 : fd2;
+        current->fds[fd].type = FT_PIPE;
+        current->fds[fd].data = pipe;
+        current->fds[fd].size = 0;
+        current->fds[fd].offset = 0;
+        current->fds[fd].in_use = 1;
+        current->fds[fd].flags = end == 0 ? O_RDONLY : O_WRONLY;
+        current->fds[fd].fd_flags = (flags & 0x80000) ? FD_CLOEXEC : 0;
+        current->fds[fd].aux0 = 0;
+        current->fds[fd].aux1 = (uint32_t)end;
+        current->fds[fd].name[0] = '\0';
+    }
+    pipefd[0] = fd1;
+    pipefd[1] = fd2;
+    return 0;
+}
+
+int sys_dup3(int oldfd, int newfd, int flags) {
+    struct task* current = get_current_task();
+    if (!current) return -1;
+    if (oldfd < 0 || oldfd >= MAX_FDS || !current->fds[oldfd].in_use) return -1;
+    if (newfd < 0 || newfd >= MAX_FDS) return -1;
+    if (oldfd == newfd) return newfd;
+    if (current->fds[newfd].in_use) fs_release_fd(&current->fds[newfd]);
+    if (fs_clone_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -1;
+    current->fds[newfd].fd_flags = (flags & 0x80000) ? FD_CLOEXEC : 0;
+    return newfd;
+}
+
+int sys_dup(int oldfd) {
+    struct task* current = get_current_task();
+    int newfd = -1;
+    if (!current) return -1;
+    if (oldfd < 0 || oldfd >= MAX_FDS || !current->fds[oldfd].in_use) return -1;
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (!current->fds[i].in_use) { newfd = i; break; }
+    }
+    if (newfd == -1) return -1;
+    if (fs_clone_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -1;
+    current->fds[newfd].fd_flags = 0;
+    return newfd;
 }
 
 int fs_clone_fd(file_descriptor_t* dst, const file_descriptor_t* src) {

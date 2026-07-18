@@ -55,6 +55,8 @@ fi
     sleep 2
     printf '/bin/echo external-exec-ok\n'
     sleep 3
+    printf 'echo a b c | wc\n'
+    sleep 3
     printf 'exit\n'
     sleep 3
 ) | "$QEMU_BIN" \
@@ -97,6 +99,7 @@ if [ -f "$ROOTFS_IMG" ]; then
     grep -q "busybox" "$SERIAL_LOG"
     grep -q "hello from riscv64 xv6fs rootfs" "$SERIAL_LOG"
     grep -q "external-exec-ok" "$SERIAL_LOG"
+    grep -qE "1 +3 +6" "$SERIAL_LOG"
 fi
 grep -q "bootstrap user exit" "$SERIAL_LOG"
 

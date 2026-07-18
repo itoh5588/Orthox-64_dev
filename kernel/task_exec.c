@@ -74,6 +74,8 @@ static int copy_user_string_vector(char* const user_vec[], char** kernel_vec,
         kernel_vec[0] = 0;
         return 0;
     }
+    /* ベクタ配列ポインタ自体も検証する (NULL 近傍の deref はカーネル死を招く) */
+    if ((uint64_t)(uintptr_t)user_vec < 0x1000ULL) return -1;
     while (count < EXEC_MAX_VEC_STRINGS) {
         const char* src = user_vec[count];
         if (!src) break;

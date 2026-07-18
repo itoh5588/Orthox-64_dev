@@ -640,8 +640,17 @@ static void riscv64_syscall_dispatch_selftest(void) {
 static void riscv64_fs_syscall_selftest(void) {
     task_context_t* ctx = task_current_context();
     riscv64_trap_frame_t frame;
-    struct kstat st;
-    struct kstat st2;
+    // syscall 境界は riscv64 ユーザー ABI の struct stat レイアウトで返る
+    struct riscv64_abi_stat {
+        uint64_t st_dev, st_ino;
+        uint32_t st_mode, st_nlink, st_uid, st_gid;
+        uint64_t st_rdev, pad1;
+        int64_t st_size;
+        int32_t st_blksize, pad2;
+        int64_t st_blocks;
+        int64_t atime_sec, atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec;
+        uint32_t unused4, unused5;
+    } st, st2;
     char read_buf[8];
     static const char root_path[] = "/";
     static const char bootstrap_path[] = "/bootstrap-user";
@@ -678,7 +687,7 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.a1 = (uint64_t)(uintptr_t)&st;
     frame.a7 = SYS_STAT;
     riscv64_syscall_dispatch(&frame);
-    if ((int64_t)frame.a0 != 0 || (st.mode & 0170000U) != KSTAT_MODE_FILE || st.size < 4) {
+    if ((int64_t)frame.a0 != 0 || (st.st_mode & 0170000U) != KSTAT_MODE_FILE || st.st_size < 4) {
         riscv64_uart_puts("  fs syscall selftest: stat failed\n");
         return;
     }
@@ -722,7 +731,7 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.a1 = (uint64_t)(uintptr_t)&st2;
     frame.a7 = SYS_FSTAT;
     riscv64_syscall_dispatch(&frame);
-    if ((int64_t)frame.a0 != 0 || st2.size != st.size || st2.mode != st.mode) {
+    if ((int64_t)frame.a0 != 0 || st2.st_size != st.st_size || st2.st_mode != st.st_mode) {
         riscv64_uart_puts("  fs syscall selftest: fstat failed\n");
         return;
     }
@@ -737,7 +746,7 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.a3 = 0;
     frame.a7 = SYS_FSTATAT;
     riscv64_syscall_dispatch(&frame);
-    if ((int64_t)frame.a0 != 0 || st2.size != st.size || st2.mode != st.mode) {
+    if ((int64_t)frame.a0 != 0 || st2.st_size != st.st_size || st2.st_mode != st.st_mode) {
         riscv64_uart_puts("  fs syscall selftest: fstatat failed\n");
         return;
     }

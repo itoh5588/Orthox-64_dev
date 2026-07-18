@@ -45,6 +45,9 @@ static int64_t riscv64_bootstrap_sys_wait4(int pid, int* wstatus, int options);
 #define RISCV64_LINUX_SYS_CLONE            220
 #define RISCV64_LINUX_SYS_EXECVE           221
 #define RISCV64_LINUX_SYS_FACCESSAT        48
+#define RISCV64_LINUX_SYS_DUP              23
+#define RISCV64_LINUX_SYS_DUP3             24
+#define RISCV64_LINUX_SYS_PIPE2            59
 #define RISCV64_LINUX_SYS_MMAP             222
 #define RISCV64_LINUX_SYS_WAIT4            260
 #define RISCV64_LINUX_SYS_GETRANDOM        278
@@ -767,7 +770,6 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                                                                    (unsigned long)arch_syscall_arg1(frame),
                                                                                    arch_syscall_arg2(frame)));
             return;
-        case SYS_EXECVE:
         case RISCV64_LINUX_SYS_EXECVE:
             {
                 int rc = task_execve(frame,
@@ -778,6 +780,30 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                     arch_syscall_set_return(frame, (uint64_t)(int64_t)-2); /* -ENOENT */
                 }
                 /* 成功時は frame が新プロセスの初期状態に書き換わっている */
+            }
+            return;
+        case RISCV64_LINUX_SYS_PIPE2:
+            {
+                extern int sys_pipe2(int* pipefd, int flags);
+                arch_syscall_set_return(frame,
+                                        (uint64_t)(int64_t)sys_pipe2((int*)(uintptr_t)arch_syscall_arg0(frame),
+                                                                     (int)arch_syscall_arg1(frame)));
+            }
+            return;
+        case RISCV64_LINUX_SYS_DUP:
+            {
+                extern int sys_dup(int oldfd);
+                arch_syscall_set_return(frame,
+                                        (uint64_t)(int64_t)sys_dup((int)arch_syscall_arg0(frame)));
+            }
+            return;
+        case RISCV64_LINUX_SYS_DUP3:
+            {
+                extern int sys_dup3(int oldfd, int newfd, int flags);
+                arch_syscall_set_return(frame,
+                                        (uint64_t)(int64_t)sys_dup3((int)arch_syscall_arg0(frame),
+                                                                    (int)arch_syscall_arg1(frame),
+                                                                    (int)arch_syscall_arg2(frame)));
             }
             return;
         case RISCV64_LINUX_SYS_FACCESSAT:
