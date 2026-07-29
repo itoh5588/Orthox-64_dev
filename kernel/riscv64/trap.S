@@ -34,12 +34,14 @@ riscv64_trap_entry:
     addi sp, sp, -288
 
     sd ra,   0(sp)
+    # t1 をスクラッチとして使う前に元の値を退避する
+    # (退避前に潰すと、割り込まれたカーネルコードの t1 が 0 に化ける)
+    sd t1,  40(sp)
     addi t1, sp, 288
     sd t1,   8(sp)
     sd gp,  16(sp)
     sd tp,  24(sp)
     sd t0,  32(sp)
-    sd zero, 40(sp)
     sd t2,  48(sp)
 
 .Ltrap_common:
