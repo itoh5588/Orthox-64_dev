@@ -129,6 +129,15 @@ void riscv64_trap_dispatch(riscv64_trap_frame_t* frame) {
             g_riscv64_logged_timer_after_user_handoff = 1;
             riscv64_uart_puts("riscv64 timer interrupt after user handoff\n");
         }
+        // ユーザーモードからの割り込みに限りプリエンプトする。
+        // trap フレームはタスク固有のカーネルスタック上にあるので、ここで
+        // arch_context_switch しても復帰時に同じフレームから sret できる。
+        // カーネル実行中の割り込みでは切り替えない (カーネル側は非プリエンプティブ)。
+        if ((frame->sstatus & RISCV64_SSTATUS_SPP) == 0 && !kernel_lock_held()) {
+            if (task_consume_resched()) {
+                kernel_yield();
+            }
+        }
         riscv64_trap_rearm_current_kernel_stack();
         return;
     }

@@ -86,6 +86,7 @@ LIBGCC =
 KERNEL_ELF = kernel.elf
 RISCV64_KERNEL_ELF = out/kernel-riscv64.elf
 RISCV64_MUSL_PROBE_ELF = out/riscv64-musl-probe.elf
+RISCV64_PREEMPT_PROBE_ELF = out/riscv64-preempt-probe.elf
 RISCV64_BOOTSTRAP_USER_BUILD_ELF = out/bootstrap-user-riscv64-default.elf
 # 埋め込み対象の外部ユーザー ELF (差し替え可能)
 RISCV64_BOOTSTRAP_USER_SRC_ELF ?= $(RISCV64_BOOTSTRAP_USER_BUILD_ELF)
@@ -235,7 +236,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: all clean run riscv64-kernel riscv64-run riscv64-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: all clean run riscv64-kernel riscv64-run riscv64-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -343,6 +344,12 @@ $(RISCV64_MUSL_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/ri
 
 riscv64-musl-probe: $(RISCV64_MUSL_PROBE_ELF)
 
+$(RISCV64_PREEMPT_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_preempt_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_preempt_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+riscv64-preempt-probe: $(RISCV64_PREEMPT_PROBE_ELF)
+
 RISCV64_BUSYBOX_ASH_MUSL_ELF = out/busybox-riscv64-musl.elf
 
 riscv64-busybox-musl: $(RISCV64_MUSL_SYSROOT)/lib/libc.a
@@ -366,6 +373,11 @@ riscv64-smoke: $(RISCV64_KERNEL_ELF)
 riscv64-musl-smoke: $(RISCV64_MUSL_PROBE_ELF)
 	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_MUSL_PROBE_ELF)
 	bash ./tests/riscv64_musl_smoke.sh
+
+# CPU を占有し続ける子の裏で親が復帰できるか = タイマープリエンプションの検証
+riscv64-preempt-smoke: $(RISCV64_PREEMPT_PROBE_ELF)
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_PREEMPT_PROBE_ELF)
+	bash ./tests/riscv64_preempt_smoke.sh
 
 RISCV64_ROOTFS_IMG = out/rootfs-riscv64-xv6.img
 RISCV64_ROOTFS_APPLETS = ash sh busybox cat chmod cp echo env false head ls mkdir mv printenv printf pwd rm rmdir stat tail test touch true wc

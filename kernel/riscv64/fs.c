@@ -26,6 +26,23 @@ static int riscv64_fs_flags_writable(int flags) {
     return acc == O_WRONLY || acc == O_RDWR;
 }
 
+/* 疑似キャラクタデバイス (xv6fs 上に inode を持たず、カーネルが直接応答する) */
+#define RISCV64_DEV_NONE     0
+#define RISCV64_DEV_NULL     1
+#define RISCV64_DEV_ZERO     2
+#define RISCV64_DEV_CONSOLE  3
+
+static int riscv64_fs_path_eq(const char* a, const char* b);
+
+static int riscv64_fs_special_dev(const char* resolved) {
+    if (!resolved) return RISCV64_DEV_NONE;
+    if (riscv64_fs_path_eq(resolved, "/dev/null")) return RISCV64_DEV_NULL;
+    if (riscv64_fs_path_eq(resolved, "/dev/zero")) return RISCV64_DEV_ZERO;
+    if (riscv64_fs_path_eq(resolved, "/dev/tty")) return RISCV64_DEV_CONSOLE;
+    if (riscv64_fs_path_eq(resolved, "/dev/console")) return RISCV64_DEV_CONSOLE;
+    return RISCV64_DEV_NONE;
+}
+
 static int riscv64_fs_path_eq(const char* a, const char* b) {
     if (!a || !b) return 0;
     while (*a && *b) {
@@ -187,13 +204,37 @@ int sys_open(const char* path, int flags, int mode) {
     if (!current || !path) return -1;
     if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
 
-    for (int i = 3; i < MAX_FDS; i++) {
+    // POSIX: open は最小の空き fd を返す。busybox ash はバックグラウンドジョブで
+    // close(0) 後の open が必ず 0 を返すことに依存している (`cmd &` の stdin=/dev/null)
+    for (int i = 0; i < MAX_FDS; i++) {
         if (!current->fds[i].in_use) {
             fd = i;
             break;
         }
     }
     if (fd < 0) return -1;
+
+    {
+        // 疑似キャラクタデバイスは xv6fs より先に解決する
+        int dev = riscv64_fs_special_dev(resolved);
+        if (dev != RISCV64_DEV_NONE) {
+            if (dev == RISCV64_DEV_CONSOLE) {
+                fs_init_console_fd(&current->fds[fd], flags);
+            } else {
+                current->fds[fd].type = FT_CHARDEV;
+                current->fds[fd].data = 0;
+                current->fds[fd].size = 0;
+                current->fds[fd].offset = 0;
+                current->fds[fd].in_use = 1;
+                current->fds[fd].flags = flags;
+                current->fds[fd].fd_flags = 0;
+                current->fds[fd].aux0 = (uint32_t)dev;
+                current->fds[fd].aux1 = 0;
+            }
+            riscv64_fs_strcpy(current->fds[fd].name, resolved, sizeof(current->fds[fd].name));
+            return fd;
+        }
+    }
 
     {
         // ディレクトリ判定: O_DIRECTORY 指定、または xv6fs 上のディレクトリ
@@ -330,6 +371,10 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
         }
         return (int64_t)written;
     }
+    if (current->fds[fd].type == FT_CHARDEV) {
+        /* /dev/null, /dev/zero: 書き込みは捨てる */
+        return (int64_t)count;
+    }
     if (current->fds[fd].type == FT_XV6FS) {
         file_descriptor_t* f = &current->fds[fd];
         size_t off;
@@ -399,6 +444,13 @@ int64_t sys_read(int fd, void* buf, size_t count) {
         return (int64_t)read_count;
     }
     if (f->type == FT_DIR) return -1;
+    if (f->type == FT_CHARDEV) {
+        if (f->aux0 == RISCV64_DEV_ZERO) {
+            for (size_t i = 0; i < count; i++) ((uint8_t*)buf)[i] = 0;
+            return (int64_t)count;
+        }
+        return 0; /* /dev/null は常に EOF */
+    }
     if (f->type == FT_PIPE) {
         pipe_t* pipe = (pipe_t*)f->data;
         if (!pipe) return -1;
@@ -469,6 +521,17 @@ int sys_stat(const char* path, struct kstat* st) {
     if (!path || !st) return -1;
     if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
 
+    {
+        int dev = riscv64_fs_special_dev(resolved);
+        if (dev != RISCV64_DEV_NONE) {
+            riscv64_fs_kstat_defaults(st, KSTAT_MODE_CHR | 0666U, 0);
+            st->dev = 1;
+            st->ino = 100U + (uint64_t)dev;
+            st->rdev = 1;
+            return 0;
+        }
+    }
+
     if (xv6fs_is_mounted()) {
         uint32_t xv6_mode = 0;
         uint64_t xv6_size = 0;
@@ -509,7 +572,7 @@ int sys_fstat(int fd, struct kstat* st) {
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
     f = &current->fds[fd];
 
-    if (f->type == FT_CONSOLE) {
+    if (f->type == FT_CONSOLE || f->type == FT_CHARDEV) {
         riscv64_fs_kstat_defaults(st, KSTAT_MODE_CHR | 0666U, 0);
         st->dev = 1;
         st->ino = (uint64_t)fd + 1U;

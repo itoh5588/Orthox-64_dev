@@ -71,6 +71,11 @@ fi
     sleep 3
     printf 'rm /w.txt; cat /w.txt || echo unlink-ok\n'
     sleep 3
+    # 疑似キャラクタデバイス (/dev/null)
+    printf 'cat /dev/null && echo devnull-read-ok\n'
+    sleep 3
+    printf 'echo x > /dev/null && echo devnull-write-ok\n'
+    sleep 3
     printf 'exit\n'
     sleep 3
 ) | "$QEMU_BIN" \
@@ -119,6 +124,8 @@ if [ -f "$ROOTFS_IMG" ]; then
     grep -qE "^ *2$" "$SERIAL_LOG"          # cat /w.txt | wc -l → 2 行 (追記が効いている)
     grep -q "mkdir-ok" "$SERIAL_LOG"
     grep -q "unlink-ok" "$SERIAL_LOG"
+    grep -q "devnull-read-ok" "$SERIAL_LOG"
+    grep -q "devnull-write-ok" "$SERIAL_LOG"
 fi
 grep -q "bootstrap user exit" "$SERIAL_LOG"
 
