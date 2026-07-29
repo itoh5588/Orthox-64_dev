@@ -7,6 +7,9 @@
 
 static struct cpu_local* g_riscv64_cpu_local;
 
+// ブート時の最初のユーザー遷移だけトレースするためのワンショットフラグ
+static int g_riscv64_trace_enter_user = 1;
+
 struct cpu_local* riscv64_task_get_cpu_local_impl(void) {
     return g_riscv64_cpu_local;
 }
@@ -112,12 +115,19 @@ void riscv64_task_enter_initial_user_context(const struct arch_task_context* ctx
         if (cur) kernel_sp = cur->kstack_top;
     }
     riscv64_task_copy_frame((arch_task_exec_frame_t*)&initial_frame, &ctx->user_frame);
-    riscv64_uart_puts("  enter user ctx root: 0x");
-    riscv64_uart_puthex64(root_pa);
-    riscv64_uart_puts("\n");
-    riscv64_uart_puts("  enter user kernel : 0x");
-    riscv64_uart_puthex64(kernel_root);
-    riscv64_uart_puts("\n");
+    // ブート時の最初のユーザー遷移だけトレースする。exec のたびに出すと
+    // 対話シェルの出力が埋まるため (smoke は最初の1件しか見ていない)
+    if (g_riscv64_trace_enter_user) {
+        g_riscv64_trace_enter_user = 0;
+        riscv64_uart_puts("  enter user ctx root: 0x");
+        riscv64_uart_puthex64(root_pa);
+        riscv64_uart_puts("\n");
+        riscv64_uart_puts("  enter user kernel : 0x");
+        riscv64_uart_puthex64(kernel_root);
+        riscv64_uart_puts("\n");
+    } else {
+        (void)kernel_root;
+    }
     riscv64_trap_set_kernel_stack(kernel_sp);
     if (root_pa != current_root) {
         riscv64_activate_address_space_and_enter_user(root_pa, (riscv64_trap_frame_t*)&initial_frame);

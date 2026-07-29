@@ -21,6 +21,8 @@
 
 static uint64_t g_riscv64_kernel_root_pa;
 static uint64_t g_riscv64_last_satp;
+// アドレス空間切替トレースのワンショットフラグ (ブート時の1回だけ出す)
+static int g_riscv64_trace_vm_activate = 1;
 
 extern char __kernel_start[];
 extern char __kernel_end[];
@@ -312,18 +314,24 @@ void riscv64_vm_activate_address_space(uint64_t root_pa) {
     uint64_t sp;
     __asm__ volatile("mv %0, sp" : "=r"(sp));
 #ifdef __riscv
-    riscv64_uart_puts("  vm activate: 0x");
-    riscv64_uart_puthex64(root_pa);
-    riscv64_uart_puts("\n");
-    riscv64_uart_puts("    text->phys: 0x");
-    riscv64_uart_puthex64(riscv64_vm_get_phys(root_pa, (uint64_t)(uintptr_t)__text_start));
-    riscv64_uart_puts("\n");
-    riscv64_uart_puts("    sp  ->phys: 0x");
-    riscv64_uart_puthex64(riscv64_vm_get_phys(root_pa, sp));
-    riscv64_uart_puts("\n");
-    riscv64_uart_puts("    uart->phys: 0x");
-    riscv64_uart_puthex64(riscv64_vm_get_phys(root_pa, RISCV64_QEMU_VIRT_UART0_BASE));
-    riscv64_uart_puts("\n");
+    // 最初の1回だけトレースする (exec のたびに 4 行出ると対話シェルが埋まる)
+    if (g_riscv64_trace_vm_activate) {
+        g_riscv64_trace_vm_activate = 0;
+        riscv64_uart_puts("  vm activate: 0x");
+        riscv64_uart_puthex64(root_pa);
+        riscv64_uart_puts("\n");
+        riscv64_uart_puts("    text->phys: 0x");
+        riscv64_uart_puthex64(riscv64_vm_get_phys(root_pa, (uint64_t)(uintptr_t)__text_start));
+        riscv64_uart_puts("\n");
+        riscv64_uart_puts("    sp  ->phys: 0x");
+        riscv64_uart_puthex64(riscv64_vm_get_phys(root_pa, sp));
+        riscv64_uart_puts("\n");
+        riscv64_uart_puts("    uart->phys: 0x");
+        riscv64_uart_puthex64(riscv64_vm_get_phys(root_pa, RISCV64_QEMU_VIRT_UART0_BASE));
+        riscv64_uart_puts("\n");
+    }
+#else
+    (void)sp;
 #endif
     g_riscv64_last_satp = riscv64_vm_satp_value(root_pa);
     riscv64_write_satp(g_riscv64_last_satp);
