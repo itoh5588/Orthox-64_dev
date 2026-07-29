@@ -57,6 +57,20 @@ fi
     sleep 3
     printf 'echo a b c | wc\n'
     sleep 3
+    printf 'echo redirect-ok > /w.txt\n'
+    sleep 2
+    printf 'cat /w.txt\n'
+    sleep 2
+    printf 'echo append-ok >> /w.txt\n'
+    sleep 2
+    printf 'cat /w.txt | wc -l\n'
+    sleep 3
+    printf 'mkdir /d && echo mkdir-ok\n'
+    sleep 3
+    printf 'cat /etc/motd > /d/copy.txt; cat /d/copy.txt\n'
+    sleep 3
+    printf 'rm /w.txt; cat /w.txt || echo unlink-ok\n'
+    sleep 3
     printf 'exit\n'
     sleep 3
 ) | "$QEMU_BIN" \
@@ -78,7 +92,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for _ in {1..30}; do
+for _ in {1..75}; do
     if grep -q "bootstrap user exit" "$SERIAL_LOG" 2>/dev/null; then
         break
     fi
@@ -100,6 +114,11 @@ if [ -f "$ROOTFS_IMG" ]; then
     grep -q "hello from riscv64 xv6fs rootfs" "$SERIAL_LOG"
     grep -q "external-exec-ok" "$SERIAL_LOG"
     grep -qE "1 +3 +6" "$SERIAL_LOG"
+    # 書き込み系 (リダイレクト / 追記 / mkdir / unlink)
+    grep -q "redirect-ok" "$SERIAL_LOG"
+    grep -qE "^ *2$" "$SERIAL_LOG"          # cat /w.txt | wc -l → 2 行 (追記が効いている)
+    grep -q "mkdir-ok" "$SERIAL_LOG"
+    grep -q "unlink-ok" "$SERIAL_LOG"
 fi
 grep -q "bootstrap user exit" "$SERIAL_LOG"
 

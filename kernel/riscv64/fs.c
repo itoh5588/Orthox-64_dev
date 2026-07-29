@@ -17,6 +17,15 @@ struct riscv64_linux_dirent64 {
     char d_name[256];
 };
 
+/* Linux AT_REMOVEDIR (unlinkat の第3引数) */
+#define RISCV64_AT_REMOVEDIR 0x200
+
+/* O_ACCMODE 判定: 書き込み可能な開き方か */
+static int riscv64_fs_flags_writable(int flags) {
+    int acc = flags & 3;
+    return acc == O_WRONLY || acc == O_RDWR;
+}
+
 static int riscv64_fs_path_eq(const char* a, const char* b) {
     if (!a || !b) return 0;
     while (*a && *b) {
@@ -174,7 +183,6 @@ int sys_open(const char* path, int flags, int mode) {
     void* file_data = 0;
     size_t file_size = 0;
     int fd = -1;
-    (void)mode;
 
     if (!current || !path) return -1;
     if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
@@ -198,6 +206,16 @@ int sys_open(const char* path, int flags, int mode) {
             if ((xv6_mode & 0170000U) == KSTAT_MODE_DIR) is_dir = 1;
         }
         if (!xv6fs_is_mounted() && riscv64_fs_path_eq(resolved, "/")) is_dir = 1;
+
+        // O_CREAT: xv6fs 上に存在しなければ通常ファイルを新規作成する
+        if (!have_xv6 && !is_dir && (flags & O_CREAT) != 0 && xv6fs_is_mounted()) {
+            int create_mode = (mode & 07777) ? (mode & 07777) : 0644;
+            if (xv6fs_create_file(resolved, create_mode, 0) == 0 &&
+                xv6fs_stat_path(resolved, &xv6_mode, &xv6_size, 0, 0) == 0) {
+                have_xv6 = 1;
+                if ((xv6_mode & 0170000U) == KSTAT_MODE_DIR) is_dir = 1;
+            }
+        }
 
         if (is_dir) {
             // 4 ページ = 約60エントリまで列挙可能
@@ -226,10 +244,16 @@ int sys_open(const char* path, int flags, int mode) {
 
         if (have_xv6) {
             if ((xv6_mode & 0170000U) != KSTAT_MODE_FILE) return -1;
+            // O_TRUNC は書き込み用に開いた場合のみ有効
+            if ((flags & O_TRUNC) != 0 && riscv64_fs_flags_writable(flags) && xv6_size != 0) {
+                if (xv6fs_truncate_file(resolved, 0) < 0) return -1;
+                xv6_size = 0;
+            }
             current->fds[fd].type = FT_XV6FS;
             current->fds[fd].data = 0;
             current->fds[fd].size = (size_t)xv6_size;
-            current->fds[fd].offset = 0;
+            // O_APPEND は末尾から書き始める (以後の write でも都度末尾へ)
+            current->fds[fd].offset = (flags & O_APPEND) ? (size_t)xv6_size : 0;
             current->fds[fd].in_use = 1;
             current->fds[fd].flags = flags;
             current->fds[fd].fd_flags = 0;
@@ -240,7 +264,7 @@ int sys_open(const char* path, int flags, int mode) {
         }
     }
 
-    if (fs_get_file_data(resolved, &file_data, &file_size) < 0) return -1;
+    if (fs_get_file_data(resolved, &file_data, &file_size) < 0) return -2; /* ENOENT */
 
     current->fds[fd].type = FT_MODULE;
     current->fds[fd].data = file_data;
@@ -305,6 +329,26 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
             if (reader_to_wake && reader_to_wake->state == TASK_SLEEPING) task_wake(reader_to_wake);
         }
         return (int64_t)written;
+    }
+    if (current->fds[fd].type == FT_XV6FS) {
+        file_descriptor_t* f = &current->fds[fd];
+        size_t off;
+        if (!riscv64_fs_flags_writable(f->flags)) return -9; /* EBADF */
+        if (f->name[0] == '\0') return -1;
+        if (count == 0) return 0;
+        if (f->flags & O_APPEND) {
+            uint32_t xv6_mode = 0;
+            uint64_t xv6_size = 0;
+            if (xv6fs_stat_path(f->name, &xv6_mode, &xv6_size, 0, 0) == 0) {
+                f->size = (size_t)xv6_size;
+            }
+            f->offset = f->size;
+        }
+        off = f->offset;
+        if (xv6fs_write_file(f->name, (uint64_t)off, buf, count) < 0) return -1;
+        f->offset = off + count;
+        if (f->offset > f->size) f->size = f->offset;
+        return (int64_t)count;
     }
     if (current->fds[fd].type != FT_CONSOLE) return -1;
 
@@ -514,6 +558,84 @@ int sys_fchdir(int fd) {
     return sys_chdir(f->name);
 }
 
+/* ------------------------------------------------------------------ */
+/* 書き込み系エントリポイント (すべて xv6fs のパスベース API に委譲)   */
+/* ------------------------------------------------------------------ */
+
+int sys_unlink(const char* path) {
+    char resolved[256];
+    if (!path || path[0] == '\0' || !xv6fs_is_mounted()) return -1;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
+    return xv6fs_unlink_path(resolved) == 0 ? 0 : -1;
+}
+
+int sys_rmdir(const char* path) {
+    char resolved[256];
+    if (!path || path[0] == '\0' || !xv6fs_is_mounted()) return -1;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
+    return xv6fs_rmdir_path(resolved) == 0 ? 0 : -1;
+}
+
+int sys_unlinkat(int dirfd, const char* path, int flags) {
+    char resolved[256];
+    if (!path || path[0] == '\0' || !xv6fs_is_mounted()) return -1;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -1;
+    if (flags & RISCV64_AT_REMOVEDIR) {
+        return xv6fs_rmdir_path(resolved) == 0 ? 0 : -1;
+    }
+    return xv6fs_unlink_path(resolved) == 0 ? 0 : -1;
+}
+
+int sys_mkdir(const char* path, int mode) {
+    char resolved[256];
+    struct kstat st;
+    if (!path || path[0] == '\0' || !xv6fs_is_mounted()) return -1;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
+    if (sys_stat(resolved, &st) == 0) return -17; /* EEXIST */
+    return xv6fs_mkdir_path(resolved, (mode & 07777) ? (mode & 07777) : 0755) == 0 ? 0 : -1;
+}
+
+int sys_mkdirat(int dirfd, const char* path, int mode) {
+    char resolved[256];
+    if (!path || path[0] == '\0') return -1;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -1;
+    return sys_mkdir(resolved, mode);
+}
+
+int sys_truncate(const char* path, uint64_t length) {
+    char resolved[256];
+    if (!path || path[0] == '\0' || !xv6fs_is_mounted()) return -1;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
+    return xv6fs_truncate_file(resolved, length) == 0 ? 0 : -1;
+}
+
+int sys_ftruncate(int fd, uint64_t length) {
+    struct task* current = get_current_task();
+    file_descriptor_t* f;
+
+    if (!current) return -1;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
+    f = &current->fds[fd];
+    if (f->type != FT_XV6FS || f->name[0] == '\0') return -1;
+    if (!riscv64_fs_flags_writable(f->flags)) return -9; /* EBADF */
+    if (xv6fs_truncate_file(f->name, length) < 0) return -1;
+    f->size = (size_t)length;
+    if (f->offset > f->size) f->offset = f->size;
+    return 0;
+}
+
+int sys_chmod(const char* path, uint32_t mode) {
+    char resolved[256];
+    if (!path || path[0] == '\0' || !xv6fs_is_mounted()) return -1;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
+    return xv6fs_chmod_path(resolved, mode & 07777U) == 0 ? 0 : -1;
+}
+
+int sys_sync(void) {
+    if (!xv6fs_is_mounted()) return 0;
+    return xv6fs_sync();
+}
+
 void fs_release_fd(file_descriptor_t* desc) {
     struct task* read_waiter = 0;
     struct task* write_waiter = 0;
@@ -634,6 +756,50 @@ int sys_dup(int oldfd) {
     if (fs_clone_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -1;
     current->fds[newfd].fd_flags = 0;
     return newfd;
+}
+
+/* fcntl コマンド (musl/Linux ABI) */
+#define RISCV64_F_DUPFD          0
+#define RISCV64_F_GETFD          1
+#define RISCV64_F_SETFD          2
+#define RISCV64_F_GETFL          3
+#define RISCV64_F_SETFL          4
+#define RISCV64_F_DUPFD_CLOEXEC  1030
+
+int sys_fcntl(int fd, int cmd, uint64_t arg) {
+    struct task* current = get_current_task();
+
+    if (!current) return -1;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -9; /* EBADF */
+
+    switch (cmd) {
+        case RISCV64_F_DUPFD:
+        case RISCV64_F_DUPFD_CLOEXEC: {
+            int minfd = (int)arg;
+            if (minfd < 0 || minfd >= MAX_FDS) return -22; /* EINVAL */
+            for (int newfd = minfd; newfd < MAX_FDS; newfd++) {
+                if (current->fds[newfd].in_use) continue;
+                if (fs_clone_fd(&current->fds[newfd], &current->fds[fd]) < 0) return -1;
+                current->fds[newfd].fd_flags =
+                    (cmd == RISCV64_F_DUPFD_CLOEXEC) ? FD_CLOEXEC : 0;
+                return newfd;
+            }
+            return -24; /* EMFILE */
+        }
+        case RISCV64_F_GETFD:
+            return current->fds[fd].fd_flags;
+        case RISCV64_F_SETFD:
+            current->fds[fd].fd_flags = (int)arg & FD_CLOEXEC;
+            return 0;
+        case RISCV64_F_GETFL:
+            return current->fds[fd].flags;
+        case RISCV64_F_SETFL:
+            /* アクセスモードは変更不可 (POSIX) */
+            current->fds[fd].flags = (current->fds[fd].flags & 3) | ((int)arg & ~3);
+            return 0;
+        default:
+            return -22; /* EINVAL */
+    }
 }
 
 int fs_clone_fd(file_descriptor_t* dst, const file_descriptor_t* src) {

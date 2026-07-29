@@ -48,6 +48,21 @@ static int64_t riscv64_bootstrap_sys_wait4(int pid, int* wstatus, int options);
 #define RISCV64_LINUX_SYS_DUP              23
 #define RISCV64_LINUX_SYS_DUP3             24
 #define RISCV64_LINUX_SYS_PIPE2            59
+#define RISCV64_LINUX_SYS_FCNTL            25
+#define RISCV64_LINUX_SYS_CHDIR            49
+#define RISCV64_LINUX_SYS_FCHDIR           50
+#define RISCV64_LINUX_SYS_MKDIRAT          34
+#define RISCV64_LINUX_SYS_UNLINKAT         35
+#define RISCV64_LINUX_SYS_RENAMEAT         38
+#define RISCV64_LINUX_SYS_TRUNCATE         45
+#define RISCV64_LINUX_SYS_FTRUNCATE        46
+#define RISCV64_LINUX_SYS_FCHMOD           52
+#define RISCV64_LINUX_SYS_FCHMODAT         53
+#define RISCV64_LINUX_SYS_SYNC             81
+#define RISCV64_LINUX_SYS_FSYNC            82
+#define RISCV64_LINUX_SYS_FDATASYNC        83
+#define RISCV64_LINUX_SYS_UTIMENSAT        88
+#define RISCV64_LINUX_SYS_RENAMEAT2        276
 #define RISCV64_LINUX_SYS_MMAP             222
 #define RISCV64_LINUX_SYS_WAIT4            260
 #define RISCV64_LINUX_SYS_GETRANDOM        278
@@ -221,9 +236,29 @@ static int64_t riscv64_bootstrap_sys_lseek(int fd, int64_t offset, int whence) {
     }
 
     next = base + offset;
-    if (next < 0 || (uint64_t)next > f->size) return -1;
+    if (next < 0) return -1;
+    /* 書き込み用に開いた xv6fs ファイルは EOF 越えのシークを許す (穴あき書き込み) */
+    if ((uint64_t)next > f->size &&
+        !(f->type == FT_XV6FS && ((f->flags & 3) == O_WRONLY || (f->flags & 3) == O_RDWR))) {
+        return -1;
+    }
     f->offset = (size_t)next;
     return next;
+}
+
+static int riscv64_bootstrap_sys_fchmodat(int dirfd, const char* path, uint32_t mode) {
+    if (!path || path[0] == '\0') return -1;
+    /* AT_FDCWD(-100) と絶対パスのみ対応。sys_chmod が cwd 相対を解決する */
+    if (path[0] != '/' && dirfd != -100) return -1;
+    return sys_chmod(path, mode);
+}
+
+static int riscv64_bootstrap_sys_fchmod(int fd, uint32_t mode) {
+    struct task* current = get_current_task();
+    if (!current) return -1;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
+    if (current->fds[fd].name[0] == '\0') return -1;
+    return sys_chmod(current->fds[fd].name, mode);
 }
 
 static int64_t riscv64_bootstrap_sys_writev(int fd, const struct riscv64_linux_iovec* iov, int iovcnt) {
@@ -671,10 +706,13 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             }
             return;
         case SYS_CHDIR:
+        case RISCV64_LINUX_SYS_CHDIR:
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)sys_chdir((const char*)(uintptr_t)arch_syscall_arg0(frame)));
             return;
-        case SYS_FCHDIR:
+        /* 注: x86 レガシー番号の SYS_FCHDIR(81) は riscv64 の sync(81) と衝突するため
+         * 採らない。musl が発行する asm-generic 番号 50 のみを受ける */
+        case RISCV64_LINUX_SYS_FCHDIR:
             arch_syscall_set_return(frame, (uint64_t)(int64_t)sys_fchdir((int)arch_syscall_arg0(frame)));
             return;
         case SYS_MMAP:
@@ -805,6 +843,60 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                                                     (int)arch_syscall_arg1(frame),
                                                                     (int)arch_syscall_arg2(frame)));
             }
+            return;
+        case RISCV64_LINUX_SYS_FCNTL:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)sys_fcntl((int)arch_syscall_arg0(frame),
+                                                                 (int)arch_syscall_arg1(frame),
+                                                                 arch_syscall_arg2(frame)));
+            return;
+        case RISCV64_LINUX_SYS_MKDIRAT:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)sys_mkdirat((int)arch_syscall_arg0(frame),
+                                                                   (const char*)(uintptr_t)arch_syscall_arg1(frame),
+                                                                   (int)arch_syscall_arg2(frame)));
+            return;
+        case RISCV64_LINUX_SYS_UNLINKAT:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)sys_unlinkat((int)arch_syscall_arg0(frame),
+                                                                    (const char*)(uintptr_t)arch_syscall_arg1(frame),
+                                                                    (int)arch_syscall_arg2(frame)));
+            return;
+        case RISCV64_LINUX_SYS_TRUNCATE:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)sys_truncate((const char*)(uintptr_t)arch_syscall_arg0(frame),
+                                                                    arch_syscall_arg1(frame)));
+            return;
+        case RISCV64_LINUX_SYS_FTRUNCATE:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)sys_ftruncate((int)arch_syscall_arg0(frame),
+                                                                     arch_syscall_arg1(frame)));
+            return;
+        case RISCV64_LINUX_SYS_FCHMODAT:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)riscv64_bootstrap_sys_fchmodat((int)arch_syscall_arg0(frame),
+                                                                                      (const char*)(uintptr_t)arch_syscall_arg1(frame),
+                                                                                      (uint32_t)arch_syscall_arg2(frame)));
+            return;
+        case RISCV64_LINUX_SYS_FCHMOD:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)riscv64_bootstrap_sys_fchmod((int)arch_syscall_arg0(frame),
+                                                                                    (uint32_t)arch_syscall_arg1(frame)));
+            return;
+        case RISCV64_LINUX_SYS_SYNC:
+        case RISCV64_LINUX_SYS_FSYNC:
+        case RISCV64_LINUX_SYS_FDATASYNC:
+            arch_syscall_set_return(frame, (uint64_t)(int64_t)sys_sync());
+            return;
+        case RISCV64_LINUX_SYS_UTIMENSAT:
+            /* xv6fs はタイムスタンプを持たないため touch を成功扱いにする */
+            arch_syscall_set_return(frame, 0);
+            return;
+        case RISCV64_LINUX_SYS_RENAMEAT:
+        case RISCV64_LINUX_SYS_RENAMEAT2:
+            /* xv6fs に rename API が無い。EXDEV を返して mv の copy+unlink
+             * フォールバックに乗せる */
+            arch_syscall_set_return(frame, (uint64_t)(int64_t)-18);
             return;
         case RISCV64_LINUX_SYS_FACCESSAT:
             {
