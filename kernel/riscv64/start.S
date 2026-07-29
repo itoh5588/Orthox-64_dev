@@ -17,6 +17,8 @@ _start:
     add sp, sp, t1
     li t0, 65536
     add sp, sp, t0
+    # カーネル実行中の tp は hart index (trap.S / per-hart scratch が参照する)
+    mv tp, a0
     call riscv64_early_main
 1:
     tail riscv64_wait_forever

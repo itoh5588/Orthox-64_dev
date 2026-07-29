@@ -24,6 +24,8 @@ riscv64_trap_entry:
     sd t1,  40(sp)
     ld t1,  16(t0)
     sd t1,  48(sp)
+    # カーネル実行中の tp を hart index にする (SMP 用の CPU 識別)
+    ld tp,  32(t0)
     # カーネル実行中は sscratch=0 (ネスト trap は fallback 経路で現 sp を使う)
     csrw sscratch, zero
     j .Ltrap_common
@@ -34,15 +36,15 @@ riscv64_trap_entry:
     addi sp, sp, -288
 
     sd ra,   0(sp)
-    # t1 をスクラッチとして使う前に元の値を退避する
-    # (退避前に潰すと、割り込まれたカーネルコードの t1 が 0 に化ける)
+    # t1/t2 をスクラッチとして使う前に元の値を退避する
+    # (退避前に潰すと、割り込まれたカーネルコードのレジスタが化ける)
     sd t1,  40(sp)
+    sd t2,  48(sp)
     addi t1, sp, 288
     sd t1,   8(sp)
     sd gp,  16(sp)
     sd tp,  24(sp)
     sd t0,  32(sp)
-    sd t2,  48(sp)
 
 .Ltrap_common:
     sd s0,  56(sp)
@@ -78,7 +80,6 @@ riscv64_trap_entry:
     sd t0, 264(sp)
     csrr t0, stval
     sd t0, 272(sp)
-    sd zero, 280(sp)
     mv a0, sp
     call riscv64_trap_dispatch
 
@@ -87,6 +88,16 @@ riscv64_trap_entry:
     ld t0, 256(sp)
     csrw sstatus, t0
 
+    # ユーザーモードへ戻る場合 (SPP=0) のみ sscratch に per-hart scratch を設定する。
+    # カーネルへ戻る場合は 0 のまま (ネスト trap は fallback 経路)。
+    # tp がまだ hart index のうちに算出する (フレームは execve がゼロ化し得るので使えない)
+    andi t0, t0, 0x100
+    bnez t0, 1f
+    la t0, g_riscv64_trap_scratch
+    slli t1, tp, 6
+    add t0, t0, t1
+    csrw sscratch, t0
+1:
     ld ra,   0(sp)
     ld gp,  16(sp)
     ld tp,  24(sp)
@@ -117,14 +128,6 @@ riscv64_trap_entry:
     ld t4, 224(sp)
     ld t5, 232(sp)
     ld t6, 240(sp)
-    # ユーザーモードへ戻る場合 (SPP=0) のみ sscratch に scratch 領域を設定する。
-    # カーネルへ戻る場合は 0 のまま (ネスト trap は fallback 経路)
-    ld t0, 256(sp)
-    andi t0, t0, 0x100
-    bnez t0, 1f
-    la t0, g_riscv64_trap_scratch
-    csrw sscratch, t0
-1:
     ld t0,  32(sp)
     ld sp,   8(sp)
     sret

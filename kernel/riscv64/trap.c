@@ -10,14 +10,24 @@
 
 extern void riscv64_trap_entry(void);
 
+// trap.S が offset 0..32 を直接参照する。サイズ 64 バイト固定 (trap.S の
+// `slli t2, tp, 6` が hart index からアドレスを算出するため変更不可)
 struct riscv64_trap_scratch {
-    uint64_t kernel_sp;
-    uint64_t saved_t1;
-    uint64_t saved_t2;
-    uint64_t saved_sp;
+    uint64_t kernel_sp;   /*  0 */
+    uint64_t saved_t1;    /*  8 */
+    uint64_t saved_t2;    /* 16 */
+    uint64_t saved_sp;    /* 24 */
+    uint64_t hart_index;  /* 32 : カーネル実行中の tp に載せる値 */
+    uint64_t reserved[3];
 };
 
-struct riscv64_trap_scratch g_riscv64_trap_scratch;
+struct riscv64_trap_scratch g_riscv64_trap_scratch[RISCV64_MAX_HARTS];
+
+static struct riscv64_trap_scratch* riscv64_trap_scratch_self(void) {
+    uint64_t hart = riscv64_current_hart_index();
+    if (hart >= RISCV64_MAX_HARTS) hart = 0;
+    return &g_riscv64_trap_scratch[hart];
+}
 
 static uint64_t g_riscv64_timer_interval = 1000000ULL;
 static uint64_t g_riscv64_timer_ticks;
@@ -30,7 +40,7 @@ static void riscv64_trap_rearm_current_kernel_stack(void) {
     if (!cpu || !cpu->kernel_stack) return;
     // カーネル実行中は sscratch=0 を保つため kernel_sp フィールドのみ更新する。
     // sscratch への書き戻しは trap 出口 (ユーザー復帰時) が行う
-    g_riscv64_trap_scratch.kernel_sp = cpu->kernel_stack;
+    riscv64_trap_scratch_self()->kernel_sp = cpu->kernel_stack;
 }
 
 static void riscv64_timer_arm_next(void) {
@@ -78,14 +88,18 @@ static void riscv64_trap_print_frame(const riscv64_trap_frame_t* frame) {
 }
 
 void riscv64_trap_init(void) {
+    struct riscv64_trap_scratch* scratch = riscv64_trap_scratch_self();
+    scratch->hart_index = riscv64_current_hart_index();
     riscv64_write_sscratch(0);
     riscv64_write_stvec((uint64_t)(uintptr_t)riscv64_trap_entry);
     riscv64_uart_puts("  trap vector installed\n");
 }
 
 void riscv64_trap_set_kernel_stack(uint64_t kernel_sp) {
-    g_riscv64_trap_scratch.kernel_sp = kernel_sp;
-    riscv64_write_sscratch((uint64_t)(uintptr_t)&g_riscv64_trap_scratch);
+    struct riscv64_trap_scratch* scratch = riscv64_trap_scratch_self();
+    scratch->hart_index = riscv64_current_hart_index();
+    scratch->kernel_sp = kernel_sp;
+    riscv64_write_sscratch((uint64_t)(uintptr_t)scratch);
 }
 
 void riscv64_timer_init(void) {

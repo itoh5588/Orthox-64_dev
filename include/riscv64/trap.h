@@ -32,6 +32,17 @@ typedef riscv64_trap_frame_t arch_interrupt_frame_t;
 #define RISCV64_SCAUSE_SSOFT     (RISCV64_SCAUSE_INTERRUPT | 1ULL)
 #define RISCV64_SCAUSE_SEXT      (RISCV64_SCAUSE_INTERRUPT | 9ULL)
 
+// start.S が 64KB×8 のブートスタックを持つのに合わせた上限
+#define RISCV64_MAX_HARTS 8
+
+// カーネル実行中は tp に hart index を載せる (trap.S が入口で設定する)。
+// ユーザーの tp はトラップフレームに退避されるので競合しない
+static inline uint64_t riscv64_current_hart_index(void) {
+    uint64_t hart;
+    __asm__ volatile("mv %0, tp" : "=r"(hart));
+    return hart;
+}
+
 void riscv64_trap_init(void);
 void riscv64_timer_init(void);
 void riscv64_trap_dispatch(riscv64_trap_frame_t* frame);
