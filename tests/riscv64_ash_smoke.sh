@@ -1,6 +1,7 @@
 #!/bin/bash
 # busybox ash を対話シェルとして起動し、シリアル (stdio) 経由でコマンドを
-# 流し込んで応答を検証する。実行前に以下でカーネルをビルドしておくこと:
+# 流し込んで応答を検証する。SMP_CPUS=4 のように指定すると複数 hart で走る。
+# 実行前に以下でカーネルをビルドしておくこと:
 #   make riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=out/busybox-riscv64-musl.elf RISCV64_BOOTSTRAP_ARG0_VALUE=sh
 # (make riscv64-ash-smoke がこの手順をまとめて行う)
 set -euo pipefail
@@ -65,7 +66,7 @@ fi
     sleep 2
     printf 'cat /w.txt | wc -l\n'
     sleep 3
-    printf 'mkdir /d && echo mkdir-ok\n'
+    printf 'mkdir /d 2>/dev/null; test -d /d && echo mkdir-ok\n'
     sleep 3
     printf 'cat /etc/motd > /d/copy.txt; cat /d/copy.txt\n'
     sleep 3
@@ -82,7 +83,7 @@ fi
     -machine virt \
     -cpu rv64 \
     -m 512M \
-    -smp 1 \
+    -smp "${SMP_CPUS:-1}" \
     -bios "$FW_PATH" \
     -kernel out/kernel-riscv64.elf \
     -display none \

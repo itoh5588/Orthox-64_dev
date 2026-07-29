@@ -94,6 +94,11 @@ static inline uint64_t riscv64_read_sip(void) {
     return value;
 }
 
+/* IPI (supervisor software interrupt) の pending ビットを落とす */
+static inline void riscv64_clear_sip_ssip(void) {
+    __asm__ volatile("csrci sip, %0" : : "i"(RISCV64_SIE_SSIE));
+}
+
 static inline uint64_t riscv64_read_time(void) {
     uint64_t value;
     __asm__ volatile("rdtime %0" : "=r"(value));

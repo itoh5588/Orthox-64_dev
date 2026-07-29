@@ -42,6 +42,10 @@ void riscv64_uart_puthex64(uint64_t value);
 void riscv64_mark_user_handoff_started(void);
 int riscv64_user_handoff_started(void);
 void riscv64_wait_forever(void);
+
+// SMP (kernel/riscv64/smp.c)
+void riscv64_smp_start_secondaries(void);
+uint32_t riscv64_smp_hart_count(void);
 void riscv64_early_main(uint64_t hart_id, uint64_t dtb_pa);
 
 #endif

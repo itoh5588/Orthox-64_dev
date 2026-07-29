@@ -9,7 +9,6 @@
 uint64_t g_hhdm_offset;
 
 static spinlock_t g_riscv64_kernel_lock;
-static struct smp_cpu_info g_riscv64_bsp_cpu = { 0, 0, 0, 1, 1 };
 static uint8_t g_riscv64_console_buf[256];
 static uint32_t g_riscv64_console_head;
 static uint32_t g_riscv64_console_tail;
@@ -158,18 +157,8 @@ void riscv64_console_clear_waiter(struct task* t) {
     if (g_riscv64_console_waiter == t) g_riscv64_console_waiter = 0;
 }
 
-const struct smp_cpu_info* smp_get_cpu_info(uint32_t cpu_index) {
-    if (cpu_index != 0) return 0;
-    return &g_riscv64_bsp_cpu;
-}
-
-uint32_t smp_get_started_cpu_count(void) {
-    return 1;
-}
-
-void smp_send_resched_ipi(uint32_t cpu_id) {
-    (void)cpu_id;
-}
+/* smp_get_cpu_info / smp_get_started_cpu_count / smp_send_resched_ipi は
+ * kernel/riscv64/smp.c に実装がある */
 
 int bottom_half_run(void) {
     return 0;

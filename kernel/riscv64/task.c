@@ -5,17 +5,22 @@
 #include "syscall.h"
 #include "task.h"
 
-static struct cpu_local* g_riscv64_cpu_local;
+// hart 毎の cpu_local。カーネル実行中は tp = hart index という規約で引く
+static struct cpu_local* g_riscv64_cpu_local[RISCV64_MAX_HARTS];
 
 // ブート時の最初のユーザー遷移だけトレースするためのワンショットフラグ
 static int g_riscv64_trace_enter_user = 1;
 
 struct cpu_local* riscv64_task_get_cpu_local_impl(void) {
-    return g_riscv64_cpu_local;
+    uint64_t hart = riscv64_current_hart_index();
+    if (hart >= RISCV64_MAX_HARTS) return 0;
+    return g_riscv64_cpu_local[hart];
 }
 
 void riscv64_task_set_cpu_local_impl(struct cpu_local* cpu) {
-    g_riscv64_cpu_local = cpu;
+    uint64_t hart = riscv64_current_hart_index();
+    if (hart >= RISCV64_MAX_HARTS) return;
+    g_riscv64_cpu_local[hart] = cpu;
 }
 
 static void riscv64_task_copy_frame(arch_task_exec_frame_t* dst,

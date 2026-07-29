@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "riscv64/boot.h"
+#include "spinlock.h"
 #include "riscv64/csr.h"
 #include "riscv64/dtb.h"
 #include "riscv64/elf.h"
@@ -319,12 +320,19 @@ int riscv64_uart_getchar_nonblock(void) {
     return (int)uart[RISCV64_UART_RHR];
 }
 
+// 複数 hart から同時に出力すると行が混ざるため、文字列単位で直列化する。
+// (割り込みコンテキストからも呼ばれるので irqsave 版を使う)
+static spinlock_t g_riscv64_uart_lock;
+
 void riscv64_uart_puts(const char* s) {
+    uint64_t flags;
     if (!s) return;
+    flags = spin_lock_irqsave(&g_riscv64_uart_lock);
     while (*s) {
         if (*s == '\n') riscv64_uart_putchar('\r');
         riscv64_uart_putchar(*s++);
     }
+    spin_unlock_irqrestore(&g_riscv64_uart_lock, flags);
 }
 
 void riscv64_uart_puthex64(uint64_t value) {
@@ -1066,6 +1074,8 @@ static void riscv64_first_user_task_bootstrap(void) {
         riscv64_uart_puts("  first user task bootstrap failed: no current task\n");
         return;
     }
+    // 副 hart は idle タスクを作れる状態 (task_init 後) で起動する
+    riscv64_smp_start_secondaries();
     riscv64_run_on_stack(current->kstack_top, riscv64_first_user_task_bootstrap_continue);
 }
 

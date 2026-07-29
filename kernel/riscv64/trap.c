@@ -52,9 +52,8 @@ static void riscv64_timer_arm_next(void) {
 }
 
 static void riscv64_handle_timer_interrupt(void) {
-    const riscv64_boot_info_t* boot = riscv64_boot_info();
     kernel_lock_enter();
-    if (boot && boot->hart_id == 0) {
+    if (riscv64_current_hart_index() == 0) {
         net_poll();
     }
     task_on_timer_tick();
@@ -92,7 +91,10 @@ void riscv64_trap_init(void) {
     scratch->hart_index = riscv64_current_hart_index();
     riscv64_write_sscratch(0);
     riscv64_write_stvec((uint64_t)(uintptr_t)riscv64_trap_entry);
-    riscv64_uart_puts("  trap vector installed\n");
+    // 副 hart のブートログは冗長なので boot hart のみ出す
+    if (scratch->hart_index == 0) {
+        riscv64_uart_puts("  trap vector installed\n");
+    }
 }
 
 void riscv64_trap_set_kernel_stack(uint64_t kernel_sp) {
@@ -105,6 +107,7 @@ void riscv64_trap_set_kernel_stack(uint64_t kernel_sp) {
 void riscv64_timer_init(void) {
     riscv64_write_sie(riscv64_read_sie() | RISCV64_SIE_STIE);
     riscv64_timer_arm_next();
+    if (riscv64_current_hart_index() != 0) return;
     riscv64_uart_puts("  sbi timer armed\n");
     if (g_riscv64_last_timer_error != 0) {
         riscv64_uart_puts("  timer err: 0x");
@@ -121,6 +124,18 @@ void riscv64_trap_dispatch(riscv64_trap_frame_t* frame) {
 
     if (frame->scause == RISCV64_SCAUSE_ECALL_U || frame->scause == RISCV64_SCAUSE_ECALL_S) {
         riscv64_handle_ecall(frame);
+        riscv64_trap_rearm_current_kernel_stack();
+        return;
+    }
+
+    if (frame->scause == RISCV64_SCAUSE_SSOFT) {
+        // resched IPI: sip.SSIP を落として、ユーザーからの割り込みなら切り替える
+        riscv64_clear_sip_ssip();
+        if ((frame->sstatus & RISCV64_SSTATUS_SPP) == 0 && !kernel_lock_held()) {
+            if (task_consume_resched()) {
+                kernel_yield();
+            }
+        }
         riscv64_trap_rearm_current_kernel_stack();
         return;
     }
