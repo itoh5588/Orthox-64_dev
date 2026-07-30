@@ -922,8 +922,12 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
 void riscv64_syscall_dispatch(riscv64_trap_frame_t* frame) {
     if (!frame) return;
 
-    if ((frame->a7 == SYS_FORK && frame->a0 == 0 && frame->a1 == 0 && frame->a2 == 0) ||
-        (frame->a7 == RISCV64_LINUX_SYS_CLONE && frame->a0 == 17 && frame->a1 == 0 && frame->a2 == 0)) {
+    // fork は clone(SIGCHLD, 0) のみで受ける。x86 レガシーの SYS_FORK(57) は
+    // riscv64 の close(57) と番号が衝突しており、`close(0)` が a7=57/a0=a1=a2=0
+    // という完全に同じレジスタ状態になるため、レガシー番号を見ると close(0) が
+    // fork として実行されてしまう (busybox ash の `cmd &` が壊れていた原因)。
+    // riscv64 ユーザーランドは musl のみで、musl の fork() は clone を出す。
+    if (frame->a7 == RISCV64_LINUX_SYS_CLONE && frame->a0 == 17 && frame->a1 == 0 && frame->a2 == 0) {
         // 子は親フレームのコピーで復帰するため、先に sepc を進めて
         // 子が ecall を再実行しないようにする (親子とも次命令から再開)
         frame->sepc += 4;

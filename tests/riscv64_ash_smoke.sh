@@ -77,6 +77,12 @@ fi
     sleep 3
     printf 'echo x > /dev/null && echo devnull-write-ok\n'
     sleep 3
+    # バックグラウンドジョブ (子は stdin を /dev/null に差し替える)。
+    # 変数展開を挟んでコマンド行のエコーと出力を区別する
+    printf 'BG=ok; /bin/echo bg-job-$BG &\n'
+    sleep 4
+    printf 'echo after-bg-ok\n'
+    sleep 3
     printf 'exit\n'
     sleep 3
 ) | "$QEMU_BIN" \
@@ -99,7 +105,7 @@ cleanup() {
 trap cleanup EXIT
 
 for _ in {1..75}; do
-    if grep -q "bootstrap user exit" "$SERIAL_LOG" 2>/dev/null; then
+    if grep -aq "bootstrap user exit" "$SERIAL_LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -109,25 +115,31 @@ echo "--- RISC-V ash Serial Output ---"
 cat "$SERIAL_LOG"
 echo "--------------------------------"
 
-grep -q "built-in shell (ash)" "$SERIAL_LOG"
-grep -q "riscv64 supervisor timer interrupt" "$SERIAL_LOG"
-grep -q "interactive-ok" "$SERIAL_LOG"
-grep -q "^/" "$SERIAL_LOG"
-grep -q "val=42" "$SERIAL_LOG"
+grep -aq "built-in shell (ash)" "$SERIAL_LOG"
+grep -aq "riscv64 supervisor timer interrupt" "$SERIAL_LOG"
+grep -aq "interactive-ok" "$SERIAL_LOG"
+grep -aq "^/" "$SERIAL_LOG"
+grep -aq "val=42" "$SERIAL_LOG"
 if [ -f "$ROOTFS_IMG" ]; then
-    grep -q "xv6fs mounted on vblk0" "$SERIAL_LOG"
-    grep -q "busybox" "$SERIAL_LOG"
-    grep -q "hello from riscv64 xv6fs rootfs" "$SERIAL_LOG"
-    grep -q "external-exec-ok" "$SERIAL_LOG"
-    grep -qE "1 +3 +6" "$SERIAL_LOG"
+    grep -aq "xv6fs mounted on vblk0" "$SERIAL_LOG"
+    grep -aq "busybox" "$SERIAL_LOG"
+    grep -aq "hello from riscv64 xv6fs rootfs" "$SERIAL_LOG"
+    grep -aq "external-exec-ok" "$SERIAL_LOG"
+    grep -aqE "1 +3 +6" "$SERIAL_LOG"
     # 書き込み系 (リダイレクト / 追記 / mkdir / unlink)
-    grep -q "redirect-ok" "$SERIAL_LOG"
-    grep -qE "^ *2$" "$SERIAL_LOG"          # cat /w.txt | wc -l → 2 行 (追記が効いている)
-    grep -q "mkdir-ok" "$SERIAL_LOG"
-    grep -q "unlink-ok" "$SERIAL_LOG"
-    grep -q "devnull-read-ok" "$SERIAL_LOG"
-    grep -q "devnull-write-ok" "$SERIAL_LOG"
+    grep -aq "redirect-ok" "$SERIAL_LOG"
+    grep -aqE "^ *2$" "$SERIAL_LOG"          # cat /w.txt | wc -l → 2 行 (追記が効いている)
+    grep -aq "mkdir-ok" "$SERIAL_LOG"
+    grep -aq "unlink-ok" "$SERIAL_LOG"
+    grep -aq "devnull-read-ok" "$SERIAL_LOG"
+    grep -aq "devnull-write-ok" "$SERIAL_LOG"
+    # `cmd &`: 子が 1 度だけ実行され (close(0) が fork に化けていないこと)、
+    # かつ /dev/null の open に失敗しないこと
+    grep -aq "bg-job-ok" "$SERIAL_LOG"
+    [ "$(grep -ac "bg-job-ok" "$SERIAL_LOG")" = "1" ]
+    ! grep -aq "can't open '/dev/null'" "$SERIAL_LOG"
+    grep -aq "after-bg-ok" "$SERIAL_LOG"
 fi
-grep -q "bootstrap user exit" "$SERIAL_LOG"
+grep -aq "bootstrap user exit" "$SERIAL_LOG"
 
 echo "riscv64 ash smoke test: PASS"
