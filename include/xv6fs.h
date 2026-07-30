@@ -231,6 +231,7 @@ int xv6fs_create_file(const char *path, int mode, struct xv6fs_inode **out_ip);
 int xv6fs_mknod_fifo(const char *path, int mode);
 int xv6fs_truncate_file(const char *path, uint64_t length);
 int xv6fs_unlink_path(const char *path);
+int xv6fs_link_path(const char *oldpath, const char *newpath);
 int xv6fs_rmdir_path(const char *path);
 int xv6fs_mkdir_path(const char *path, int mode);
 int xv6fs_chmod_path(const char *path, uint32_t mode);

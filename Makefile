@@ -236,7 +236,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: all clean run riscv64-kernel riscv64-run riscv64-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: all clean run riscv64-kernel riscv64-user-bin riscv64-run riscv64-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -350,6 +350,19 @@ $(RISCV64_PREEMPT_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)
 
 riscv64-preempt-probe: $(RISCV64_PREEMPT_PROBE_ELF)
 
+# user/riscv64-bin/<name>.c → rootfs の /bin/<name>。ファイルを置くだけで拾われる。
+# リンクは busybox と同じ ports/orthos-riscv64-musl-gcc.sh に任せる
+# (musl の crt1.o と riscv64-elf-gcc の libgcc をまとめてくれる。libgcc が無いと
+#  musl の printf が long double 用の __divtf3 で未解決になる)
+RISCV64_USER_BIN_SRCS = $(wildcard user/riscv64-bin/*.c)
+RISCV64_USER_BIN_ELFS = $(patsubst user/riscv64-bin/%.c,$(BUILD_DIR)/riscv64-bin/%.elf,$(RISCV64_USER_BIN_SRCS))
+
+$(BUILD_DIR)/riscv64-bin/%.elf: user/riscv64-bin/%.c $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	./ports/orthos-riscv64-musl-gcc.sh -O2 -Wall -Wextra $< -o $@
+
+riscv64-user-bin: $(RISCV64_USER_BIN_ELFS)
+
 RISCV64_BUSYBOX_ASH_MUSL_ELF = out/busybox-riscv64-musl.elf
 
 riscv64-busybox-musl: $(RISCV64_MUSL_SYSROOT)/lib/libc.a
@@ -385,14 +398,29 @@ riscv64-smp-smoke: $(RISCV64_PREEMPT_PROBE_ELF)
 	bash ./tests/riscv64_smp_smoke.sh
 
 RISCV64_ROOTFS_IMG = out/rootfs-riscv64-xv6.img
-RISCV64_ROOTFS_APPLETS = ash sh busybox cat chmod cp echo env false head ls mkdir mv printenv printf pwd rm rmdir stat tail test touch true wc
+RISCV64_ROOTFS_APPLETS = ash sh busybox basename cat chmod cmp cp cut date dd df dirname du \
+                         echo env expr false find grep head hexdump ln ls md5sum mkdir mktemp \
+                         mv od printenv printf pwd realpath rev rm rmdir sed seq sleep sort \
+                         stat sync tail tee test touch tr true uname uniq wc which xargs yes
 
-# riscv64 用 xv6fs rootfs イメージ (busybox applet を /bin にコピー配置)
-riscv64-rootfs: riscv64-busybox-musl
+# riscv64 用 xv6fs rootfs イメージ。
+# applet は busybox 本体へのハードリンクにする (xv6fs に symlink 型が無いため)。
+# build_rootfs_xv6fs.py がホスト側のハードリンクを検出して 1 inode に集約するので、
+# applet を増やしてもイメージは busybox 1 本分しか太らない。
+riscv64-rootfs: riscv64-busybox-musl $(RISCV64_USER_BIN_ELFS)
 	rm -rf $(BUILD_DIR)/riscv64-rootfs
 	mkdir -p $(BUILD_DIR)/riscv64-rootfs/bin $(BUILD_DIR)/riscv64-rootfs/etc $(BUILD_DIR)/riscv64-rootfs/tmp
-	for a in $(RISCV64_ROOTFS_APPLETS); do cp $(RISCV64_BUSYBOX_ASH_MUSL_ELF) $(BUILD_DIR)/riscv64-rootfs/bin/$$a; done
+	cp $(RISCV64_BUSYBOX_ASH_MUSL_ELF) $(BUILD_DIR)/riscv64-rootfs/bin/busybox
+	for a in $(filter-out busybox,$(RISCV64_ROOTFS_APPLETS)); do \
+	    ln -f $(BUILD_DIR)/riscv64-rootfs/bin/busybox $(BUILD_DIR)/riscv64-rootfs/bin/$$a; \
+	done
+	for e in $(RISCV64_USER_BIN_ELFS); do \
+	    cp $$e $(BUILD_DIR)/riscv64-rootfs/bin/$$(basename $$e .elf); \
+	done
 	printf 'hello from riscv64 xv6fs rootfs\n' > $(BUILD_DIR)/riscv64-rootfs/etc/motd
+	printf 'root:x:0:0:root:/:/bin/sh\n' > $(BUILD_DIR)/riscv64-rootfs/etc/passwd
+	printf 'root:x:0:\n' > $(BUILD_DIR)/riscv64-rootfs/etc/group
+	printf 'PATH=/bin\nexport PATH\n' > $(BUILD_DIR)/riscv64-rootfs/etc/profile
 	python3 scripts/build_rootfs_xv6fs.py $(BUILD_DIR)/riscv64-rootfs $(RISCV64_ROOTFS_IMG) | tail -4
 
 # busybox ash を対話シェルとして起動 (stdin/stdout = シリアルコンソール)

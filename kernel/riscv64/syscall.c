@@ -36,10 +36,16 @@ static int64_t riscv64_bootstrap_sys_wait4(int pid, int* wstatus, int options);
 #define RISCV64_LINUX_SYS_WAITID           95
 #define RISCV64_LINUX_SYS_SET_TID_ADDRESS  96
 #define RISCV64_LINUX_SYS_FUTEX            98
+#define RISCV64_LINUX_SYS_NANOSLEEP        101
 #define RISCV64_LINUX_SYS_CLOCK_GETTIME    113
 #define RISCV64_LINUX_SYS_RT_SIGACTION     134
 #define RISCV64_LINUX_SYS_RT_SIGPROCMASK   135
 #define RISCV64_LINUX_SYS_GETPID           172
+#define RISCV64_LINUX_SYS_GETPPID          173
+#define RISCV64_LINUX_SYS_GETUID           174
+#define RISCV64_LINUX_SYS_GETEUID          175
+#define RISCV64_LINUX_SYS_GETGID           176
+#define RISCV64_LINUX_SYS_GETEGID          177
 #define RISCV64_LINUX_SYS_BRK              214
 #define RISCV64_LINUX_SYS_MUNMAP           215
 #define RISCV64_LINUX_SYS_CLONE            220
@@ -53,7 +59,10 @@ static int64_t riscv64_bootstrap_sys_wait4(int pid, int* wstatus, int options);
 #define RISCV64_LINUX_SYS_FCHDIR           50
 #define RISCV64_LINUX_SYS_MKDIRAT          34
 #define RISCV64_LINUX_SYS_UNLINKAT         35
+#define RISCV64_LINUX_SYS_LINKAT           37
+#define RISCV64_LINUX_SYS_READLINKAT       78
 #define RISCV64_LINUX_SYS_RENAMEAT         38
+#define RISCV64_LINUX_SYS_UNAME            160
 #define RISCV64_LINUX_SYS_TRUNCATE         45
 #define RISCV64_LINUX_SYS_FTRUNCATE        46
 #define RISCV64_LINUX_SYS_FCHMOD           52
@@ -66,6 +75,11 @@ static int64_t riscv64_bootstrap_sys_wait4(int pid, int* wstatus, int options);
 #define RISCV64_LINUX_SYS_MMAP             222
 #define RISCV64_LINUX_SYS_WAIT4            260
 #define RISCV64_LINUX_SYS_GETRANDOM        278
+
+/* clone(2) のフラグ (musl の vfork が使う分だけ) */
+#define RISCV64_LINUX_CLONE_VM      0x00000100ULL
+#define RISCV64_LINUX_CLONE_VFORK   0x00004000ULL
+#define RISCV64_LINUX_CLONE_SIGCHLD 17ULL
 
 #define RISCV64_LINUX_AT_EMPTY_PATH        0x1000
 #define RISCV64_LINUX_TCGETS               0x5401UL
@@ -182,6 +196,45 @@ static int riscv64_sys_fstatat_user(int dirfd, const char* path, struct riscv64_
     int rc = sys_fstatat(dirfd, path, &st, flags);
     if (rc == 0 && user_st) riscv64_stat_from_kstat(user_st, &st);
     return rc;
+}
+
+/* Linux の struct utsname (asm-generic は各フィールド 65 バイト固定) */
+struct riscv64_linux_utsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+
+static void riscv64_utsname_set(char* dst, const char* src) {
+    size_t i = 0;
+    for (; src[i] && i < 64; i++) dst[i] = src[i];
+    for (; i < 65; i++) dst[i] = '\0';
+}
+
+static int riscv64_sys_uname(struct riscv64_linux_utsname* out) {
+    if (!out) return -1;
+    riscv64_utsname_set(out->sysname, "Linux");
+    riscv64_utsname_set(out->nodename, "orthox");
+    /* busybox の一部は release を Linux のバージョンとしてパースするので
+     * それらしい形にしておく。実体は Orthox-64 なので version 側で名乗る */
+    riscv64_utsname_set(out->release, "5.0.0-orthox");
+    riscv64_utsname_set(out->version, "Orthox-64 riscv64");
+    riscv64_utsname_set(out->machine, "riscv64");
+    riscv64_utsname_set(out->domainname, "(none)");
+    return 0;
+}
+
+/* xv6fs に symlink が無いので、存在するパスは「symlink ではない」= EINVAL、
+ * 存在しないパスは ENOENT を返す。musl の realpath() はこの EINVAL を見て
+ * 「このパス要素は symlink ではない」と判断して先へ進む。 */
+static int riscv64_sys_readlinkat(int dirfd, const char* path) {
+    struct kstat st;
+    if (!path) return -14; /* EFAULT */
+    if (sys_fstatat(dirfd, path, &st, 0) < 0) return -2; /* ENOENT */
+    return -22; /* EINVAL: not a symbolic link */
 }
 
 struct riscv64_linux_winsize {
@@ -356,6 +409,44 @@ static int riscv64_bootstrap_sys_clock_gettime(int clock_id, struct riscv64_linu
     if (clock_id != 0 && clock_id != 1) return -1;
     ts->tv_sec = (int64_t)(ms / 1000ULL);
     ts->tv_nsec = (int64_t)((ms % 1000ULL) * 1000000ULL);
+    return 0;
+}
+
+/* nanosleep(2)。ms 解像度しか無いので端数は切り上げる (0 を要求されない限り
+ * 必ず 1 tick 以上眠らせる)。既存の sleep 機構 (task_mark_io_wait_until +
+ * sched.c の起床走査) にそのまま載せる。 */
+static int riscv64_bootstrap_sys_nanosleep(const struct riscv64_linux_timespec* req,
+                                           struct riscv64_linux_timespec* rem) {
+    struct task* current = get_current_task();
+    int64_t req_sec;
+    int64_t req_nsec;
+    uint64_t ms;
+    uint64_t deadline;
+
+    if (!req) return -14; /* EFAULT */
+    /* musl の sleep() は nanosleep(&tv, &tv) と req と rem に同じポインタを渡す。
+     * rem を先に書くと要求時間を自分で潰すので、必ず req を退避してから触ること */
+    req_sec = req->tv_sec;
+    req_nsec = req->tv_nsec;
+    if (req_sec < 0 || req_nsec < 0 || req_nsec >= 1000000000L) return -22; /* EINVAL */
+    if (rem) {
+        rem->tv_sec = 0;
+        rem->tv_nsec = 0;
+    }
+    ms = (uint64_t)req_sec * 1000ULL + ((uint64_t)req_nsec + 999999ULL) / 1000000ULL;
+    if (ms == 0 || !current) {
+        kernel_yield();
+        return 0;
+    }
+    /* 本来は task_mark_io_wait_until() で寝かせてタイマー走査に起こさせたいが、
+     * riscv64 ではその起床経路がまだ動かない (sleep_until_ms を見る
+     * task_on_timer_tick の走査までタイマー割り込みが届かず、寝たきりになる)。
+     * 当面はデッドラインまで yield し続けるスピン待ちにしておく。単核前提の
+     * 暫定実装で、CPU は食うがハングはしない。 */
+    deadline = arch_time_now_ms() + ms;
+    while (arch_time_now_ms() < deadline) {
+        kernel_yield();
+    }
     return 0;
 }
 
@@ -649,6 +740,19 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                 arch_syscall_set_return(frame, current ? (uint64_t)current->pid : 0);
                 return;
             }
+        case RISCV64_LINUX_SYS_GETPPID:
+            {
+                struct task* current = get_current_task();
+                arch_syscall_set_return(frame, current ? (uint64_t)current->ppid : 0);
+                return;
+            }
+        /* 単一ユーザー (root 固定)。/etc/passwd も root だけを持つ */
+        case RISCV64_LINUX_SYS_GETUID:
+        case RISCV64_LINUX_SYS_GETEUID:
+        case RISCV64_LINUX_SYS_GETGID:
+        case RISCV64_LINUX_SYS_GETEGID:
+            arch_syscall_set_return(frame, 0);
+            return;
         case SYS_OPEN:
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)sys_open((const char*)(uintptr_t)arch_syscall_arg0(frame),
@@ -674,11 +778,15 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
         case RISCV64_LINUX_SYS_CLOSE:
             arch_syscall_set_return(frame, (uint64_t)(int64_t)sys_close((int)arch_syscall_arg0(frame)));
             return;
-        case SYS_GETDENTS:
+        /* 78 は riscv64 では readlinkat。x86 レガシーの SYS_GETDENTS(78) と衝突して
+         * いたため、以前は readlinkat が getdents64 として実行され realpath が
+         * 壊れていた。getdents64 は riscv64 番号 61 (switch 手前のヒューリスティック)
+         * で受けているので、こちらは readlinkat に明け渡す。 */
+        case RISCV64_LINUX_SYS_READLINKAT:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)sys_getdents64((int)arch_syscall_arg0(frame),
-                                                                      (void*)(uintptr_t)arch_syscall_arg1(frame),
-                                                                      (size_t)arch_syscall_arg2(frame)));
+                                    (uint64_t)(int64_t)riscv64_sys_readlinkat(
+                                        (int)arch_syscall_arg0(frame),
+                                        (const char*)(uintptr_t)arch_syscall_arg1(frame)));
             return;
         case SYS_FSTAT:
             arch_syscall_set_return(frame,
@@ -758,6 +866,12 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                     (uint64_t)(int64_t)riscv64_bootstrap_sys_futex((volatile int*)(uintptr_t)arch_syscall_arg0(frame),
                                                                                     (int)arch_syscall_arg1(frame),
                                                                                     (int)arch_syscall_arg2(frame)));
+            return;
+        case RISCV64_LINUX_SYS_NANOSLEEP:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)riscv64_bootstrap_sys_nanosleep(
+                                        (const struct riscv64_linux_timespec*)(uintptr_t)arch_syscall_arg0(frame),
+                                        (struct riscv64_linux_timespec*)(uintptr_t)arch_syscall_arg1(frame)));
             return;
         case RISCV64_LINUX_SYS_CLOCK_GETTIME:
             arch_syscall_set_return(frame,
@@ -862,6 +976,19 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                                                     (const char*)(uintptr_t)arch_syscall_arg1(frame),
                                                                     (int)arch_syscall_arg2(frame)));
             return;
+        case RISCV64_LINUX_SYS_LINKAT:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)sys_linkat((int)arch_syscall_arg0(frame),
+                                                                  (const char*)(uintptr_t)arch_syscall_arg1(frame),
+                                                                  (int)arch_syscall_arg2(frame),
+                                                                  (const char*)(uintptr_t)arch_syscall_arg3(frame),
+                                                                  (int)arch_syscall_arg4(frame)));
+            return;
+        case RISCV64_LINUX_SYS_UNAME:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)riscv64_sys_uname(
+                                        (struct riscv64_linux_utsname*)(uintptr_t)arch_syscall_arg0(frame)));
+            return;
         case RISCV64_LINUX_SYS_TRUNCATE:
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)sys_truncate((const char*)(uintptr_t)arch_syscall_arg0(frame),
@@ -927,7 +1054,19 @@ void riscv64_syscall_dispatch(riscv64_trap_frame_t* frame) {
     // という完全に同じレジスタ状態になるため、レガシー番号を見ると close(0) が
     // fork として実行されてしまう (busybox ash の `cmd &` が壊れていた原因)。
     // riscv64 ユーザーランドは musl のみで、musl の fork() は clone を出す。
-    if (frame->a7 == RISCV64_LINUX_SYS_CLONE && frame->a0 == 17 && frame->a1 == 0 && frame->a2 == 0) {
+    //
+    // vfork も同じ入口で受ける。musl の riscv64 vfork は手書き asm で
+    //   clone(CLONE_VM|CLONE_VFORK|SIGCHLD, sp)   (= a0=0x4111, a1=sp)
+    // を出す (src/process/riscv64/vfork.s)。busybox の spawn() がこれを使うため、
+    // 対応しないと xargs 等が ENOSYS で落ちる。
+    // **アドレス空間は共有せず通常の fork としてコピーする**。vfork の子は直後に
+    // exec するのが前提なので実用上は問題ないが、exec 前に子が書いた内容が親から
+    // 見えない点だけ本来の vfork と異なる。親を停止させないのも同様に許容している
+    // (呼び出し側は waitpid か pipe で同期するため)。
+    if (frame->a7 == RISCV64_LINUX_SYS_CLONE &&
+        ((frame->a0 == RISCV64_LINUX_CLONE_SIGCHLD && frame->a1 == 0 && frame->a2 == 0) ||
+         frame->a0 == (RISCV64_LINUX_CLONE_VM | RISCV64_LINUX_CLONE_VFORK |
+                       RISCV64_LINUX_CLONE_SIGCHLD))) {
         // 子は親フレームのコピーで復帰するため、先に sepc を進めて
         // 子が ecall を再実行しないようにする (親子とも次命令から再開)
         frame->sepc += 4;

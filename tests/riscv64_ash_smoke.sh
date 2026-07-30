@@ -83,6 +83,25 @@ fi
     sleep 4
     printf 'echo after-bg-ok\n'
     sleep 3
+    # 追加 applet (テキスト処理 / パイプ)
+    printf 'printf "b\\na\\nc\\na\\n" > /s.txt; sort /s.txt | uniq | tr "\\n" "-"; echo TEXT\n'
+    sleep 4
+    printf 'grep -c a /s.txt | sed s/^/grepcount=/\n'
+    sleep 4
+    # readlinkat 経由 (以前は getdents64 に化けて EPERM だった)
+    printf 'realpath /etc/motd\n'
+    sleep 3
+    # ハードリンク (linkat)
+    printf 'rm -f /h.txt; ln /etc/motd /h.txt && cat /h.txt\n'
+    sleep 4
+    # vfork (clone CLONE_VM|CLONE_VFORK) 経由で exec する applet
+    printf 'echo xargs-in | xargs echo\n'
+    sleep 4
+    printf 'uname -m\n'
+    sleep 3
+    # 自作コマンド (user/riscv64-bin) がビルドされて /bin に入っているか
+    printf 'orthinfo | tail -1\n'
+    sleep 4
     printf 'exit\n'
     sleep 3
 ) | "$QEMU_BIN" \
@@ -104,7 +123,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for _ in {1..75}; do
+for _ in {1..150}; do
     if grep -aq "bootstrap user exit" "$SERIAL_LOG" 2>/dev/null; then
         break
     fi
@@ -139,6 +158,15 @@ if [ -f "$ROOTFS_IMG" ]; then
     [ "$(grep -ac "bg-job-ok" "$SERIAL_LOG")" = "1" ]
     ! grep -aq "can't open '/dev/null'" "$SERIAL_LOG"
     grep -aq "after-bg-ok" "$SERIAL_LOG"
+    # 追加 applet
+    grep -aq "a-b-c-TEXT" "$SERIAL_LOG"        # sort | uniq | tr
+    grep -aq "grepcount=2" "$SERIAL_LOG"       # grep -c | sed
+    grep -aq "^/etc/motd$" "$SERIAL_LOG"       # realpath (readlinkat が EINVAL を返すこと)
+    grep -aq "xargs-in" "$SERIAL_LOG"          # xargs = vfork + exec
+    grep -aq "^riscv64$" "$SERIAL_LOG"         # uname -m
+    grep -aq "orthinfo : ok" "$SERIAL_LOG"     # user/riscv64-bin のビルド導線
+    # ln (linkat): /h.txt が motd の内容を持つ = ハードリンクが張れている
+    [ "$(grep -ac "hello from riscv64 xv6fs rootfs" "$SERIAL_LOG")" -ge 3 ]
 fi
 grep -aq "bootstrap user exit" "$SERIAL_LOG"
 

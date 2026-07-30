@@ -551,7 +551,10 @@ int sys_stat(const char* path, struct kstat* st) {
         return 0;
     }
 
-    if (fs_get_file_data(resolved, &file_data, &file_size) < 0) return -1;
+    /* 存在しないパスは必ず -ENOENT を返すこと。-1 のままだと musl 側で EPERM に
+     * なり、`rm -f nonexistent` が "Operation not permitted" で失敗する
+     * (busybox は lstat の ENOENT を見て -f を黙って成功扱いにする) */
+    if (fs_get_file_data(resolved, &file_data, &file_size) < 0) return -2; /* ENOENT */
     riscv64_fs_kstat_defaults(st, KSTAT_MODE_FILE | 0644U, (int64_t)file_size);
     st->ino = ((uint64_t)(uintptr_t)file_data) >> 4;
     return 0;
@@ -647,6 +650,28 @@ int sys_unlinkat(int dirfd, const char* path, int flags) {
         return xv6fs_rmdir_path(resolved) == 0 ? 0 : -1;
     }
     return xv6fs_unlink_path(resolved) == 0 ? 0 : -1;
+}
+
+int sys_link(const char* oldpath, const char* newpath) {
+    char old_resolved[256];
+    char new_resolved[256];
+    struct kstat st;
+    if (!oldpath || !newpath || oldpath[0] == '\0' || newpath[0] == '\0') return -1;
+    if (!xv6fs_is_mounted()) return -1;
+    if (riscv64_fs_resolve_path(oldpath, old_resolved, sizeof(old_resolved)) < 0) return -1;
+    if (riscv64_fs_resolve_path(newpath, new_resolved, sizeof(new_resolved)) < 0) return -1;
+    if (sys_stat(new_resolved, &st) == 0) return -17; /* EEXIST */
+    return xv6fs_link_path(old_resolved, new_resolved) == 0 ? 0 : -1;
+}
+
+int sys_linkat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags) {
+    char old_resolved[256];
+    char new_resolved[256];
+    (void)flags; /* AT_SYMLINK_FOLLOW: xv6fs に symlink が無いので無視してよい */
+    if (!oldpath || !newpath || oldpath[0] == '\0' || newpath[0] == '\0') return -1;
+    if (riscv64_fs_resolve_dirfd_path(olddirfd, oldpath, old_resolved, sizeof(old_resolved)) < 0) return -1;
+    if (riscv64_fs_resolve_dirfd_path(newdirfd, newpath, new_resolved, sizeof(new_resolved)) < 0) return -1;
+    return sys_link(old_resolved, new_resolved);
 }
 
 int sys_mkdir(const char* path, int mode) {

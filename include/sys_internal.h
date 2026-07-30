@@ -146,6 +146,8 @@ int sys_utimensat(int dirfd, const char* path, const void* times, int flags);
 int sys_sync(void);
 int sys_unlink(const char* path);
 int sys_unlinkat(int dirfd, const char* path, int flags);
+int sys_link(const char* oldpath, const char* newpath);
+int sys_linkat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags);
 int sys_rename(const char* oldpath, const char* newpath);
 int sys_chmod(const char* path, uint32_t mode);
 int sys_mkdir(const char* path, int mode);

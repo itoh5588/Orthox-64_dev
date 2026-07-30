@@ -305,6 +305,20 @@ def should_skip(name: str) -> bool:
     return name == '.DS_Store' or name.startswith('._')
 
 
+# ホスト側のハードリンク (同一 st_dev/st_ino) を xv6fs 上でも 1 inode に集約する。
+# busybox のように 1 バイナリを何十個ものコマンド名で置く場合、コピーのままだと
+# イメージが applet 数だけ膨らむ。{(st_dev, st_ino): inum}
+hardlink_map: dict[tuple[int, int], int] = {}
+
+
+def add_hardlink(parent: int, name: str, inum: int) -> None:
+    """既存 inode に対する 2 本目以降のリンクを張り、nlink を増やす。"""
+    add_dirent(parent, name, inum)
+    din = rinode(inum)
+    din['nlink'] += 1
+    winode(inum, din)
+
+
 # ──────────────────────────────────────────────
 # rootfs ツリーの書き込み
 # ──────────────────────────────────────────────
@@ -345,9 +359,22 @@ def populate(host_path: Path, dir_inum: int, depth: int = 0) -> None:
 
         else:
             try:
-                fsize = entry.stat().st_size
-                child = ialloc(T_FILE, entry.stat().st_mode & 0o7777)
+                st = entry.stat()
+                fsize = st.st_size
+                # ホスト側で既に見た inode ならリンクを張るだけで中身は書かない
+                if st.st_nlink > 1:
+                    key = (st.st_dev, st.st_ino)
+                    if key in hardlink_map:
+                        add_hardlink(dir_inum, name, hardlink_map[key])
+                        if depth == 0:
+                            pct = done * 100 // max(total, 1)
+                            print(f"\r  [{done:4d}/{total}] {pct:3d}%  {name[:32]:<32}",
+                                  end='', flush=True)
+                        continue
+                child = ialloc(T_FILE, st.st_mode & 0o7777)
                 add_dirent(dir_inum, name, child)
+                if st.st_nlink > 1:
+                    hardlink_map[(st.st_dev, st.st_ino)] = child
                 with entry.open('rb') as f:
                     while True:
                         chunk = f.read(512 * 1024)

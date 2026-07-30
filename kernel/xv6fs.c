@@ -1115,6 +1115,48 @@ int xv6fs_rmdir_path(const char *path) {
     return 0;
 }
 
+/* ハードリンクを張る。xv6 本家の sys_link と同じ手順:
+ * 先に nlink を増やしてから dirlink し、失敗したら巻き戻す。
+ * (逆順だと dirlink 成功後にクラッシュした場合 nlink が実数より少なくなる) */
+int xv6fs_link_path(const char *oldpath, const char *newpath) {
+    char name[XV6FS_DIRSIZ];
+    struct xv6fs_inode *ip = xv6fs_namei(oldpath);
+    struct xv6fs_inode *dp;
+
+    if (!ip) return -1;
+
+    xv6log_begin_op();
+    xv6fs_ilock(ip);
+    /* ディレクトリのハードリンクはループを作るので禁止 */
+    if (ip->type == XV6FS_T_DIR) {
+        xv6fs_iunlock(ip); xv6log_end_op(); xv6fs_iput(ip); return -1;
+    }
+    ip->nlink++;
+    xv6fs_iupdate(ip);
+    xv6fs_iunlock(ip);
+
+    dp = xv6fs_nameiparent(newpath, name);
+    if (!dp) goto bad;
+    xv6fs_ilock(dp);
+    if (dp->dev != ip->dev || xv6fs_dirlink(dp, name, ip->inum) < 0) {
+        xv6fs_iunlock(dp); xv6fs_iput(dp);
+        goto bad;
+    }
+    xv6fs_iunlock(dp); xv6fs_iput(dp);
+    xv6log_end_op();
+    xv6fs_iput(ip);
+    return 0;
+
+bad:
+    xv6fs_ilock(ip);
+    ip->nlink--;
+    xv6fs_iupdate(ip);
+    xv6fs_iunlock(ip);
+    xv6log_end_op();
+    xv6fs_iput(ip);
+    return -1;
+}
+
 int xv6fs_mkdir_path(const char *path, int mode) {
     char name[XV6FS_DIRSIZ];
     struct xv6fs_inode *dp = xv6fs_nameiparent(path, name);
