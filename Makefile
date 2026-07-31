@@ -722,12 +722,7 @@ nativekernelbootsmoke: $(ISO)
 pythonnumpysmoke: $(ISO)
 	bash ./tests/python_numpy_smoke.sh $(ISO)
 
-smp# x86 カーネルの回帰テスト。ISO はスクリプト側で組む
-# (rootfs.img は既存のものを使う。macOS では x86 ユーザーランドを再ビルドできない)
-x86-kernel-smoke: $(KERNEL_ELF)
-	bash ./tests/x86_kernel_smoke.sh
-
-run: $(ISO)
+smprun: $(ISO)
 	bash tests/run_qemu_stdio.sh \
 		-smp 2
 
@@ -737,21 +732,11 @@ persistsmprun: $(ISO) $(ROOTFS_IMG)
 		$(ROOTFS_VBLK_ARGS) \
 		-smp 2
 
-smp4# x86 カーネルの回帰テスト。ISO はスクリプト側で組む
-# (rootfs.img は既存のものを使う。macOS では x86 ユーザーランドを再ビルドできない)
-x86-kernel-smoke: $(KERNEL_ELF)
-	bash ./tests/x86_kernel_smoke.sh
-
-run: $(ISO)
+smp4run: $(ISO)
 	bash tests/run_qemu_stdio.sh \
 		-smp 4
 
-net# x86 カーネルの回帰テスト。ISO はスクリプト側で組む
-# (rootfs.img は既存のものを使う。macOS では x86 ユーザーランドを再ビルドできない)
-x86-kernel-smoke: $(KERNEL_ELF)
-	bash ./tests/x86_kernel_smoke.sh
-
-run: $(ISO)
+netrun: $(ISO)
 	bash tests/run_qemu_stdio.sh \
 		-netdev user,id=net0,hostfwd=tcp::8080-:8080,hostfwd=udp::12345-:12345,hostfwd=udp::12346-:12346 \
 		-device virtio-net-pci,netdev=net0
