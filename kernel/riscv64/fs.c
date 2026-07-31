@@ -20,6 +20,24 @@ struct riscv64_linux_dirent64 {
 /* Linux AT_REMOVEDIR (unlinkat の第3引数) */
 #define RISCV64_AT_REMOVEDIR 0x200
 
+/*
+ * syscall の戻り値は -errno 規約 (musl の __syscall_ret がそのまま errno にする)。
+ * 「よく分からない失敗はとりあえず -1」は -EPERM = "Operation not permitted"
+ * としてユーザーに出るので使わないこと。busybox は ENOENT を見て挙動を変える
+ * 箇所が多く (`rm -f` が典型)、EPERM だと誤動作する。
+ */
+#define RISCV64_EPERM       1
+#define RISCV64_ENOENT      2
+#define RISCV64_EBADF       9
+#define RISCV64_EFAULT     14
+#define RISCV64_ENOTDIR    20
+#define RISCV64_EISDIR     21
+#define RISCV64_EINVAL     22
+#define RISCV64_EMFILE     24
+#define RISCV64_ENOSPC     28
+#define RISCV64_EROFS      30
+#define RISCV64_ENOTEMPTY  39
+
 /* O_ACCMODE 判定: 書き込み可能な開き方か */
 static int riscv64_fs_flags_writable(int flags) {
     int acc = flags & 3;
@@ -201,8 +219,8 @@ int sys_open(const char* path, int flags, int mode) {
     size_t file_size = 0;
     int fd = -1;
 
-    if (!current || !path) return -1;
-    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
+    if (!current || !path) return -RISCV64_EFAULT;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -RISCV64_ENOENT;
 
     // POSIX: open は最小の空き fd を返す。busybox ash はバックグラウンドジョブで
     // close(0) 後の open が必ず 0 を返すことに依存している (`cmd &` の stdin=/dev/null)
@@ -212,7 +230,7 @@ int sys_open(const char* path, int flags, int mode) {
             break;
         }
     }
-    if (fd < 0) return -1;
+    if (fd < 0) return -RISCV64_EMFILE;
 
     {
         // 疑似キャラクタデバイスは xv6fs より先に解決する
@@ -305,7 +323,7 @@ int sys_open(const char* path, int flags, int mode) {
         }
     }
 
-    if (fs_get_file_data(resolved, &file_data, &file_size) < 0) return -2; /* ENOENT */
+    if (fs_get_file_data(resolved, &file_data, &file_size) < 0) return -RISCV64_ENOENT;
 
     current->fds[fd].type = FT_MODULE;
     current->fds[fd].data = file_data;
@@ -321,7 +339,7 @@ int sys_open(const char* path, int flags, int mode) {
 
 int sys_openat(int dirfd, const char* path, int flags, int mode) {
     char resolved[256];
-    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -1;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -RISCV64_ENOENT;
     return sys_open(resolved, flags, mode);
 }
 
@@ -329,8 +347,9 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
     struct task* current = get_current_task();
     const uint8_t* src = (const uint8_t*)buf;
 
-    if (!current || !buf) return -1;
-    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
+    if (!current) return -RISCV64_EPERM;
+    if (!buf) return -RISCV64_EFAULT;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
     if (current->fds[fd].type == FT_PIPE) {
         pipe_t* pipe = (pipe_t*)current->fds[fd].data;
         size_t written = 0;
@@ -379,7 +398,7 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
         file_descriptor_t* f = &current->fds[fd];
         size_t off;
         if (!riscv64_fs_flags_writable(f->flags)) return -9; /* EBADF */
-        if (f->name[0] == '\0') return -1;
+        if (f->name[0] == '\0') return -RISCV64_EBADF;
         if (count == 0) return 0;
         if (f->flags & O_APPEND) {
             uint32_t xv6_mode = 0;
@@ -390,12 +409,12 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
             f->offset = f->size;
         }
         off = f->offset;
-        if (xv6fs_write_file(f->name, (uint64_t)off, buf, count) < 0) return -1;
+        if (xv6fs_write_file(f->name, (uint64_t)off, buf, count) < 0) return -RISCV64_ENOSPC;
         f->offset = off + count;
         if (f->offset > f->size) f->size = f->offset;
         return (int64_t)count;
     }
-    if (current->fds[fd].type != FT_CONSOLE) return -1;
+    if (current->fds[fd].type != FT_CONSOLE) return -RISCV64_EBADF;
 
     for (size_t i = 0; i < count; i++) {
         riscv64_uart_putchar((char)src[i]);
@@ -409,8 +428,9 @@ int64_t sys_read(int fd, void* buf, size_t count) {
     size_t remaining;
     size_t to_read;
 
-    if (!current || !buf) return -1;
-    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
+    if (!current) return -RISCV64_EPERM;
+    if (!buf) return -RISCV64_EFAULT;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
     f = &current->fds[fd];
     if (f->type == FT_CONSOLE) {
         uint8_t* dst = (uint8_t*)buf;
@@ -443,7 +463,7 @@ int64_t sys_read(int fd, void* buf, size_t count) {
         }
         return (int64_t)read_count;
     }
-    if (f->type == FT_DIR) return -1;
+    if (f->type == FT_DIR) return -RISCV64_EISDIR;
     if (f->type == FT_CHARDEV) {
         if (f->aux0 == RISCV64_DEV_ZERO) {
             for (size_t i = 0; i < count; i++) ((uint8_t*)buf)[i] = 0;
@@ -501,7 +521,7 @@ int64_t sys_read(int fd, void* buf, size_t count) {
         f->offset += (size_t)got;
         return (int64_t)got;
     }
-    if (f->type != FT_MODULE) return -1;
+    if (f->type != FT_MODULE) return -RISCV64_EBADF;
     if (f->offset >= f->size) return 0;
 
     remaining = f->size - f->offset;
@@ -518,8 +538,8 @@ int sys_stat(const char* path, struct kstat* st) {
     void* file_data = 0;
     size_t file_size = 0;
 
-    if (!path || !st) return -1;
-    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
+    if (!path || !st) return -RISCV64_EFAULT;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -RISCV64_ENOENT;
 
     {
         int dev = riscv64_fs_special_dev(resolved);
@@ -554,7 +574,7 @@ int sys_stat(const char* path, struct kstat* st) {
     /* 存在しないパスは必ず -ENOENT を返すこと。-1 のままだと musl 側で EPERM に
      * なり、`rm -f nonexistent` が "Operation not permitted" で失敗する
      * (busybox は lstat の ENOENT を見て -f を黙って成功扱いにする) */
-    if (fs_get_file_data(resolved, &file_data, &file_size) < 0) return -2; /* ENOENT */
+    if (fs_get_file_data(resolved, &file_data, &file_size) < 0) return -RISCV64_ENOENT;
     riscv64_fs_kstat_defaults(st, KSTAT_MODE_FILE | 0644U, (int64_t)file_size);
     st->ino = ((uint64_t)(uintptr_t)file_data) >> 4;
     return 0;
@@ -564,7 +584,8 @@ int sys_fstat(int fd, struct kstat* st) {
     struct task* current = get_current_task();
     file_descriptor_t* f;
 
-    if (!current || !st) return -1;
+    if (!current) return -RISCV64_EPERM;
+    if (!st) return -RISCV64_EFAULT;
     if (fd == 0 || fd == 1 || fd == 2) {
         riscv64_fs_kstat_defaults(st, KSTAT_MODE_CHR | 0666U, 0);
         st->dev = 1;
@@ -572,7 +593,7 @@ int sys_fstat(int fd, struct kstat* st) {
         st->rdev = 1;
         return 0;
     }
-    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
     f = &current->fds[fd];
 
     if (f->type == FT_CONSOLE || f->type == FT_CHARDEV) {
@@ -590,13 +611,13 @@ int sys_fstat(int fd, struct kstat* st) {
     if ((f->type == FT_MODULE || f->type == FT_XV6FS) && f->name[0] != '\0') {
         return sys_stat(f->name, st);
     }
-    return -1;
+    return -RISCV64_EBADF;
 }
 
 int sys_fstatat(int dirfd, const char* path, struct kstat* st, int flags) {
     char resolved[256];
     (void)flags;
-    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -1;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -RISCV64_ENOENT;
     return sys_stat(resolved, st);
 }
 
@@ -605,10 +626,10 @@ int sys_chdir(const char* path) {
     struct kstat st;
     char resolved[256];
 
-    if (!current || !path || path[0] == '\0') return -1;
-    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
-    if (sys_stat(resolved, &st) < 0) return -1;
-    if ((st.mode & 0170000U) != KSTAT_MODE_DIR) return -1;
+    if (!current || !path || path[0] == '\0') return -RISCV64_ENOENT;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -RISCV64_ENOENT;
+    if (sys_stat(resolved, &st) < 0) return -RISCV64_ENOENT;
+    if ((st.mode & 0170000U) != KSTAT_MODE_DIR) return -RISCV64_ENOTDIR;
     riscv64_fs_strcpy(current->cwd, resolved, sizeof(current->cwd));
     return 0;
 }
@@ -617,10 +638,10 @@ int sys_fchdir(int fd) {
     struct task* current = get_current_task();
     file_descriptor_t* f;
 
-    if (!current) return -1;
-    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
+    if (!current) return -RISCV64_EPERM;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
     f = &current->fds[fd];
-    if (f->type != FT_DIR || f->name[0] == '\0') return -1;
+    if (f->type != FT_DIR || f->name[0] == '\0') return -RISCV64_ENOTDIR;
     return sys_chdir(f->name);
 }
 
@@ -628,85 +649,109 @@ int sys_fchdir(int fd) {
 /* 書き込み系エントリポイント (すべて xv6fs のパスベース API に委譲)   */
 /* ------------------------------------------------------------------ */
 
+/* xv6fs のパス API は失敗を -1 でしか返さないので、事前に stat して errno を
+ * 決める。`rm -f` は lstat の ENOENT を見て黙って成功扱いにするため、ここが
+ * EPERM だと `rm -f nonexistent` が失敗する */
+static int riscv64_fs_unlink_resolved(const char* resolved) {
+    struct kstat st;
+    if (sys_stat(resolved, &st) < 0) return -RISCV64_ENOENT;
+    if ((st.mode & 0170000U) == KSTAT_MODE_DIR) return -RISCV64_EISDIR;
+    return xv6fs_unlink_path(resolved) == 0 ? 0 : -RISCV64_EPERM;
+}
+
+static int riscv64_fs_rmdir_resolved(const char* resolved) {
+    struct kstat st;
+    if (sys_stat(resolved, &st) < 0) return -RISCV64_ENOENT;
+    if ((st.mode & 0170000U) != KSTAT_MODE_DIR) return -RISCV64_ENOTDIR;
+    /* xv6fs_rmdir_path が弾くのは実質「空でない」ケース */
+    return xv6fs_rmdir_path(resolved) == 0 ? 0 : -RISCV64_ENOTEMPTY;
+}
+
 int sys_unlink(const char* path) {
     char resolved[256];
-    if (!path || path[0] == '\0' || !xv6fs_is_mounted()) return -1;
-    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
-    return xv6fs_unlink_path(resolved) == 0 ? 0 : -1;
+    if (!path || path[0] == '\0') return -RISCV64_ENOENT;
+    if (!xv6fs_is_mounted()) return -RISCV64_EROFS;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -RISCV64_ENOENT;
+    return riscv64_fs_unlink_resolved(resolved);
 }
 
 int sys_rmdir(const char* path) {
     char resolved[256];
-    if (!path || path[0] == '\0' || !xv6fs_is_mounted()) return -1;
-    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
-    return xv6fs_rmdir_path(resolved) == 0 ? 0 : -1;
+    if (!path || path[0] == '\0') return -RISCV64_ENOENT;
+    if (!xv6fs_is_mounted()) return -RISCV64_EROFS;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -RISCV64_ENOENT;
+    return riscv64_fs_rmdir_resolved(resolved);
 }
 
 int sys_unlinkat(int dirfd, const char* path, int flags) {
     char resolved[256];
-    if (!path || path[0] == '\0' || !xv6fs_is_mounted()) return -1;
-    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -1;
-    if (flags & RISCV64_AT_REMOVEDIR) {
-        return xv6fs_rmdir_path(resolved) == 0 ? 0 : -1;
-    }
-    return xv6fs_unlink_path(resolved) == 0 ? 0 : -1;
+    if (!path || path[0] == '\0') return -RISCV64_ENOENT;
+    if (!xv6fs_is_mounted()) return -RISCV64_EROFS;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -RISCV64_ENOENT;
+    if (flags & RISCV64_AT_REMOVEDIR) return riscv64_fs_rmdir_resolved(resolved);
+    return riscv64_fs_unlink_resolved(resolved);
 }
 
 int sys_link(const char* oldpath, const char* newpath) {
     char old_resolved[256];
     char new_resolved[256];
     struct kstat st;
-    if (!oldpath || !newpath || oldpath[0] == '\0' || newpath[0] == '\0') return -1;
-    if (!xv6fs_is_mounted()) return -1;
-    if (riscv64_fs_resolve_path(oldpath, old_resolved, sizeof(old_resolved)) < 0) return -1;
-    if (riscv64_fs_resolve_path(newpath, new_resolved, sizeof(new_resolved)) < 0) return -1;
+    if (!oldpath || !newpath || oldpath[0] == '\0' || newpath[0] == '\0') return -RISCV64_ENOENT;
+    if (!xv6fs_is_mounted()) return -RISCV64_EROFS;
+    if (riscv64_fs_resolve_path(oldpath, old_resolved, sizeof(old_resolved)) < 0) return -RISCV64_ENOENT;
+    if (riscv64_fs_resolve_path(newpath, new_resolved, sizeof(new_resolved)) < 0) return -RISCV64_ENOENT;
     if (sys_stat(new_resolved, &st) == 0) return -17; /* EEXIST */
-    return xv6fs_link_path(old_resolved, new_resolved) == 0 ? 0 : -1;
+    if (sys_stat(old_resolved, &st) < 0) return -RISCV64_ENOENT;
+    return xv6fs_link_path(old_resolved, new_resolved) == 0 ? 0 : -RISCV64_EPERM;
 }
 
 int sys_linkat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags) {
     char old_resolved[256];
     char new_resolved[256];
     (void)flags; /* AT_SYMLINK_FOLLOW: xv6fs に symlink が無いので無視してよい */
-    if (!oldpath || !newpath || oldpath[0] == '\0' || newpath[0] == '\0') return -1;
-    if (riscv64_fs_resolve_dirfd_path(olddirfd, oldpath, old_resolved, sizeof(old_resolved)) < 0) return -1;
-    if (riscv64_fs_resolve_dirfd_path(newdirfd, newpath, new_resolved, sizeof(new_resolved)) < 0) return -1;
+    if (!oldpath || !newpath || oldpath[0] == '\0' || newpath[0] == '\0') return -RISCV64_ENOENT;
+    if (riscv64_fs_resolve_dirfd_path(olddirfd, oldpath, old_resolved, sizeof(old_resolved)) < 0) return -RISCV64_ENOENT;
+    if (riscv64_fs_resolve_dirfd_path(newdirfd, newpath, new_resolved, sizeof(new_resolved)) < 0) return -RISCV64_ENOENT;
     return sys_link(old_resolved, new_resolved);
 }
 
 int sys_mkdir(const char* path, int mode) {
     char resolved[256];
     struct kstat st;
-    if (!path || path[0] == '\0' || !xv6fs_is_mounted()) return -1;
-    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
+    if (!path || path[0] == '\0') return -RISCV64_ENOENT;
+    if (!xv6fs_is_mounted()) return -RISCV64_EROFS;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -RISCV64_ENOENT;
     if (sys_stat(resolved, &st) == 0) return -17; /* EEXIST */
-    return xv6fs_mkdir_path(resolved, (mode & 07777) ? (mode & 07777) : 0755) == 0 ? 0 : -1;
+    /* xv6fs_mkdir_path が弾くのは実質「親ディレクトリが無い」ケース */
+    return xv6fs_mkdir_path(resolved, (mode & 07777) ? (mode & 07777) : 0755) == 0
+               ? 0 : -RISCV64_ENOENT;
 }
 
 int sys_mkdirat(int dirfd, const char* path, int mode) {
     char resolved[256];
-    if (!path || path[0] == '\0') return -1;
-    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -1;
+    if (!path || path[0] == '\0') return -RISCV64_ENOENT;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -RISCV64_ENOENT;
     return sys_mkdir(resolved, mode);
 }
 
 int sys_truncate(const char* path, uint64_t length) {
     char resolved[256];
-    if (!path || path[0] == '\0' || !xv6fs_is_mounted()) return -1;
-    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
-    return xv6fs_truncate_file(resolved, length) == 0 ? 0 : -1;
+    if (!path || path[0] == '\0') return -RISCV64_ENOENT;
+    if (!xv6fs_is_mounted()) return -RISCV64_EROFS;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -RISCV64_ENOENT;
+    return xv6fs_truncate_file(resolved, length) == 0 ? 0 : -RISCV64_ENOENT;
 }
 
 int sys_ftruncate(int fd, uint64_t length) {
     struct task* current = get_current_task();
     file_descriptor_t* f;
 
-    if (!current) return -1;
-    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
+    if (!current) return -RISCV64_EPERM;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
     f = &current->fds[fd];
-    if (f->type != FT_XV6FS || f->name[0] == '\0') return -1;
-    if (!riscv64_fs_flags_writable(f->flags)) return -9; /* EBADF */
-    if (xv6fs_truncate_file(f->name, length) < 0) return -1;
+    if (f->type != FT_XV6FS || f->name[0] == '\0') return -RISCV64_EINVAL;
+    if (!riscv64_fs_flags_writable(f->flags)) return -RISCV64_EBADF;
+    if (xv6fs_truncate_file(f->name, length) < 0) return -RISCV64_EINVAL;
     f->size = (size_t)length;
     if (f->offset > f->size) f->offset = f->size;
     return 0;
@@ -714,9 +759,10 @@ int sys_ftruncate(int fd, uint64_t length) {
 
 int sys_chmod(const char* path, uint32_t mode) {
     char resolved[256];
-    if (!path || path[0] == '\0' || !xv6fs_is_mounted()) return -1;
-    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -1;
-    return xv6fs_chmod_path(resolved, mode & 07777U) == 0 ? 0 : -1;
+    if (!path || path[0] == '\0') return -RISCV64_ENOENT;
+    if (!xv6fs_is_mounted()) return -RISCV64_EROFS;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -RISCV64_ENOENT;
+    return xv6fs_chmod_path(resolved, mode & 07777U) == 0 ? 0 : -RISCV64_ENOENT;
 }
 
 int sys_sync(void) {
@@ -765,9 +811,9 @@ void fs_release_fd(file_descriptor_t* desc) {
 int sys_close(int fd) {
     struct task* current = get_current_task();
 
-    if (!current) return -1;
-    if (fd < 0 || fd >= MAX_FDS) return -1;
-    if (!current->fds[fd].in_use) return -1;
+    if (!current) return -RISCV64_EPERM;
+    if (fd < 0 || fd >= MAX_FDS) return -RISCV64_EBADF;
+    if (!current->fds[fd].in_use) return -RISCV64_EBADF;
     fs_release_fd(&current->fds[fd]);
     return 0;
 }
@@ -779,9 +825,10 @@ int sys_pipe2(int* pipefd, int flags) {
     int fd1 = -1;
     int fd2 = -1;
 
-    if (!current || !pipefd) return -1;
+    if (!current) return -RISCV64_EPERM;
+    if (!pipefd) return -RISCV64_EFAULT;
     /* O_CLOEXEC(0x80000)/O_NONBLOCK(0x800) 以外は未対応 */
-    if (flags & ~(0x80000 | 0x800)) return -1;
+    if (flags & ~(0x80000 | 0x800)) return -RISCV64_EINVAL;
 
     for (int i = 0; i < MAX_FDS; i++) {
         if (!current->fds[i].in_use) {
@@ -789,10 +836,10 @@ int sys_pipe2(int* pipefd, int flags) {
             else { fd2 = i; break; }
         }
     }
-    if (fd1 == -1 || fd2 == -1) return -1;
+    if (fd1 == -1 || fd2 == -1) return -RISCV64_EMFILE;
 
     phys = pmm_alloc(1);
-    if (!phys) return -1;
+    if (!phys) return -RISCV64_EMFILE;
     pipe = (pipe_t*)PHYS_TO_VIRT(phys);
     pipe->read_pos = 0;
     pipe->write_pos = 0;
@@ -822,12 +869,12 @@ int sys_pipe2(int* pipefd, int flags) {
 
 int sys_dup3(int oldfd, int newfd, int flags) {
     struct task* current = get_current_task();
-    if (!current) return -1;
-    if (oldfd < 0 || oldfd >= MAX_FDS || !current->fds[oldfd].in_use) return -1;
-    if (newfd < 0 || newfd >= MAX_FDS) return -1;
+    if (!current) return -RISCV64_EPERM;
+    if (oldfd < 0 || oldfd >= MAX_FDS || !current->fds[oldfd].in_use) return -RISCV64_EBADF;
+    if (newfd < 0 || newfd >= MAX_FDS) return -RISCV64_EBADF;
     if (oldfd == newfd) return newfd;
     if (current->fds[newfd].in_use) fs_release_fd(&current->fds[newfd]);
-    if (fs_clone_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -1;
+    if (fs_clone_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -RISCV64_EBADF;
     current->fds[newfd].fd_flags = (flags & 0x80000) ? FD_CLOEXEC : 0;
     return newfd;
 }
@@ -835,13 +882,13 @@ int sys_dup3(int oldfd, int newfd, int flags) {
 int sys_dup(int oldfd) {
     struct task* current = get_current_task();
     int newfd = -1;
-    if (!current) return -1;
-    if (oldfd < 0 || oldfd >= MAX_FDS || !current->fds[oldfd].in_use) return -1;
+    if (!current) return -RISCV64_EPERM;
+    if (oldfd < 0 || oldfd >= MAX_FDS || !current->fds[oldfd].in_use) return -RISCV64_EBADF;
     for (int i = 0; i < MAX_FDS; i++) {
         if (!current->fds[i].in_use) { newfd = i; break; }
     }
-    if (newfd == -1) return -1;
-    if (fs_clone_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -1;
+    if (newfd == -1) return -RISCV64_EMFILE;
+    if (fs_clone_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -RISCV64_EBADF;
     current->fds[newfd].fd_flags = 0;
     return newfd;
 }
@@ -857,17 +904,17 @@ int sys_dup(int oldfd) {
 int sys_fcntl(int fd, int cmd, uint64_t arg) {
     struct task* current = get_current_task();
 
-    if (!current) return -1;
-    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -9; /* EBADF */
+    if (!current) return -RISCV64_EPERM;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
 
     switch (cmd) {
         case RISCV64_F_DUPFD:
         case RISCV64_F_DUPFD_CLOEXEC: {
             int minfd = (int)arg;
-            if (minfd < 0 || minfd >= MAX_FDS) return -22; /* EINVAL */
+            if (minfd < 0 || minfd >= MAX_FDS) return -RISCV64_EINVAL;
             for (int newfd = minfd; newfd < MAX_FDS; newfd++) {
                 if (current->fds[newfd].in_use) continue;
-                if (fs_clone_fd(&current->fds[newfd], &current->fds[fd]) < 0) return -1;
+                if (fs_clone_fd(&current->fds[newfd], &current->fds[fd]) < 0) return -RISCV64_EBADF;
                 current->fds[newfd].fd_flags =
                     (cmd == RISCV64_F_DUPFD_CLOEXEC) ? FD_CLOEXEC : 0;
                 return newfd;
@@ -949,10 +996,11 @@ int sys_getdents(int fd, struct orth_dirent* dirp, size_t count) {
     size_t remaining;
     size_t to_copy;
 
-    if (!current || !dirp) return -1;
-    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
+    if (!current) return -RISCV64_EPERM;
+    if (!dirp) return -RISCV64_EFAULT;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
     f = &current->fds[fd];
-    if (f->type != FT_DIR || !f->data) return -1;
+    if (f->type != FT_DIR || !f->data) return -RISCV64_ENOTDIR;
     if (f->offset >= f->size) return 0;
     remaining = f->size - f->offset;
     to_copy = (count > remaining) ? remaining : count;
@@ -971,10 +1019,11 @@ int sys_getdents64(int fd, void* dirp, size_t count) {
     size_t out_used = 0;
     size_t index;
 
-    if (!current || !dirp) return -1;
-    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
+    if (!current) return -RISCV64_EPERM;
+    if (!dirp) return -RISCV64_EFAULT;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
     f = &current->fds[fd];
-    if (f->type != FT_DIR || !f->data) return -1;
+    if (f->type != FT_DIR || !f->data) return -RISCV64_ENOTDIR;
     if (f->offset >= f->size) return 0;
 
     src = (struct orth_dirent*)f->data;

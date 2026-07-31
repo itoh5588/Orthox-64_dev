@@ -205,10 +205,11 @@ static int64_t riscv64_bootstrap_sys_lseek(int fd, int64_t offset, int whence) {
     int64_t base;
     int64_t next;
 
-    if (!current) return -1;
-    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
+    /* 戻り値は -errno 規約。-1 は EPERM として顕在化するので使わない */
+    if (!current) return -1 /* EPERM */;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -9;  /* EBADF */
     f = &current->fds[fd];
-    if (f->type == FT_DIR) return -1;
+    if (f->type == FT_DIR) return -29; /* ESPIPE */
 
     switch (whence) {
         case 0:
@@ -221,15 +222,15 @@ static int64_t riscv64_bootstrap_sys_lseek(int fd, int64_t offset, int whence) {
             base = (int64_t)f->size;
             break;
         default:
-            return -1;
+            return -22; /* EINVAL */
     }
 
     next = base + offset;
-    if (next < 0) return -1;
+    if (next < 0) return -22; /* EINVAL */
     /* 書き込み用に開いた xv6fs ファイルは EOF 越えのシークを許す (穴あき書き込み) */
     if ((uint64_t)next > f->size &&
         !(f->type == FT_XV6FS && ((f->flags & 3) == O_WRONLY || (f->flags & 3) == O_RDWR))) {
-        return -1;
+        return -22; /* EINVAL */
     }
     f->offset = (size_t)next;
     return next;

@@ -88,6 +88,7 @@ RISCV64_KERNEL_ELF = out/kernel-riscv64.elf
 RISCV64_MUSL_PROBE_ELF = out/riscv64-musl-probe.elf
 RISCV64_PREEMPT_PROBE_ELF = out/riscv64-preempt-probe.elf
 RISCV64_SLEEP_PROBE_ELF = out/riscv64-sleep-probe.elf
+RISCV64_ERRNO_PROBE_ELF = out/riscv64-errno-probe.elf
 RISCV64_BOOTSTRAP_USER_BUILD_ELF = out/bootstrap-user-riscv64-default.elf
 # 埋め込み対象の外部ユーザー ELF (差し替え可能)
 RISCV64_BOOTSTRAP_USER_SRC_ELF ?= $(RISCV64_BOOTSTRAP_USER_BUILD_ELF)
@@ -237,7 +238,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: all clean run riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: all clean run riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -357,6 +358,12 @@ $(RISCV64_SLEEP_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/r
 
 riscv64-sleep-probe: $(RISCV64_SLEEP_PROBE_ELF)
 
+$(RISCV64_ERRNO_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_errno_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_errno_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+riscv64-errno-probe: $(RISCV64_ERRNO_PROBE_ELF)
+
 # user/riscv64-bin/<name>.c → rootfs の /bin/<name>。ファイルを置くだけで拾われる。
 # リンクは busybox と同じ ports/orthos-riscv64-musl-gcc.sh に任せる
 # (musl の crt1.o と riscv64-elf-gcc の libgcc をまとめてくれる。libgcc が無いと
@@ -407,6 +414,11 @@ riscv64-preempt-smoke: $(RISCV64_PREEMPT_PROBE_ELF)
 riscv64-sleep-smoke: $(RISCV64_SLEEP_PROBE_ELF)
 	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_SLEEP_PROBE_ELF)
 	bash ./tests/riscv64_sleep_smoke.sh
+
+# 失敗系の syscall が正しい errno を返すかの検証 (-1 は EPERM として顕在化する)
+riscv64-errno-smoke: $(RISCV64_ERRNO_PROBE_ELF)
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_ERRNO_PROBE_ELF)
+	bash ./tests/riscv64_errno_smoke.sh
 
 # -smp 4 で副 hart が idle まで上がり、ユーザーランドが完走するかの検証
 riscv64-smp-smoke: $(RISCV64_PREEMPT_PROBE_ELF)
