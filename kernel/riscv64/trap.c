@@ -5,6 +5,7 @@
 #include "riscv64/sbi.h"
 #include "riscv64/syscall.h"
 #include "riscv64/trap.h"
+#include "riscv64/virtio_blk_mmio.h"
 #include "net.h"
 #include "spinlock.h"
 #include "task.h"
@@ -42,6 +43,7 @@ static uint64_t g_riscv64_last_timer_deadline;
 static int g_riscv64_logged_first_timer;
 static int g_riscv64_logged_timer_after_user_handoff;
 static int g_riscv64_logged_first_uart_irq;
+static int g_riscv64_logged_first_vblk_irq;
 
 static int riscv64_log_once(int* flag) {
     return __atomic_exchange_n(flag, 1, __ATOMIC_RELAXED) == 0;
@@ -198,6 +200,11 @@ void riscv64_trap_dispatch(riscv64_trap_frame_t* frame) {
             riscv64_console_poll_input();
             if (riscv64_log_once(&g_riscv64_logged_first_uart_irq)) {
                 riscv64_uart_puts("riscv64 uart rx interrupt\n");
+            }
+        } else if (irq != 0 && irq == riscv64_virtio_blk_mmio_irq_number()) {
+            riscv64_virtio_blk_mmio_irq();
+            if (riscv64_log_once(&g_riscv64_logged_first_vblk_irq)) {
+                riscv64_uart_puts("riscv64 virtio-blk interrupt\n");
             }
         }
         riscv64_plic_complete(irq);

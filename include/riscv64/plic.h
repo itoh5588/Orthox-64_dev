@@ -19,6 +19,8 @@
 void riscv64_plic_init_global(void);
 /* hart ごとに 1 回。しきい値と有効化ビット */
 void riscv64_plic_init_hart(void);
+/* 割り込み源の優先度を設定する (0 = 無効)。有効化ビットとセットで要る */
+void riscv64_plic_set_priority(uint32_t irq, uint32_t priority);
 /* 割り込み源を有効にする (現在の hart のコンテキストに対して) */
 void riscv64_plic_enable_irq(uint32_t irq);
 /* 保留中の割り込みを 1 つ受け取る。0 = 何も無い */

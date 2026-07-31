@@ -1042,6 +1042,14 @@ static void riscv64_storage_bootstrap(void) {
         riscv64_uart_puts("  virtio-blk (mmio): not found\n");
         return;
     }
+    /* 完了割り込みを有効にする。最初のディスク I/O (この直後のマウント) より
+     * 前に済ませること。有効化しないと完了待ちが誰にも起こされず固まる。
+     * ここは既に riscv64_interrupts_enable() 済みで PLIC のコンテキストも
+     * 初期化されている (割り込み番号はデバイスを見つけて初めて確定するため、
+     * early_main ではなくここで有効化する) */
+    riscv64_plic_set_priority(riscv64_virtio_blk_mmio_irq_number(), 1);
+    riscv64_plic_enable_irq(riscv64_virtio_blk_mmio_irq_number());
+
     capacity = riscv64_virtio_blk_mmio_capacity();
     riscv64_uart_puts("  virtio-blk (mmio): capacity 0x");
     riscv64_uart_puthex64(capacity);

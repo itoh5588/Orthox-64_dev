@@ -37,6 +37,11 @@ static uint32_t plic_self_context(void) {
     return (uint32_t)(2ULL * hartid + 1ULL);
 }
 
+void riscv64_plic_set_priority(uint32_t irq, uint32_t priority) {
+    if (irq == 0 || irq >= PLIC_MAX_IRQ) return;
+    *plic_reg(PLIC_PRIORITY(irq)) = priority;
+}
+
 void riscv64_plic_init_global(void) {
     /* 優先度 0 は「無効」なので、使う番号だけ 1 にする。
      * 残りは 0 のままにして、有効化ビットを立て忘れても発火しないようにする */

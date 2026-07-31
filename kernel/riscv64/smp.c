@@ -56,9 +56,19 @@ uint32_t riscv64_smp_hart_count(void) {
 }
 
 /* cpu index -> 物理 hart id。PLIC のコンテキスト番号算出に要る
- * (S モードのコンテキストは hart id から決まり、CPU 番号からではない) */
+ * (S モードのコンテキストは hart id から決まり、CPU 番号からではない)。
+ *
+ * cpu 0 は必ず boot hart なので boot info から直接引く。g_riscv64_cpu_hartid[]
+ * を埋めるのは riscv64_smp_start_secondaries() で、PLIC の初期化はそれより
+ * 前に走るため、テーブルを見ると boot hart が 0 番でない環境 (OpenSBI が
+ * 選ぶ boot hart は hart 0 とは限らない) でコンテキストがずれる。
+ * SMP=4 の ash smoke がブート hart 次第で落ちる形で顕在化した。 */
 uint64_t riscv64_smp_hartid(uint32_t cpu_index) {
     if (cpu_index >= RISCV64_MAX_HARTS) return 0;
+    if (cpu_index == 0) {
+        const riscv64_boot_info_t* boot = riscv64_boot_info();
+        return boot ? boot->hart_id : 0;
+    }
     return g_riscv64_cpu_hartid[cpu_index];
 }
 

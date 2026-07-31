@@ -10,7 +10,9 @@
 #include "virtio.h"
 #include "virtio_blk.h"
 #include "riscv64/boot.h"
+#include "riscv64/plic.h"
 #include "spinlock.h"
+#include "task.h"
 
 // virtio-mmio レジスタ (virtio spec 4.2.2, legacy 4.2.4)
 #define VIRTIO_MMIO_MAGIC_VALUE      0x000
@@ -47,13 +49,22 @@ static uint8_t* g_vblk_mmio_status;
 static uint64_t g_vblk_mmio_hdr_phys;
 static uint64_t g_vblk_mmio_capacity;
 /*
+ * 状態 (busy / 待ち手) を守るロック。静的変数のゼロ初期化 = spinlock_init 済み。
+ *
  * リクエスト 1 件分のディスクリプタ (desc[0..2]) とヘッダ/ステータス領域を
- * 1 組しか持たない設計なので、複数 hart が同時に入ると互いのリクエストを
- * 上書きしてしまう (SMP=4 で `xv6bio: disk read error` が多発した)。
- * 完了はポーリング待ちで yield しないため、リクエスト全体をスピンロックで
- * 囲って直列化する。静的変数のゼロ初期化 = spinlock_init 済み。
+ * 1 組しか持たないので、複数 hart が同時に入ると互いのリクエストを上書きする
+ * (SMP=4 で `xv6bio: disk read error` が多発した)。
+ *
+ * ただしリクエスト全体をこのスピンロックで囲うことはできない。完了待ちの間は
+ * 割り込みを通しておかないと、完了割り込みが永久に来ないデッドロックになる
+ * (spin_lock_irqsave は割り込みを閉じる)。そのため「busy フラグで所有権を取り、
+ * 待っている間はロックを手放して yield する」形にしている。
  */
 static spinlock_t g_vblk_mmio_lock;
+static int g_vblk_mmio_busy;
+static struct task* g_vblk_mmio_waiter;
+/* PLIC の割り込み番号 (virtio-mmio スロット n = IRQ 1+n) */
+static uint32_t g_vblk_mmio_irq;
 
 static inline uint32_t vblk_mmio_read32(uint32_t off) {
     return *(volatile uint32_t*)(g_vblk_mmio_base + off);
@@ -108,17 +119,85 @@ static int vblk_mmio_setup_queue(void) {
     return 0;
 }
 
-// 1 リクエスト = ヘッダ + データ + ステータスの 3 ディスクリプタ (ポーリング完了待ち)
+/* デバイスの所有権を取る (記述子が 1 組しか無いので 1 リクエストずつ)。
+ * 空くまで yield する。タスクがまだ無い文脈 (ごく初期のブート) では
+ * 競合し得ないのでそのまま進む */
+static void vblk_mmio_acquire(void) {
+    for (;;) {
+        uint64_t flags = spin_lock_irqsave(&g_vblk_mmio_lock);
+        if (!g_vblk_mmio_busy) {
+            g_vblk_mmio_busy = 1;
+            spin_unlock_irqrestore(&g_vblk_mmio_lock, flags);
+            return;
+        }
+        spin_unlock_irqrestore(&g_vblk_mmio_lock, flags);
+        if (!get_current_task()) return;
+        kernel_yield();
+    }
+}
+
+static void vblk_mmio_release(void) {
+    uint64_t flags = spin_lock_irqsave(&g_vblk_mmio_lock);
+    g_vblk_mmio_busy = 0;
+    spin_unlock_irqrestore(&g_vblk_mmio_lock, flags);
+}
+
+/*
+ * 完了待ち。デバイスは used->idx を DMA で直接更新し、そのあと割り込みを上げる。
+ * 「used->idx を見る」と「寝る」の間を割り込みに対して不可分にしないと、
+ * その隙に完了した場合に誰も起こしてくれない (コンソール入力と同じ形)。
+ */
+static void vblk_mmio_wait_used(struct virtio_queue* q, uint16_t used_idx) {
+    struct task* self = get_current_task();
+    for (;;) {
+        uint64_t flags = spin_lock_irqsave(&g_vblk_mmio_lock);
+        __sync_synchronize();
+        if (q->used->idx != used_idx) {
+            g_vblk_mmio_waiter = 0;
+            spin_unlock_irqrestore(&g_vblk_mmio_lock, flags);
+            return;
+        }
+        if (!self) {
+            /* タスクが無い文脈 (ごく初期のブート) では寝られないので回すだけ */
+            spin_unlock_irqrestore(&g_vblk_mmio_lock, flags);
+            continue;
+        }
+        g_vblk_mmio_waiter = self;
+        task_mark_io_wait(self);
+        spin_unlock_irqrestore(&g_vblk_mmio_lock, flags);
+        kernel_yield();
+    }
+}
+
+/* 完了割り込み。used->idx はデバイスが直接書いているので、待ち手を起こすだけ */
+void riscv64_virtio_blk_mmio_irq(void) {
+    struct task* waiter;
+    uint64_t flags;
+    if (!g_vblk_mmio_base) return;
+    vblk_mmio_write32(VIRTIO_MMIO_INTERRUPT_ACK,
+                      vblk_mmio_read32(VIRTIO_MMIO_INTERRUPT_STATUS));
+    flags = spin_lock_irqsave(&g_vblk_mmio_lock);
+    waiter = g_vblk_mmio_waiter;
+    g_vblk_mmio_waiter = 0;
+    spin_unlock_irqrestore(&g_vblk_mmio_lock, flags);
+    /* task_wake() は g_task_lock を取るのでデバイスロックの外で呼ぶ */
+    if (waiter) task_wake(waiter);
+}
+
+uint32_t riscv64_virtio_blk_mmio_irq_number(void) {
+    return g_vblk_mmio_irq;
+}
+
+// 1 リクエスト = ヘッダ + データ + ステータスの 3 ディスクリプタ
 static int vblk_mmio_rw(uint32_t type, uint64_t sector, void* buf, uint32_t sectors) {
     struct virtio_queue* q = &g_vblk_mmio_q;
     uint16_t head = 0;
     uint16_t used_idx;
-    uint64_t flags;
     int ret;
 
     if (!g_vblk_mmio_base || !buf || sectors == 0) return -1;
 
-    flags = spin_lock_irqsave(&g_vblk_mmio_lock);
+    vblk_mmio_acquire();
     g_vblk_mmio_hdr->type = type;
     g_vblk_mmio_hdr->reserved = 0;
     g_vblk_mmio_hdr->sector = sector;
@@ -146,13 +225,11 @@ static int vblk_mmio_rw(uint32_t type, uint64_t sector, void* buf, uint32_t sect
     __sync_synchronize();
     vblk_mmio_write32(VIRTIO_MMIO_QUEUE_NOTIFY, 0);
 
-    while (q->used->idx == used_idx) {
-        __sync_synchronize();
-    }
+    vblk_mmio_wait_used(q, used_idx);
     q->last_used_idx = q->used->idx;
 
     ret = (*g_vblk_mmio_status == VIRTIO_BLK_S_OK) ? 0 : -1;
-    spin_unlock_irqrestore(&g_vblk_mmio_lock, flags);
+    vblk_mmio_release();
     return ret;
 }
 
@@ -182,6 +259,8 @@ int riscv64_virtio_blk_mmio_init(void) {
         if (vblk_mmio_read32(VIRTIO_MMIO_MAGIC_VALUE) != VIRTIO_MMIO_MAGIC) continue;
         if (vblk_mmio_read32(VIRTIO_MMIO_VERSION) != 1) continue;  // legacy のみ対応
         if (vblk_mmio_read32(VIRTIO_MMIO_DEVICE_ID) != VIRTIO_MMIO_DEVICE_ID_BLK) continue;
+        /* QEMU virt は virtio-mmio スロット n を IRQ 1+n に割り当てる */
+        g_vblk_mmio_irq = RISCV64_IRQ_VIRTIO0 + (uint32_t)slot;
         goto found;
     }
     g_vblk_mmio_base = 0;
