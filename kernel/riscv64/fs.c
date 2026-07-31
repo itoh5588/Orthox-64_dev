@@ -4,6 +4,7 @@
 #include "pmm.h"
 #include "riscv64/boot.h"
 #include "riscv64/bootstrap_user.h"
+#include "riscv64/syscall.h"
 #include "sys_internal.h"
 #include "task.h"
 #include "vmm.h"
@@ -448,7 +449,9 @@ int64_t sys_read(int fd, void* buf, size_t count) {
                 continue;
             }
             read_count = (size_t)got;
-            if (fd == 0) {
+            /* termios の ECHO が落ちていれば何も出さない (raw モードの
+             * 行編集は自前でエコーするので、ここで出すと二重になる) */
+            if (fd == 0 && riscv64_console_echo_enabled()) {
                 for (size_t i = 0; i < read_count; i++) {
                     int ch = dst[i];
                     if (ch == '\n') {

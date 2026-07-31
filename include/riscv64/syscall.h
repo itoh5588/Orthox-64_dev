@@ -11,6 +11,7 @@ typedef riscv64_trap_frame_t arch_syscall_frame_t;
 void riscv64_syscall_dispatch(riscv64_trap_frame_t* frame);
 void riscv64_syscall_sync_current_user_frame(const riscv64_trap_frame_t* frame);
 void riscv64_syscall_set_current_context(struct arch_task_context* ctx);
+int riscv64_console_echo_enabled(void);
 
 static inline uint64_t arch_syscall_number(const arch_syscall_frame_t* frame) {
     return frame ? frame->a7 : 0;

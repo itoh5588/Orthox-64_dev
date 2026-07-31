@@ -121,3 +121,44 @@ index d8f41327b..5cf6b9ae4 100644
  
  static int
  skiploop(void)
+diff --git a/libbb/lineedit.c b/libbb/lineedit.c
+index 2a5d4e704..65501e5da 100644
+--- a/libbb/lineedit.c
++++ b/libbb/lineedit.c
+@@ -173,7 +173,19 @@ struct lineedit_statics {
+ };
+ 
+ /* See lineedit_ptr_hack.c */
++/* Orthox BusyBox build uses a writable pointer here to avoid Clang/RISC-V
++ * miscompiling the cast-based initialization hack used by upstream lineedit:
++ * with the `const` declaration Clang folds the load in read_line_input() to
++ * the initial NULL and the first store through S faults. Same fix as
++ * ORTHOX_BUSYBOX_ASH_PTR_HACK in shell/ash.c. */
++#ifndef ORTHOX_BUSYBOX_LINEEDIT_PTR_HACK
++#define ORTHOX_BUSYBOX_LINEEDIT_PTR_HACK 0
++#endif
++#if ORTHOX_BUSYBOX_LINEEDIT_PTR_HACK
++extern struct lineedit_statics *lineedit_ptr_to_statics;
++#else
+ extern struct lineedit_statics *const lineedit_ptr_to_statics;
++#endif
+ 
+ #define S (*lineedit_ptr_to_statics)
+ #define state            (S.state           )
+diff --git a/libbb/lineedit_ptr_hack.c b/libbb/lineedit_ptr_hack.c
+index dc45855d5..cdc1ace0f 100644
+--- a/libbb/lineedit_ptr_hack.c
++++ b/libbb/lineedit_ptr_hack.c
+@@ -7,7 +7,11 @@
+ 
+ struct lineedit_statics;
+ 
+-#ifndef GCC_COMBINE
++#ifndef ORTHOX_BUSYBOX_LINEEDIT_PTR_HACK
++#define ORTHOX_BUSYBOX_LINEEDIT_PTR_HACK 0
++#endif
++
++#if !defined(GCC_COMBINE) || ORTHOX_BUSYBOX_LINEEDIT_PTR_HACK
+ 
+ /* We cheat here. It is declared as const ptr in libbb.h,
+  * but here we make it live in R/W memory */

@@ -35,6 +35,7 @@ void riscv64_uart_putchar(char ch);
 int riscv64_uart_getchar_nonblock(void);
 void riscv64_console_poll_input(void);
 int riscv64_console_read(char* buf, int count);
+int riscv64_console_has_input(void);
 void riscv64_console_set_waiter(struct task* t);
 void riscv64_console_clear_waiter(struct task* t);
 void riscv64_uart_puts(const char* s);

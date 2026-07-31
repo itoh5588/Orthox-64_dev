@@ -384,7 +384,7 @@ riscv64-busybox-musl: $(RISCV64_MUSL_SYSROOT)/lib/libc.a
 	ORTHOS_CC=$(abspath ports/orthos-riscv64-musl-gcc.sh) \
 	ORTHOS_SYSROOT=$(abspath $(RISCV64_MUSL_SYSROOT)) \
 	ORTHOS_INCLUDEDIR=$(abspath $(RISCV64_MUSL_SYSROOT))/include \
-	ORTHOS_EXTRA_CFLAGS="-DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS=1" \
+	ORTHOS_EXTRA_CFLAGS="-DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_LINEEDIT_PTR_HACK=1 -DORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS=1" \
 	ORTHOS_AR="$(RISCV64_LLVM_AR)" ORTHOS_RANLIB="$(RISCV64_LLVM_RANLIB)" \
 	ORTHOS_STRIP="$(shell if [ -x /opt/homebrew/opt/llvm/bin/llvm-strip ]; then printf /opt/homebrew/opt/llvm/bin/llvm-strip; else printf llvm-strip; fi)" \
 	./ports/build_busybox_ash.sh $(abspath ports/busybox) $(abspath $(RISCV64_BUSYBOX_ASH_MUSL_ELF))

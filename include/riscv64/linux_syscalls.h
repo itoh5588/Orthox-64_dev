@@ -41,6 +41,7 @@
 #define RISCV64_LINUX_SYS_WRITE            64
 #define RISCV64_LINUX_SYS_READV            65
 #define RISCV64_LINUX_SYS_WRITEV           66
+#define RISCV64_LINUX_SYS_PPOLL            73
 #define RISCV64_LINUX_SYS_READLINKAT       78
 #define RISCV64_LINUX_SYS_NEWFSTATAT       79
 #define RISCV64_LINUX_SYS_FSTAT            80

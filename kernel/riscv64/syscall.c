@@ -191,6 +191,13 @@ static struct riscv64_linux_termios g_riscv64_console_termios = {
     .c_ospeed = 115200,
 };
 
+/* termios の ECHO (c_lflag bit3)。行編集 (busybox の lineedit) は raw モードに
+ * して自前でエコーするので、ここが立っていないときにカーネルがエコーすると
+ * 1 文字が 2 回出る。fs.c のコンソール読み取りが参照する */
+int riscv64_console_echo_enabled(void) {
+    return (g_riscv64_console_termios.c_lflag & 0x00000008u) != 0;
+}
+
 static uint64_t riscv64_align_up_page(uint64_t value) {
     return (value + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
 }
@@ -352,6 +359,93 @@ static int riscv64_bootstrap_sys_clock_gettime(int clock_id, struct riscv64_linu
 /* nanosleep(2)。ms 解像度しか無いので端数は切り上げる (0 を要求されない限り
  * 必ず 1 tick 以上眠らせる)。既存の sleep 機構 (task_mark_io_wait_until +
  * sched.c の起床走査) にそのまま載せる。 */
+/* poll(2)/ppoll(2)。riscv64 に poll は無く、musl の poll() は ppoll(73) を出す。
+ * busybox の行編集 (CONFIG_FEATURE_EDITING) が 1 文字ごとに呼ぶ。 */
+#define RISCV64_POLLIN   0x001
+#define RISCV64_POLLPRI  0x002
+#define RISCV64_POLLOUT  0x004
+#define RISCV64_POLLERR  0x008
+#define RISCV64_POLLHUP  0x010
+#define RISCV64_POLLNVAL 0x020
+
+struct riscv64_linux_pollfd {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
+};
+
+/* 1 つの fd の現在の readiness。events でマスクした結果を返す */
+static int16_t riscv64_poll_fd_revents(int fd, int16_t events) {
+    struct task* current = get_current_task();
+    file_descriptor_t* f;
+    int16_t ready = 0;
+
+    if (!current || fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) {
+        return RISCV64_POLLNVAL;
+    }
+    f = &current->fds[fd];
+    switch (f->type) {
+        case FT_CONSOLE:
+            if (riscv64_console_has_input()) ready |= RISCV64_POLLIN;
+            ready |= RISCV64_POLLOUT;  /* シリアル出力は常に受け付ける */
+            break;
+        case FT_PIPE: {
+            pipe_t* pipe = (pipe_t*)f->data;
+            if (!pipe) { ready |= RISCV64_POLLERR; break; }
+            {
+                uint64_t flags = spin_lock_irqsave(&pipe->lock);
+                if (pipe->count > 0) ready |= RISCV64_POLLIN;
+                if (pipe->count < PIPE_BUF_SIZE) ready |= RISCV64_POLLOUT;
+                /* 相手側が閉じた = 自分しか参照していない */
+                if (pipe->ref_count <= 1) ready |= RISCV64_POLLHUP;
+                spin_unlock_irqrestore(&pipe->lock, flags);
+            }
+            break;
+        }
+        default:
+            /* 通常ファイル / ディレクトリ / /dev/null 等は常に ready (POSIX 準拠) */
+            ready |= RISCV64_POLLIN | RISCV64_POLLOUT;
+            break;
+    }
+    /* POLLERR/POLLHUP/POLLNVAL は events に無くても返る */
+    return (int16_t)((ready & (events | RISCV64_POLLERR | RISCV64_POLLHUP | RISCV64_POLLNVAL)));
+}
+
+static int64_t riscv64_bootstrap_sys_ppoll(struct riscv64_linux_pollfd* fds, uint64_t nfds,
+                                           const struct riscv64_linux_timespec* timeout) {
+    uint64_t deadline = 0;
+    int has_deadline = 0;
+
+    if (nfds > MAX_FDS) return -22;        /* EINVAL */
+    if (nfds != 0 && !fds) return -14;     /* EFAULT */
+
+    if (timeout) {
+        uint64_t ms = (uint64_t)timeout->tv_sec * 1000ULL +
+                      ((uint64_t)timeout->tv_nsec + 999999ULL) / 1000000ULL;
+        deadline = arch_time_now_ms() + ms;
+        has_deadline = 1;
+    }
+
+    for (;;) {
+        int ready_count = 0;
+        for (uint64_t i = 0; i < nfds; i++) {
+            int16_t revents;
+            if (fds[i].fd < 0) {          /* 負の fd は無視する規約 */
+                fds[i].revents = 0;
+                continue;
+            }
+            revents = riscv64_poll_fd_revents(fds[i].fd, fds[i].events);
+            fds[i].revents = revents;
+            if (revents != 0) ready_count++;
+        }
+        if (ready_count > 0) return ready_count;
+        if (has_deadline && arch_time_now_ms() >= deadline) return 0;
+        /* 割り込み駆動の待ち合わせが無いのでポーリングする。kernel_yield() が
+         * コンソール入力の取り込みと期限切れ起床も回す */
+        kernel_yield();
+    }
+}
+
 static int riscv64_bootstrap_sys_nanosleep(const struct riscv64_linux_timespec* req,
                                            struct riscv64_linux_timespec* rem) {
     struct task* current = get_current_task();
@@ -683,6 +777,13 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                     (uint64_t)(int64_t)sys_getdents64((int)arch_syscall_arg0(frame),
                                                                       (void*)(uintptr_t)arch_syscall_arg1(frame),
                                                                       (size_t)arch_syscall_arg2(frame)));
+            return;
+        case RISCV64_LINUX_SYS_PPOLL:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)riscv64_bootstrap_sys_ppoll(
+                                        (struct riscv64_linux_pollfd*)(uintptr_t)arch_syscall_arg0(frame),
+                                        arch_syscall_arg1(frame),
+                                        (const struct riscv64_linux_timespec*)(uintptr_t)arch_syscall_arg2(frame)));
             return;
         case RISCV64_LINUX_SYS_READLINKAT:
             arch_syscall_set_return(frame,

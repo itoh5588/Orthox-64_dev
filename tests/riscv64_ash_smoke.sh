@@ -99,6 +99,22 @@ fi
     sleep 4
     printf 'uname -m\n'
     sleep 3
+    # CONFIG_FEATURE_SH_MATH: 算術展開
+    printf 'i=6; echo math=$((i*7+0))\n'
+    sleep 3
+    # CONFIG_ASH_BASH_COMPAT: ${var/from/to} 置換と [[ ]]
+    printf 'v=abcdef; echo subst=${v/cd/-}\n'
+    sleep 3
+    # 部分文字列展開。エコーバックに ${...} がそのまま出るので grep は結果側だけに当たる
+    printf 'echo slice=${v:2:2}\n'
+    sleep 3
+    # CONFIG_FEATURE_EDITING: 行編集が backspace を処理する。
+    # X を打ってから \b で消すので、エコーにも出力にも edit-okX は現れない
+    printf 'e=ok; echo edit-$eX\b\n'
+    sleep 3
+    # CONFIG_FEATURE_TAB_COMPLETION: /bin/orthin<TAB> が /bin/orthinfo に補完される
+    printf 'c=ok; /bin/orthin\t| tail -1; echo tab-$c\n'
+    sleep 5
     # nanosleep のタイマー起床経路。ここで止まるなら寝たきり (詳細は
     # tests/riscv64_sleep_smoke.sh)
     printf 'sleep 1; echo sleep-ok\n'
@@ -168,6 +184,12 @@ if [ -f "$ROOTFS_IMG" ]; then
     grep -aq "^/etc/motd$" "$SERIAL_LOG"       # realpath (readlinkat が EINVAL を返すこと)
     grep -aq "xargs-in" "$SERIAL_LOG"          # xargs = vfork + exec
     grep -aq "^riscv64$" "$SERIAL_LOG"         # uname -m
+    grep -aq "math=42" "$SERIAL_LOG"           # $((...)) = FEATURE_SH_MATH
+    grep -aq "subst=ab-ef" "$SERIAL_LOG"       # ${var/from/to} = ASH_BASH_COMPAT
+    grep -aq "slice=cd" "$SERIAL_LOG"          # ${v:2:2} = ASH_BASH_COMPAT
+    grep -aq "edit-ok" "$SERIAL_LOG"           # 行編集の backspace = FEATURE_EDITING
+    ! grep -aq "edit-okX" "$SERIAL_LOG"        # X が消えていること
+    grep -aq "tab-ok" "$SERIAL_LOG"            # TAB 補完後もコマンドが通る
     grep -aq "sleep-ok" "$SERIAL_LOG"          # sleep = nanosleep のタイマー起床
     grep -aq "orthinfo : ok" "$SERIAL_LOG"     # user/riscv64-bin のビルド導線
     # ln (linkat): /h.txt が motd の内容を持つ = ハードリンクが張れている

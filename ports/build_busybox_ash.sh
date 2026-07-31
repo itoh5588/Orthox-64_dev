@@ -51,7 +51,7 @@ export STRIP="${ORTHOS_STRIP:-$(find_tool x86_64-elf-strip x86_64-linux-gnu-stri
 INCLUDEDIR="${ORTHOS_INCLUDEDIR:-$ROOT/user/include}"
 if [ "$BUILD_DYNAMIC" = "1" ]; then
   export CFLAGS=""
-  BUSYBOX_EXTRA_CFLAGS="-O2 -fPIE -fno-strict-aliasing -D__ORTHOS__ -D_GNU_SOURCE -DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -Wno-format-security -Wno-stringop-overflow -Wno-unused-but-set-variable"
+  BUSYBOX_EXTRA_CFLAGS="-O2 -fPIE -fno-strict-aliasing -D__ORTHOS__ -D_GNU_SOURCE -DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_LINEEDIT_PTR_HACK=1 -Wno-format-security -Wno-stringop-overflow -Wno-unused-but-set-variable"
   BUSYBOX_EXTRA_LDFLAGS=""
 else
   export CFLAGS=""

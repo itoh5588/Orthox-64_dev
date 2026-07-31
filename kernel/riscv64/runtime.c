@@ -177,6 +177,15 @@ void riscv64_console_poll_input(void) {
     if (waiter) task_wake(waiter);
 }
 
+/* poll/ppoll 用。リングにデータが残っているかだけを見る */
+int riscv64_console_has_input(void) {
+    int has;
+    uint64_t flags = spin_lock_irqsave(&g_riscv64_console_lock);
+    has = g_riscv64_console_head != g_riscv64_console_tail;
+    spin_unlock_irqrestore(&g_riscv64_console_lock, flags);
+    return has;
+}
+
 int riscv64_console_read(char* buf, int count) {
     int read = 0;
     uint64_t flags;
