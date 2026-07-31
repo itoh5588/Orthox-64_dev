@@ -104,10 +104,30 @@ int kernel_lock_held(void) {
     return cpu->kernel_lock_depth != 0;
 }
 
+/*
+ * カーネル実行中はタイマー割り込みが入らないので、期限切れ起床をここで自前に回す。
+ *
+ * riscv64 のトラップは sstatus.SIE を落とすため、カーネルに入ったあとは割り込みが
+ * 一切来ない。一方ユーザーモード実行中は sstatus.SIE と無関係に S 割り込みが入る
+ * (現在の特権モードが S より低ければ常に有効) ので、タイマープリエンプションだけは
+ * 効いているように見えていた。
+ *
+ * この非対称性のせいで「カーネル内でブロック待ちループを回している間はタイマー
+ * 割り込みが 1 度も来ない」状態になる。期限切れ起床は task_poll_sleep_wakeups() の
+ * 走査でしか起きないので、例えば「子が nanosleep で寝て、親が wait4 で
+ * kernel_yield() を回す」形だと誰も子を起こせずシステム全体が停止する
+ * (走れるタスクがある以上 idle には落ちないため、idle 側の wfi 窓も開かない)。
+ *
+ * kernel_yield() で sstatus.SIE を一時的に開ける手も試したが、カーネルスタック上で
+ * トラップがネストして current_task が壊れた (store page fault)。既に
+ * riscv64_console_poll_input() を直接呼んでいるのと同じ流儀でポーリングする方が、
+ * 現状の「カーネルは割り込みを取らない」設計と整合する。
+ */
 void kernel_yield(void) {
     struct cpu_local* cpu = get_cpu_local();
     uint32_t depth = cpu ? cpu->kernel_lock_depth : 0;
     riscv64_console_poll_input();
+    (void)task_poll_sleep_wakeups();
     for (uint32_t i = 0; i < depth; i++) kernel_lock_exit();
     schedule();
     for (uint32_t i = 0; i < depth; i++) kernel_lock_enter();

@@ -84,6 +84,18 @@ static void riscv64_trap_print_frame(const riscv64_trap_frame_t* frame) {
     riscv64_uart_puts("  sstatus: 0x");
     riscv64_uart_puthex64(frame->sstatus);
     riscv64_uart_puts("\n");
+    riscv64_uart_puts("  tp     : 0x");
+    riscv64_uart_puthex64(frame->tp);
+    riscv64_uart_puts("\n");
+    riscv64_uart_puts("  sp     : 0x");
+    riscv64_uart_puthex64(frame->sp);
+    riscv64_uart_puts("\n");
+    riscv64_uart_puts("  ra     : 0x");
+    riscv64_uart_puthex64(frame->ra);
+    riscv64_uart_puts("\n");
+    riscv64_uart_puts("  curtp  : 0x");
+    riscv64_uart_puthex64(riscv64_current_hart_index());
+    riscv64_uart_puts("\n");
 }
 
 void riscv64_trap_init(void) {

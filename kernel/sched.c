@@ -82,28 +82,59 @@ void schedule(void) {
     arch_context_switch(&next->ctx, &prev->ctx);
 }
 
+/*
+ * sleep_until_ms を過ぎたタスクを起こす。戻り値は起こした数。
+ *
+ * task_lock の外から呼べる。どの CPU から呼んでも安全なので、タイマー割り込み
+ * (task_on_timer_tick) だけでなく、カーネル内でブロック待ちを回す側からも
+ * 直接呼ぶ (riscv64 の kernel_yield など。理由は下の task_on_timer_tick の
+ * コメント参照)。
+ */
+int task_poll_sleep_wakeups(void) {
+    /* 起床させた CPU の集合。task_wake_locked_internal() は runqueue に
+     * 積むだけで resched_pending を立てないため、ここで要求しないと
+     * 起床したタスクは走行中タスクのタイムスライスが尽きるまで
+     * (TASK_TIMESLICE_TICKS 分) 待たされる。idle が回っている場合も
+     * 同じで、idle は resched_pending を見て初めて kernel_yield() する。
+     * task_wake() (ロック外の版) は同じことを既にやっている。 */
+    uint64_t woken_cpus = 0;
+    uint64_t now = arch_time_now_ms();
+    int woken = 0;
+    uint64_t flags = task_lock_irqsave();
+    struct task* t = task_list;
+    while (t) {
+        if ((t->state == TASK_SLEEPING || t->state == TASK_IO_WAIT) &&
+            t->sleep_until_ms != 0 && t->sleep_until_ms <= now) {
+            t->sleep_until_ms = 0;
+            if (task_wake_locked_internal(t) >= 0) {
+                uint32_t target =
+                    task_normalize_cpu_affinity_internal((uint32_t)t->cpu_affinity);
+                if (target < 64U) woken_cpus |= (1ULL << target);
+                woken++;
+            }
+        }
+        t = t->next;
+    }
+    task_unlock_irqrestore(flags);
+    /* IPI を伴うのでロックの外で。自 CPU 分はフラグを立てるだけ */
+    for (uint32_t id = 0; woken_cpus != 0 && id < 64U; id++) {
+        if (woken_cpus & (1ULL << id)) {
+            woken_cpus &= ~(1ULL << id);
+            task_request_resched_cpu(id);
+        }
+    }
+    return woken;
+}
+
 void task_on_timer_tick(void) {
     struct task* current_task = get_current_task();
     struct cpu_local* cpu = task_this_cpu();
-    uint64_t now = 0;
     if (cpu && cpu->cpu_id == 0) {
-        now = arch_time_now_ms();
-        uint64_t flags = task_lock_irqsave();
-        struct task* t = task_list;
-        while (t) {
-            if ((t->state == TASK_SLEEPING || t->state == TASK_IO_WAIT) &&
-                t->sleep_until_ms != 0 && t->sleep_until_ms <= now) {
-                t->sleep_until_ms = 0;
-                task_wake_locked_internal(t);
-            }
-            t = t->next;
-        }
-        task_unlock_irqrestore(flags);
+        (void)task_poll_sleep_wakeups();
     }
     if (!current_task || current_task->state != TASK_RUNNING) return;
 #if ORTHOX_MEM_PROGRESS
-    if (now == 0) now = arch_time_now_ms();
-    task_trace_progress_tick_internal(current_task, now);
+    task_trace_progress_tick_internal(current_task, arch_time_now_ms());
 #endif
     if (current_task->timeslice_ticks > 1) {
         current_task->timeslice_ticks--;

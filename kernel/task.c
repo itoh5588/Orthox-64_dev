@@ -505,6 +505,10 @@ int task_wake_locked_internal(struct task* t) {
     return task_wake_locked(t);
 }
 
+uint32_t task_normalize_cpu_affinity_internal(uint32_t cpu_id) {
+    return (uint32_t)normalize_cpu_affinity(cpu_id);
+}
+
 static int task_reap_locked(struct task* t) {
     struct task** link;
     if (!t) return -1;

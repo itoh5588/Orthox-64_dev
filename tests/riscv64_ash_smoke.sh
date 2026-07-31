@@ -99,6 +99,10 @@ fi
     sleep 4
     printf 'uname -m\n'
     sleep 3
+    # nanosleep のタイマー起床経路。ここで止まるなら寝たきり (詳細は
+    # tests/riscv64_sleep_smoke.sh)
+    printf 'sleep 1; echo sleep-ok\n'
+    sleep 5
     # 自作コマンド (user/riscv64-bin) がビルドされて /bin に入っているか
     printf 'orthinfo | tail -1\n'
     sleep 4
@@ -164,6 +168,7 @@ if [ -f "$ROOTFS_IMG" ]; then
     grep -aq "^/etc/motd$" "$SERIAL_LOG"       # realpath (readlinkat が EINVAL を返すこと)
     grep -aq "xargs-in" "$SERIAL_LOG"          # xargs = vfork + exec
     grep -aq "^riscv64$" "$SERIAL_LOG"         # uname -m
+    grep -aq "sleep-ok" "$SERIAL_LOG"          # sleep = nanosleep のタイマー起床
     grep -aq "orthinfo : ok" "$SERIAL_LOG"     # user/riscv64-bin のビルド導線
     # ln (linkat): /h.txt が motd の内容を持つ = ハードリンクが張れている
     [ "$(grep -ac "hello from riscv64 xv6fs rootfs" "$SERIAL_LOG")" -ge 3 ]

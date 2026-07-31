@@ -35,6 +35,7 @@ int task_mark_ready_on_cpu_locked_internal(struct task* t, uint32_t cpu_id);
 uint32_t task_rebalance_ready_task_locked_internal(struct task* t);
 struct cpu_local* task_this_cpu(void);
 int task_wake_locked_internal(struct task* t);
+uint32_t task_normalize_cpu_affinity_internal(uint32_t cpu_id);
 struct task* task_runq_pop_locked_internal(struct cpu_local* cpu);
 int task_is_idle_task_internal(struct task* t);
 void task_refresh_cpu_local_msrs_internal(struct cpu_local* cpu);

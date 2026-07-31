@@ -141,6 +141,9 @@ void task_request_resched(void);
 void task_request_resched_cpu(uint32_t cpu_id);
 int task_consume_resched(void);
 void task_on_timer_tick(void);
+/* 期限切れの sleep/IO 待ちを起こす。task_on_timer_tick から呼ばれるほか、
+ * 割り込みに頼れない環境ではブロック待ちループ側からも直接呼ぶ */
+int task_poll_sleep_wakeups(void);
 int task_prepare_initial_user_stack(arch_address_space_t address_space, struct task* t,
                                     const struct elf_info* info,
                                     const struct elf_info* interp_info,

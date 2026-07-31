@@ -438,13 +438,12 @@ static int riscv64_bootstrap_sys_nanosleep(const struct riscv64_linux_timespec* 
         kernel_yield();
         return 0;
     }
-    /* 本来は task_mark_io_wait_until() で寝かせてタイマー走査に起こさせたいが、
-     * riscv64 ではその起床経路がまだ動かない (sleep_until_ms を見る
-     * task_on_timer_tick の走査までタイマー割り込みが届かず、寝たきりになる)。
-     * 当面はデッドラインまで yield し続けるスピン待ちにしておく。単核前提の
-     * 暫定実装で、CPU は食うがハングはしない。 */
     deadline = arch_time_now_ms() + ms;
+    /* 早すぎる起床 (console 待ちの起床など、sleep_until_ms と無関係な経路から
+     * READY にされる) があり得るので、デッドラインを再確認して寝直す。
+     * 起床は sched.c の task_on_timer_tick() の走査が行う。 */
     while (arch_time_now_ms() < deadline) {
+        task_mark_io_wait_until(current, deadline);
         kernel_yield();
     }
     return 0;
