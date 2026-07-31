@@ -39,6 +39,12 @@ struct riscv64_linux_dirent64 {
 #define RISCV64_EROFS      30
 #define RISCV64_ENOTEMPTY  39
 
+/* 待ち手が「寝ている」かの判定。read/write は TASK_SLEEPING で寝るが、
+ * ppoll は期限付きで待つため TASK_IO_WAIT になる。どちらも起こす対象 */
+static int riscv64_fs_task_is_waiting(const struct task* t) {
+    return t && (t->state == TASK_SLEEPING || t->state == TASK_IO_WAIT);
+}
+
 /* O_ACCMODE 判定: 書き込み可能な開き方か */
 static int riscv64_fs_flags_writable(int flags) {
     int acc = flags & 3;
@@ -387,7 +393,7 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
             reader_to_wake = pipe->read_waiter;
             pipe->read_waiter = 0;
             spin_unlock_irqrestore(&pipe->lock, irqf);
-            if (reader_to_wake && reader_to_wake->state == TASK_SLEEPING) task_wake(reader_to_wake);
+            if (reader_to_wake && riscv64_fs_task_is_waiting(reader_to_wake)) task_wake(reader_to_wake);
         }
         return (int64_t)written;
     }
@@ -502,7 +508,7 @@ int64_t sys_read(int fd, void* buf, size_t count) {
             writer_to_wake = pipe->write_waiter;
             pipe->write_waiter = 0;
             spin_unlock_irqrestore(&pipe->lock, irqf);
-            if (writer_to_wake && writer_to_wake->state == TASK_SLEEPING) task_wake(writer_to_wake);
+            if (writer_to_wake && riscv64_fs_task_is_waiting(writer_to_wake)) task_wake(writer_to_wake);
             return (int64_t)to_read;
         }
     }
@@ -789,8 +795,8 @@ void fs_release_fd(file_descriptor_t* desc) {
             pipe->write_waiter = 0;
             free_pipe = (pipe->ref_count == 0);
             spin_unlock_irqrestore(&pipe->lock, flags);
-            if (read_waiter && read_waiter->state == TASK_SLEEPING) task_wake(read_waiter);
-            if (write_waiter && write_waiter->state == TASK_SLEEPING) task_wake(write_waiter);
+            if (read_waiter && riscv64_fs_task_is_waiting(read_waiter)) task_wake(read_waiter);
+            if (write_waiter && riscv64_fs_task_is_waiting(write_waiter)) task_wake(write_waiter);
             if (free_pipe) {
                 pmm_free((void*)VIRT_TO_PHYS((uint64_t)pipe), 1);
             }

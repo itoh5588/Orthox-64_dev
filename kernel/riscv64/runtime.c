@@ -173,7 +173,10 @@ void riscv64_console_poll_input(void) {
         if (next_head != g_riscv64_console_tail) {
             g_riscv64_console_buf[g_riscv64_console_head] = (uint8_t)ch;
             g_riscv64_console_head = next_head;
-            if (g_riscv64_console_waiter && g_riscv64_console_waiter->state == TASK_SLEEPING) {
+            /* read は TASK_SLEEPING、ppoll は期限付きの TASK_IO_WAIT で待つ */
+            if (g_riscv64_console_waiter &&
+                (g_riscv64_console_waiter->state == TASK_SLEEPING ||
+                 g_riscv64_console_waiter->state == TASK_IO_WAIT)) {
                 waiter = g_riscv64_console_waiter;
                 g_riscv64_console_waiter = 0;
             }
