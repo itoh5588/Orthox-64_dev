@@ -9,6 +9,19 @@
 uint64_t g_hhdm_offset;
 
 static spinlock_t g_riscv64_kernel_lock;
+/*
+ * コンソール入力リングと UART の受信 FIFO を守るロック。
+ *
+ * BKL では守れない: riscv64_console_poll_input() は kernel_yield() から
+ * (BKL を保持しているとは限らない) と、タイマー割り込みの net_poll() から
+ * 呼ばれ、どの hart からも走る。UART の RBR は読むと文字が消えるので、
+ * 2 つの hart が同時に読むと片方が取った文字がリングに入らないまま失われる
+ * (SMP=4 で `x=42` が `x=2` になる形で観測した)。head/tail の更新も競合する。
+ *
+ * 静的変数なのでゼロ初期化 = spinlock_init 済みと同じ (g_riscv64_kernel_lock
+ * と同じ扱い)。
+ */
+static spinlock_t g_riscv64_console_lock;
 static uint8_t g_riscv64_console_buf[256];
 static uint32_t g_riscv64_console_head;
 static uint32_t g_riscv64_console_tail;
@@ -142,6 +155,8 @@ void puthex(uint64_t value) {
 }
 
 void riscv64_console_poll_input(void) {
+    struct task* waiter = 0;
+    uint64_t flags = spin_lock_irqsave(&g_riscv64_console_lock);
     int ch = riscv64_uart_getchar_nonblock();
     while (ch >= 0) {
         uint32_t next_head = (g_riscv64_console_head + 1U) % (uint32_t)sizeof(g_riscv64_console_buf);
@@ -150,31 +165,42 @@ void riscv64_console_poll_input(void) {
             g_riscv64_console_buf[g_riscv64_console_head] = (uint8_t)ch;
             g_riscv64_console_head = next_head;
             if (g_riscv64_console_waiter && g_riscv64_console_waiter->state == TASK_SLEEPING) {
-                task_wake(g_riscv64_console_waiter);
+                waiter = g_riscv64_console_waiter;
                 g_riscv64_console_waiter = 0;
             }
         }
         ch = riscv64_uart_getchar_nonblock();
     }
+    spin_unlock_irqrestore(&g_riscv64_console_lock, flags);
+    /* task_wake() は g_task_lock を取って IPI も飛ばすので、コンソールロックの
+     * 外で呼ぶ (ロック順序を作らない) */
+    if (waiter) task_wake(waiter);
 }
 
 int riscv64_console_read(char* buf, int count) {
     int read = 0;
+    uint64_t flags;
     if (!buf || count <= 0) return 0;
+    flags = spin_lock_irqsave(&g_riscv64_console_lock);
     while (read < count) {
         if (g_riscv64_console_head == g_riscv64_console_tail) break;
         buf[read++] = (char)g_riscv64_console_buf[g_riscv64_console_tail];
         g_riscv64_console_tail = (g_riscv64_console_tail + 1U) % (uint32_t)sizeof(g_riscv64_console_buf);
     }
+    spin_unlock_irqrestore(&g_riscv64_console_lock, flags);
     return read;
 }
 
 void riscv64_console_set_waiter(struct task* t) {
+    uint64_t flags = spin_lock_irqsave(&g_riscv64_console_lock);
     g_riscv64_console_waiter = t;
+    spin_unlock_irqrestore(&g_riscv64_console_lock, flags);
 }
 
 void riscv64_console_clear_waiter(struct task* t) {
+    uint64_t flags = spin_lock_irqsave(&g_riscv64_console_lock);
     if (g_riscv64_console_waiter == t) g_riscv64_console_waiter = 0;
+    spin_unlock_irqrestore(&g_riscv64_console_lock, flags);
 }
 
 /* smp_get_cpu_info / smp_get_started_cpu_count / smp_send_resched_ipi は

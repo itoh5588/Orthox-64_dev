@@ -10,6 +10,7 @@
 #include "virtio.h"
 #include "virtio_blk.h"
 #include "riscv64/boot.h"
+#include "spinlock.h"
 
 // virtio-mmio レジスタ (virtio spec 4.2.2, legacy 4.2.4)
 #define VIRTIO_MMIO_MAGIC_VALUE      0x000
@@ -45,6 +46,14 @@ static struct virtio_blk_req* g_vblk_mmio_hdr;
 static uint8_t* g_vblk_mmio_status;
 static uint64_t g_vblk_mmio_hdr_phys;
 static uint64_t g_vblk_mmio_capacity;
+/*
+ * リクエスト 1 件分のディスクリプタ (desc[0..2]) とヘッダ/ステータス領域を
+ * 1 組しか持たない設計なので、複数 hart が同時に入ると互いのリクエストを
+ * 上書きしてしまう (SMP=4 で `xv6bio: disk read error` が多発した)。
+ * 完了はポーリング待ちで yield しないため、リクエスト全体をスピンロックで
+ * 囲って直列化する。静的変数のゼロ初期化 = spinlock_init 済み。
+ */
+static spinlock_t g_vblk_mmio_lock;
 
 static inline uint32_t vblk_mmio_read32(uint32_t off) {
     return *(volatile uint32_t*)(g_vblk_mmio_base + off);
@@ -104,9 +113,12 @@ static int vblk_mmio_rw(uint32_t type, uint64_t sector, void* buf, uint32_t sect
     struct virtio_queue* q = &g_vblk_mmio_q;
     uint16_t head = 0;
     uint16_t used_idx;
+    uint64_t flags;
+    int ret;
 
     if (!g_vblk_mmio_base || !buf || sectors == 0) return -1;
 
+    flags = spin_lock_irqsave(&g_vblk_mmio_lock);
     g_vblk_mmio_hdr->type = type;
     g_vblk_mmio_hdr->reserved = 0;
     g_vblk_mmio_hdr->sector = sector;
@@ -139,7 +151,9 @@ static int vblk_mmio_rw(uint32_t type, uint64_t sector, void* buf, uint32_t sect
     }
     q->last_used_idx = q->used->idx;
 
-    return (*g_vblk_mmio_status == VIRTIO_BLK_S_OK) ? 0 : -1;
+    ret = (*g_vblk_mmio_status == VIRTIO_BLK_S_OK) ? 0 : -1;
+    spin_unlock_irqrestore(&g_vblk_mmio_lock, flags);
+    return ret;
 }
 
 static int vblk_mmio_storage_read(void* ctx, uint64_t lba, void* buf, size_t count) {

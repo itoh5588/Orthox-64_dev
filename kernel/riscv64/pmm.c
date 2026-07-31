@@ -3,6 +3,7 @@
 #include "pmm.h"
 #include "riscv64/boot.h"
 #include "riscv64/vm.h"
+#include "spinlock.h"
 #include "vmm.h"
 
 extern char __kernel_end[];
@@ -14,6 +15,15 @@ static uint16_t g_riscv64_pmm_refcounts[RISCV64_PMM_MAX_PAGES];
 static uint64_t g_riscv64_pmm_base;
 static uint64_t g_riscv64_pmm_pages;
 static void* g_riscv64_isa_dma_page;
+/*
+ * ビットマップと refcount を守るロック。無いと複数 hart の pmm_alloc() が
+ * 同じページを 2 度配ってしまう (ビットマップ更新が read-modify-write
+ * なので、同じバイトに当たる別ページの取り合いでも壊れる)。
+ * SMP=4 でアドレス空間破棄中の load page fault
+ * (riscv64_vm_destroy_table が壊れた PTE を辿る) として顕在化した。
+ * 静的変数のゼロ初期化 = spinlock_init 済み。
+ */
+static spinlock_t g_riscv64_pmm_lock;
 
 static inline void riscv64_pmm_set(uint64_t page) {
     g_riscv64_pmm_bitmap[page / 8U] |= (uint8_t)(1U << (page % 8U));
@@ -78,9 +88,12 @@ void pmm_init(void) {
 void* pmm_alloc(size_t pages) {
     uint64_t run = 0;
     uint64_t start = 0;
+    void* result = 0;
+    uint64_t flags;
 
     if (pages == 0 || g_riscv64_pmm_pages == 0) return 0;
 
+    flags = spin_lock_irqsave(&g_riscv64_pmm_lock);
     for (uint64_t i = 0; i < g_riscv64_pmm_pages; i++) {
         if (!riscv64_pmm_test(i)) {
             if (run == 0) start = i;
@@ -91,19 +104,23 @@ void* pmm_alloc(size_t pages) {
                     riscv64_pmm_set(page);
                     g_riscv64_pmm_refcounts[page] = 1;
                 }
-                return (void*)(uintptr_t)(g_riscv64_pmm_base + start * PAGE_SIZE);
+                result = (void*)(uintptr_t)(g_riscv64_pmm_base + start * PAGE_SIZE);
+                break;
             }
         } else {
             run = 0;
         }
     }
+    spin_unlock_irqrestore(&g_riscv64_pmm_lock, flags);
 
-    return 0;
+    return result;
 }
 
 void pmm_free(void* addr, size_t pages) {
     uint64_t base = (uint64_t)(uintptr_t)addr;
+    uint64_t flags;
     if (!addr || pages == 0 || base < g_riscv64_pmm_base) return;
+    flags = spin_lock_irqsave(&g_riscv64_pmm_lock);
     for (size_t i = 0; i < pages; i++) {
         uint64_t phys = base + i * PAGE_SIZE;
         uint64_t page = (phys - g_riscv64_pmm_base) / PAGE_SIZE;
@@ -115,24 +132,33 @@ void pmm_free(void* addr, size_t pages) {
             }
         }
     }
+    spin_unlock_irqrestore(&g_riscv64_pmm_lock, flags);
 }
 
 void pmm_incref(void* addr) {
     uint64_t phys = (uint64_t)(uintptr_t)addr;
     uint64_t page;
+    uint64_t flags;
     if (!addr || phys < g_riscv64_pmm_base) return;
     page = (phys - g_riscv64_pmm_base) / PAGE_SIZE;
     if (page >= g_riscv64_pmm_pages) return;
+    flags = spin_lock_irqsave(&g_riscv64_pmm_lock);
     g_riscv64_pmm_refcounts[page]++;
+    spin_unlock_irqrestore(&g_riscv64_pmm_lock, flags);
 }
 
 uint16_t pmm_get_ref(void* addr) {
     uint64_t phys = (uint64_t)(uintptr_t)addr;
     uint64_t page;
+    uint64_t flags;
+    uint16_t ref;
     if (!addr || phys < g_riscv64_pmm_base) return 0;
     page = (phys - g_riscv64_pmm_base) / PAGE_SIZE;
     if (page >= g_riscv64_pmm_pages) return 0;
-    return g_riscv64_pmm_refcounts[page];
+    flags = spin_lock_irqsave(&g_riscv64_pmm_lock);
+    ref = g_riscv64_pmm_refcounts[page];
+    spin_unlock_irqrestore(&g_riscv64_pmm_lock, flags);
+    return ref;
 }
 
 void* pmm_get_isa_dma_page(void) {

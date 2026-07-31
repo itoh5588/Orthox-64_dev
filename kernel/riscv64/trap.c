@@ -31,9 +31,19 @@ static struct riscv64_trap_scratch* riscv64_trap_scratch_self(void) {
 
 static uint64_t g_riscv64_timer_interval = 1000000ULL;
 static uint64_t g_riscv64_timer_ticks;
-static long g_riscv64_last_timer_error;
 static uint64_t g_riscv64_last_timer_deadline;
+/*
+ * ワンショットログ用のフラグ。全 hart がタイマー割り込みを受けるので、
+ * 「カウンタが 1 のときだけ出す」方式だと誰も 1 を観測できないことがある
+ * (無ロックの ++ が競合する)。__atomic_exchange で最初の 1 人だけが 0 を
+ * 受け取るようにして、ちょうど 1 回出す。
+ */
+static int g_riscv64_logged_first_timer;
 static int g_riscv64_logged_timer_after_user_handoff;
+
+static int riscv64_log_once(int* flag) {
+    return __atomic_exchange_n(flag, 1, __ATOMIC_RELAXED) == 0;
+}
 
 static void riscv64_trap_rearm_current_kernel_stack(void) {
     struct cpu_local* cpu = get_cpu_local();
@@ -43,12 +53,13 @@ static void riscv64_trap_rearm_current_kernel_stack(void) {
     riscv64_trap_scratch_self()->kernel_sp = cpu->kernel_stack;
 }
 
-static void riscv64_timer_arm_next(void) {
+/* 戻り値は SBI のエラー。全 hart が呼ぶのでグローバルに溜めず呼び出し元へ返す */
+static long riscv64_timer_arm_next(void) {
     uint64_t now = riscv64_read_time();
-    riscv64_sbi_ret_t ret;
-    g_riscv64_last_timer_deadline = now + g_riscv64_timer_interval;
-    ret = riscv64_sbi_set_timer(g_riscv64_last_timer_deadline);
-    g_riscv64_last_timer_error = ret.error;
+    uint64_t deadline = now + g_riscv64_timer_interval;
+    riscv64_sbi_ret_t ret = riscv64_sbi_set_timer(deadline);
+    g_riscv64_last_timer_deadline = deadline;
+    return ret.error;
 }
 
 static void riscv64_handle_timer_interrupt(void) {
@@ -117,13 +128,14 @@ void riscv64_trap_set_kernel_stack(uint64_t kernel_sp) {
 }
 
 void riscv64_timer_init(void) {
+    long err;
     riscv64_write_sie(riscv64_read_sie() | RISCV64_SIE_STIE);
-    riscv64_timer_arm_next();
+    err = riscv64_timer_arm_next();
     if (riscv64_current_hart_index() != 0) return;
     riscv64_uart_puts("  sbi timer armed\n");
-    if (g_riscv64_last_timer_error != 0) {
+    if (err != 0) {
         riscv64_uart_puts("  timer err: 0x");
-        riscv64_uart_puthex64((uint64_t)g_riscv64_last_timer_error);
+        riscv64_uart_puthex64((uint64_t)err);
         riscv64_uart_puts("\n");
     }
 }
@@ -160,14 +172,14 @@ void riscv64_trap_dispatch(riscv64_trap_frame_t* frame) {
     }
 
     if (frame->scause == RISCV64_SCAUSE_STIMER) {
-        g_riscv64_timer_ticks++;
-        riscv64_timer_arm_next();
+        __atomic_fetch_add(&g_riscv64_timer_ticks, 1ULL, __ATOMIC_RELAXED);
+        (void)riscv64_timer_arm_next();
         riscv64_handle_timer_interrupt();
-        if (g_riscv64_timer_ticks == 1) {
+        if (riscv64_log_once(&g_riscv64_logged_first_timer)) {
             riscv64_uart_puts("riscv64 supervisor timer interrupt\n");
         }
-        if (riscv64_user_handoff_started() && !g_riscv64_logged_timer_after_user_handoff) {
-            g_riscv64_logged_timer_after_user_handoff = 1;
+        if (riscv64_user_handoff_started() &&
+            riscv64_log_once(&g_riscv64_logged_timer_after_user_handoff)) {
             riscv64_uart_puts("riscv64 timer interrupt after user handoff\n");
         }
         // ユーザーモードからの割り込みに限りプリエンプトする。
