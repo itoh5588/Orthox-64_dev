@@ -173,7 +173,7 @@ SRCS = kernel/init.c kernel/kassert.c kernel/pmm.c kernel/elf.c kernel/gdt.c ker
        kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c kernel/wait.c kernel/bottom_half.c kernel/irq.c kernel/task_switch.S kernel/fs.c kernel/vfs.c kernel/storage.c kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c kernel/pic.c kernel/keyboard.c kernel/pci.c kernel/net.c kernel/net_socket.c kernel/virtio.c kernel/virtio_net.c kernel/virtio_blk.c kernel/lwip_port.c kernel/cstring.c kernel/cstdio.c kernel/cstdlib.c kernel/usb.c kernel/smp.c kernel/spinlock.c
 
 RISCV64_C_SRCS = kernel/riscv64/boot.c kernel/riscv64/bootstrap_user.c kernel/riscv64/elf.c \
-	kernel/riscv64/entry.c kernel/riscv64/fs.c kernel/riscv64/net_socket.c kernel/riscv64/pmm.c \
+	kernel/riscv64/entry.c kernel/riscv64/fs.c kernel/riscv64/net_socket.c kernel/riscv64/plic.c kernel/riscv64/pmm.c \
 	kernel/riscv64/runtime.c kernel/riscv64/smp.c kernel/riscv64/task.c kernel/riscv64/trap.c kernel/riscv64/syscall.c \
 	kernel/riscv64/virtio_blk_mmio.c kernel/riscv64/vm.c
 RISCV64_SHARED_C_SRCS = kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c \

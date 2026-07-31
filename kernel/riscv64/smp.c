@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "riscv64/boot.h"
 #include "riscv64/csr.h"
+#include "riscv64/plic.h"
 #include "riscv64/sbi.h"
 #include "riscv64/trap.h"
 #include "riscv64/vm.h"
@@ -52,6 +53,13 @@ static volatile uint32_t g_riscv64_started_harts = 1;
 
 uint32_t riscv64_smp_hart_count(void) {
     return g_riscv64_hart_count;
+}
+
+/* cpu index -> 物理 hart id。PLIC のコンテキスト番号算出に要る
+ * (S モードのコンテキストは hart id から決まり、CPU 番号からではない) */
+uint64_t riscv64_smp_hartid(uint32_t cpu_index) {
+    if (cpu_index >= RISCV64_MAX_HARTS) return 0;
+    return g_riscv64_cpu_hartid[cpu_index];
 }
 
 const struct smp_cpu_info* smp_get_cpu_info(uint32_t cpu_index) {
@@ -103,6 +111,8 @@ void riscv64_secondary_main(uint64_t cpu_index_arg) {
 
     riscv64_trap_set_kernel_stack(idle->kstack_top);
     riscv64_timer_init();
+    /* 副 hart はしきい値だけ下げて有効化ビットは立てない (UART は boot hart 担当) */
+    riscv64_plic_init_hart();
     riscv64_interrupts_enable();
 
     __atomic_add_fetch(&g_riscv64_started_harts, 1, __ATOMIC_SEQ_CST);

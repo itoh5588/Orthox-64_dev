@@ -12,11 +12,11 @@ static spinlock_t g_riscv64_kernel_lock;
 /*
  * コンソール入力リングと UART の受信 FIFO を守るロック。
  *
- * BKL では守れない: riscv64_console_poll_input() は kernel_yield() から
- * (BKL を保持しているとは限らない) と、タイマー割り込みの net_poll() から
- * 呼ばれ、どの hart からも走る。UART の RBR は読むと文字が消えるので、
- * 2 つの hart が同時に読むと片方が取った文字がリングに入らないまま失われる
- * (SMP=4 で `x=42` が `x=2` になる形で観測した)。head/tail の更新も競合する。
+ * BKL では守れない: riscv64_console_poll_input() は UART 受信割り込みから
+ * 呼ばれ、リングの読み出し側 (riscv64_console_read_or_wait) は syscall 文脈で
+ * 走る。UART の RBR は読むと文字が消えるので、取り合うと片方が取った文字が
+ * リングに入らないまま失われる (SMP=4 で `x=42` が `x=2` になる形で観測した)。
+ * head/tail の更新も競合する。
  *
  * 静的変数なのでゼロ初期化 = spinlock_init 済みと同じ (g_riscv64_kernel_lock
  * と同じ扱い)。
@@ -27,8 +27,10 @@ static uint32_t g_riscv64_console_head;
 static uint32_t g_riscv64_console_tail;
 static struct task* g_riscv64_console_waiter;
 
+/* riscv64 にネットワークスタックは無い。コンソール入力もタイマー経由の
+ * ポーリングをやめ、UART 受信割り込み (PLIC) だけで拾うようにしたので何もしない。
+ * ここで保険を残すと、割り込みが死んでも 10Hz で動いてしまい気付けない */
 void net_poll(void) {
-    riscv64_console_poll_input();
 }
 
 uint64_t arch_time_now_ms(void) {
@@ -137,18 +139,17 @@ int kernel_lock_held(void) {
 }
 
 /*
- * コンソール入力はまだポーリング。UART は PLIC 経由の外部割り込み (SEIE) を
- * 使っておらず、受信 FIFO を舐めるのはここだけなので、待ちに入る前に 1 回引く。
+ * ここではもう何もポーリングしない。
  *
- * 期限切れ起床 (task_poll_sleep_wakeups) はここでは呼ばない。タイマー割り込みが
- * カーネル実行中にも届くようになった (riscv64_interrupts_enable) ので、
- * task_on_timer_tick() 側だけで起こせる。ここで二重に回すと、割り込みが
- * 死んだときに気付けなくなる。
+ * - 期限切れ起床はタイマー割り込み (task_on_timer_tick)
+ * - コンソール入力は UART 受信割り込み (PLIC 経由、riscv64_console_poll_input)
+ *
+ * どちらもカーネル実行中に届く (riscv64_interrupts_enable)。ここで保険として
+ * 二重に回すと、割り込みが死んだときに気付けなくなる。
  */
 void kernel_yield(void) {
     struct cpu_local* cpu = get_cpu_local();
     uint32_t depth = cpu ? cpu->kernel_lock_depth : 0;
-    riscv64_console_poll_input();
     for (uint32_t i = 0; i < depth; i++) kernel_lock_exit();
     schedule();
     for (uint32_t i = 0; i < depth; i++) kernel_lock_enter();
@@ -192,6 +193,36 @@ int riscv64_console_has_input(void) {
     has = g_riscv64_console_head != g_riscv64_console_tail;
     spin_unlock_irqrestore(&g_riscv64_console_lock, flags);
     return has;
+}
+
+/*
+ * データがあれば読み、無ければ「待ち手」に登録して SLEEPING にする。
+ * 戻り値 >0 = 読めた、0 = 寝る準備ができた (呼び出し側は kernel_yield すること)。
+ *
+ * 「空を確認する」と「寝る」の間を割り込みに対して不可分にする必要がある。
+ * 分かれていると、その隙に届いた文字は UART 割り込みハンドラがリングへ入れる
+ * ものの、まだ waiter が登録されていないので誰も起こしてくれず、次の 1 文字が
+ * 来るまで固まる。コンソールロック (irqsave) の中で両方やることで閉じる。
+ *
+ * ロック順序は console -> task。task_wake() 側は必ずコンソールロックの外で
+ * 呼んでいるので逆順にはならない。
+ */
+int riscv64_console_read_or_wait(char* buf, int count, struct task* self) {
+    int read = 0;
+    uint64_t flags;
+    if (!buf || count <= 0) return 0;
+    flags = spin_lock_irqsave(&g_riscv64_console_lock);
+    while (read < count) {
+        if (g_riscv64_console_head == g_riscv64_console_tail) break;
+        buf[read++] = (char)g_riscv64_console_buf[g_riscv64_console_tail];
+        g_riscv64_console_tail = (g_riscv64_console_tail + 1U) % (uint32_t)sizeof(g_riscv64_console_buf);
+    }
+    if (read == 0 && self) {
+        g_riscv64_console_waiter = self;
+        task_mark_sleeping(self);
+    }
+    spin_unlock_irqrestore(&g_riscv64_console_lock, flags);
+    return read;
 }
 
 int riscv64_console_read(char* buf, int count) {

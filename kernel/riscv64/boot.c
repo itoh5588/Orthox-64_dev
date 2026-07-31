@@ -5,6 +5,7 @@
 #include "riscv64/dtb.h"
 #include "riscv64/elf.h"
 #include "riscv64/entry.h"
+#include "riscv64/plic.h"
 #include "riscv64/linux_syscalls.h"
 #include "riscv64/syscall.h"
 #include "riscv64/task.h"
@@ -313,6 +314,12 @@ void riscv64_uart_putchar(char ch) {
     while ((uart[RISCV64_UART_LSR] & RISCV64_UART_LSR_TX_IDLE) == 0) {
     }
     uart[RISCV64_UART_THR] = (uint8_t)ch;
+}
+
+/* 受信割り込み (ERBFI) を有効にする。PLIC 側の有効化とセットで意味を持つ */
+void riscv64_uart_enable_rx_interrupt(void) {
+    volatile uint8_t* uart = riscv64_uart0_regs();
+    uart[RISCV64_UART_IER] |= 0x01U;
 }
 
 int riscv64_uart_getchar_nonblock(void) {
@@ -1130,6 +1137,12 @@ void riscv64_early_main(uint64_t hart_id, uint64_t dtb_pa) {
     riscv64_trap_init();
     riscv64_trap_set_kernel_stack(riscv64_boot_stack_top());
     riscv64_timer_init();
+    /* UART 受信を PLIC 経由の外部割り込みで拾う (boot hart のコンテキストのみ
+     * 有効にする。複数 hart で claim を取り合っても得が無い) */
+    riscv64_plic_init_global();
+    riscv64_plic_init_hart();
+    riscv64_plic_enable_irq(RISCV64_IRQ_UART0);
+    riscv64_uart_enable_rx_interrupt();
     riscv64_interrupts_enable();
     riscv64_first_user_task_bootstrap();
     riscv64_wait_forever();

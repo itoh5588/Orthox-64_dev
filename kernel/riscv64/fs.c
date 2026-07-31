@@ -438,12 +438,10 @@ int64_t sys_read(int fd, void* buf, size_t count) {
         size_t read_count = 0;
         if (count == 0) return 0;
         while (read_count == 0) {
-            int got;
-            riscv64_console_poll_input();
-            got = riscv64_console_read((char*)dst, (int)count);
+            /* 「空だから寝る」までを不可分にする。分けると、その隙に届いた
+             * 文字で誰も起こしてくれず固まる (UART 割り込み化で顕在化する) */
+            int got = riscv64_console_read_or_wait((char*)dst, (int)count, current);
             if (got <= 0) {
-                task_mark_sleeping(current);
-                riscv64_console_set_waiter(current);
                 kernel_yield();
                 riscv64_console_clear_waiter(current);
                 continue;

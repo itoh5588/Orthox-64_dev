@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include "riscv64/csr.h"
 #include "riscv64/boot.h"
+#include "riscv64/plic.h"
 #include "riscv64/sbi.h"
 #include "riscv64/syscall.h"
 #include "riscv64/trap.h"
@@ -40,6 +41,7 @@ static uint64_t g_riscv64_last_timer_deadline;
  */
 static int g_riscv64_logged_first_timer;
 static int g_riscv64_logged_timer_after_user_handoff;
+static int g_riscv64_logged_first_uart_irq;
 
 static int riscv64_log_once(int* flag) {
     return __atomic_exchange_n(flag, 1, __ATOMIC_RELAXED) == 0;
@@ -146,7 +148,7 @@ void riscv64_trap_set_kernel_stack(uint64_t kernel_sp) {
 void riscv64_interrupts_enable(void) {
     /* resched IPI (supervisor software interrupt) は boot hart でも受ける。
      * 以前は副 hart 側だけで有効化しており、cpu 0 への IPI が届かなかった */
-    riscv64_write_sie(riscv64_read_sie() | RISCV64_SIE_SSIE);
+    riscv64_write_sie(riscv64_read_sie() | RISCV64_SIE_SSIE | RISCV64_SIE_SEIE);
     riscv64_write_sstatus(riscv64_read_sstatus() | RISCV64_SSTATUS_SIE);
 }
 
@@ -178,6 +180,27 @@ void riscv64_trap_dispatch(riscv64_trap_frame_t* frame) {
     if (frame->scause == RISCV64_SCAUSE_SSOFT) {
         // resched IPI: sip.SSIP を落として、ユーザーからの割り込みなら切り替える
         riscv64_clear_sip_ssip();
+        if ((frame->sstatus & RISCV64_SSTATUS_SPP) == 0 && !kernel_lock_held()) {
+            if (task_consume_resched()) {
+                kernel_yield();
+            }
+        }
+        riscv64_trap_rearm_current_kernel_stack();
+        return;
+    }
+
+    if (frame->scause == RISCV64_SCAUSE_SEXT) {
+        /* PLIC から 1 件受け取って処理し、完了を返す。
+         * claim が 0 を返すのは他 hart に取られた場合 (何もしないのが正しい) */
+        uint32_t irq = riscv64_plic_claim();
+        if (irq == RISCV64_IRQ_UART0) {
+            /* 受信 FIFO をリングへ移し、待っているタスクを起こす */
+            riscv64_console_poll_input();
+            if (riscv64_log_once(&g_riscv64_logged_first_uart_irq)) {
+                riscv64_uart_puts("riscv64 uart rx interrupt\n");
+            }
+        }
+        riscv64_plic_complete(irq);
         if ((frame->sstatus & RISCV64_SSTATUS_SPP) == 0 && !kernel_lock_held()) {
             if (task_consume_resched()) {
                 kernel_yield();

@@ -35,6 +35,7 @@ void riscv64_uart_putchar(char ch);
 int riscv64_uart_getchar_nonblock(void);
 void riscv64_console_poll_input(void);
 int riscv64_console_read(char* buf, int count);
+int riscv64_console_read_or_wait(char* buf, int count, struct task* self);
 int riscv64_console_has_input(void);
 void riscv64_console_set_waiter(struct task* t);
 void riscv64_console_clear_waiter(struct task* t);
@@ -47,6 +48,8 @@ void riscv64_wait_forever(void);
 // SMP (kernel/riscv64/smp.c)
 void riscv64_smp_start_secondaries(void);
 uint32_t riscv64_smp_hart_count(void);
+uint64_t riscv64_smp_hartid(uint32_t cpu_index);
+void riscv64_uart_enable_rx_interrupt(void);
 void riscv64_early_main(uint64_t hart_id, uint64_t dtb_pa);
 
 #endif
