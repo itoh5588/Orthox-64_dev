@@ -48,8 +48,8 @@ static int riscv64_log_once(int* flag) {
 static void riscv64_trap_rearm_current_kernel_stack(void) {
     struct cpu_local* cpu = get_cpu_local();
     if (!cpu || !cpu->kernel_stack) return;
-    // カーネル実行中は sscratch=0 を保つため kernel_sp フィールドのみ更新する。
-    // sscratch への書き戻しは trap 出口 (ユーザー復帰時) が行う
+    // sscratch は riscv64_trap_init() で一度だけ設定し、以後は動かさない。
+    // ここは「次にユーザーから来たときに張るカーネルスタック」の更新だけ
     riscv64_trap_scratch_self()->kernel_sp = cpu->kernel_stack;
 }
 
@@ -75,7 +75,11 @@ static void riscv64_handle_ecall(riscv64_trap_frame_t* frame) {
     uint64_t sstatus;
     if (!frame) return;
     sstatus = riscv64_read_sstatus();
-    riscv64_write_sstatus(sstatus | RISCV64_SSTATUS_SUM);
+    /* トラップ時にハードウェアが SIE を落とすので、syscall 処理の間は明示的に
+     * 開け直す。ここを開けないと「カーネル内で待つ処理にはタイマーが届かない」
+     * ままになる (wait4 の kernel_yield ループが典型)。
+     * SUM はユーザー空間のアクセス許可。どちらも復帰時に元へ戻す。 */
+    riscv64_write_sstatus(sstatus | RISCV64_SSTATUS_SUM | RISCV64_SSTATUS_SIE);
     riscv64_syscall_dispatch(frame);
     riscv64_write_sstatus(sstatus);
 }
@@ -112,7 +116,9 @@ static void riscv64_trap_print_frame(const riscv64_trap_frame_t* frame) {
 void riscv64_trap_init(void) {
     struct riscv64_trap_scratch* scratch = riscv64_trap_scratch_self();
     scratch->hart_index = riscv64_current_hart_index();
-    riscv64_write_sscratch(0);
+    // sscratch は常に per-hart scratch を指す。ユーザー/カーネルの判定は
+    // trap.S が sstatus.SPP で行うので、ここ以降 sscratch を動かしてはいけない
+    riscv64_write_sscratch((uint64_t)(uintptr_t)scratch);
     riscv64_write_stvec((uint64_t)(uintptr_t)riscv64_trap_entry);
     // 副 hart のブートログは冗長なので boot hart のみ出す
     if (scratch->hart_index == 0) {
@@ -120,11 +126,28 @@ void riscv64_trap_init(void) {
     }
 }
 
+/* 次にユーザーモードからトラップしたときに張るカーネルスタックを登録する。
+ * sscratch には触らない (触ると「カーネル実行中に sscratch が変わる」窓ができ、
+ * かつては入口がそれをユーザー由来と誤判定してスタックを踏み潰していた) */
 void riscv64_trap_set_kernel_stack(uint64_t kernel_sp) {
     struct riscv64_trap_scratch* scratch = riscv64_trap_scratch_self();
     scratch->hart_index = riscv64_current_hart_index();
     scratch->kernel_sp = kernel_sp;
-    riscv64_write_sscratch((uint64_t)(uintptr_t)scratch);
+}
+
+/*
+ * カーネル実行中も割り込みを取れるようにする (hart ごとに 1 回)。
+ * stvec / sscratch / タイマーが揃ったあとに呼ぶこと。
+ *
+ * カーネルは非プリエンプティブのまま: riscv64_trap_dispatch() が
+ * 「SPP==0 (ユーザーから来た) かつ BKL 非保持」のときしか切り替えない。
+ * 割り込みハンドラ自身は SIE を開け直さないので、ネストは 1 段までに収まる。
+ */
+void riscv64_interrupts_enable(void) {
+    /* resched IPI (supervisor software interrupt) は boot hart でも受ける。
+     * 以前は副 hart 側だけで有効化しており、cpu 0 への IPI が届かなかった */
+    riscv64_write_sie(riscv64_read_sie() | RISCV64_SIE_SSIE);
+    riscv64_write_sstatus(riscv64_read_sstatus() | RISCV64_SSTATUS_SIE);
 }
 
 void riscv64_timer_init(void) {

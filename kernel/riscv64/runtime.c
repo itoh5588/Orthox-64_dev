@@ -85,28 +85,47 @@ void spin_unlock_irqrestore(spinlock_t* lock, uint64_t flags) {
     irq_restore(flags);
 }
 
+/*
+ * kernel_lock_depth は per-CPU だが read-modify-write なので、同一 CPU に
+ * 割り込みが入ると壊れる (他 CPU との競合ではなく自分の割り込みが相手)。
+ * カーネル実行中も割り込みを取るようになったので割り込みを閉じて更新する。
+ *
+ * 「spinlock の取得」と「depth を 1 にする」は割り込みに対して不可分でなければ
+ * ならない。間で割り込まれると、ハンドラが depth==0 を見て spin_lock に入り、
+ * 自分が握っているロックを自分の割り込みの中で待つデッドロックになる。
+ * そのため取得中は割り込みを閉じたままにする (待たされるのは競合した CPU 側
+ * だけで、単核では競合しない)。
+ */
 void kernel_lock_enter(void) {
+    uint64_t flags = irq_save_disable();
     struct cpu_local* cpu = get_cpu_local();
     if (!cpu) {
         spin_lock(&g_riscv64_kernel_lock);
+        irq_restore(flags);
         return;
     }
-    if (cpu->kernel_lock_depth++ == 0) {
+    if (cpu->kernel_lock_depth == 0) {
         spin_lock(&g_riscv64_kernel_lock);
     }
+    cpu->kernel_lock_depth++;
+    irq_restore(flags);
 }
 
 void kernel_lock_exit(void) {
+    uint64_t flags = irq_save_disable();
     struct cpu_local* cpu = get_cpu_local();
     if (!cpu) {
         spin_unlock(&g_riscv64_kernel_lock);
+        irq_restore(flags);
         return;
     }
-    if (cpu->kernel_lock_depth == 0) return;
-    cpu->kernel_lock_depth--;
-    if (cpu->kernel_lock_depth == 0) {
-        spin_unlock(&g_riscv64_kernel_lock);
+    if (cpu->kernel_lock_depth != 0) {
+        cpu->kernel_lock_depth--;
+        if (cpu->kernel_lock_depth == 0) {
+            spin_unlock(&g_riscv64_kernel_lock);
+        }
     }
+    irq_restore(flags);
 }
 
 int kernel_lock_held(void) {
@@ -118,29 +137,18 @@ int kernel_lock_held(void) {
 }
 
 /*
- * カーネル実行中はタイマー割り込みが入らないので、期限切れ起床をここで自前に回す。
+ * コンソール入力はまだポーリング。UART は PLIC 経由の外部割り込み (SEIE) を
+ * 使っておらず、受信 FIFO を舐めるのはここだけなので、待ちに入る前に 1 回引く。
  *
- * riscv64 のトラップは sstatus.SIE を落とすため、カーネルに入ったあとは割り込みが
- * 一切来ない。一方ユーザーモード実行中は sstatus.SIE と無関係に S 割り込みが入る
- * (現在の特権モードが S より低ければ常に有効) ので、タイマープリエンプションだけは
- * 効いているように見えていた。
- *
- * この非対称性のせいで「カーネル内でブロック待ちループを回している間はタイマー
- * 割り込みが 1 度も来ない」状態になる。期限切れ起床は task_poll_sleep_wakeups() の
- * 走査でしか起きないので、例えば「子が nanosleep で寝て、親が wait4 で
- * kernel_yield() を回す」形だと誰も子を起こせずシステム全体が停止する
- * (走れるタスクがある以上 idle には落ちないため、idle 側の wfi 窓も開かない)。
- *
- * kernel_yield() で sstatus.SIE を一時的に開ける手も試したが、カーネルスタック上で
- * トラップがネストして current_task が壊れた (store page fault)。既に
- * riscv64_console_poll_input() を直接呼んでいるのと同じ流儀でポーリングする方が、
- * 現状の「カーネルは割り込みを取らない」設計と整合する。
+ * 期限切れ起床 (task_poll_sleep_wakeups) はここでは呼ばない。タイマー割り込みが
+ * カーネル実行中にも届くようになった (riscv64_interrupts_enable) ので、
+ * task_on_timer_tick() 側だけで起こせる。ここで二重に回すと、割り込みが
+ * 死んだときに気付けなくなる。
  */
 void kernel_yield(void) {
     struct cpu_local* cpu = get_cpu_local();
     uint32_t depth = cpu ? cpu->kernel_lock_depth : 0;
     riscv64_console_poll_input();
-    (void)task_poll_sleep_wakeups();
     for (uint32_t i = 0; i < depth; i++) kernel_lock_exit();
     schedule();
     for (uint32_t i = 0; i < depth; i++) kernel_lock_enter();

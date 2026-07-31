@@ -3,48 +3,43 @@
 .extern riscv64_trap_dispatch
 
 .p2align 2
+# ユーザーから来たかカーネルから来たかは sstatus.SPP で判定する。
+#
+# 以前は「sscratch が 0 ならカーネル」という規約にしていたが、
+# riscv64_trap_set_kernel_stack() がカーネル実行中に sscratch へ非ゼロを書く
+# 窓があり、そこで割り込みが入るとユーザー経路が選ばれて scratch->kernel_sp から
+# sp を張り直す = 今まさに走っているカーネルスタックを踏み潰していた。
+# SPP はトラップ前の特権モードをハードウェアが記録したもので、ソフト側の
+# 書き込み順に依存しない。sscratch は常に per-hart scratch を指したままにする。
 riscv64_trap_entry:
-    csrrw t0, sscratch, t0
-    beqz t0, .Ltrap_fallback
+    csrrw t0, sscratch, t0     # t0 = &scratch, sscratch = 退避した元の t0
+    sd t1,   8(t0)             # scratch.saved_t1
+    sd sp,  24(t0)             # scratch.saved_sp (ユーザー/カーネルどちらでも)
 
-    sd t1,   8(t0)
-    sd t2,  16(t0)
-    sd sp,  24(t0)
-    ld sp,   0(t0)
+    csrr t1, sstatus
+    andi t1, t1, 0x100         # SPP: 1 = カーネル(S)から
+    bnez t1, .Ltrap_have_sp
+    ld sp,   0(t0)             # ユーザーから: このタスクのカーネルスタックへ
+.Ltrap_have_sp:
+    # カーネルから来た場合は現在の sp をそのまま使う (ネストして深くなるだけ)
     addi sp, sp, -288
 
     sd ra,   0(sp)
-    ld t1,  24(t0)
+    ld t1,  24(t0)             # 元の sp
     sd t1,   8(sp)
     sd gp,  16(sp)
     sd tp,  24(sp)
-    csrr t1, sscratch
+    csrr t1, sscratch          # 元の t0
     sd t1,  32(sp)
-    ld t1,   8(t0)
+    ld t1,   8(t0)             # 元の t1
     sd t1,  40(sp)
-    ld t1,  16(t0)
-    sd t1,  48(sp)
+    sd t2,  48(sp)             # t2 はまだ潰していない
     # カーネル実行中の tp を hart index にする (SMP 用の CPU 識別)
     ld tp,  32(t0)
-    # カーネル実行中は sscratch=0 (ネスト trap は fallback 経路で現 sp を使う)
-    csrw sscratch, zero
-    j .Ltrap_common
-
-.Ltrap_fallback:
-    csrr t0, sscratch
-    csrw sscratch, zero
-    addi sp, sp, -288
-
-    sd ra,   0(sp)
-    # t1/t2 をスクラッチとして使う前に元の値を退避する
-    # (退避前に潰すと、割り込まれたカーネルコードのレジスタが化ける)
-    sd t1,  40(sp)
-    sd t2,  48(sp)
-    addi t1, sp, 288
-    sd t1,   8(sp)
-    sd gp,  16(sp)
-    sd tp,  24(sp)
-    sd t0,  32(sp)
+    # sscratch を戻す。以後は常に &scratch なのでネスト trap も同じ入口を通れる。
+    # ここまでの入口処理中は SIE=0 (ハードウェアがトラップ時に落とす) なので、
+    # scratch のフィールドが生きている間に割り込みがネストすることはない。
+    csrw sscratch, t0
 
 .Ltrap_common:
     sd s0,  56(sp)
@@ -88,16 +83,8 @@ riscv64_trap_entry:
     ld t0, 256(sp)
     csrw sstatus, t0
 
-    # ユーザーモードへ戻る場合 (SPP=0) のみ sscratch に per-hart scratch を設定する。
-    # カーネルへ戻る場合は 0 のまま (ネスト trap は fallback 経路)。
-    # tp がまだ hart index のうちに算出する (フレームは execve がゼロ化し得るので使えない)
-    andi t0, t0, 0x100
-    bnez t0, 1f
-    la t0, g_riscv64_trap_scratch
-    slli t1, tp, 6
-    add t0, t0, t1
-    csrw sscratch, t0
-1:
+    # sscratch は入口で &scratch に戻してあり、ユーザー/カーネルどちらへ帰るときも
+    # そのままでよい (SPP 判定にしたので 0 に落とす必要が無い)
     ld ra,   0(sp)
     ld gp,  16(sp)
     ld tp,  24(sp)

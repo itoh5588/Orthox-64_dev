@@ -45,6 +45,7 @@ static inline uint64_t riscv64_current_hart_index(void) {
 
 void riscv64_trap_init(void);
 void riscv64_timer_init(void);
+void riscv64_interrupts_enable(void);
 void riscv64_trap_dispatch(riscv64_trap_frame_t* frame);
 void riscv64_trap_set_kernel_stack(uint64_t kernel_sp);
 

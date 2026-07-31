@@ -1130,6 +1130,7 @@ void riscv64_early_main(uint64_t hart_id, uint64_t dtb_pa) {
     riscv64_trap_init();
     riscv64_trap_set_kernel_stack(riscv64_boot_stack_top());
     riscv64_timer_init();
+    riscv64_interrupts_enable();
     riscv64_first_user_task_bootstrap();
     riscv64_wait_forever();
 }

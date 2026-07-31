@@ -103,8 +103,7 @@ void riscv64_secondary_main(uint64_t cpu_index_arg) {
 
     riscv64_trap_set_kernel_stack(idle->kstack_top);
     riscv64_timer_init();
-    /* resched IPI (supervisor software interrupt) を受け取れるように */
-    riscv64_write_sie(riscv64_read_sie() | RISCV64_SIE_SSIE);
+    riscv64_interrupts_enable();
 
     __atomic_add_fetch(&g_riscv64_started_harts, 1, __ATOMIC_SEQ_CST);
 
