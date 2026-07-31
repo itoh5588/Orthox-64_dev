@@ -5,6 +5,7 @@
 #include "riscv64/csr.h"
 #include "riscv64/time.h"
 #include "spinlock.h"
+#include "riscv64/linux_syscalls.h"
 #include "riscv64/syscall.h"
 #include "syscall.h"
 #include "sys_internal.h"
@@ -19,69 +20,11 @@ static int64_t riscv64_bootstrap_sys_wait4(int pid, int* wstatus, int options);
 
 #define RISCV64_USER_MMAP_BASE_VADDR 0x0000002000000000ULL
 
-#define RISCV64_LINUX_SYS_IOCTL            29
-#define RISCV64_LINUX_SYS_GETCWD           17
-#define RISCV64_LINUX_SYS_OPENAT           56
-#define RISCV64_LINUX_SYS_CLOSE            57
-#define RISCV64_LINUX_SYS_GETDENTS64       61
-#define RISCV64_LINUX_SYS_LSEEK            62
-#define RISCV64_LINUX_SYS_READ             63
-#define RISCV64_LINUX_SYS_WRITE            64
-#define RISCV64_LINUX_SYS_READV            65
-#define RISCV64_LINUX_SYS_WRITEV           66
-#define RISCV64_LINUX_SYS_NEWFSTATAT       79
-#define RISCV64_LINUX_SYS_FSTAT            80
-#define RISCV64_LINUX_SYS_EXIT             93
-#define RISCV64_LINUX_SYS_EXIT_GROUP       94
-#define RISCV64_LINUX_SYS_WAITID           95
-#define RISCV64_LINUX_SYS_SET_TID_ADDRESS  96
-#define RISCV64_LINUX_SYS_FUTEX            98
-#define RISCV64_LINUX_SYS_NANOSLEEP        101
-#define RISCV64_LINUX_SYS_CLOCK_GETTIME    113
-#define RISCV64_LINUX_SYS_RT_SIGACTION     134
-#define RISCV64_LINUX_SYS_RT_SIGPROCMASK   135
-#define RISCV64_LINUX_SYS_GETPID           172
-#define RISCV64_LINUX_SYS_GETPPID          173
-#define RISCV64_LINUX_SYS_GETUID           174
-#define RISCV64_LINUX_SYS_GETEUID          175
-#define RISCV64_LINUX_SYS_GETGID           176
-#define RISCV64_LINUX_SYS_GETEGID          177
-#define RISCV64_LINUX_SYS_BRK              214
-#define RISCV64_LINUX_SYS_MUNMAP           215
-#define RISCV64_LINUX_SYS_CLONE            220
-#define RISCV64_LINUX_SYS_EXECVE           221
-#define RISCV64_LINUX_SYS_FACCESSAT        48
-#define RISCV64_LINUX_SYS_DUP              23
-#define RISCV64_LINUX_SYS_DUP3             24
-#define RISCV64_LINUX_SYS_PIPE2            59
-#define RISCV64_LINUX_SYS_FCNTL            25
-#define RISCV64_LINUX_SYS_CHDIR            49
-#define RISCV64_LINUX_SYS_FCHDIR           50
-#define RISCV64_LINUX_SYS_MKDIRAT          34
-#define RISCV64_LINUX_SYS_UNLINKAT         35
-#define RISCV64_LINUX_SYS_LINKAT           37
-#define RISCV64_LINUX_SYS_READLINKAT       78
-#define RISCV64_LINUX_SYS_RENAMEAT         38
-#define RISCV64_LINUX_SYS_UNAME            160
-#define RISCV64_LINUX_SYS_TRUNCATE         45
-#define RISCV64_LINUX_SYS_FTRUNCATE        46
-#define RISCV64_LINUX_SYS_FCHMOD           52
-#define RISCV64_LINUX_SYS_FCHMODAT         53
-#define RISCV64_LINUX_SYS_SYNC             81
-#define RISCV64_LINUX_SYS_FSYNC            82
-#define RISCV64_LINUX_SYS_FDATASYNC        83
-#define RISCV64_LINUX_SYS_UTIMENSAT        88
-#define RISCV64_LINUX_SYS_RENAMEAT2        276
-#define RISCV64_LINUX_SYS_MMAP             222
-#define RISCV64_LINUX_SYS_WAIT4            260
-#define RISCV64_LINUX_SYS_GETRANDOM        278
-
 /* clone(2) のフラグ (musl の vfork が使う分だけ) */
 #define RISCV64_LINUX_CLONE_VM      0x00000100ULL
 #define RISCV64_LINUX_CLONE_VFORK   0x00004000ULL
 #define RISCV64_LINUX_CLONE_SIGCHLD 17ULL
 
-#define RISCV64_LINUX_AT_EMPTY_PATH        0x1000
 #define RISCV64_LINUX_TCGETS               0x5401UL
 #define RISCV64_LINUX_TCSETS               0x5402UL
 #define RISCV64_LINUX_TIOCGPGRP            0x540FUL
@@ -180,13 +123,6 @@ static void riscv64_stat_from_kstat(struct riscv64_linux_stat* out, const struct
 static int riscv64_sys_fstat_user(int fd, struct riscv64_linux_stat* user_st) {
     struct kstat st;
     int rc = sys_fstat(fd, &st);
-    if (rc == 0 && user_st) riscv64_stat_from_kstat(user_st, &st);
-    return rc;
-}
-
-static int riscv64_sys_stat_user(const char* path, struct riscv64_linux_stat* user_st) {
-    struct kstat st;
-    int rc = sys_stat(path, &st);
     if (rc == 0 && user_st) riscv64_stat_from_kstat(user_st, &st);
     return rc;
 }
@@ -660,55 +596,29 @@ static void riscv64_bootstrap_sys_exit(int status) {
     while (1) kernel_yield();
 }
 
+/*
+ * ディスパッチは riscv64 (asm-generic) の番号だけを見る。
+ *
+ * かつては x86 レガシー番号 (include/syscall.h の SYS_*) も `case` に混ぜていたが、
+ * 番号空間が無関係なので衝突が起き、実害が 2 度出た:
+ *   - SYS_FORK(57) vs close(57)       → `close(0)` が fork として実行された
+ *   - SYS_GETDENTS(78) vs readlinkat  → realpath が壊れた
+ * 衝突を引数のヒューリスティックで分離していた箇所 (newfstatat/fstat/getdents64)
+ * も、レガシー番号を落としたことで全部消せた。riscv64 のユーザーランドは musl
+ * のみで、musl は asm-generic 番号しか発行しない。
+ */
 static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
     uint64_t syscall_no;
-    int64_t arg0_s;
     if (!frame) return;
     syscall_no = arch_syscall_number(frame);
-    arg0_s = (int64_t)arch_syscall_arg0(frame);
-
-    if (syscall_no == RISCV64_LINUX_SYS_NEWFSTATAT && arg0_s >= -4096 && arg0_s <= 4096) {
-        int dirfd = (int)arch_syscall_arg0(frame);
-        const char* path = (const char*)(uintptr_t)arch_syscall_arg1(frame);
-        struct riscv64_linux_stat* st = (struct riscv64_linux_stat*)(uintptr_t)arch_syscall_arg2(frame);
-        int flags = (int)arch_syscall_arg3(frame);
-        int rc;
-        if (path && path[0] == '\0' && (flags & RISCV64_LINUX_AT_EMPTY_PATH) != 0) {
-            rc = riscv64_sys_fstat_user(dirfd, st);
-        } else {
-            rc = riscv64_sys_fstatat_user(dirfd, path, st, flags);
-        }
-        arch_syscall_set_return(frame, (uint64_t)(int64_t)rc);
-        return;
-    }
-
-    if (syscall_no == RISCV64_LINUX_SYS_FSTAT && arg0_s >= -4096 && arg0_s <= 4096) {
-        arch_syscall_set_return(frame,
-                                (uint64_t)(int64_t)riscv64_sys_fstat_user((int)arch_syscall_arg0(frame),
-                                                                          (struct riscv64_linux_stat*)(uintptr_t)arch_syscall_arg1(frame)));
-        return;
-    }
-
-    if (syscall_no == RISCV64_LINUX_SYS_GETDENTS64 &&
-        arg0_s >= 0 && arg0_s < MAX_FDS &&
-        arch_syscall_arg1(frame) >= 0x1000ULL &&
-        arch_syscall_arg2(frame) >= sizeof(struct orth_dirent)) {
-        arch_syscall_set_return(frame,
-                                (uint64_t)(int64_t)sys_getdents64((int)arch_syscall_arg0(frame),
-                                                                  (void*)(uintptr_t)arch_syscall_arg1(frame),
-                                                                  (size_t)arch_syscall_arg2(frame)));
-        return;
-    }
 
     switch (syscall_no) {
-        case SYS_WRITE:
         case RISCV64_LINUX_SYS_WRITE:
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)riscv64_bootstrap_sys_write((int)arch_syscall_arg0(frame),
                                                                                     (const void*)(uintptr_t)arch_syscall_arg1(frame),
                                                                                     (size_t)arch_syscall_arg2(frame)));
             return;
-        case SYS_GETCWD:
         case RISCV64_LINUX_SYS_GETCWD:
             {
                 struct task* task = get_current_task();
@@ -732,7 +642,6 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                 arch_syscall_set_return(frame, (uint64_t)(uintptr_t)dst);
                 return;
             }
-        case SYS_GETPID:
         case RISCV64_LINUX_SYS_GETPID:
             {
                 struct task* current = get_current_task();
@@ -752,13 +661,6 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
         case RISCV64_LINUX_SYS_GETEGID:
             arch_syscall_set_return(frame, 0);
             return;
-        case SYS_OPEN:
-            arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)sys_open((const char*)(uintptr_t)arch_syscall_arg0(frame),
-                                                                (int)arch_syscall_arg1(frame),
-                                                                (int)arch_syscall_arg2(frame)));
-            return;
-        case SYS_OPENAT:
         case RISCV64_LINUX_SYS_OPENAT:
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)sys_openat((int)arch_syscall_arg0(frame),
@@ -766,38 +668,34 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                                                   (int)arch_syscall_arg2(frame),
                                                                   (int)arch_syscall_arg3(frame)));
             return;
-        case SYS_READ:
         case RISCV64_LINUX_SYS_READ:
             arch_syscall_set_return(frame,
                                     (uint64_t)sys_read((int)arch_syscall_arg0(frame),
                                                        (void*)(uintptr_t)arch_syscall_arg1(frame),
                                                        (size_t)arch_syscall_arg2(frame)));
             return;
-        case SYS_CLOSE:
         case RISCV64_LINUX_SYS_CLOSE:
             arch_syscall_set_return(frame, (uint64_t)(int64_t)sys_close((int)arch_syscall_arg0(frame)));
             return;
-        /* 78 は riscv64 では readlinkat。x86 レガシーの SYS_GETDENTS(78) と衝突して
-         * いたため、以前は readlinkat が getdents64 として実行され realpath が
-         * 壊れていた。getdents64 は riscv64 番号 61 (switch 手前のヒューリスティック)
-         * で受けているので、こちらは readlinkat に明け渡す。 */
+        case RISCV64_LINUX_SYS_GETDENTS64:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)sys_getdents64((int)arch_syscall_arg0(frame),
+                                                                      (void*)(uintptr_t)arch_syscall_arg1(frame),
+                                                                      (size_t)arch_syscall_arg2(frame)));
+            return;
         case RISCV64_LINUX_SYS_READLINKAT:
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)riscv64_sys_readlinkat(
                                         (int)arch_syscall_arg0(frame),
                                         (const char*)(uintptr_t)arch_syscall_arg1(frame)));
             return;
-        case SYS_FSTAT:
+        case RISCV64_LINUX_SYS_FSTAT:
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)riscv64_sys_fstat_user((int)arch_syscall_arg0(frame),
                                                                               (struct riscv64_linux_stat*)(uintptr_t)arch_syscall_arg1(frame)));
             return;
-        case SYS_STAT:
-            arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)riscv64_sys_stat_user((const char*)(uintptr_t)arch_syscall_arg0(frame),
-                                                                             (struct riscv64_linux_stat*)(uintptr_t)arch_syscall_arg1(frame)));
-            return;
-        case SYS_FSTATAT:
+        /* riscv64 に stat(2) は無い。musl は newfstatat(AT_FDCWD, ...) を出す */
+        case RISCV64_LINUX_SYS_NEWFSTATAT:
             {
                 int dirfd = (int)arch_syscall_arg0(frame);
                 const char* path = (const char*)(uintptr_t)arch_syscall_arg1(frame);
@@ -812,7 +710,6 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                 arch_syscall_set_return(frame, (uint64_t)(int64_t)rc);
             }
             return;
-        case SYS_CHDIR:
         case RISCV64_LINUX_SYS_CHDIR:
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)sys_chdir((const char*)(uintptr_t)arch_syscall_arg0(frame)));
@@ -822,7 +719,6 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
         case RISCV64_LINUX_SYS_FCHDIR:
             arch_syscall_set_return(frame, (uint64_t)(int64_t)sys_fchdir((int)arch_syscall_arg0(frame)));
             return;
-        case SYS_MMAP:
         case RISCV64_LINUX_SYS_MMAP:
             arch_syscall_set_return(frame,
                                     (uint64_t)(uintptr_t)riscv64_bootstrap_sys_mmap((void*)(uintptr_t)arch_syscall_arg0(frame),
@@ -832,17 +728,14 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                                                                     (int)arch_syscall_arg4(frame),
                                                                                     (int64_t)arch_syscall_arg5(frame)));
             return;
-        case SYS_MUNMAP:
         case RISCV64_LINUX_SYS_MUNMAP:
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)riscv64_bootstrap_sys_munmap((void*)(uintptr_t)arch_syscall_arg0(frame),
                                                                                      (size_t)arch_syscall_arg1(frame)));
             return;
-        case SYS_BRK:
         case RISCV64_LINUX_SYS_BRK:
             arch_syscall_set_return(frame, riscv64_bootstrap_sys_brk(arch_syscall_arg0(frame)));
             return;
-        case SYS_WAIT4:
         case RISCV64_LINUX_SYS_WAIT4:
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)riscv64_bootstrap_sys_wait4((int)arch_syscall_arg0(frame),
@@ -1018,7 +911,8 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             /* xv6fs はタイムスタンプを持たないため touch を成功扱いにする */
             arch_syscall_set_return(frame, 0);
             return;
-        case RISCV64_LINUX_SYS_RENAMEAT:
+        /* riscv64 に renameat(38) は無い (asm-generic の __ARCH_WANT_RENAMEAT を
+         * 立てていないため未割り当て)。musl は renameat2 を出す */
         case RISCV64_LINUX_SYS_RENAMEAT2:
             /* xv6fs に rename API が無い。EXDEV を返して mv の copy+unlink
              * フォールバックに乗せる */
@@ -1033,9 +927,7 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                 arch_syscall_set_return(frame, (uint64_t)(int64_t)(rc == 0 ? 0 : -2));
             }
             return;
-        case SYS_EXIT:
         case RISCV64_LINUX_SYS_EXIT:
-        case SYS_EXIT_GROUP:
         case RISCV64_LINUX_SYS_EXIT_GROUP:
             riscv64_bootstrap_sys_exit((int)arch_syscall_arg0(frame));
             return;
@@ -1048,11 +940,8 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
 void riscv64_syscall_dispatch(riscv64_trap_frame_t* frame) {
     if (!frame) return;
 
-    // fork は clone(SIGCHLD, 0) のみで受ける。x86 レガシーの SYS_FORK(57) は
-    // riscv64 の close(57) と番号が衝突しており、`close(0)` が a7=57/a0=a1=a2=0
-    // という完全に同じレジスタ状態になるため、レガシー番号を見ると close(0) が
-    // fork として実行されてしまう (busybox ash の `cmd &` が壊れていた原因)。
-    // riscv64 ユーザーランドは musl のみで、musl の fork() は clone を出す。
+    // fork は clone(SIGCHLD, 0) のみで受ける。riscv64 に fork(2) は無く、
+    // musl の fork() は clone を出す。
     //
     // vfork も同じ入口で受ける。musl の riscv64 vfork は手書き asm で
     //   clone(CLONE_VM|CLONE_VFORK|SIGCHLD, sp)   (= a0=0x4111, a1=sp)

@@ -237,7 +237,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: all clean run riscv64-kernel riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: all clean run riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -382,7 +382,11 @@ riscv64-busybox-musl: $(RISCV64_MUSL_SYSROOT)/lib/libc.a
 	ORTHOS_STRIP="$(shell if [ -x /opt/homebrew/opt/llvm/bin/llvm-strip ]; then printf /opt/homebrew/opt/llvm/bin/llvm-strip; else printf llvm-strip; fi)" \
 	./ports/build_busybox_ash.sh $(abspath ports/busybox) $(abspath $(RISCV64_BUSYBOX_ASH_MUSL_ELF))
 
-riscv64-kernel: $(RISCV64_KERNEL_ELF)
+# レガシー syscall 番号の混入と番号ズレの監査 (過去 2 度衝突で実害が出ている)
+riscv64-syscall-audit:
+	python3 scripts/check_riscv64_syscalls.py
+
+riscv64-kernel: riscv64-syscall-audit $(RISCV64_KERNEL_ELF)
 
 riscv64-run: $(RISCV64_KERNEL_ELF)
 	bash ./run_qemu_riscv64.sh
