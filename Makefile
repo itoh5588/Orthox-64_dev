@@ -238,7 +238,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: all clean run riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: all clean run x86-kernel-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -625,6 +625,11 @@ endif
 	rm -rf iso_root
 
 
+# x86 カーネルの回帰テスト。ISO はスクリプト側で組む
+# (rootfs.img は既存のものを使う。macOS では x86 ユーザーランドを再ビルドできない)
+x86-kernel-smoke: $(KERNEL_ELF)
+	bash ./tests/x86_kernel_smoke.sh
+
 run: $(ISO)
 	bash tests/run_qemu_stdio.sh
 
@@ -717,7 +722,12 @@ nativekernelbootsmoke: $(ISO)
 pythonnumpysmoke: $(ISO)
 	bash ./tests/python_numpy_smoke.sh $(ISO)
 
-smprun: $(ISO)
+smp# x86 カーネルの回帰テスト。ISO はスクリプト側で組む
+# (rootfs.img は既存のものを使う。macOS では x86 ユーザーランドを再ビルドできない)
+x86-kernel-smoke: $(KERNEL_ELF)
+	bash ./tests/x86_kernel_smoke.sh
+
+run: $(ISO)
 	bash tests/run_qemu_stdio.sh \
 		-smp 2
 
@@ -727,11 +737,21 @@ persistsmprun: $(ISO) $(ROOTFS_IMG)
 		$(ROOTFS_VBLK_ARGS) \
 		-smp 2
 
-smp4run: $(ISO)
+smp4# x86 カーネルの回帰テスト。ISO はスクリプト側で組む
+# (rootfs.img は既存のものを使う。macOS では x86 ユーザーランドを再ビルドできない)
+x86-kernel-smoke: $(KERNEL_ELF)
+	bash ./tests/x86_kernel_smoke.sh
+
+run: $(ISO)
 	bash tests/run_qemu_stdio.sh \
 		-smp 4
 
-netrun: $(ISO)
+net# x86 カーネルの回帰テスト。ISO はスクリプト側で組む
+# (rootfs.img は既存のものを使う。macOS では x86 ユーザーランドを再ビルドできない)
+x86-kernel-smoke: $(KERNEL_ELF)
+	bash ./tests/x86_kernel_smoke.sh
+
+run: $(ISO)
 	bash tests/run_qemu_stdio.sh \
 		-netdev user,id=net0,hostfwd=tcp::8080-:8080,hostfwd=udp::12345-:12345,hostfwd=udp::12346-:12346 \
 		-device virtio-net-pci,netdev=net0
