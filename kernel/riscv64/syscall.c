@@ -3,6 +3,7 @@
 #include "pmm.h"
 #include "riscv64/boot.h"
 #include "riscv64/csr.h"
+#include "riscv64/errno.h"
 #include "riscv64/time.h"
 #include "spinlock.h"
 #include "riscv64/linux_syscalls.h"
@@ -151,7 +152,7 @@ static void riscv64_utsname_set(char* dst, const char* src) {
 }
 
 static int riscv64_sys_uname(struct riscv64_linux_utsname* out) {
-    if (!out) return -1;
+    if (!out) return -RISCV64_EFAULT;
     riscv64_utsname_set(out->sysname, "Linux");
     riscv64_utsname_set(out->nodename, "orthox");
     /* busybox の一部は release を Linux のバージョンとしてパースするので
@@ -168,9 +169,9 @@ static int riscv64_sys_uname(struct riscv64_linux_utsname* out) {
  * 「このパス要素は symlink ではない」と判断して先へ進む。 */
 static int riscv64_sys_readlinkat(int dirfd, const char* path) {
     struct kstat st;
-    if (!path) return -14; /* EFAULT */
-    if (sys_fstatat(dirfd, path, &st, 0) < 0) return -2; /* ENOENT */
-    return -22; /* EINVAL: not a symbolic link */
+    if (!path) return -RISCV64_EFAULT;
+    if (sys_fstatat(dirfd, path, &st, 0) < 0) return -RISCV64_ENOENT;
+    return -RISCV64_EINVAL; /* not a symbolic link */
 }
 
 struct riscv64_linux_winsize {
@@ -213,10 +214,10 @@ static int64_t riscv64_bootstrap_sys_lseek(int fd, int64_t offset, int whence) {
     int64_t next;
 
     /* 戻り値は -errno 規約。-1 は EPERM として顕在化するので使わない */
-    if (!current) return -1 /* EPERM */;
-    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -9;  /* EBADF */
+    if (!current) return -RISCV64_ESRCH;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
     f = &current->fds[fd];
-    if (f->type == FT_DIR) return -29; /* ESPIPE */
+    if (f->type == FT_DIR) return -RISCV64_ESPIPE;
 
     switch (whence) {
         case 0:
@@ -229,38 +230,42 @@ static int64_t riscv64_bootstrap_sys_lseek(int fd, int64_t offset, int whence) {
             base = (int64_t)f->size;
             break;
         default:
-            return -22; /* EINVAL */
+            return -RISCV64_EINVAL;
     }
 
     next = base + offset;
-    if (next < 0) return -22; /* EINVAL */
+    if (next < 0) return -RISCV64_EINVAL;
     /* 書き込み用に開いた xv6fs ファイルは EOF 越えのシークを許す (穴あき書き込み) */
     if ((uint64_t)next > f->size &&
         !(f->type == FT_XV6FS && ((f->flags & 3) == O_WRONLY || (f->flags & 3) == O_RDWR))) {
-        return -22; /* EINVAL */
+        return -RISCV64_EINVAL;
     }
     f->offset = (size_t)next;
     return next;
 }
 
 static int riscv64_bootstrap_sys_fchmodat(int dirfd, const char* path, uint32_t mode) {
-    if (!path || path[0] == '\0') return -1;
-    /* AT_FDCWD(-100) と絶対パスのみ対応。sys_chmod が cwd 相対を解決する */
-    if (path[0] != '/' && dirfd != -100) return -1;
+    if (!path) return -RISCV64_EFAULT;
+    if (path[0] == '\0') return -RISCV64_ENOENT;
+    /* AT_FDCWD(-100) と絶対パスのみ対応。sys_chmod が cwd 相対を解決する。
+     * それ以外の dirfd は解決できないので EBADF を返す (「この dirfd は使えない」) */
+    if (path[0] != '/' && dirfd != -100) return -RISCV64_EBADF;
     return sys_chmod(path, mode);
 }
 
 static int riscv64_bootstrap_sys_fchmod(int fd, uint32_t mode) {
     struct task* current = get_current_task();
-    if (!current) return -1;
-    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -1;
-    if (current->fds[fd].name[0] == '\0') return -1;
+    if (!current) return -RISCV64_ESRCH;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
+    /* パスを持たない fd (パイプ / 疑似デバイス) は xv6fs の inode を辿れない */
+    if (current->fds[fd].name[0] == '\0') return -RISCV64_EINVAL;
     return sys_chmod(current->fds[fd].name, mode);
 }
 
 static int64_t riscv64_bootstrap_sys_writev(int fd, const struct riscv64_linux_iovec* iov, int iovcnt) {
     int64_t total = 0;
-    if (!iov || iovcnt < 0) return -1;
+    if (iovcnt < 0) return -RISCV64_EINVAL;
+    if (iovcnt != 0 && !iov) return -RISCV64_EFAULT;
     for (int i = 0; i < iovcnt; i++) {
         int64_t rc = riscv64_bootstrap_sys_write(fd, iov[i].iov_base, iov[i].iov_len);
         if (rc < 0) return (total > 0) ? total : rc;
@@ -272,7 +277,8 @@ static int64_t riscv64_bootstrap_sys_writev(int fd, const struct riscv64_linux_i
 
 static int64_t riscv64_bootstrap_sys_readv(int fd, const struct riscv64_linux_iovec* iov, int iovcnt) {
     int64_t total = 0;
-    if (!iov || iovcnt < 0) return -1;
+    if (iovcnt < 0) return -RISCV64_EINVAL;
+    if (iovcnt != 0 && !iov) return -RISCV64_EFAULT;
     for (int i = 0; i < iovcnt; i++) {
         int64_t rc = sys_read(fd, iov[i].iov_base, iov[i].iov_len);
         if (rc < 0) return (total > 0) ? total : rc;
@@ -316,8 +322,10 @@ static int riscv64_bootstrap_sys_munmap(void* addr, size_t length) {
     uint64_t size = riscv64_align_up_page((uint64_t)length);
     arch_address_space_t address_space;
 
-    if (!current || !addr || length == 0) return -1;
-    if ((base & (PAGE_SIZE - 1ULL)) != 0) return -1;
+    if (!current) return -RISCV64_ESRCH;
+    /* Linux の munmap は addr がページ境界でない / length が 0 を EINVAL とする */
+    if (!addr || length == 0) return -RISCV64_EINVAL;
+    if ((base & (PAGE_SIZE - 1ULL)) != 0) return -RISCV64_EINVAL;
 
     address_space = arch_task_context_get_address_space(&current->ctx);
     for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
@@ -330,27 +338,29 @@ static int riscv64_bootstrap_sys_munmap(void* addr, size_t length) {
 static int riscv64_bootstrap_sys_set_tid_address(int* tidptr) {
     struct task* current = get_current_task();
     (void)tidptr;
-    return current ? current->pid : -1;
+    return current ? current->pid : -RISCV64_ESRCH;
 }
 
 static int riscv64_bootstrap_sys_futex(volatile int* uaddr, int op, int val) {
     int cmd = op & ~FUTEX_PRIVATE;
-    if (!uaddr) return -1;
+    if (!uaddr) return -RISCV64_EFAULT;
     switch (cmd) {
         case FUTEX_WAIT:
-            return (*uaddr == val) ? 0 : -11;
+            return (*uaddr == val) ? 0 : -RISCV64_EAGAIN;
         case FUTEX_WAKE:
             return 0;
         default:
-            return -1;
+            /* 未対応の futex 操作。EPERM だと呼び出し側が「権限が無い」と
+             * 誤解するので、実装が無いことを ENOSYS で伝える */
+            return -RISCV64_ENOSYS;
     }
 }
 
 static int riscv64_bootstrap_sys_clock_gettime(int clock_id, struct riscv64_linux_timespec* ts) {
     uint64_t ms;
-    if (!ts) return -1;
+    if (!ts) return -RISCV64_EFAULT;
     ms = arch_time_now_ms();
-    if (clock_id != 0 && clock_id != 1) return -1;
+    if (clock_id != 0 && clock_id != 1) return -RISCV64_EINVAL;
     ts->tv_sec = (int64_t)(ms / 1000ULL);
     ts->tv_nsec = (int64_t)((ms % 1000ULL) * 1000000ULL);
     return 0;
@@ -465,8 +475,8 @@ static int64_t riscv64_bootstrap_sys_ppoll(struct riscv64_linux_pollfd* fds, uin
     uint64_t deadline = 0;
     int has_deadline = 0;
 
-    if (nfds > MAX_FDS) return -22;        /* EINVAL */
-    if (nfds != 0 && !fds) return -14;     /* EFAULT */
+    if (nfds > MAX_FDS) return -RISCV64_EINVAL;
+    if (nfds != 0 && !fds) return -RISCV64_EFAULT;
 
     if (timeout) {
         uint64_t ms = (uint64_t)timeout->tv_sec * 1000ULL +
@@ -523,12 +533,12 @@ static int riscv64_bootstrap_sys_nanosleep(const struct riscv64_linux_timespec* 
     uint64_t ms;
     uint64_t deadline;
 
-    if (!req) return -14; /* EFAULT */
+    if (!req) return -RISCV64_EFAULT;
     /* musl の sleep() は nanosleep(&tv, &tv) と req と rem に同じポインタを渡す。
      * rem を先に書くと要求時間を自分で潰すので、必ず req を退避してから触ること */
     req_sec = req->tv_sec;
     req_nsec = req->tv_nsec;
-    if (req_sec < 0 || req_nsec < 0 || req_nsec >= 1000000000L) return -22; /* EINVAL */
+    if (req_sec < 0 || req_nsec < 0 || req_nsec >= 1000000000L) return -RISCV64_EINVAL;
     if (rem) {
         rem->tv_sec = 0;
         rem->tv_nsec = 0;
@@ -552,14 +562,14 @@ static int riscv64_bootstrap_sys_nanosleep(const struct riscv64_linux_timespec* 
 static int64_t riscv64_bootstrap_sys_ioctl(int fd, unsigned long request, uint64_t arg) {
     switch (request) {
         case RISCV64_LINUX_TIOCGWINSZ:
-            if (!arg) return -1;
+            if (!arg) return -RISCV64_EFAULT;
             ((struct riscv64_linux_winsize*)(uintptr_t)arg)->ws_row = 25;
             ((struct riscv64_linux_winsize*)(uintptr_t)arg)->ws_col = 80;
             ((struct riscv64_linux_winsize*)(uintptr_t)arg)->ws_xpixel = 0;
             ((struct riscv64_linux_winsize*)(uintptr_t)arg)->ws_ypixel = 0;
             return 0;
         case RISCV64_LINUX_TIOCGPGRP:
-            if (!arg) return -1;
+            if (!arg) return -RISCV64_EFAULT;
             if (g_riscv64_tty_pgrp == 0) {
                 struct task* current = get_current_task();
                 if (current) g_riscv64_tty_pgrp = current->pgid;
@@ -567,28 +577,30 @@ static int64_t riscv64_bootstrap_sys_ioctl(int fd, unsigned long request, uint64
             *(int*)(uintptr_t)arg = g_riscv64_tty_pgrp;
             return 0;
         case RISCV64_LINUX_TIOCSPGRP:
-            if (!arg) return -1;
+            if (!arg) return -RISCV64_EFAULT;
             g_riscv64_tty_pgrp = *(const int*)(uintptr_t)arg;
             return 0;
         case RISCV64_LINUX_TCGETS:
-            if (!arg) return -1;
+            if (!arg) return -RISCV64_EFAULT;
             *(struct riscv64_linux_termios*)(uintptr_t)arg = g_riscv64_console_termios;
             return 0;
         case RISCV64_LINUX_TCSETS:
-            if (!arg) return -1;
+            if (!arg) return -RISCV64_EFAULT;
             g_riscv64_console_termios = *(const struct riscv64_linux_termios*)(uintptr_t)arg;
             return 0;
         default:
             (void)fd;
-            return -25;
+            /* コンソール以外の ioctl は無い。ENOTTY は musl/busybox が
+             * 「tty ではない」と解釈して素通りできる唯一の値 */
+            return -RISCV64_ENOTTY;
     }
 }
 
 static int riscv64_bootstrap_sys_rt_sigprocmask(int how, const uint64_t* set, uint64_t* oldset, size_t sigsetsize) {
     struct task* current = get_current_task();
     uint64_t newmask;
-    if (!current) return -1;
-    if (sigsetsize != sizeof(uint64_t)) return -1;
+    if (!current) return -RISCV64_ESRCH;
+    if (sigsetsize != sizeof(uint64_t)) return -RISCV64_EINVAL;
     if (oldset) *oldset = current->sig_mask;
     if (!set) return 0;
     newmask = *set;
@@ -603,7 +615,7 @@ static int riscv64_bootstrap_sys_rt_sigprocmask(int how, const uint64_t* set, ui
             current->sig_mask = newmask;
             break;
         default:
-            return -1;
+            return -RISCV64_EINVAL;
     }
     return 0;
 }
@@ -611,8 +623,9 @@ static int riscv64_bootstrap_sys_rt_sigprocmask(int how, const uint64_t* set, ui
 static int riscv64_bootstrap_sys_rt_sigaction(int sig, const struct riscv64_linux_sigaction* act,
                                               struct riscv64_linux_sigaction* oldact, size_t sigsetsize) {
     struct task* current = get_current_task();
-    if (!current || sig <= 0 || sig >= 32) return -1;
-    if (sigsetsize != sizeof(uint64_t)) return -1;
+    if (!current) return -RISCV64_ESRCH;
+    if (sig <= 0 || sig >= 32) return -RISCV64_EINVAL;
+    if (sigsetsize != sizeof(uint64_t)) return -RISCV64_EINVAL;
     if (oldact) {
         oldact->sa_handler = current->sig_handlers[sig];
         oldact->sa_flags = current->sig_action_flags[sig];
@@ -632,7 +645,7 @@ static int64_t riscv64_bootstrap_sys_getrandom(void* buf, size_t len, unsigned f
     uint8_t* out = (uint8_t*)buf;
     uint64_t seed;
     (void)flags;
-    if (!out) return -1;
+    if (!out) return -RISCV64_EFAULT;
     seed = arch_time_now_ms() ^ (uint64_t)(uintptr_t)get_current_task() ^ 0x9E3779B97F4A7C15ULL;
     for (size_t i = 0; i < len; i++) {
         seed ^= seed >> 12;
@@ -652,7 +665,7 @@ static int64_t riscv64_bootstrap_sys_waitid(int idtype, int id, struct riscv64_l
 
     if (idtype == 0) target = id;
     else if (idtype == 1) target = -1;
-    else return -1;
+    else return -RISCV64_EINVAL;
 
     wait_pid = (int)riscv64_bootstrap_sys_wait4(target, &status, options);
     if (wait_pid < 0) return wait_pid;
@@ -662,6 +675,13 @@ static int64_t riscv64_bootstrap_sys_waitid(int idtype, int id, struct riscv64_l
         infop->si_code = 1;
     }
     return 0;
+}
+
+/* mmap(2) の失敗は「戻り値そのもの」が -errno になる (musl の __syscall_ret は
+ * -4096 < ret < 0 を errno へ写す)。(void*)-1 を返すと MAP_FAILED ではなく
+ * -EPERM を返したことになり、ユーザーには "Operation not permitted" として出る */
+static void* riscv64_mmap_err(int err) {
+    return (void*)(intptr_t)(-err);
 }
 
 static void* riscv64_bootstrap_sys_mmap(void* addr, size_t length, int prot, int flags, int fd, int64_t offset) {
@@ -676,12 +696,15 @@ static void* riscv64_bootstrap_sys_mmap(void* addr, size_t length, int prot, int
     (void)addr;
     (void)offset;
 
-    if (!current || length == 0) return (void*)-1;
-    if ((flags & MAP_ANONYMOUS) == 0 || (flags & MAP_PRIVATE) == 0) return (void*)-1;
-    if (fd != -1) return (void*)-1;
+    if (!current) return riscv64_mmap_err(RISCV64_ESRCH);
+    if (length == 0) return riscv64_mmap_err(RISCV64_EINVAL);
+    /* 無名 private マップ以外は未対応。ファイルマップは ENODEV ではなく、
+     * musl が「この組み合わせは使えない」と判断できる EINVAL で返す */
+    if ((flags & MAP_ANONYMOUS) == 0 || (flags & MAP_PRIVATE) == 0) return riscv64_mmap_err(RISCV64_EINVAL);
+    if (fd != -1) return riscv64_mmap_err(RISCV64_EINVAL);
 
     size = riscv64_align_up_page((uint64_t)length);
-    if (!size) return (void*)-1;
+    if (!size) return riscv64_mmap_err(RISCV64_EINVAL);
 
     base = current->mmap_end;
     if (base < RISCV64_USER_MMAP_BASE_VADDR) base = RISCV64_USER_MMAP_BASE_VADDR;
@@ -700,12 +723,13 @@ static void* riscv64_bootstrap_sys_mmap(void* addr, size_t length, int prot, int
         if (!occupied) break;
         base += PAGE_SIZE;
     }
-    if (base + size > limit) return (void*)-1;
+    /* ユーザー VA を使い切った */
+    if (base + size > limit) return riscv64_mmap_err(RISCV64_ENOMEM);
 
     map_flags = arch_vm_user_page_flags((prot & PROT_WRITE) != 0, 0);
     for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
         uint64_t phys = (uint64_t)(uintptr_t)pmm_alloc(1);
-        if (!phys) return (void*)-1;
+        if (!phys) return riscv64_mmap_err(RISCV64_ENOMEM);
         for (uint64_t i = 0; i < PAGE_SIZE; i++) {
             ((uint8_t*)(uintptr_t)phys)[i] = 0;
         }
@@ -720,7 +744,7 @@ static int64_t riscv64_bootstrap_sys_wait4(int pid, int* wstatus, int options) {
     struct task* current = get_current_task();
     (void)options;
 
-    if (!current) return -1;
+    if (!current) return -RISCV64_ESRCH;
 
     while (1) {
         int found_child = 0;
@@ -737,7 +761,9 @@ static int64_t riscv64_bootstrap_sys_wait4(int pid, int* wstatus, int options) {
             }
             candidate = candidate->next;
         }
-        if (!found_child) return -1;
+        /* 待つべき子がいない。ash のジョブ回収は wait4 が ECHILD を返すまで
+         * 回すので、ここを EPERM にすると回収ループが止まらない */
+        if (!found_child) return -RISCV64_ECHILD;
         kernel_yield();
     }
 }

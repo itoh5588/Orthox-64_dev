@@ -14,7 +14,11 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int g_bad;
@@ -113,6 +117,45 @@ int main(void) {
 
     errno = 0;
     check("unlink-dir", unlink("/etc") < 0, errno, EISDIR);
+
+    /* ここから下は kernel/riscv64/syscall.c 側 (fs.c 以外) の失敗経路。
+     * mmap は「戻り値そのものが -errno」なので -1 を返すと MAP_FAILED では
+     * なく EPERM になる。wait4 の ECHILD は ash のジョブ回収が見ている */
+
+    errno = 0;
+    check("wait-nochild", wait(NULL) < 0, errno, ECHILD);
+
+    errno = 0;
+    check("mmap-zero-len",
+          mmap(NULL, 0, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED,
+          errno, EINVAL);
+
+    errno = 0;
+    /* 無名マップ以外は未対応 (fd を渡した形) */
+    check("mmap-with-fd",
+          mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 0, 0) == MAP_FAILED,
+          errno, EINVAL);
+
+    errno = 0;
+    /* ページ境界でない addr */
+    check("munmap-misaligned", munmap((void*)0x1001, 4096) < 0, errno, EINVAL);
+
+    errno = 0;
+    check("munmap-zero-len", munmap((void*)0x2000, 0) < 0, errno, EINVAL);
+
+    errno = 0;
+    {
+        struct timespec ts;
+        check("clock_gettime-badclock", clock_gettime(99, &ts) < 0, errno, EINVAL);
+    }
+
+    errno = 0;
+    /* コンソール以外の ioctl は無い。ENOTTY でないと musl/busybox が
+     * 「tty ではない」と判断できない */
+    check("ioctl-unknown", ioctl(1, 0x1234, 0) < 0, errno, ENOTTY);
+
+    errno = 0;
+    check("lseek-bad-whence", lseek(1, 0, 99) < 0, errno, EINVAL);
 
     if (g_bad == 0) {
         put_str("ERRNO-PROBE-OK\n");

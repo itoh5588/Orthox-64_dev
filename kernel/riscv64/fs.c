@@ -4,6 +4,7 @@
 #include "pmm.h"
 #include "riscv64/boot.h"
 #include "riscv64/bootstrap_user.h"
+#include "riscv64/errno.h"
 #include "riscv64/syscall.h"
 #include "sys_internal.h"
 #include "task.h"
@@ -21,23 +22,7 @@ struct riscv64_linux_dirent64 {
 /* Linux AT_REMOVEDIR (unlinkat の第3引数) */
 #define RISCV64_AT_REMOVEDIR 0x200
 
-/*
- * syscall の戻り値は -errno 規約 (musl の __syscall_ret がそのまま errno にする)。
- * 「よく分からない失敗はとりあえず -1」は -EPERM = "Operation not permitted"
- * としてユーザーに出るので使わないこと。busybox は ENOENT を見て挙動を変える
- * 箇所が多く (`rm -f` が典型)、EPERM だと誤動作する。
- */
-#define RISCV64_EPERM       1
-#define RISCV64_ENOENT      2
-#define RISCV64_EBADF       9
-#define RISCV64_EFAULT     14
-#define RISCV64_ENOTDIR    20
-#define RISCV64_EISDIR     21
-#define RISCV64_EINVAL     22
-#define RISCV64_EMFILE     24
-#define RISCV64_ENOSPC     28
-#define RISCV64_EROFS      30
-#define RISCV64_ENOTEMPTY  39
+/* errno 定数は include/riscv64/errno.h (syscall.c と共有) */
 
 /* 待ち手が「寝ている」かの判定。read/write は TASK_SLEEPING で寝るが、
  * ppoll は期限付きで待つため TASK_IO_WAIT になる。どちらも起こす対象 */
