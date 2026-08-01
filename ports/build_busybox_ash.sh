@@ -16,6 +16,36 @@ if [ ! -d "$SRC" ]; then
   exit 1
 fi
 
+# Orthox 向けの busybox 改変を当てる。
+#
+# ports/busybox は .gitignore 対象なので、clone した直後の木には当たっていない。
+# 以前はこのパッチがどこからも適用されておらず「手で当てる」運用だった (当て
+# 忘れると Clang が ash / lineedit の const ポインタハックを畳み込んで、起動
+# 直後にページフォルトする)。ビルドの入口で必ず通るここに置く。
+#
+# 冪等性: 逆向きに当たるなら適用済みとみなして何もしない。順方向に当たるなら
+# 当てる。どちらでもない (部分適用など) なら黙って進まず落とす。
+# 判定はすべて --dry-run で行うので .rej / .orig を残さない。
+PATCH_FILE="${ORTHOS_BUSYBOX_PATCH:-$ROOT/ports/busybox-orthox.patch}"
+if [ -f "$PATCH_FILE" ]; then
+  if (cd "$SRC" && patch -p1 --dry-run -R -f -s < "$PATCH_FILE" >/dev/null 2>&1); then
+    echo "busybox: Orthox パッチは適用済み ($PATCH_FILE)"
+  elif (cd "$SRC" && patch -p1 --dry-run -f -s < "$PATCH_FILE" >/dev/null 2>&1); then
+    (cd "$SRC" && patch -p1 -f -s < "$PATCH_FILE")
+    echo "busybox: Orthox パッチを適用した ($PATCH_FILE)"
+  else
+    echo "busybox: Orthox パッチを適用できない: $PATCH_FILE" >&2
+    echo "  適用済みでも未適用でもない (部分適用 / busybox のバージョン違い) 可能性がある。" >&2
+    echo "  確認: cd $SRC && patch -p1 --dry-run < $PATCH_FILE" >&2
+    echo "  git 管理下なら復旧: git -C $SRC checkout ." >&2
+    echo "  (自動では直さない。busybox 側の手作業を消してしまうため)" >&2
+    exit 1
+  fi
+else
+  echo "busybox: パッチが見つからない: $PATCH_FILE" >&2
+  exit 1
+fi
+
 export PATH="/opt/homebrew/bin:$PATH"
 export LC_ALL=C
 
