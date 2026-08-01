@@ -6,12 +6,26 @@
 # ものの、**既存の rootfs.img に必要なテストプログラムが入っている**ので、
 # 新しくビルドしたカーネルと組み合わせれば実行検証はできる。
 #
-# 位置づけ (重要): これは**退行検出**のテストであって、riscv64 で入れた
-# 「起床時に resched を要求する」修正の効果を測るものではない。
-# 実測したところ、その修正を無効にしても x86 では sleep_ms の実測経過が
-# 変わらなかった (120ms -> 120ms, 250ms -> 250ms)。理由は詰め切れていない。
-# ここで守れるのは「タイマー割り込み文脈から IPI を飛ばすようになっても
-# SMP でハング/クラッシュしない」ことと、スケジューラが壊れていないこと。
+# 起床レイテンシについて:
+# riscv64 で入れた「起床時に resched を要求する」修正 (task_poll_sleep_wakeups)
+# は x86 でも効く。以前ここには「x86 では実測経過が変わらなかった」と書いて
+# あったが、それは 1 回しか測っていなかったための誤りだった。
+#
+#   resched 要求あり  sleep_ms(120) -> 120 120 120 120 120 120
+#   resched 要求なし  sleep_ms(120) -> 130 140 140 160 150 170
+#
+# 差が riscv64 (2601ms -> 1033ms) より小さいのは、x86 には resched のもう一つの
+# 出どころがあるため。task_on_timer_tick() は idle タスクも「RUNNING の
+# タスク」として扱うので、そのタイムスライスが尽きるたびに resched を要求する
+# = TASK_TIMESLICE_TICKS(5) x SCHED_TICK_MS(10ms) = 50ms ごと。
+# よって起床時の要求が無くても、待たされるのは最大 50ms (10ms 刻み) で済む。
+# riscv64 は tick が 100ms なので同じ構造で 500ms になる。
+# sleep_ms(250) がほぼ常に 250ms なのは、250 が 50ms の倍数で、起床する tick が
+# idle の resched tick と重なりやすいから。ここを 1 回だけ測ると「効果が無い」
+# ように見える。**下ではそれを踏まないよう 4 回測って全サンプルを見ている。**
+#
+# ここで守れるのはそれに加えて「タイマー割り込み文脈から IPI を飛ばすように
+# なっても SMP でハング/クラッシュしない」ことと、スケジューラが壊れていないこと。
 #
 # 使うもの (すべて rootfs.img に既存):
 #   /bin/testtime.elf      sleep_ms の実測経過 -> 起床レイテンシ
@@ -74,6 +88,14 @@ xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
 # ブート直後に /etc/bootcmd のスモークが走るので、それが終わるまで待ってから流す
 (
     sleep 25
+    # 4 回測る。遅れ幅は 0..50ms に散るので、1 回だけだと遅れ 0 のサンプルを
+    # 引いて見逃す (下で「全サンプル」を見るのはこのため)
+    printf '/bin/testtime.elf\n'
+    sleep 8
+    printf '/bin/testtime.elf\n'
+    sleep 8
+    printf '/bin/testtime.elf\n'
+    sleep 8
     printf '/bin/testtime.elf\n'
     sleep 8
     printf '/bin/tickratecheck.elf\n'
@@ -118,15 +140,35 @@ python3 - "$SERIAL_LOG" <<'PY'
 import re, sys
 log = open(sys.argv[1], 'rb').read().decode('utf-8', 'replace')
 deltas = [int(m) for m in re.findall(r'\(delta=(\d+)\)', log)]
-if len(deltas) < 2:
+# testtime.elf は 1 回の実行で (120, 250) の順に 2 個出す
+runs = list(zip(deltas[0::2], deltas[1::2]))
+if not runs:
     print("testtime: delta が取れない: %r" % deltas); sys.exit(1)
-d120, d250 = deltas[0], deltas[1]
-print("testtime: sleep_ms(120) -> %dms, sleep_ms(250) -> %dms" % (d120, d250))
-# 寝ていない (短すぎる) / 起床が遅すぎる のどちらも落とす
-if not (100 <= d120 <= 400):
-    print("testtime: sleep_ms(120) の実測が範囲外"); sys.exit(1)
-if not (230 <= d250 <= 600):
-    print("testtime: sleep_ms(250) の実測が範囲外"); sys.exit(1)
+print("testtime: %s" % ", ".join("120->%dms/250->%dms" % r for r in runs))
+
+for d120, d250 in runs:
+    # 寝ていない (短すぎる) / 起床が極端に遅い のどちらも落とす
+    if not (100 <= d120 <= 400):
+        print("testtime: sleep_ms(120) の実測が範囲外"); sys.exit(1)
+    if not (230 <= d250 <= 600):
+        print("testtime: sleep_ms(250) の実測が範囲外"); sys.exit(1)
+
+# 起床時に resched を要求しているか。要求が無いと idle のタイムスライスが
+# 尽きるまで待たされる (0..50ms のどこか)。
+#
+# 判定は「全サンプルが 130ms 以下」。
+#   - 上限が 130 なのは、tick が 10ms なので寝始めた位置によって 1 tick 分の
+#     量子化が乗るため (SMP=1 で実測 130ms)。これはスケジューラの遅れではない
+#   - 最小値で見てはいけない: 要求が無くてもたまたま遅れ 0 のサンプルが混じる
+#     ので、最小値だと素通りする (実際に 3 回の最小値で試して見逃した)
+#   - 要求が無いときは 130..170ms に散るので、4 サンプルのどれかが 130 を超える。
+#     全部が 130 以下に収まる確率は数 % 残るが、それ以上詰めると量子化と
+#     区別できなくなる
+worst = max(d for d, _ in runs)
+print("testtime: sleep_ms(120) の最大 = %dms (%d サンプル)" % (worst, len(runs)))
+if worst > 130:
+    print("testtime: 起床が遅い。task_poll_sleep_wakeups() の resched 要求を疑う")
+    sys.exit(1)
 PY
 
 # タイマー起床が 5 回続けて効く
