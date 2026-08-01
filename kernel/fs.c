@@ -42,8 +42,46 @@ extern void puthex(uint64_t v);
  * most of the throughput lost by the earlier conservative 64 KiB cap.
  */
 #define XV6FS_WRITE_CHUNK_MAX (112U * 1024U)
+/*
+ * syscall の戻り値は -errno 規約 (kernel/sys_fs.c が fs_* の戻り値をそのまま
+ * ユーザーへ返し、user/syscalls.c が -4095..-1 を errno へ写す)。
+ * 「よく分からない失敗はとりあえず -1」は -EPERM = "Operation not permitted"
+ * としてユーザーに出るので、公開 fs_* からは返さないこと。
+ * busybox は errno を見て挙動を変える箇所が多く (`rm -f` が典型)、
+ * EPERM だと誤動作する。tests/x86_errno_smoke.sh が代表例を見張っている。
+ *
+ * 内部ヘルパ (FAT/USB/dirent 構築など) は「見つからない」を -1 で表す内部規約の
+ * ままにしてあり、公開 fs_* の境界で errno に翻訳している。
+ */
 #ifndef ENOENT
 #define ENOENT 2
+#endif
+#ifndef ESRCH
+#define ESRCH 3
+#endif
+#ifndef EIO
+#define EIO 5
+#endif
+#ifndef ENOMEM
+#define ENOMEM 12
+#endif
+#ifndef EACCES
+#define EACCES 13
+#endif
+#ifndef EFAULT
+#define EFAULT 14
+#endif
+#ifndef ENOTDIR
+#define ENOTDIR 20
+#endif
+#ifndef ENFILE
+#define ENFILE 23
+#endif
+#ifndef EMFILE
+#define EMFILE 24
+#endif
+#ifndef ERANGE
+#define ERANGE 34
 #endif
 #ifndef EBADF
 #define EBADF 9
@@ -1353,7 +1391,7 @@ int fs_get_mount_status(char* buf, size_t size) {
                                "root=xv6fs:vblk0" : "root=xv6fs:bootimg0";
     const char* src = (g_root_source == ROOT_SOURCE_MODULE) ? module_root : xv6fs_root;
     size_t i = 0;
-    if (!buf || size == 0) return -1;
+    if (!buf || size == 0) return -EFAULT;
     while (src[i] && i + 1 < size) { buf[i] = src[i]; i++; }
     buf[(i < size) ? i : (size - 1)] = '\0';
     return 0;
@@ -1680,7 +1718,7 @@ int fs_open(const char* path, int flags, int mode) {
     const char* mount_subpath = 0;
     const struct vfs_mountpoint* mount = 0;
     char resolved_path[256];
-    if (!current) return -1;
+    if (!current) return -ESRCH;
 
     int fd = -1;
     /* POSIX: 最小の空き fd を割り当てる (0-2 も対象。busybox ash の
@@ -1691,7 +1729,7 @@ int fs_open(const char* path, int flags, int mode) {
             break;
         }
     }
-    if (fd == -1) return -1;
+    if (fd == -1) return -EMFILE;
 
     resolve_task_path(path, resolved_path, sizeof(resolved_path));
     path = normalize_fs_path(resolved_path);
@@ -1706,28 +1744,28 @@ int fs_open(const char* path, int flags, int mode) {
         size_t entry_count = 0;
         fs_file_t* file;
         void* phys = pmm_alloc(DIR_BUF_PAGES);
-        if (!phys) return -1;
+        if (!phys) return -ENOMEM;
         dirents = (struct orth_dirent*)PHYS_TO_VIRT(phys);
         if (*path == '\0') {
             if (build_root_dirents(dirents, DIR_BUF_BYTES / sizeof(struct orth_dirent), &entry_count) < 0) {
                 pmm_free(phys, DIR_BUF_PAGES);
-                return -1;
+                return -ENOENT;
             }
         } else if (mount && mount->kind == VFS_MOUNT_USB_FAT) {
             if (build_usb_dirents(path, dirents, DIR_BUF_BYTES / sizeof(struct orth_dirent), &entry_count) < 0) {
                 pmm_free(phys, DIR_BUF_PAGES);
-                return -1;
+                return -ENOENT;
             }
         } else {
             if (build_active_root_dirents(path, dirents, DIR_BUF_BYTES / sizeof(struct orth_dirent), &entry_count) < 0) {
                 pmm_free(phys, DIR_BUF_PAGES);
-                return -1;
+                return -ENOENT;
             }
         }
         file = fs_alloc_file();
         if (!file) {
             pmm_free(phys, DIR_BUF_PAGES);
-            return -1;
+            return -ENFILE;
         }
         file->type = FT_DIR;
         file->size = entry_count * sizeof(struct orth_dirent);
@@ -1765,10 +1803,10 @@ int fs_open(const char* path, int flags, int mode) {
         struct fat_dir_entry_info ent;
         fs_file_t* file;
         if ((flags & O_WRONLY) || (flags & O_RDWR) || want_creat) return -EROFS;
-        if (fat_resolve_path(path, &ent) < 0) return -1;
-        if (ent.attr & 0x10U) return -1;
+        if (fat_resolve_path(path, &ent) < 0) return -ENOENT;
+        if (ent.attr & 0x10U) return -EISDIR;
         file = fs_alloc_file();
-        if (!file) return -1;
+        if (!file) return -ENFILE;
         file->type = FT_USB;
         file->size = ent.size;
         file->offset = 0;
@@ -1808,7 +1846,7 @@ int fs_open(const char* path, int flags, int mode) {
             rf->ctime_sec = rf->mtime_sec;
         }
         file = fs_alloc_file();
-        if (!file) return -1;
+        if (!file) return -ENFILE;
         file->type = FT_RAMFS;
         file->size = rf->size;
         file->offset = 0;
@@ -1839,7 +1877,7 @@ int fs_open(const char* path, int flags, int mode) {
         (path[0]=='d' && path[1]=='e' && path[2]=='v' && path[3]=='/' &&
          path[4]=='k' && path[5]=='o' && path[6]=='u' && path[7]=='t' && path[8]=='\0')) {
         fs_file_t* file = fs_alloc_file();
-        if (!file) return -1;
+        if (!file) return -ENFILE;
         file->type = FT_RAWDEV;
         file->size = 0;
         file->offset = 0;
@@ -1882,12 +1920,12 @@ int fs_open(const char* path, int flags, int mode) {
                 }
                 if (want_trunc && xv6fs_truncate_file(path, 0) < 0) {
                     xv6fs_iput(ip);
-                    return -1;
+                    return -EIO;
                 }
                 file = fs_alloc_file();
                 if (!file) {
                     xv6fs_iput(ip);
-                    return -1;
+                    return -ENFILE;
                 }
                 file->type = FT_XV6FS;
                 file->size = 0;
@@ -1923,7 +1961,7 @@ int fs_open(const char* path, int flags, int mode) {
         rf = create_ramfs(path, (uint32_t)mode);
         if (rf) {
             fs_file_t* file = fs_alloc_file();
-            if (!file) return -1;
+            if (!file) return -ENFILE;
             file->type = FT_RAMFS;
             file->size = 0;
             file->offset = 0;
@@ -1986,7 +2024,7 @@ int fs_open(const char* path, int flags, int mode) {
                     pmm_free((void*)VIRT_TO_PHYS((uint64_t)root_data),
                              (int)((root_size + PAGE_SIZE - 1U) / PAGE_SIZE));
                 }
-                return -1;
+                return -ENFILE;
             }
             file->type = FT_XV6FS;
             file->size = root_size;
@@ -2024,7 +2062,7 @@ int fs_open(const char* path, int flags, int mode) {
         struct limine_file* m = module_request.response->modules[i];
         if (strcmp_suffix_fs(m->path, path)) {
             fs_file_t* file = fs_alloc_file();
-            if (!file) return -1;
+            if (!file) return -ENFILE;
             file->type = FT_MODULE;
             file->size = m->size;
             file->offset = 0;
@@ -2061,7 +2099,7 @@ int fs_openat(int dirfd, const char* path, int flags, int mode) {
 
 int64_t fs_write(int fd, const void* buf, size_t count) {
     struct task* current = get_current_task();
-    if (!current) return -1;
+    if (!current) return -ESRCH;
     if (fd >= 0 && fd < MAX_FDS && current->fds[fd].in_use
         && fs_fd_type(&current->fds[fd]) == FT_CONSOLE) {
         extern int64_t sys_write_serial(const char* buf, size_t count);
@@ -2108,7 +2146,7 @@ int64_t fs_write(int fd, const void* buf, size_t count) {
 
     if (fs_fd_type(f) == FT_RAWDEV) {
         size_t off = fs_fd_offset(f);
-        if (virtio_kout_write_raw((uint64_t)off, buf, count) < 0) return -1;
+        if (virtio_kout_write_raw((uint64_t)off, buf, count) < 0) return -EIO;
         fs_fd_set_offset(f, off + count);
         return (int64_t)count;
     }
@@ -2145,7 +2183,7 @@ int64_t fs_write(int fd, const void* buf, size_t count) {
             if (ip->size > fs_fd_size(f)) fs_fd_set_size(f, ip->size);
             xv6fs_iunlock(ip);
             xv6log_end_op();
-            if (n < 0) return written ? (int64_t)written : -1;
+            if (n < 0) return written ? (int64_t)written : -EIO;
             if (n == 0) break;
             written += (size_t)n;
             if ((size_t)n < chunk) break;
@@ -2154,7 +2192,7 @@ int64_t fs_write(int fd, const void* buf, size_t count) {
         return (int64_t)written;
     }
 
-    if (fs_fd_type(f) != FT_RAMFS) return -1;
+    if (fs_fd_type(f) != FT_RAMFS) return -EBADF;
     {
         struct ramfs_file* rf_w = find_ramfs(fs_fd_name(f));
         if (!rf_w || !rf_w->in_use) return -ENOENT;
@@ -2259,7 +2297,7 @@ static int fs_console_read_blocking(struct task* current, char* buf, size_t coun
 
 int64_t fs_read(int fd, void* buf, size_t count) {
     struct task* current = get_current_task();
-    if (!current) return -1;
+    if (!current) return -ESRCH;
     if (fd >= 0 && fd < MAX_FDS && current->fds[fd].in_use
         && fs_fd_type(&current->fds[fd]) == FT_CONSOLE) {
         extern int kb_read(char* buf, int count);
@@ -2342,10 +2380,10 @@ int64_t fs_read(int fd, void* buf, size_t count) {
         size_t skip;
         size_t offset_now = fs_fd_offset(f);
         size_t size_now = fs_fd_size(f);
-        if (usb_load_fat_boot(&info) < 0) return -1;
+        if (usb_load_fat_boot(&info) < 0) return -EIO;
         cluster = fs_fd_aux0(f);
         cluster_size = (uint32_t)info.bytes_per_sector * info.sectors_per_cluster;
-        if (cluster_size > sizeof(sector)) return -1;
+        if (cluster_size > sizeof(sector)) return -EIO;
         skip = offset_now;
         while (skip >= cluster_size && cluster >= 2 && cluster < 0x0FFFFFF8U) {
             cluster = fat_read_next_cluster(&info, cluster);
@@ -2354,7 +2392,7 @@ int64_t fs_read(int fd, void* buf, size_t count) {
         while (done < count && offset_now < size_now && cluster >= 2 && cluster < 0x0FFFFFF8U) {
             size_t chunk;
             uint32_t lba = fat_cluster_to_lba(&info, cluster);
-            if (usb_read_blocks_safe(lba, sector, info.sectors_per_cluster) < 0) return (done > 0) ? (int64_t)done : -1;
+            if (usb_read_blocks_safe(lba, sector, info.sectors_per_cluster) < 0) return (done > 0) ? (int64_t)done : -EIO;
             chunk = cluster_size - skip;
             if (chunk > count - done) chunk = count - done;
             if (chunk > size_now - offset_now) chunk = size_now - offset_now;
@@ -2369,7 +2407,7 @@ int64_t fs_read(int fd, void* buf, size_t count) {
         return (int64_t)done;
     }
 
-    if (fs_fd_type(f) == FT_DIR) return -1;
+    if (fs_fd_type(f) == FT_DIR) return -EISDIR;
 
     if (fs_fd_type(f) == FT_CHARDEV) {
         uint32_t major = fs_fd_aux0(f);
@@ -2389,7 +2427,7 @@ int64_t fs_read(int fd, void* buf, size_t count) {
                 return sys_getrandom(buf, count, 0);
             }
         }
-        return -1;
+        return -EIO;
     }
 
     if (fs_fd_type(f) == FT_XV6FS) {
@@ -2398,7 +2436,7 @@ int64_t fs_read(int fd, void* buf, size_t count) {
         uint32_t off = (uint32_t)fs_fd_offset(f);
         int n = xv6fs_readi(ip, buf, off, (uint32_t)count);
         xv6fs_iunlock(ip);
-        if (n < 0) return -1;
+        if (n < 0) return -EIO;
         fs_fd_set_offset(f, fs_fd_offset(f) + (size_t)n);
         return (int64_t)n;
     }
@@ -2420,7 +2458,7 @@ int64_t fs_read(int fd, void* buf, size_t count) {
 
 int fs_close(int fd) {
     struct task* current = get_current_task();
-    if (!current) return -1;
+    if (!current) return -ESRCH;
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -EBADF;
 
     fs_assert_open_file_consistent(&current->fds[fd]);
@@ -2430,7 +2468,7 @@ int fs_close(int fd) {
 
 int fs_dup2(int oldfd, int newfd) {
     struct task* current = get_current_task();
-    if (!current) return -1;
+    if (!current) return -ESRCH;
     if (oldfd < 0 || oldfd >= MAX_FDS || !current->fds[oldfd].in_use) return -EBADF;
     if (newfd < 0 || newfd >= MAX_FDS) return -EBADF;
     if (oldfd == newfd) return newfd;
@@ -2439,13 +2477,13 @@ int fs_dup2(int oldfd, int newfd) {
         fs_close(newfd);
     }
 
-    if (fs_dup_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -1;
+    if (fs_dup_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -EMFILE;
     return newfd;
 }
 
 int fs_fcntl(int fd, int cmd, uint64_t arg) {
     struct task* current = get_current_task();
-    if (!current) return -1;
+    if (!current) return -ESRCH;
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -EBADF;
 
     switch (cmd) {
@@ -2456,13 +2494,13 @@ int fs_fcntl(int fd, int cmd, uint64_t arg) {
             if (minfd < 0) return -EINVAL;
             for (int newfd = minfd; newfd < MAX_FDS; newfd++) {
                 if (!current->fds[newfd].in_use) {
-                    if (fs_dup2(fd, newfd) < 0) return -1;
+                    if (fs_dup2(fd, newfd) < 0) return -EMFILE;
                     current->fds[newfd].fd_flags =
                         (cmd != F_DUPFD) ? FD_CLOEXEC : 0;
                     return newfd;
                 }
             }
-            return -1;
+            return -EMFILE;
         }
         case F_GETFD:
             return current->fds[fd].fd_flags;
@@ -2476,13 +2514,13 @@ int fs_fcntl(int fd, int cmd, uint64_t arg) {
                                    | ((int)arg & ~ORTH_O_ACCMODE);
             return 0;
         default:
-            return -1;
+            return -EINVAL;
     }
 }
 
 int fs_pipe(int pipefd[2]) {
     struct task* current = get_current_task();
-    if (!current) return -1;
+    if (!current) return -ESRCH;
 
     int fd1 = -1, fd2 = -1;
     /* POSIX: 最小の空き fd を割り当てる */
@@ -2495,10 +2533,10 @@ int fs_pipe(int pipefd[2]) {
             }
         }
     }
-    if (fd1 == -1 || fd2 == -1) return -1;
+    if (fd1 == -1 || fd2 == -1) return -EMFILE;
 
     void* phys = pmm_alloc(1);
-    if (!phys) return -1;
+    if (!phys) return -ENOMEM;
     pipe_t* pipe = (pipe_t*)PHYS_TO_VIRT(phys);
     pipe->read_pos = 0;
     pipe->write_pos = 0;
@@ -2514,7 +2552,7 @@ int fs_pipe(int pipefd[2]) {
         if (read_file) fs_file_put(read_file);
         if (write_file) fs_file_put(write_file);
         pmm_free((void*)VIRT_TO_PHYS((uint64_t)pipe), 1);
-        return -1;
+        return -ENOMEM;
     }
     read_file->type = FT_PIPE;
     read_file->ops = &g_pipe_file_ops;
@@ -2544,7 +2582,7 @@ int fs_pipe(int pipefd[2]) {
 
 int fs_pipe2(int pipefd[2], int flags) {
     int ret;
-    if (flags & ~(ORTH_LINUX_O_CLOEXEC | ORTH_LINUX_O_NONBLOCK)) return -1;
+    if (flags & ~(ORTH_LINUX_O_CLOEXEC | ORTH_LINUX_O_NONBLOCK)) return -EINVAL;
     ret = fs_pipe(pipefd);
     if (ret < 0) return ret;
     if (flags & ORTH_LINUX_O_CLOEXEC) {
@@ -2559,7 +2597,7 @@ int fs_pipe2(int pipefd[2], int flags) {
 
 int fs_fstat(int fd, struct kstat* st) {
     struct task* current = get_current_task();
-    if (!current || !st) return -1;
+    if (!current || !st) return -EFAULT;
     
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -EBADF;
     
@@ -2634,10 +2672,10 @@ int fs_getdents(int fd, struct orth_dirent* dirp, size_t count) {
     file_descriptor_t* f;
     size_t remaining;
     size_t to_copy;
-    if (!current || !dirp) return -1;
+    if (!current || !dirp) return -EFAULT;
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -EBADF;
     f = &current->fds[fd];
-    if (fs_fd_type(f) != FT_DIR) return -1;
+    if (fs_fd_type(f) != FT_DIR) return -ENOTDIR;
     fs_assert_open_file_consistent(f);
     if (fs_fd_offset(f) >= fs_fd_size(f)) return 0;
     (void)fs_fd_data_required(f, FT_DIR);
@@ -2673,10 +2711,10 @@ int fs_getdents64(int fd, void* dirp, size_t count) {
     size_t out_used = 0;
     size_t index;
 
-    if (!current || !dirp) return -1;
+    if (!current || !dirp) return -EFAULT;
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -EBADF;
     f = &current->fds[fd];
-    if (fs_fd_type(f) != FT_DIR) return -1;
+    if (fs_fd_type(f) != FT_DIR) return -ENOTDIR;
     fs_assert_open_file_consistent(f);
     if (fs_fd_offset(f) >= fs_fd_size(f)) return 0;
 
@@ -2827,10 +2865,10 @@ int fs_faccessat(int dirfd, const char* path, int mode, int flags) {
     struct kstat st;
     uint32_t perm_bits;
     char resolved_path[256];
-    if (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW)) return -1;
-    if (resolve_dirfd_path(dirfd, path, resolved_path, sizeof(resolved_path)) < 0) return -1;
+    if (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW)) return -EINVAL;
+    if (resolve_dirfd_path(dirfd, path, resolved_path, sizeof(resolved_path)) < 0) return -ENOENT;
     if (fs_stat(resolved_path, &st) < 0) {
-        return -1;
+        return -ENOENT;
     }
     if (mode == F_OK) return 0;
     perm_bits = st.mode & 0777U;
@@ -2838,7 +2876,7 @@ int fs_faccessat(int dirfd, const char* path, int mode, int flags) {
     if ((mode & X_OK) == 0) return 0;
     if ((st.mode & 0170000U) == KSTAT_MODE_DIR) return 0;
     if (perm_bits & 0111U) return 0;
-    return -1;
+    return -EACCES;
 }
 
 int fs_utimensat(int dirfd, const char* path, const void* times, int flags) {
@@ -2890,14 +2928,14 @@ int64_t fs_readlinkat(int dirfd, const char* path, char* buf, size_t bufsiz) {
     struct kstat dummy;
     (void)buf;
     (void)bufsiz;
-    if (!path) return -1;
-    if (fs_fstatat(dirfd, path, &dummy, AT_SYMLINK_NOFOLLOW) < 0) return -1;
-    return -1;
+    if (!path) return -EFAULT;
+    if (fs_fstatat(dirfd, path, &dummy, AT_SYMLINK_NOFOLLOW) < 0) return -ENOENT;
+    return -EINVAL;
 }
 
 int64_t fs_lseek(int fd, int64_t offset, int whence) {
     struct task* current = get_current_task();
-    if (!current) return -1;
+    if (!current) return -ESRCH;
     
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -EBADF;
 
@@ -2913,17 +2951,17 @@ int64_t fs_lseek(int fd, int64_t offset, int whence) {
     } else if (whence == 2) { // SEEK_END
         new_offset = (int64_t)fs_fd_size(f) + offset;
     } else {
-        return -1;
+        return -EINVAL;
     }
     
-    if (new_offset < 0) return -1;
+    if (new_offset < 0) return -EINVAL;
     fs_fd_set_offset(f, (size_t)new_offset);
     return new_offset;
 }
 
 int fs_unlink(const char* path) {
     char resolved_path[256];
-    if (!path) return -1;
+    if (!path) return -EFAULT;
     resolve_task_path(path, resolved_path, sizeof(resolved_path));
     path = normalize_fs_path(resolved_path);
     
@@ -2935,7 +2973,7 @@ int fs_unlink(const char* path) {
     // 現在の簡易実装では Ramfs のファイルのみ削除可能とする
     for (int i = 0; i < MAX_RAMFS_FILES; i++) {
         if (ramfs_table[i].in_use && strcmp_exact(ramfs_table[i].name, path)) {
-            if ((ramfs_table[i].mode & 0170000U) == KSTAT_MODE_DIR) return -1;
+            if ((ramfs_table[i].mode & 0170000U) == KSTAT_MODE_DIR) return -EISDIR;
             ramfs_table[i].in_use = 0;
             if (ramfs_table[i].data && ramfs_table[i].capacity) {
                 void* phys_addr = (void*)VIRT_TO_PHYS((uint64_t)ramfs_table[i].data);
@@ -2956,7 +2994,7 @@ int fs_unlink(const char* path) {
         }
     }
     
-    return -1; // ファイルが見つからないか、TAR 内など削除できないファイル
+    return -ENOENT; // ファイルが見つからないか、TAR 内など削除できないファイル
 }
 
 int fs_rename(const char* oldpath, const char* newpath) {
@@ -2965,18 +3003,18 @@ int fs_rename(const char* oldpath, const char* newpath) {
     const char* old_norm;
     const char* new_norm;
     struct ramfs_file* rf;
-    if (!oldpath || !newpath) return -1;
+    if (!oldpath || !newpath) return -EFAULT;
     exec_cache_invalidate(oldpath);
     exec_cache_invalidate(newpath);
     resolve_task_path(oldpath, old_resolved, sizeof(old_resolved));
     resolve_task_path(newpath, new_resolved, sizeof(new_resolved));
     old_norm = normalize_fs_path(old_resolved);
     new_norm = normalize_fs_path(new_resolved);
-    if (*old_norm == '\0' || *new_norm == '\0') return -1;
+    if (*old_norm == '\0' || *new_norm == '\0') return -ENOENT;
     if (strcmp_exact(old_norm, new_norm)) return 0;
-    if (find_ramfs(new_norm)) return -1;
+    if (find_ramfs(new_norm)) return -EEXIST;
     rf = find_ramfs(old_norm);
-    if (!rf) return -1;
+    if (!rf) return -ENOENT;
     int i = 0;
     for (; new_norm[i] && i + 1 < (int)sizeof(rf->name); i++) {
         rf->name[i] = new_norm[i];
@@ -2990,10 +3028,10 @@ int fs_chmod(const char* path, uint32_t mode) {
     char resolved_path[256];
     const char* norm;
     struct ramfs_file* rf;
-    if (!path) return -1;
+    if (!path) return -EFAULT;
     resolve_task_path(path, resolved_path, sizeof(resolved_path));
     norm = normalize_fs_path(resolved_path);
-    if (*norm == '\0') return -1;
+    if (*norm == '\0') return -ENOENT;
     rf = find_ramfs(norm);
     if (rf) {
         rf->mode = (rf->mode & 0170000U) | (mode & 07777U);
@@ -3001,9 +3039,9 @@ int fs_chmod(const char* path, uint32_t mode) {
         return 0;
     }
     if (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
-        return xv6fs_chmod_path(norm, mode) == 0 ? 0 : -1;
+        return xv6fs_chmod_path(norm, mode) == 0 ? 0 : -ENOENT;
     }
-    return -1;
+    return -ENOENT;
 }
 
 /* mknod: 現状は S_IFIFO (named pipe) のみ対応。 */
@@ -3011,7 +3049,7 @@ int fs_mknod(const char* path, uint32_t mode, uint64_t dev) {
     char resolved_path[256];
     const char* norm;
     (void)dev;
-    if (!path || path[0] == '\0') return -1;
+    if (!path || path[0] == '\0') return -ENOENT;
     if ((mode & 0170000U) != KSTAT_MODE_FIFO) return -22; /* EINVAL */
     resolve_task_path(path, resolved_path, sizeof(resolved_path));
     norm = normalize_fs_path(resolved_path);
@@ -3020,42 +3058,42 @@ int fs_mknod(const char* path, uint32_t mode, uint64_t dev) {
     if (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
         return xv6fs_mknod_fifo(norm, (int)(mode & 07777U));
     }
-    return -1;
+    return -ENOENT;
 }
 
 int fs_mkdir(const char* path, int mode) {
     char resolved_path[256];
     const char* norm;
     struct kstat st;
-    if (!path || path[0] == '\0') return -1;
+    if (!path || path[0] == '\0') return -ENOENT;
     resolve_task_path(path, resolved_path, sizeof(resolved_path));
     norm = normalize_fs_path(resolved_path);
     if (*norm == '\0') return -EEXIST;
 
-    if (find_ramfs(norm)) return -1;
+    if (find_ramfs(norm)) return -EEXIST;
     if (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
         if (fs_try_active_root_stat(norm, &st) == 0) {
             if ((st.mode & 0170000U) == KSTAT_MODE_DIR) return -EEXIST;
-            return -1;
+            return -EEXIST;
         }
-        return xv6fs_mkdir_path(norm, mode) == 0 ? 0 : -1;
+        return xv6fs_mkdir_path(norm, mode) == 0 ? 0 : -ENOENT;
     }
-    return create_ramfs_dir(norm, (uint32_t)mode) ? 0 : -1;
+    return create_ramfs_dir(norm, (uint32_t)mode) ? 0 : -ENOENT;
 }
 
 int fs_mkdirat(int dirfd, const char* path, int mode) {
     char resolved_path[256];
-    if (resolve_dirfd_path(dirfd, path, resolved_path, sizeof(resolved_path)) < 0) return -1;
+    if (resolve_dirfd_path(dirfd, path, resolved_path, sizeof(resolved_path)) < 0) return -ENOENT;
     return fs_mkdir(resolved_path, mode);
 }
 
 int fs_rmdir(const char* path) {
     char resolved_path[256];
     const char* norm;
-    if (!path || path[0] == '\0') return -1;
+    if (!path || path[0] == '\0') return -ENOENT;
     resolve_task_path(path, resolved_path, sizeof(resolved_path));
     norm = normalize_fs_path(resolved_path);
-    if (*norm == '\0') return -1;
+    if (*norm == '\0') return -ENOENT;
 
     if (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
         if (xv6fs_rmdir_path(norm) == 0) return 0;
@@ -3064,7 +3102,7 @@ int fs_rmdir(const char* path) {
     for (int i = 0; i < MAX_RAMFS_FILES; i++) {
         if (!ramfs_table[i].in_use) continue;
         if (!strcmp_exact(ramfs_table[i].name, norm)) continue;
-        if ((ramfs_table[i].mode & 0170000U) != KSTAT_MODE_DIR) return -1;
+        if ((ramfs_table[i].mode & 0170000U) != KSTAT_MODE_DIR) return -ENOTDIR;
         ramfs_table[i].in_use = 0;
         ramfs_table[i].size = 0;
         ramfs_table[i].data = NULL;
@@ -3078,7 +3116,7 @@ int fs_rmdir(const char* path) {
         ramfs_table[i].name[0] = '\0';
         return 0;
     }
-    return -1;
+    return -ENOENT;
 }
 
 int fs_sync(void) {
@@ -3090,7 +3128,7 @@ int fs_sync(void) {
 
 int fs_unlinkat(int dirfd, const char* path, int flags) {
     char resolved_path[256];
-    if (resolve_dirfd_path(dirfd, path, resolved_path, sizeof(resolved_path)) < 0) return -1;
+    if (resolve_dirfd_path(dirfd, path, resolved_path, sizeof(resolved_path)) < 0) return -ENOENT;
     if (flags & ORTH_AT_REMOVEDIR) return fs_rmdir(resolved_path);
     return fs_unlink(resolved_path);
 }
@@ -3101,10 +3139,10 @@ int fs_chdir(const char* path) {
     char resolved_path[256];
     const char* norm;
     size_t i = 0;
-    if (!current || !path || path[0] == '\0') return -1;
+    if (!current || !path || path[0] == '\0') return -ENOENT;
     resolve_task_path(path, resolved_path, sizeof(resolved_path));
-    if (fs_stat(resolved_path, &st) < 0) return -1;
-    if ((st.mode & 0170000U) != KSTAT_MODE_DIR) return -1;
+    if (fs_stat(resolved_path, &st) < 0) return -ENOENT;
+    if ((st.mode & 0170000U) != KSTAT_MODE_DIR) return -ENOTDIR;
     norm = normalize_fs_path(resolved_path);
     current->cwd[i++] = '/';
     while (*norm && i + 1 < sizeof(current->cwd)) {
@@ -3120,14 +3158,14 @@ int fs_fchdir(int fd) {
     file_descriptor_t* f;
     const char* norm;
     size_t i = 0;
-    if (!current) return -1;
+    if (!current) return -ESRCH;
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -EBADF;
     f = &current->fds[fd];
-    if (fs_fd_type(f) != FT_DIR) return -1;
-    if (fs_fd_name(f)[0] == '\0') return -1;
+    if (fs_fd_type(f) != FT_DIR) return -ENOTDIR;
+    if (fs_fd_name(f)[0] == '\0') return -EBADF;
     norm = normalize_fs_path(fs_fd_name(f));
-    if (fs_stat_normalized_path(norm, &st) < 0) return -1;
-    if ((st.mode & 0170000U) != KSTAT_MODE_DIR) return -1;
+    if (fs_stat_normalized_path(norm, &st) < 0) return -ENOENT;
+    if ((st.mode & 0170000U) != KSTAT_MODE_DIR) return -ENOTDIR;
     current->cwd[i++] = '/';
     while (*norm && i + 1 < sizeof(current->cwd)) {
         current->cwd[i++] = *norm++;
@@ -3139,12 +3177,12 @@ int fs_fchdir(int fd) {
 int fs_getcwd(char* buf, size_t size) {
     struct task* current = get_current_task();
     size_t i = 0;
-    if (!current || !buf || size == 0) return -1;
+    if (!current || !buf || size == 0) return -EFAULT;
     while (current->cwd[i] && i + 1 < size) {
         buf[i] = current->cwd[i];
         i++;
     }
-    if (current->cwd[i] != '\0' && i + 1 >= size) return -1;
+    if (current->cwd[i] != '\0' && i + 1 >= size) return -ERANGE;
     buf[i] = '\0';
     return (int)(i + 1);
 }
