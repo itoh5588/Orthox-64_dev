@@ -30,6 +30,14 @@ static int riscv64_fs_task_is_waiting(const struct task* t) {
     return t && (t->state == TASK_SLEEPING || t->state == TASK_IO_WAIT);
 }
 
+/* 待ち行列から取り出した面々を起こす。必ずロックの外で呼ぶこと
+ * (task_wake は g_task_lock と IPI を伴う) */
+static void riscv64_fs_wake_list(struct task** list, int n) {
+    for (int i = 0; i < n; i++) {
+        if (riscv64_fs_task_is_waiting(list[i])) task_wake(list[i]);
+    }
+}
+
 /* O_ACCMODE 判定: 書き込み可能な開き方か */
 static int riscv64_fs_flags_writable(int flags) {
     int acc = flags & 3;
@@ -349,7 +357,8 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
         while (written < count) {
             size_t space;
             size_t chunk;
-            struct task* reader_to_wake = 0;
+            struct task* readers_to_wake[FS_WAITQ_MAX];
+            int n_readers = 0;
             uint64_t irqf = spin_lock_irqsave(&pipe->lock);
             if (pipe->ref_count < 2) {
                 spin_unlock_irqrestore(&pipe->lock, irqf);
@@ -359,11 +368,11 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
             space = PIPE_BUF_SIZE - pipe->count;
             if (space == 0) {
                 task_mark_sleeping(current);
-                pipe->write_waiter = current;
+                fs_waitq_add(&pipe->write_wq, current);
                 spin_unlock_irqrestore(&pipe->lock, irqf);
                 kernel_yield();
                 irqf = spin_lock_irqsave(&pipe->lock);
-                if (pipe->write_waiter == current) pipe->write_waiter = 0;
+                fs_waitq_remove(&pipe->write_wq, current);
                 spin_unlock_irqrestore(&pipe->lock, irqf);
                 continue;
             }
@@ -375,10 +384,9 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
                 pipe->count++;
             }
             written += chunk;
-            reader_to_wake = pipe->read_waiter;
-            pipe->read_waiter = 0;
+            n_readers = fs_waitq_take_all(&pipe->read_wq, readers_to_wake, FS_WAITQ_MAX);
             spin_unlock_irqrestore(&pipe->lock, irqf);
-            if (reader_to_wake && riscv64_fs_task_is_waiting(reader_to_wake)) task_wake(reader_to_wake);
+            riscv64_fs_wake_list(readers_to_wake, n_readers);
         }
         return (int64_t)written;
     }
@@ -468,7 +476,8 @@ int64_t sys_read(int fd, void* buf, size_t count) {
         if (!pipe) return -1;
         for (;;) {
             size_t to_read;
-            struct task* writer_to_wake = 0;
+            struct task* writers_to_wake[FS_WAITQ_MAX];
+            int n_writers = 0;
             uint64_t irqf = spin_lock_irqsave(&pipe->lock);
             if (pipe->count == 0 && pipe->ref_count < 2) {
                 spin_unlock_irqrestore(&pipe->lock, irqf);
@@ -476,11 +485,11 @@ int64_t sys_read(int fd, void* buf, size_t count) {
             }
             if (pipe->count == 0) {
                 task_mark_sleeping(current);
-                pipe->read_waiter = current;
+                fs_waitq_add(&pipe->read_wq, current);
                 spin_unlock_irqrestore(&pipe->lock, irqf);
                 kernel_yield();
                 irqf = spin_lock_irqsave(&pipe->lock);
-                if (pipe->read_waiter == current) pipe->read_waiter = 0;
+                fs_waitq_remove(&pipe->read_wq, current);
                 spin_unlock_irqrestore(&pipe->lock, irqf);
                 continue;
             }
@@ -490,10 +499,9 @@ int64_t sys_read(int fd, void* buf, size_t count) {
                 pipe->read_pos = (pipe->read_pos + 1) % PIPE_BUF_SIZE;
                 pipe->count--;
             }
-            writer_to_wake = pipe->write_waiter;
-            pipe->write_waiter = 0;
+            n_writers = fs_waitq_take_all(&pipe->write_wq, writers_to_wake, FS_WAITQ_MAX);
             spin_unlock_irqrestore(&pipe->lock, irqf);
-            if (writer_to_wake && riscv64_fs_task_is_waiting(writer_to_wake)) task_wake(writer_to_wake);
+            riscv64_fs_wake_list(writers_to_wake, n_writers);
             return (int64_t)to_read;
         }
     }
@@ -763,8 +771,10 @@ int sys_sync(void) {
 }
 
 void fs_release_fd(file_descriptor_t* desc) {
-    struct task* read_waiter = 0;
-    struct task* write_waiter = 0;
+    struct task* readers_to_wake[FS_WAITQ_MAX];
+    struct task* writers_to_wake[FS_WAITQ_MAX];
+    int n_readers = 0;
+    int n_writers = 0;
     int free_pipe = 0;
 
     if (!desc || !desc->in_use) return;
@@ -774,14 +784,12 @@ void fs_release_fd(file_descriptor_t* desc) {
         if (pipe) {
             uint64_t flags = spin_lock_irqsave(&pipe->lock);
             if (pipe->ref_count > 0) pipe->ref_count--;
-            read_waiter = pipe->read_waiter;
-            write_waiter = pipe->write_waiter;
-            pipe->read_waiter = 0;
-            pipe->write_waiter = 0;
+            n_readers = fs_waitq_take_all(&pipe->read_wq, readers_to_wake, FS_WAITQ_MAX);
+            n_writers = fs_waitq_take_all(&pipe->write_wq, writers_to_wake, FS_WAITQ_MAX);
             free_pipe = (pipe->ref_count == 0);
             spin_unlock_irqrestore(&pipe->lock, flags);
-            if (read_waiter && riscv64_fs_task_is_waiting(read_waiter)) task_wake(read_waiter);
-            if (write_waiter && riscv64_fs_task_is_waiting(write_waiter)) task_wake(write_waiter);
+            riscv64_fs_wake_list(readers_to_wake, n_readers);
+            riscv64_fs_wake_list(writers_to_wake, n_writers);
             if (free_pipe) {
                 pmm_free((void*)VIRT_TO_PHYS((uint64_t)pipe), 1);
             }
@@ -837,8 +845,8 @@ int sys_pipe2(int* pipefd, int flags) {
     pipe->write_pos = 0;
     pipe->count = 0;
     pipe->ref_count = 2;
-    pipe->read_waiter = 0;
-    pipe->write_waiter = 0;
+    fs_waitq_init(&pipe->read_wq);
+    fs_waitq_init(&pipe->write_wq);
     spinlock_init(&pipe->lock);
 
     for (int end = 0; end < 2; end++) {

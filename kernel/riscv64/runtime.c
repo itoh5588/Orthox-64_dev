@@ -25,7 +25,9 @@ static spinlock_t g_riscv64_console_lock;
 static uint8_t g_riscv64_console_buf[256];
 static uint32_t g_riscv64_console_head;
 static uint32_t g_riscv64_console_tail;
-static struct task* g_riscv64_console_waiter;
+/* コンソール入力の待ち行列。単一スロットだと、複数タスクが同時に待ったとき
+ * 後から来た側が前を上書きして、前の待ち手が誰にも起こされなくなる */
+static fs_waitq_t g_riscv64_console_wq;
 
 /* riscv64 にネットワークスタックは無い。コンソール入力もタイマー経由の
  * ポーリングをやめ、UART 受信割り込み (PLIC) だけで拾うようにしたので何もしない。
@@ -164,7 +166,9 @@ void puthex(uint64_t value) {
 }
 
 void riscv64_console_poll_input(void) {
-    struct task* waiter = 0;
+    struct task* waiters[FS_WAITQ_MAX];
+    int n_waiters = 0;
+    int pushed = 0;
     uint64_t flags = spin_lock_irqsave(&g_riscv64_console_lock);
     int ch = riscv64_uart_getchar_nonblock();
     while (ch >= 0) {
@@ -173,20 +177,21 @@ void riscv64_console_poll_input(void) {
         if (next_head != g_riscv64_console_tail) {
             g_riscv64_console_buf[g_riscv64_console_head] = (uint8_t)ch;
             g_riscv64_console_head = next_head;
-            /* read は TASK_SLEEPING、ppoll は期限付きの TASK_IO_WAIT で待つ */
-            if (g_riscv64_console_waiter &&
-                (g_riscv64_console_waiter->state == TASK_SLEEPING ||
-                 g_riscv64_console_waiter->state == TASK_IO_WAIT)) {
-                waiter = g_riscv64_console_waiter;
-                g_riscv64_console_waiter = 0;
-            }
+            pushed = 1;
         }
         ch = riscv64_uart_getchar_nonblock();
     }
+    /* 取り出しはループの外で 1 回だけ。中でやると 2 文字目以降の
+     * take_all が空を返し、1 文字目で取り出した待ち手を消してしまう。
+     * read は TASK_SLEEPING、ppoll は TASK_IO_WAIT で待つ */
+    if (pushed) n_waiters = fs_waitq_take_all(&g_riscv64_console_wq, waiters, FS_WAITQ_MAX);
     spin_unlock_irqrestore(&g_riscv64_console_lock, flags);
     /* task_wake() は g_task_lock を取って IPI も飛ばすので、コンソールロックの
      * 外で呼ぶ (ロック順序を作らない) */
-    if (waiter) task_wake(waiter);
+    for (int i = 0; i < n_waiters; i++) {
+        struct task* w = waiters[i];
+        if (w && (w->state == TASK_SLEEPING || w->state == TASK_IO_WAIT)) task_wake(w);
+    }
 }
 
 /* poll/ppoll 用。リングにデータが残っているかだけを見る */
@@ -221,7 +226,7 @@ int riscv64_console_read_or_wait(char* buf, int count, struct task* self) {
         g_riscv64_console_tail = (g_riscv64_console_tail + 1U) % (uint32_t)sizeof(g_riscv64_console_buf);
     }
     if (read == 0 && self) {
-        g_riscv64_console_waiter = self;
+        fs_waitq_add(&g_riscv64_console_wq, self);
         task_mark_sleeping(self);
     }
     spin_unlock_irqrestore(&g_riscv64_console_lock, flags);
@@ -242,15 +247,18 @@ int riscv64_console_read(char* buf, int count) {
     return read;
 }
 
-void riscv64_console_set_waiter(struct task* t) {
+/* 戻り値: 登録できたら 1、待ち行列が溢れたら 0 */
+int riscv64_console_set_waiter(struct task* t) {
+    int ok;
     uint64_t flags = spin_lock_irqsave(&g_riscv64_console_lock);
-    g_riscv64_console_waiter = t;
+    ok = fs_waitq_add(&g_riscv64_console_wq, t);
     spin_unlock_irqrestore(&g_riscv64_console_lock, flags);
+    return ok;
 }
 
 void riscv64_console_clear_waiter(struct task* t) {
     uint64_t flags = spin_lock_irqsave(&g_riscv64_console_lock);
-    if (g_riscv64_console_waiter == t) g_riscv64_console_waiter = 0;
+    fs_waitq_remove(&g_riscv64_console_wq, t);
     spin_unlock_irqrestore(&g_riscv64_console_lock, flags);
 }
 

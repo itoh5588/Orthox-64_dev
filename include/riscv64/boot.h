@@ -37,7 +37,8 @@ void riscv64_console_poll_input(void);
 int riscv64_console_read(char* buf, int count);
 int riscv64_console_read_or_wait(char* buf, int count, struct task* self);
 int riscv64_console_has_input(void);
-void riscv64_console_set_waiter(struct task* t);
+/* 待ち行列へ登録する。戻り値: 登録できたら 1、溢れたら 0 */
+int riscv64_console_set_waiter(struct task* t);
 void riscv64_console_clear_waiter(struct task* t);
 void riscv64_uart_puts(const char* s);
 void riscv64_uart_puthex64(uint64_t value);

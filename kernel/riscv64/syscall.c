@@ -427,25 +427,33 @@ static int16_t riscv64_poll_fd_revents(int fd, int16_t events) {
 
 /* 待ち手として登録する。コンソールとパイプだけが待ち合わせを持つ
  * (通常ファイルなどは常に ready なのでここへ来ない) */
-static void riscv64_ppoll_register_waiters(struct riscv64_linux_pollfd* fds, uint64_t nfds,
-                                           struct task* self) {
+/* 全 fd の待ち行列へ自分を登録する。
+ * 戻り値: 全部に登録できたら 1、1 つでも溢れたら 0 (呼び出し側が期限付きで寝る) */
+static int riscv64_ppoll_register_waiters(struct riscv64_linux_pollfd* fds, uint64_t nfds,
+                                          struct task* self) {
     struct task* current = get_current_task();
-    if (!current || !self) return;
+    int all_registered = 1;
+    if (!current || !self) return 0;
     for (uint64_t i = 0; i < nfds; i++) {
         file_descriptor_t* f;
         int fd = fds[i].fd;
         if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) continue;
         f = &current->fds[fd];
         if (f->type == FT_CONSOLE) {
-            riscv64_console_set_waiter(self);
+            if (!riscv64_console_set_waiter(self)) all_registered = 0;
         } else if (f->type == FT_PIPE && f->data) {
             pipe_t* pipe = (pipe_t*)f->data;
             uint64_t flags = spin_lock_irqsave(&pipe->lock);
-            if (fds[i].events & RISCV64_POLLIN) pipe->read_waiter = self;
-            if (fds[i].events & RISCV64_POLLOUT) pipe->write_waiter = self;
+            if (fds[i].events & RISCV64_POLLIN) {
+                if (!fs_waitq_add(&pipe->read_wq, self)) all_registered = 0;
+            }
+            if (fds[i].events & RISCV64_POLLOUT) {
+                if (!fs_waitq_add(&pipe->write_wq, self)) all_registered = 0;
+            }
             spin_unlock_irqrestore(&pipe->lock, flags);
         }
     }
+    return all_registered;
 }
 
 static void riscv64_ppoll_clear_waiters(struct riscv64_linux_pollfd* fds, uint64_t nfds,
@@ -462,11 +470,27 @@ static void riscv64_ppoll_clear_waiters(struct riscv64_linux_pollfd* fds, uint64
         } else if (f->type == FT_PIPE && f->data) {
             pipe_t* pipe = (pipe_t*)f->data;
             uint64_t flags = spin_lock_irqsave(&pipe->lock);
-            if (pipe->read_waiter == self) pipe->read_waiter = 0;
-            if (pipe->write_waiter == self) pipe->write_waiter = 0;
+            fs_waitq_remove(&pipe->read_wq, self);
+            fs_waitq_remove(&pipe->write_wq, self);
             spin_unlock_irqrestore(&pipe->lock, flags);
         }
     }
+}
+
+/* 全 fd の revents を埋め、ready だった数を返す。何度呼んでも同じ (冪等) */
+static int riscv64_ppoll_scan(struct riscv64_linux_pollfd* fds, uint64_t nfds) {
+    int ready_count = 0;
+    for (uint64_t i = 0; i < nfds; i++) {
+        int16_t revents;
+        if (fds[i].fd < 0) {          /* 負の fd は無視する規約 */
+            fds[i].revents = 0;
+            continue;
+        }
+        revents = riscv64_poll_fd_revents(fds[i].fd, fds[i].events);
+        fds[i].revents = revents;
+        if (revents != 0) ready_count++;
+    }
+    return ready_count;
 }
 
 static int64_t riscv64_bootstrap_sys_ppoll(struct riscv64_linux_pollfd* fds, uint64_t nfds,
@@ -486,19 +510,11 @@ static int64_t riscv64_bootstrap_sys_ppoll(struct riscv64_linux_pollfd* fds, uin
     }
 
     for (;;) {
-        int ready_count = 0;
+        int ready_count;
+        int registered;
         uint64_t now;
-        uint64_t wake;
-        for (uint64_t i = 0; i < nfds; i++) {
-            int16_t revents;
-            if (fds[i].fd < 0) {          /* 負の fd は無視する規約 */
-                fds[i].revents = 0;
-                continue;
-            }
-            revents = riscv64_poll_fd_revents(fds[i].fd, fds[i].events);
-            fds[i].revents = revents;
-            if (revents != 0) ready_count++;
-        }
+
+        ready_count = riscv64_ppoll_scan(fds, nfds);
         if (ready_count > 0) return ready_count;
         now = arch_time_now_ms();
         if (has_deadline && now >= deadline) return 0;
@@ -508,18 +524,41 @@ static int64_t riscv64_bootstrap_sys_ppoll(struct riscv64_linux_pollfd* fds, uin
             continue;
         }
 
-        /* 待ちに入る。まず期限付きで寝る状態にしてから待ち手として登録する。
-         * 逆順にすると、登録から就寝までの間に来たイベントで一度 READY に
-         * されたあと自分で寝直してしまう。
+        /*
+         * 待ちに入る手順。以前は「寝る状態にしてから登録」で、その間に来た
+         * イベントを取りこぼすため 100ms で必ず起き直していた (アイドル時に
+         * 10Hz で回る)。登録先が fd ごとの待ち行列になったので閉じられる:
          *
-         * それでも「就寝」と「登録」の間は残る。取りこぼしてもハングしない
-         * ように、待ちには必ず上限 (RISCV64_PPOLL_SLICE_MS) を持たせて
-         * 起き直し、条件を見直す。イベントが来れば即座に起きるので、この上限が
-         * 効くのは競合したときだけ。 */
-        wake = now + RISCV64_PPOLL_SLICE_MS;
-        if (has_deadline && deadline < wake) wake = deadline;
-        task_mark_io_wait_until(current, wake);
-        riscv64_ppoll_register_waiters(fds, nfds, current);
+         *   1. 先に全 fd の待ち行列へ登録する (自分はまだ RUNNING)
+         *   2. 寝る状態にする
+         *   3. **もう一度**条件を見る            <- ここが競合を閉じる
+         *   4. yield
+         *
+         * 1 より後に来たイベントは、登録済みなので必ず task_wake が飛んで
+         * READY に戻される。2 と 3 の間に来た分も同じ。3 で条件が揃っていれば
+         * 自分で就寝を取り消して先頭へ戻る。どの順で挟まれても取りこぼさない。
+         *
+         * 期限は呼び出し側が timeout を指定したときだけ持つ。指定が無ければ
+         * 期限なしで寝る (定期的な起き直しはしない)。
+         */
+        registered = riscv64_ppoll_register_waiters(fds, nfds, current);
+        if (has_deadline) {
+            task_mark_io_wait_until(current, deadline);
+        } else if (registered) {
+            task_mark_io_wait(current);
+        } else {
+            /* 待ち行列が溢れて登録できなかった fd がある。この 1 回だけは
+             * 期限を持たせて起き直す (溢れの保険であって、通常の経路ではない) */
+            task_mark_io_wait_until(current, now + RISCV64_PPOLL_SLICE_MS);
+        }
+
+        if (riscv64_ppoll_scan(fds, nfds) > 0) {
+            /* task_wake() ではなく task_cancel_sleep()。あちらは runqueue へ
+             * 積むので、走行中の自分が runqueue にも載って二重になる */
+            task_cancel_sleep(current);
+        }
+        /* 取り消した場合も yield は必ず通す。誰かが先に起こしていて既に
+         * runqueue へ載っているときは、ここで正規の経路から選び直される */
         kernel_yield();
         riscv64_ppoll_clear_waiters(fds, nfds, current);
     }

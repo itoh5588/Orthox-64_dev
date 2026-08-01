@@ -731,6 +731,29 @@ int task_mark_io_wait_until(struct task* t, uint64_t deadline_ms) {
     return ret;
 }
 
+/*
+ * 「寝ると決めたが、まだ切り替わる前に条件が揃った」ときに自分の就寝を取り消す。
+ *
+ * task_wake() を自分に対して使ってはいけない。あちらは runqueue へ積むので、
+ * まだ走行中のタスクが runqueue にも載った状態になり、別 CPU が同じタスクを
+ * 走らせ得る。ここは状態を戻すだけで積まない。
+ *
+ * 既に誰かが起こしていた (TASK_READY になっている) 場合は何もしない。
+ * その場合は runqueue に正しく載っているので、呼び出し側の kernel_yield() で
+ * 通常どおり選び直される。
+ */
+int task_cancel_sleep(struct task* t) {
+    int ret = -1;
+    uint64_t flags = spin_lock_irqsave(&g_task_lock);
+    if (t && (t->state == TASK_SLEEPING || t->state == TASK_IO_WAIT)) {
+        t->sleep_until_ms = 0;
+        t->state = TASK_RUNNING;
+        ret = 0;
+    }
+    spin_unlock_irqrestore(&g_task_lock, flags);
+    return ret;
+}
+
 int task_mark_zombie(struct task* t, int exit_status) {
     int ret;
     uint64_t flags = spin_lock_irqsave(&g_task_lock);

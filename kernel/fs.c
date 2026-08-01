@@ -107,27 +107,18 @@ extern void puthex(uint64_t v);
 
 static void pipe_wake_task(struct task* waiter) {
     if (!waiter) return;
-    if (waiter->state == TASK_SLEEPING) {
+    if (waiter->state == TASK_SLEEPING || waiter->state == TASK_IO_WAIT) {
         task_wake(waiter);
     }
 }
 
-static struct task* pipe_take_waiter_locked(struct task** waiter) {
-    struct task* task;
-    if (!waiter) return 0;
-    task = *waiter;
-    *waiter = 0;
-    return task;
+/* 待ち行列から全員取り出す。起床はロックを離してから pipe_wake_list() で行う */
+static int pipe_take_waiters_locked(fs_waitq_t* q, struct task** out, int max) {
+    return fs_waitq_take_all(q, out, max);
 }
 
-static void pipe_set_waiter(struct task** waiter, struct task* task) {
-    if (!waiter) return;
-    *waiter = task;
-}
-
-static void pipe_clear_waiter(struct task** waiter, struct task* task) {
-    if (!waiter) return;
-    if (*waiter == task) *waiter = 0;
+static void pipe_wake_list(struct task** list, int n) {
+    for (int i = 0; i < n; i++) pipe_wake_task(list[i]);
 }
 
 static int fs_fd_has_private_copy(const file_descriptor_t* fd) {
@@ -180,8 +171,10 @@ static void fs_release_xv6fs_file(fs_file_t* file) {
 
 static void fs_release_pipe_file(fs_file_t* file) {
     pipe_t* pipe;
-    struct task* reader_to_wake;
-    struct task* writer_to_wake;
+    struct task* readers_to_wake[FS_WAITQ_MAX];
+    struct task* writers_to_wake[FS_WAITQ_MAX];
+    int n_readers;
+    int n_writers;
     int free_pipe = 0;
     uint64_t flags;
 
@@ -191,15 +184,15 @@ static void fs_release_pipe_file(fs_file_t* file) {
 
     flags = spin_lock_irqsave(&pipe->lock);
     pipe->ref_count--;
-    reader_to_wake = pipe_take_waiter_locked(&pipe->read_waiter);
-    writer_to_wake = pipe_take_waiter_locked(&pipe->write_waiter);
+    n_readers = pipe_take_waiters_locked(&pipe->read_wq, readers_to_wake, FS_WAITQ_MAX);
+    n_writers = pipe_take_waiters_locked(&pipe->write_wq, writers_to_wake, FS_WAITQ_MAX);
     if (pipe->ref_count == 0) {
         free_pipe = 1;
     }
     spin_unlock_irqrestore(&pipe->lock, flags);
 
-    pipe_wake_task(reader_to_wake);
-    pipe_wake_task(writer_to_wake);
+    pipe_wake_list(readers_to_wake, n_readers);
+    pipe_wake_list(writers_to_wake, n_writers);
     if (free_pipe) {
         pmm_free((void*)VIRT_TO_PHYS((uint64_t)pipe), 1);
     }
@@ -1460,8 +1453,8 @@ retry:
             pipe->write_pos = 0;
             pipe->count = 0;
             pipe->ref_count = 0;
-            pipe->read_waiter = 0;
-            pipe->write_waiter = 0;
+            fs_waitq_init(&pipe->read_wq);
+            fs_waitq_init(&pipe->write_wq);
         }
         irqf = spin_lock_irqsave(&g_fifo_lock);
         g_fifo_table[idx].pipe = pipe;
@@ -2114,15 +2107,16 @@ int64_t fs_write(int fd, const void* buf, size_t count) {
         size_t written = 0;
         const char* src = (const char*)buf;
         while (written < count) {
-            struct task* reader_to_wake = 0;
+            struct task* readers_to_wake[FS_WAITQ_MAX];
+            int n_readers = 0;
             uint64_t flags = spin_lock_irqsave(&pipe->lock);
             if (pipe->count == PIPE_BUF_SIZE) {
                 task_mark_sleeping(current);
-                pipe_set_waiter(&pipe->write_waiter, current);
+                fs_waitq_add(&pipe->write_wq, current);
                 spin_unlock_irqrestore(&pipe->lock, flags);
                 kernel_yield();
                 flags = spin_lock_irqsave(&pipe->lock);
-                pipe_clear_waiter(&pipe->write_waiter, current);
+                fs_waitq_remove(&pipe->write_wq, current);
                 spin_unlock_irqrestore(&pipe->lock, flags);
                 continue;
             }
@@ -2132,9 +2126,9 @@ int64_t fs_write(int fd, const void* buf, size_t count) {
                 pipe->count++;
                 written++;
             }
-            reader_to_wake = pipe_take_waiter_locked(&pipe->read_waiter);
+            n_readers = pipe_take_waiters_locked(&pipe->read_wq, readers_to_wake, FS_WAITQ_MAX);
             spin_unlock_irqrestore(&pipe->lock, flags);
-            pipe_wake_task(reader_to_wake);
+            pipe_wake_list(readers_to_wake, n_readers);
         }
         return (int64_t)written;
     }
@@ -2336,7 +2330,8 @@ int64_t fs_read(int fd, void* buf, size_t count) {
         pipe_t* pipe = (pipe_t*)fs_fd_data_required(f, FT_PIPE);
         while (1) {
             size_t to_read;
-            struct task* writer_to_wake = 0;
+            struct task* writers_to_wake[FS_WAITQ_MAX];
+            int n_writers = 0;
             uint64_t flags = spin_lock_irqsave(&pipe->lock);
             if (pipe->count == 0 && pipe->ref_count < 2) {
                 spin_unlock_irqrestore(&pipe->lock, flags);
@@ -2344,11 +2339,11 @@ int64_t fs_read(int fd, void* buf, size_t count) {
             }
             if (pipe->count == 0) {
                 task_mark_sleeping(current);
-                pipe_set_waiter(&pipe->read_waiter, current);
+                fs_waitq_add(&pipe->read_wq, current);
                 spin_unlock_irqrestore(&pipe->lock, flags);
                 kernel_yield();
                 flags = spin_lock_irqsave(&pipe->lock);
-                pipe_clear_waiter(&pipe->read_waiter, current);
+                fs_waitq_remove(&pipe->read_wq, current);
                 spin_unlock_irqrestore(&pipe->lock, flags);
                 continue;
             }
@@ -2359,9 +2354,9 @@ int64_t fs_read(int fd, void* buf, size_t count) {
                 pipe->read_pos = (pipe->read_pos + 1) % PIPE_BUF_SIZE;
                 pipe->count--;
             }
-            writer_to_wake = pipe_take_waiter_locked(&pipe->write_waiter);
+            n_writers = pipe_take_waiters_locked(&pipe->write_wq, writers_to_wake, FS_WAITQ_MAX);
             spin_unlock_irqrestore(&pipe->lock, flags);
-            pipe_wake_task(writer_to_wake);
+            pipe_wake_list(writers_to_wake, n_writers);
             return (int64_t)to_read;
         }
     }
@@ -2542,8 +2537,8 @@ int fs_pipe(int pipefd[2]) {
     pipe->write_pos = 0;
     pipe->count = 0;
     pipe->ref_count = 2;
-    pipe->read_waiter = 0;
-    pipe->write_waiter = 0;
+    fs_waitq_init(&pipe->read_wq);
+    fs_waitq_init(&pipe->write_wq);
     spinlock_init(&pipe->lock);
 
     fs_file_t* read_file = fs_alloc_file();

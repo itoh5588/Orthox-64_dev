@@ -56,6 +56,65 @@ typedef struct fs_file {
 
 #define PIPE_BUF_SIZE 4000
 
+/*
+ * 待ち行列。以前は待ち手を 1 つしか覚えられず、後から待った側が前を上書きして
+ * いた。上書きされた側は誰にも起こされないので、複数タスクが同じ fd を待つと
+ * (ppoll が典型) 取り残される。
+ *
+ * リストではなく固定長の配列にしてあるのは、待ち行列のノードを struct task に
+ * 持たせずに済ませるため。1 つの fd を待つタスクがこの数を超えることは現状の
+ * 規模では無く、溢れた場合は追加が失敗する (呼び出し側が期限付きで寝る)。
+ *
+ * 出し入れは必ず所有者のロック (pipe->lock / コンソールロック) の中で行うこと。
+ * 起こすのはロックの外 (task_wake は g_task_lock と IPI を伴う)。
+ */
+/* pipe_t は pmm_alloc(1) の 1 ページに収める前提で、旧レイアウト (待ち手 2 本)
+ * の時点で残りは 56 バイトしかない。ここを大きくするとページを溢れて隣を
+ * 壊すので、下の _Static_assert で必ず気付けるようにしてある。
+ * 1 つの fd を 4 タスク以上が同時に待つことは現状の規模では無い */
+#define FS_WAITQ_MAX 4
+typedef struct {
+    struct task* waiters[FS_WAITQ_MAX];
+} fs_waitq_t;
+
+/* 登録済みなら何もしない。空きが無ければ 0 を返す */
+static inline int fs_waitq_add(fs_waitq_t* q, struct task* t) {
+    int free_slot = -1;
+    if (!q || !t) return 0;
+    for (int i = 0; i < FS_WAITQ_MAX; i++) {
+        if (q->waiters[i] == t) return 1;
+        if (!q->waiters[i] && free_slot < 0) free_slot = i;
+    }
+    if (free_slot < 0) return 0;
+    q->waiters[free_slot] = t;
+    return 1;
+}
+
+static inline void fs_waitq_remove(fs_waitq_t* q, struct task* t) {
+    if (!q || !t) return;
+    for (int i = 0; i < FS_WAITQ_MAX; i++) {
+        if (q->waiters[i] == t) q->waiters[i] = 0;
+    }
+}
+
+/* 待ち手を全部取り出して空にする。戻り値は取り出した数。
+ * 起床はロックを離してから out[] に対して行うこと */
+static inline int fs_waitq_take_all(fs_waitq_t* q, struct task** out, int max) {
+    int n = 0;
+    if (!q || !out) return 0;
+    for (int i = 0; i < FS_WAITQ_MAX; i++) {
+        if (!q->waiters[i]) continue;
+        if (n < max) out[n++] = q->waiters[i];
+        q->waiters[i] = 0;
+    }
+    return n;
+}
+
+static inline void fs_waitq_init(fs_waitq_t* q) {
+    if (!q) return;
+    for (int i = 0; i < FS_WAITQ_MAX; i++) q->waiters[i] = 0;
+}
+
 typedef struct {
     spinlock_t lock;
     char buffer[PIPE_BUF_SIZE];
@@ -63,9 +122,13 @@ typedef struct {
     uint32_t write_pos;
     uint32_t count;
     int ref_count;
-    struct task* read_waiter;
-    struct task* write_waiter;
+    fs_waitq_t read_wq;
+    fs_waitq_t write_wq;
 } pipe_t;
+
+/* pipe_t は 1 ページ丸ごとで確保している (kernel/fs.c と kernel/riscv64/fs.c の
+ * pmm_alloc(1))。溢れると隣のページを踏み潰し、パイプを使った瞬間に固まる */
+_Static_assert(sizeof(pipe_t) <= 4096, "pipe_t が 1 ページに収まらない");
 
 typedef struct {
     file_type_t type;
