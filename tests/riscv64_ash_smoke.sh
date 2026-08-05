@@ -95,6 +95,14 @@ fi
     # 以前は SMP でここが停止した。/s.txt は b,a,c,a の 4 行。
     printf 'echo "subpipe=$(cat /s.txt | wc -l)"\n'
     sleep 4
+    # 読み端を dup してから書き手が終わるケース。pipe が読み/書きを区別せず
+    # ref_count の合計だけで EOF を判定していたころは、書き手ゼロでも
+    # ref_count==2 のままで read が返らず固まった。
+    printf 'echo "dupeof=$(cat /s.txt | { exec 4<&0; wc -l; })"\n'
+    sleep 4
+    # 読み手が先に消えるケース: 書き側は EPIPE で止まり、ハングしないこと。
+    printf 'yes 2>/dev/null | head -2 | wc -l | sed s/^/sigpipe=/\n'
+    sleep 4
     # readlinkat 経由 (以前は getdents64 に化けて EPERM だった)
     printf 'realpath /etc/motd\n'
     sleep 3
@@ -211,6 +219,8 @@ if [ -f "$ROOTFS_IMG" ]; then
     grep -aq "a-b-c-TEXT" "$SERIAL_LOG"        # sort | uniq | tr
     grep -aq "grepcount=2" "$SERIAL_LOG"       # grep -c | sed
     grep -aq "subpipe=4" "$SERIAL_LOG"         # $(cmd | cmd) が SMP で停止しない
+    grep -aq "dupeof=4" "$SERIAL_LOG"          # 読み端を dup しても EOF が来る
+    grep -aq "sigpipe=2" "$SERIAL_LOG"         # 読み手が消えた書き側が EPIPE で抜ける
     grep -aq "^/etc/motd$" "$SERIAL_LOG"       # realpath (readlinkat が EINVAL を返すこと)
     grep -aq "xargs-in" "$SERIAL_LOG"          # xargs = vfork + exec
     grep -aq "^riscv64$" "$SERIAL_LOG"         # uname -m

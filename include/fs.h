@@ -122,6 +122,16 @@ typedef struct {
     uint32_t write_pos;
     uint32_t count;
     int ref_count;
+    /* ref_count は読み端と書き端の合計なので、これだけでは EOF も EPIPE も
+     * 判定できない。1R+1W ちょうどのときしか ref_count<2 が成立しないため、
+     * dup や fork で片側が 2 本になると書き手が全滅しても reader が寝たまま
+     * になる。端ごとの本数は下の 2 つで数える。
+     * いまは kernel/riscv64/fs.c だけが使う。kernel/fs.c (x86) は従来どおり
+     * ref_count で判定しており、この 2 つを更新しない。
+     * pipe_t は 1 ページ上限が厳しいので uint16_t にしてある (fd 数の上限は
+     * MAX_FDS なので 16 bit で足りる)。 */
+    uint16_t readers;
+    uint16_t writers;
     fs_waitq_t read_wq;
     fs_waitq_t write_wq;
 } pipe_t;

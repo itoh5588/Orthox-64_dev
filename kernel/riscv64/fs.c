@@ -54,6 +54,13 @@ static void riscv64_fs_wake_list(struct task** list, int n) {
     }
 }
 
+/* pipe fd がどちらの端か。sys_pipe2() が aux1 に 0=読み端 / 1=書き端 を入れて
+ * おり、fs_clone_fd() の丸ごとコピーでも保たれる。RISC-V に FIFO は無いので
+ * O_RDWR で開かれた pipe fd は存在しない。 */
+static int riscv64_pipe_fd_is_writer(const file_descriptor_t* desc) {
+    return desc && desc->aux1 == 1;
+}
+
 /* O_ACCMODE 判定: 書き込み可能な開き方か */
 static int riscv64_fs_flags_writable(int flags) {
     int acc = flags & 3;
@@ -462,9 +469,9 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
             struct task* readers_to_wake[FS_WAITQ_MAX];
             int n_readers = 0;
             uint64_t irqf = spin_lock_irqsave(&pipe->lock);
-            if (pipe->ref_count < 2) {
+            if (pipe->readers == 0) {
                 spin_unlock_irqrestore(&pipe->lock, irqf);
-                /* 読み手が閉じた: EPIPE 相当 */
+                /* 読み手が全部閉じた: EPIPE 相当 */
                 return written > 0 ? (int64_t)written : -32;
             }
             space = PIPE_BUF_SIZE - pipe->count;
@@ -581,9 +588,9 @@ int64_t sys_read(int fd, void* buf, size_t count) {
             struct task* writers_to_wake[FS_WAITQ_MAX];
             int n_writers = 0;
             uint64_t irqf = spin_lock_irqsave(&pipe->lock);
-            if (pipe->count == 0 && pipe->ref_count < 2) {
+            if (pipe->count == 0 && pipe->writers == 0) {
                 spin_unlock_irqrestore(&pipe->lock, irqf);
-                return 0; /* 書き込み側クローズ → EOF */
+                return 0; /* 書き手が全部閉じた → EOF */
             }
             if (pipe->count == 0) {
                 task_mark_sleeping(current);
@@ -897,6 +904,14 @@ void fs_release_fd(file_descriptor_t* desc) {
         if (pipe) {
             uint64_t flags = spin_lock_irqsave(&pipe->lock);
             if (pipe->ref_count > 0) pipe->ref_count--;
+            /* 端ごとの本数も減らす。ここで writers が 0 になった場合に
+             * read_wq で寝ている側を起こさないと EOF に気づけない (下の
+             * take_all がその役)。 */
+            if (riscv64_pipe_fd_is_writer(desc)) {
+                if (pipe->writers > 0) pipe->writers--;
+            } else {
+                if (pipe->readers > 0) pipe->readers--;
+            }
             n_readers = fs_waitq_take_all(&pipe->read_wq, readers_to_wake, FS_WAITQ_MAX);
             n_writers = fs_waitq_take_all(&pipe->write_wq, writers_to_wake, FS_WAITQ_MAX);
             free_pipe = (pipe->ref_count == 0);
@@ -958,6 +973,8 @@ int sys_pipe2(int* pipefd, int flags) {
     pipe->write_pos = 0;
     pipe->count = 0;
     pipe->ref_count = 2;
+    pipe->readers = 1;
+    pipe->writers = 1;
     fs_waitq_init(&pipe->read_wq);
     fs_waitq_init(&pipe->write_wq);
     spinlock_init(&pipe->lock);
@@ -1057,6 +1074,10 @@ int fs_clone_fd(file_descriptor_t* dst, const file_descriptor_t* src) {
         pipe_t* pipe = (pipe_t*)src->data;
         uint64_t flags = spin_lock_irqsave(&pipe->lock);
         pipe->ref_count++;
+        /* dup / dup2 / fcntl(F_DUPFD) / fork のいずれもここを通る。
+         * 増えるのは複製元と同じ端だけ。 */
+        if (riscv64_pipe_fd_is_writer(src)) pipe->writers++;
+        else pipe->readers++;
         spin_unlock_irqrestore(&pipe->lock, flags);
     }
     return 0;
