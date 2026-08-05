@@ -33,9 +33,11 @@ KERNEL_CFLAGS += $(KERNEL_CFLAGS_EXTRA)
 
 KERNEL_LDFLAGS = -nostdlib -static -T scripts/kernel.ld
 
+# 調査用に一時的なフラグを足す口 (例: RISCV64_EXTRA_CFLAGS=-DRISCV64_SYSCALL_TRACE=1)
+RISCV64_EXTRA_CFLAGS ?=
 RISCV64_CFLAGS = --target=riscv64-none-elf -march=rv64gc -mabi=lp64 -ffreestanding \
 	-fno-stack-protector -fno-stack-check -fno-lto -fno-PIE -mcmodel=medany -O2 -Wall -Wextra \
-	-Iinclude -MMD -MP
+	-Iinclude -MMD -MP $(RISCV64_EXTRA_CFLAGS)
 # ブート時に /bootstrap-user へ渡す argv (例: make riscv64-ash-run は sh を渡す)
 RISCV64_BOOTSTRAP_ARG0_VALUE ?=
 RISCV64_BOOTSTRAP_ARG1_VALUE ?=

@@ -23,6 +23,114 @@ static int64_t riscv64_bootstrap_sys_wait4(int pid, int* wstatus, int options);
 
 #define RISCV64_USER_MMAP_BASE_VADDR 0x0000002000000000ULL
 
+/* 未実装の syscall を ENOSYS で返すとき、番号を 1 回だけ出す。
+ * 黙って失敗値を返すと、呼び出し側が戻り値を見ていない場合に
+ * 「成功したのに何も起きない」形になり、原因の特定が極端に難しくなる。
+ * 番号ごとに 1 回だけなので、ループで呼ばれてもログは溢れない。 */
+#define RISCV64_ENOSYS_SEEN_MAX 64
+static uint64_t g_riscv64_enosys_seen[RISCV64_ENOSYS_SEEN_MAX];
+static int g_riscv64_enosys_seen_count;
+
+static void riscv64_report_unimplemented_syscall(uint64_t number) {
+    for (int i = 0; i < g_riscv64_enosys_seen_count; i++) {
+        if (g_riscv64_enosys_seen[i] == number) return;
+    }
+    if (g_riscv64_enosys_seen_count < RISCV64_ENOSYS_SEEN_MAX) {
+        g_riscv64_enosys_seen[g_riscv64_enosys_seen_count++] = number;
+    }
+    riscv64_uart_puts("ENOSYS: syscall ");
+    riscv64_uart_puthex64(number);
+    riscv64_uart_puts("\n");
+}
+
+/* ファイル系 syscall の一時トレース。既定では無効で、
+ *   make riscv64-kernel RISCV64_EXTRA_CFLAGS=-DRISCV64_SYSCALL_TRACE=1
+ * のときだけ入る。ユーザー空間から見た「成功したのに書けていない」を
+ * 追うためのもので、常用のカーネルには入れない。 */
+#ifdef RISCV64_SYSCALL_TRACE
+static uint64_t g_riscv64_trace_num;
+static uint64_t g_riscv64_trace_a0;
+static uint64_t g_riscv64_trace_a1;
+static uint64_t g_riscv64_trace_a2;
+static int g_riscv64_trace_active;
+
+static int riscv64_syscall_trace_wanted(uint64_t number) {
+    switch (number) {
+        case 23:  /* dup */
+        case 24:  /* dup3 */
+        case 25:  /* fcntl */
+        case 35:  /* unlinkat */
+        case 63:  /* read */
+        case 45:  /* truncate */
+        case 46:  /* ftruncate */
+        case 56:  /* openat */
+        case 57:  /* close */
+        case 62:  /* lseek */
+        case 64:  /* write */
+        case 66:  /* writev */
+        case 68:  /* pwrite64 */
+        case 82:  /* fsync */
+        case 276: /* renameat2 */
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static void riscv64_trace_puts_user(const char* s) {
+    if (!s) {
+        riscv64_uart_puts("(null)");
+        return;
+    }
+    for (int i = 0; i < 96 && s[i]; i++) {
+        char buf[2] = {s[i], 0};
+        riscv64_uart_puts(buf);
+    }
+}
+
+static void riscv64_syscall_trace_enter(const riscv64_trap_frame_t* frame) {
+    g_riscv64_trace_active = riscv64_syscall_trace_wanted(frame->a7);
+    if (!g_riscv64_trace_active) return;
+    g_riscv64_trace_num = frame->a7;
+    g_riscv64_trace_a0 = frame->a0;
+    g_riscv64_trace_a1 = frame->a1;
+    g_riscv64_trace_a2 = frame->a2;
+}
+
+static void riscv64_syscall_trace_leave(const riscv64_trap_frame_t* frame) {
+    if (!g_riscv64_trace_active) return;
+    g_riscv64_trace_active = 0;
+    riscv64_uart_puts("TR ");
+    riscv64_uart_puthex64(g_riscv64_trace_num);
+    riscv64_uart_puts(" a0=");
+    riscv64_uart_puthex64(g_riscv64_trace_a0);
+    riscv64_uart_puts(" a1=");
+    riscv64_uart_puthex64(g_riscv64_trace_a1);
+    riscv64_uart_puts(" a2=");
+    riscv64_uart_puthex64(g_riscv64_trace_a2);
+    riscv64_uart_puts(" -> ");
+    riscv64_uart_puthex64(frame->a0);
+    if (g_riscv64_trace_num == 56 || g_riscv64_trace_num == 35) {
+        /* openat(dirfd, path, ...) / unlinkat(dirfd, path, ...) */
+        riscv64_uart_puts(" path=");
+        riscv64_trace_puts_user((const char*)(uintptr_t)g_riscv64_trace_a1);
+    }
+    if (g_riscv64_trace_num == 45) {
+        /* truncate(path, len) は a0 が path */
+        riscv64_uart_puts(" path=");
+        riscv64_trace_puts_user((const char*)(uintptr_t)g_riscv64_trace_a0);
+    }
+    if (g_riscv64_trace_num == 276) {
+        riscv64_uart_puts(" from=");
+        riscv64_trace_puts_user((const char*)(uintptr_t)g_riscv64_trace_a1);
+    }
+    riscv64_uart_puts("\n");
+}
+#else
+static void riscv64_syscall_trace_enter(const riscv64_trap_frame_t* frame) { (void)frame; }
+static void riscv64_syscall_trace_leave(const riscv64_trap_frame_t* frame) { (void)frame; }
+#endif
+
 /* clone(2) のフラグ (musl の vfork が使う分だけ) */
 #define RISCV64_LINUX_CLONE_VM      0x00000100ULL
 #define RISCV64_LINUX_CLONE_VFORK   0x00004000ULL
@@ -1174,6 +1282,7 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             riscv64_bootstrap_sys_exit((int)arch_syscall_arg0(frame));
             return;
         default:
+            riscv64_report_unimplemented_syscall(frame->a7);
             arch_syscall_set_return(frame, (uint64_t)-38);
             return;
     }
@@ -1216,7 +1325,9 @@ void riscv64_syscall_dispatch(riscv64_trap_frame_t* frame) {
     // arch_syscall_frame_t はトラップフレームそのものなので直接ディスパッチする。
     // ecall の次命令から再開する既定値を先に設定し、execve 等が sepc/sp を上書きできるようにする。
     frame->sepc += 4;
+    riscv64_syscall_trace_enter(frame);
     riscv64_bootstrap_syscall_dispatch(frame);
+    riscv64_syscall_trace_leave(frame);
     riscv64_syscall_sync_current_user_frame(frame);
 }
 
