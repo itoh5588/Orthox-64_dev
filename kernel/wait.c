@@ -68,6 +68,14 @@ int wait_event(struct wait_queue* q, wait_condition_t condition, void* arg) {
     for (;;) {
         uint64_t flags = spin_lock_irqsave(&q->lock);
         if (condition(arg)) {
+            /* **抜けるときは必ず自分を外すこと** (wait_event_timeout と同じ)。
+             * wake_up_one / wake_up_all で起こされた場合は既に pop されている
+             * ので何もしないが、それ以外の経路で起こされた (task_wake が
+             * 直接呼ばれた) 場合はここに繋がったまま残る。
+             * 残ったまま別のキューで待つと、wait_next が **別のキューの鎖を
+             * 指す**ため、wake_up_all が無関係なタスクまで起こして
+             * 2 つのリストが交差する。1 度も外さないのは片手落ちだった。 */
+            wait_queue_remove_locked(q, current);
             spin_unlock_irqrestore(&q->lock, flags);
             return 0;
         }
