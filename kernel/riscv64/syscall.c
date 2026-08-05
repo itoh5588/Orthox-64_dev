@@ -21,6 +21,33 @@ extern int task_execve(arch_task_exec_frame_t* frame, const char* path,
 extern struct task* task_list;
 static int64_t riscv64_bootstrap_sys_wait4(int pid, int* wstatus, int options);
 
+/* Linux/RISC-V の SIGCHLD。wait4 で眠った親を起こすためにも使う。 */
+#define RISCV64_SIGCHLD 17
+
+static struct task* riscv64_find_task_by_pid(int pid) {
+    struct task* task = task_list;
+    while (task) {
+        if (task->pid == pid) return task;
+        task = task->next;
+    }
+    return 0;
+}
+
+/*
+ * 子の終了は、zombie 化だけでは待機中の親へ伝わらない。特に BusyBox ash の
+ * $(cmd | cmd) はブロッキング waitpid に入り得るため、親を起こさないと
+ * TASK_SLEEPING のまま残る。pipe の close より先にこの通知を行う必要はなく、
+ * 親が wait4 を再走査した時点で child の zombie 状態が見えていればよい。
+ */
+static void riscv64_notify_parent_exit(struct task* child) {
+    struct task* parent;
+    if (!child || child->ppid <= 0) return;
+    parent = riscv64_find_task_by_pid(child->ppid);
+    if (!parent) return;
+    parent->sig_pending |= (1ULL << RISCV64_SIGCHLD);
+    if (parent->state == TASK_SLEEPING) (void)task_wake(parent);
+}
+
 #define RISCV64_USER_MMAP_BASE_VADDR 0x0000002000000000ULL
 
 /* 未実装の syscall を ENOSYS で返すとき、番号を 1 回だけ出す。
@@ -936,6 +963,7 @@ static void riscv64_bootstrap_sys_exit(int status) {
         }
     }
     (void)task_mark_zombie(current, status);
+    riscv64_notify_parent_exit(current);
     while (1) kernel_yield();
 }
 

@@ -91,6 +91,10 @@ fi
     sleep 4
     printf 'grep -c a /s.txt | sed s/^/grepcount=/\n'
     sleep 4
+    # command substitution 内のパイプ: child exit が親の wait4 を起床すること。
+    # 以前は SMP でここが停止した。/s.txt は b,a,c,a の 4 行。
+    printf 'echo "subpipe=$(cat /s.txt | wc -l)"\n'
+    sleep 4
     # readlinkat 経由 (以前は getdents64 に化けて EPERM だった)
     printf 'realpath /etc/motd\n'
     sleep 3
@@ -206,6 +210,7 @@ if [ -f "$ROOTFS_IMG" ]; then
     # 追加 applet
     grep -aq "a-b-c-TEXT" "$SERIAL_LOG"        # sort | uniq | tr
     grep -aq "grepcount=2" "$SERIAL_LOG"       # grep -c | sed
+    grep -aq "subpipe=4" "$SERIAL_LOG"         # $(cmd | cmd) が SMP で停止しない
     grep -aq "^/etc/motd$" "$SERIAL_LOG"       # realpath (readlinkat が EINVAL を返すこと)
     grep -aq "xargs-in" "$SERIAL_LOG"          # xargs = vfork + exec
     grep -aq "^riscv64$" "$SERIAL_LOG"         # uname -m
