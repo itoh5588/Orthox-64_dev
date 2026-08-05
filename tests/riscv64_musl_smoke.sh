@@ -96,6 +96,10 @@ grep -q "^CLONEG-OK$" "$SERIAL_LOG"
 # rootfs を繋いだ構成でのみ出る。
 if [ -f out/rootfs-riscv64-xv6.img ]; then
     grep -q "^BIGWRITE-OK$" "$SERIAL_LOG"
+    # dup した fd から書き込み内容を読み戻せること。fd ごとに持っている
+    # size の写しを inode から取り直していないと read が即 EOF を返し、
+    # binutils の ar が **エラーを出さずに 0 バイトのアーカイブ**を作る。
+    grep -q "^DUPRW-OK$" "$SERIAL_LOG"
 fi
 grep -q "bootstrap user exit" "$SERIAL_LOG"
 

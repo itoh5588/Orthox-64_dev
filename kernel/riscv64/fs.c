@@ -24,6 +24,22 @@ struct riscv64_linux_dirent64 {
 
 /* errno 定数は include/riscv64/errno.h (syscall.c と共有) */
 
+/* file_descriptor_t の size は fd ごとの写しで、open した時点の値で止まる。
+ * dup / fork で複製された fd は元の fd の書き込みを知らないため、Linux なら
+ * 読める内容が EOF になる。ファイルの本当の長さは inode にしか無いので、
+ * 長さを見る前にここで取り直す。
+ *
+ * これが無いと binutils の ar が壊れる: ar は mkstemp した一時ファイルを
+ * dup し、片方の fd で書いて、もう片方から読み戻してコピーする。読み戻しが
+ * 0 バイトになるため rc=0 のまま 0 バイトのアーカイブが出来上がる。 */
+void riscv64_fs_refresh_xv6fs_size(file_descriptor_t* f) {
+    uint32_t mode = 0;
+    uint64_t size = 0;
+    if (!f || f->type != FT_XV6FS || f->name[0] == '\0') return;
+    if (xv6fs_stat_path(f->name, &mode, &size, 0, 0) != 0) return;
+    f->size = (size_t)size;
+}
+
 /* 待ち手が「寝ている」かの判定。read/write は TASK_SLEEPING で寝るが、
  * ppoll は期限付きで待つため TASK_IO_WAIT になる。どちらも起こす対象 */
 static int riscv64_fs_task_is_waiting(const struct task* t) {
@@ -594,6 +610,12 @@ int64_t sys_read(int fd, void* buf, size_t count) {
     if (f->type == FT_XV6FS) {
         struct xv6fs_inode* ip;
         int got;
+        /* f->size は fd ごとの写しなので、他の fd が書いた分を知らない。
+         * dup / fork で複製した fd から読むと EOF 扱いになっていた
+         * (binutils の ar が一時ファイルを dup した fd で読み直すため、
+         *  74 バイト書いたアーカイブが 0 バイトになっていた)。
+         * 本物のサイズは inode にしか無いので、読む前に取り直す。 */
+        riscv64_fs_refresh_xv6fs_size(f);
         if (f->offset >= f->size) return 0;
         remaining = f->size - f->offset;
         to_read = (count > remaining) ? remaining : count;

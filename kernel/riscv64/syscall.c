@@ -13,6 +13,8 @@
 #include "task.h"
 
 static task_context_t* g_riscv64_fallback_current_context;
+/* kernel/riscv64/fs.c。fd ごとに持っている size の写しを inode から取り直す */
+extern void riscv64_fs_refresh_xv6fs_size(file_descriptor_t* f);
 extern int task_fork(arch_task_exec_frame_t* frame);
 extern int task_execve(arch_task_exec_frame_t* frame, const char* path,
                        char* const argv[], char* const envp[]);
@@ -218,6 +220,10 @@ static int64_t riscv64_bootstrap_sys_lseek(int fd, int64_t offset, int whence) {
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
     f = &current->fds[fd];
     if (f->type == FT_DIR) return -RISCV64_ESPIPE;
+    /* SEEK_END と EOF 判定に使う f->size は fd ごとの写しなので、
+     * dup / fork した相方が書いた分を知らない。inode から取り直す
+     * (詳細は kernel/riscv64/fs.c の riscv64_fs_refresh_xv6fs_size) */
+    riscv64_fs_refresh_xv6fs_size(f);
 
     switch (whence) {
         case 0:

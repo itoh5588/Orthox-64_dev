@@ -110,5 +110,32 @@ int main(void) {
             unlink("/tmp/bigwrite.bin");
         }
     }
+
+    /* dup した fd から書き込み内容を読み戻せること。
+     *
+     * file_descriptor_t は size を **fd ごとの写し**で持つ。複製した fd は
+     * 元の fd が書いた分を知らないので、read が即 EOF (0) を返していた。
+     * binutils の ar はまさにこの形 —— mkstemp した一時ファイルを dup し、
+     * 一方の fd で書いて、もう一方から読み戻してコピーする —— で
+     * アーカイブを作るため、**rc=0 のまま 0 バイトの .a が出来上がっていた**。
+     * ar はエラーを一切出さないので、リンク段階まで誰も気付かない。
+     * xv6fs が無い構成では書けないので、その場合は静かに飛ばす。 */
+    {
+        int wfd = open("/tmp/duprw.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (wfd >= 0) {
+            char rbuf[16];
+            int rfd = dup(wfd);
+            if (rfd < 0) return 35;
+            if (write(wfd, "hello", 5) != 5) return 36;
+            if (close(wfd) < 0) return 37;
+            if (lseek(rfd, 0, SEEK_SET) != 0) return 38;
+            memset(rbuf, 0, sizeof(rbuf));
+            if (read(rfd, rbuf, sizeof(rbuf)) != 5) return 39;
+            if (memcmp(rbuf, "hello", 5) != 0) return 40;
+            if (close(rfd) < 0) return 41;
+            if (write_all(1, "DUPRW-OK\n", 9) < 0) return 42;
+            unlink("/tmp/duprw.bin");
+        }
+    }
     return 0;
 }
