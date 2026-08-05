@@ -41,7 +41,7 @@ extern void puthex(uint64_t v);
  * 112 KiB leaves room for bitmap and triple-indirect metadata while restoring
  * most of the throughput lost by the earlier conservative 64 KiB cap.
  */
-#define XV6FS_WRITE_CHUNK_MAX (112U * 1024U)
+/* XV6FS_WRITE_CHUNK_MAX は include/xv6fs.h に移した (riscv64 側と共有するため) */
 /*
  * syscall の戻り値は -errno 規約 (kernel/sys_fs.c が fs_* の戻り値をそのまま
  * ユーザーへ返し、user/syscalls.c が -4095..-1 を errno へ写す)。

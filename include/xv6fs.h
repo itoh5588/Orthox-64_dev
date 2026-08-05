@@ -45,6 +45,18 @@ void xv6_sleep_unlock(struct xv6_sleeplock *s);
 #define XV6FS_NINODES     8192
 #define XV6FS_LOGBLOCKS   126
 
+/* 1 トランザクションで書ける最大バイト数。**大きな書き込みは必ず分割すること。**
+ *
+ * 分割しないと 1 回の write でログを使い切り、xv6log_write の
+ * KASSERT(lg.lh.n < XV6FS_LOGBLOCKS) でカーネルパニックになる。
+ * 112KB = 112 ブロックで、inode / ビットマップ / 間接ブロックを足しても
+ * XV6FS_LOGBLOCKS (126) に収まる。
+ *
+ * x86 (kernel/fs.c) は元からこれで分割していたが、riscv64
+ * (xv6fs_write_file) には分割が無く、Orthox 上の gcc が .o を書いた瞬間に
+ * パニックしていた。同じ定数を両方から使って二度と離れないようにする。 */
+#define XV6FS_WRITE_CHUNK_MAX (112U * 1024U)
+
 /* inode type */
 #define XV6FS_T_DIR    1
 #define XV6FS_T_FILE   2
@@ -223,6 +235,9 @@ struct orth_dirent;   /* forward declaration (fs.h で定義) */
 int xv6fs_is_mounted(void);
 int xv6fs_stat_path(const char *path, uint32_t *mode, uint64_t *size,
                     int64_t *mtime, uint32_t *rdev);
+/* path の inode 番号を返す。stat の st_ino に本物の値を入れるために要る。
+ * (xv6fs_stat_path は呼び出し側が 8 箇所あるので引数を増やさず別関数にした) */
+int xv6fs_ino_path(const char *path, uint64_t *out_ino);
 int xv6fs_list_dir(const char *path, struct orth_dirent *dirents,
                    size_t max_entries, size_t *out_count);
 int xv6fs_write_file(const char *path, uint64_t offset,

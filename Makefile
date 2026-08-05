@@ -238,7 +238,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -371,9 +371,14 @@ riscv64-errno-probe: $(RISCV64_ERRNO_PROBE_ELF)
 RISCV64_USER_BIN_SRCS = $(wildcard user/riscv64-bin/*.c)
 RISCV64_USER_BIN_ELFS = $(patsubst user/riscv64-bin/%.c,$(BUILD_DIR)/riscv64-bin/%.elf,$(RISCV64_USER_BIN_SRCS))
 
+# musl ユーザーランドを作るコンパイラドライバ。既定は clang 版 (macOS の従来経路)。
+# 移植した GCC 4.7.4 で作るときは
+#   make riscv64-ash-smoke RISCV64_MUSL_CC_DRIVER=ports/orthos-riscv64-musl-gcc474.sh ...
+RISCV64_MUSL_CC_DRIVER ?= ports/orthos-riscv64-musl-gcc.sh
+
 $(BUILD_DIR)/riscv64-bin/%.elf: user/riscv64-bin/%.c $(RISCV64_MUSL_SYSROOT)/lib/libc.a
 	@mkdir -p $(@D)
-	./ports/orthos-riscv64-musl-gcc.sh -O2 -Wall -Wextra $< -o $@
+	./$(RISCV64_MUSL_CC_DRIVER) -O2 -Wall -Wextra $< -o $@
 
 riscv64-user-bin: $(RISCV64_USER_BIN_ELFS)
 
@@ -381,7 +386,7 @@ RISCV64_BUSYBOX_ASH_MUSL_ELF = out/busybox-riscv64-musl.elf
 
 riscv64-busybox-musl: $(RISCV64_MUSL_SYSROOT)/lib/libc.a
 	@mkdir -p out
-	ORTHOS_CC=$(abspath ports/orthos-riscv64-musl-gcc.sh) \
+	ORTHOS_CC=$(abspath $(RISCV64_MUSL_CC_DRIVER)) \
 	ORTHOS_SYSROOT=$(abspath $(RISCV64_MUSL_SYSROOT)) \
 	ORTHOS_INCLUDEDIR=$(abspath $(RISCV64_MUSL_SYSROOT))/include \
 	ORTHOS_EXTRA_CFLAGS="-DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_LINEEDIT_PTR_HACK=1 -DORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS=1" \
@@ -390,7 +395,12 @@ riscv64-busybox-musl: $(RISCV64_MUSL_SYSROOT)/lib/libc.a
 	./ports/build_busybox_ash.sh $(abspath ports/busybox) $(abspath $(RISCV64_BUSYBOX_ASH_MUSL_ELF))
 
 # レガシー syscall 番号の混入と番号ズレの監査 (過去 2 度衝突で実害が出ている)
-riscv64-syscall-audit:
+# パス正規化の単体テスト (ホスト側・1 秒未満、QEMU 不要)。
+# kernel/riscv64/fs.c から関数をその場で抜き出して回すので実装と乖離しない。
+riscv64-path-test:
+	bash ./tests/riscv64_path_normalize_test.sh
+
+riscv64-syscall-audit: riscv64-path-test
 	python3 scripts/check_riscv64_syscalls.py
 
 riscv64-kernel: riscv64-syscall-audit $(RISCV64_KERNEL_ELF)
@@ -435,6 +445,11 @@ RISCV64_ROOTFS_APPLETS = ash sh busybox basename cat chmod cmp cp cut date dd df
 # applet は busybox 本体へのハードリンクにする (xv6fs に symlink 型が無いため)。
 # build_rootfs_xv6fs.py がホスト側のハードリンクを検出して 1 inode に集約するので、
 # applet を増やしてもイメージは busybox 1 本分しか太らない。
+# rootfs に追加で入れたいディレクトリツリー (既定は無し。空白区切りで複数可)。
+# セルフホスト一式を入れるときは
+#   make riscv64-rootfs RISCV64_ROOTFS_EXTRA="ports/orthox-native build/riscv64-native-root"
+RISCV64_ROOTFS_EXTRA ?=
+
 riscv64-rootfs: riscv64-busybox-musl $(RISCV64_USER_BIN_ELFS)
 	rm -rf $(BUILD_DIR)/riscv64-rootfs
 	mkdir -p $(BUILD_DIR)/riscv64-rootfs/bin $(BUILD_DIR)/riscv64-rootfs/etc $(BUILD_DIR)/riscv64-rootfs/tmp
@@ -448,7 +463,11 @@ riscv64-rootfs: riscv64-busybox-musl $(RISCV64_USER_BIN_ELFS)
 	printf 'hello from riscv64 xv6fs rootfs\n' > $(BUILD_DIR)/riscv64-rootfs/etc/motd
 	printf 'root:x:0:0:root:/:/bin/sh\n' > $(BUILD_DIR)/riscv64-rootfs/etc/passwd
 	printf 'root:x:0:\n' > $(BUILD_DIR)/riscv64-rootfs/etc/group
-	printf 'PATH=/bin\nexport PATH\n' > $(BUILD_DIR)/riscv64-rootfs/etc/profile
+	printf 'PATH=/bin:/usr/bin\nexport PATH\n' > $(BUILD_DIR)/riscv64-rootfs/etc/profile
+	@for d in $(RISCV64_ROOTFS_EXTRA); do \
+	    echo "rootfs に $$d を追加"; \
+	    cp -a $$d/. $(BUILD_DIR)/riscv64-rootfs/; \
+	done
 	python3 scripts/build_rootfs_xv6fs.py $(BUILD_DIR)/riscv64-rootfs $(RISCV64_ROOTFS_IMG) | tail -4
 
 # busybox ash を対話シェルとして起動 (stdin/stdout = シリアルコンソール)

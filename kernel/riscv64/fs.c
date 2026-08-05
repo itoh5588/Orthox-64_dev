@@ -137,6 +137,53 @@ static int riscv64_fs_build_dirents(const char* resolved, struct orth_dirent* di
     return 0;
 }
 
+/* '.' と '..' をその場で畳んでパスを正規化する。
+ *
+ * **畳まないと文字列が実体より長いまま残る。** cwd と相対パスを単純連結すると
+ *   /src/gcc-self/build/gcc + ../../gcc/ada/gcc-interface/ada-tree.def
+ *   = 64 文字
+ * になるが、file_descriptor_t の name[64] は 63 文字までしか保持できないので
+ * 黙って切り捨てられ、別のパスとして扱われて I/O error になる。
+ * 畳めば /src/gcc-self/gcc/ada/gcc-interface/ada-tree.def の 47 文字で収まる。
+ * (Orthox 上で GCC のソースをコンパイルしたときに実際に踏んだ)
+ *
+ * xv6fs は '..' の dirent を辿れるので畳まなくても解決自体はできるが、
+ * 長さのぶんだけ上限に当たりやすくなる。 */
+static void riscv64_fs_normalize_path(char* p) {
+    char* w = p;         /* 書き込み位置 */
+    const char* r = p;   /* 読み取り位置 */
+
+    if (!p) return;
+    if (*r == '/') { *w++ = '/'; r++; }
+
+    while (*r) {
+        const char* seg;
+        size_t len = 0;
+        size_t k;
+
+        while (*r == '/') r++;
+        if (!*r) break;
+        seg = r;
+        while (*r && *r != '/') { r++; len++; }
+
+        if (len == 1 && seg[0] == '.') continue;             /* "." は捨てる */
+        if (len == 2 && seg[0] == '.' && seg[1] == '.') {    /* ".." は 1 段戻る */
+            while (w > p && w[-1] != '/') w--;                /* 直前の要素を消す */
+            if (w > p + 1) w--;                               /* その前の '/' も (root は残す) */
+            continue;
+        }
+        /* **区切りは要素の前に書くこと。** 後ろに書くと、最後の要素の直後に
+         * '/' を書いた時点で読み取り側 (r) がまだ見ている終端 NUL を潰し、
+         * その先の残骸を読み続けてしまう (/dev/null が /dev/null/-user になった)。
+         * 前に書けば w は常に r より後ろに行かない。 */
+        if (w > p && w[-1] != '/') *w++ = '/';
+        for (k = 0; k < len; k++) *w++ = seg[k];
+    }
+
+    if (w == p) *w++ = '/';               /* 全部消えたら "/" */
+    *w = '\0';
+}
+
 static int riscv64_fs_resolve_path(const char* path, char* out, size_t size) {
     struct task* current = get_current_task();
     size_t i = 0;
@@ -145,15 +192,20 @@ static int riscv64_fs_resolve_path(const char* path, char* out, size_t size) {
     if (!path || !out || size == 0) return -1;
     if (path[0] == '/') {
         while (path[j] && i + 1 < size) out[i++] = path[j++];
+        if (path[j]) return -1;           /* 収まらなければ黙って切らずに失敗させる */
         out[i] = '\0';
+        riscv64_fs_normalize_path(out);
         return 0;
     }
     if (!current || current->cwd[0] == '\0') return -1;
     while (current->cwd[j] && i + 1 < size) out[i++] = current->cwd[j++];
+    if (current->cwd[j]) return -1;
     if (i > 0 && out[i - 1] != '/' && i + 1 < size) out[i++] = '/';
     j = 0;
     while (path[j] && i + 1 < size) out[i++] = path[j++];
+    if (path[j]) return -1;
     out[i] = '\0';
+    riscv64_fs_normalize_path(out);
     return 0;
 }
 
@@ -277,20 +329,54 @@ int sys_open(const char* path, int flags, int mode) {
         }
 
         if (is_dir) {
-            // 4 ページ = 約60エントリまで列挙可能
-            void* dir_page = pmm_alloc(4);
+            /* ディレクトリの中身を open 時に丸ごと写し取る。
+             *
+             * 入りきらないと「一部だけ見える」状態になり、しかも何も言わない。
+             * 4 ページ = 64 エントリ固定だった頃、GCC のビルドディレクトリ
+             * (185 エントリ) で後から作った .o が列挙に出ず、`echo *.o` が
+             * 展開されないという形で出た。個別の stat では見えるので、
+             * 気付くまで遠回りした。
+             *
+             * 収まらなかったら諦めずにページ数を増やして取り直す。
+             * count == cap は「ちょうど入った」と「溢れた」の区別が付かないので、
+             * 安全側 (取り直し) に倒す。 */
+            size_t pages = 4;
+            size_t cap;
+            void* dir_page;
             struct orth_dirent* dirents;
             size_t count = 0;
+
+            /* 必要な大きさは先に決める。足りなければ捨てて取り直す、という
+             * 形にすると、そのたびに全エントリの inode を読み直すことになり、
+             * 185 エントリのディレクトリで `echo *.o` が返らなくなった。
+             * ディレクトリの size をエントリ 1 個分で割れば個数の上限が出る。 */
+            if (xv6fs_is_mounted()) {
+                uint64_t dsize = 0;
+                if (xv6fs_stat_path(resolved, 0, &dsize, 0, 0) == 0) {
+                    size_t need = (size_t)(dsize / sizeof(struct xv6fs_dirent));
+                    size_t want = (need * sizeof(struct orth_dirent) + PAGE_SIZE - 1) / PAGE_SIZE;
+                    if (want + 1 > pages) pages = want + 1;
+                }
+            }
+            if (pages > 512) return -1;   /* 2MB を超えるディレクトリは扱わない */
+
+            cap = pages * PAGE_SIZE / sizeof(struct orth_dirent);
+            dir_page = pmm_alloc(pages);
             if (!dir_page) return -1;
             dirents = (struct orth_dirent*)PHYS_TO_VIRT(dir_page);
-            for (size_t i = 0; i < 4 * PAGE_SIZE; i++) ((uint8_t*)dirents)[i] = 0;
-            if (riscv64_fs_build_dirents(resolved, dirents, 4 * PAGE_SIZE / sizeof(struct orth_dirent), &count) < 0) {
-                pmm_free(dir_page, 4);
+            for (size_t i = 0; i < pages * PAGE_SIZE; i++) ((uint8_t*)dirents)[i] = 0;
+            if (riscv64_fs_build_dirents(resolved, dirents, cap, &count) < 0) {
+                pmm_free(dir_page, pages);
+                return -1;
+            }
+            /* 見積もりを超えた = 一部しか見えていない。黙って切り捨てない */
+            if (count >= cap) {
+                pmm_free(dir_page, pages);
                 return -1;
             }
             current->fds[fd].data = dirents;
             current->fds[fd].size = count * sizeof(struct orth_dirent);
-            current->fds[fd].aux0 = 4;
+            current->fds[fd].aux0 = (uint32_t)pages;
             current->fds[fd].type = FT_DIR;
             current->fds[fd].offset = 0;
             current->fds[fd].in_use = 1;
@@ -557,9 +643,14 @@ int sys_stat(const char* path, struct kstat* st) {
         uint64_t xv6_size = 0;
         uint32_t xv6_rdev = 0;
         if (xv6fs_stat_path(resolved, &xv6_mode, &xv6_size, 0, &xv6_rdev) == 0) {
+            uint64_t xv6_ino = 0;
             riscv64_fs_kstat_defaults(st, xv6_mode, (int64_t)xv6_size);
             st->rdev = xv6_rdev;
-            st->ino = 2;
+            /* **本物の inode 番号を返すこと。** ここを定数 2 にしていたため
+             * すべてのディレクトリが同じ ino になり、Orthox 上の gcc が
+             * インクルードパスの重複判定 (dev+ino で比較する) で /include を
+             * "duplicate" と見なして捨て、stdio.h が見つからなくなっていた。 */
+            if (xv6fs_ino_path(resolved, &xv6_ino) == 0) st->ino = xv6_ino;
             return 0;
         }
         // xv6fs に無くても埋め込み /bootstrap-user は見せる

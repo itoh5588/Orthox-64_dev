@@ -27,6 +27,9 @@ if [ -f /opt/homebrew/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin ]; then
     FW_PATH=/opt/homebrew/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
 elif [ -f /usr/local/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin ]; then
     FW_PATH=/usr/local/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+elif [ -f /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin ]; then
+    # Debian/Ubuntu の qemu-system-misc はここに置く
+    FW_PATH=/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
 else
     echo "OpenSBI firmware not found" >&2
     exit 1

@@ -23,6 +23,9 @@ if [ -f /opt/homebrew/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin ]; then
     FW_PATH=/opt/homebrew/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
 elif [ -f /usr/local/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin ]; then
     FW_PATH=/usr/local/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+elif [ -f /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin ]; then
+    # Debian/Ubuntu の qemu-system-misc はここに置く
+    FW_PATH=/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
 else
     echo "OpenSBI firmware not found" >&2
     exit 1
@@ -73,6 +76,9 @@ grep -q "vm clone selftest passed" "$SERIAL_LOG"
 grep -q "user stack selftest passed" "$SERIAL_LOG"
 grep -q "user frame selftest passed" "$SERIAL_LOG"
 grep -q "user frame sync selftest passed" "$SERIAL_LOG"
+# 自己テストが「通った」ことまで見る。ここを見ないと、カーネルが
+# 「selftest: ... failed」を出しても素通りする (st_ino の退行検査で実際に踏んだ)。
+grep -q "fs syscall selftest passed" "$SERIAL_LOG"
 grep -q "trap vector installed" "$SERIAL_LOG"
 grep -q "sbi timer armed" "$SERIAL_LOG"
 grep -q "Task system initialized." "$SERIAL_LOG"

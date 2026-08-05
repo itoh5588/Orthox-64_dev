@@ -15,8 +15,12 @@ from pathlib import Path
 # FS 定数 (Orthox-64 拡張版)
 # ──────────────────────────────────────────────
 BSIZE      = 1024
-FSSIZE     = 327680       # 320 MB in 1 KB blocks
-NINODES    = 8192
+# 既定は 320MB / 8192 inode。セルフホストで GCC のソースを載せるときなど、
+# 足りない場合は環境変数で上げる (カーネルはスーパーブロックから読むので変更不要。
+# ブロック番号は uint32 なので上限は 4TB):
+#   XV6FS_FSSIZE=1048576 XV6FS_NINODES=32768 python3 scripts/build_rootfs_xv6fs.py ...
+FSSIZE     = int(os.environ.get("XV6FS_FSSIZE", 327680))   # 1 KB ブロック単位
+NINODES    = int(os.environ.get("XV6FS_NINODES", 8192))
 LOGBLOCKS  = 126          # log data-blocks (excluding header block)
 
 NDIRECT    = 9            # 直接ブロック数

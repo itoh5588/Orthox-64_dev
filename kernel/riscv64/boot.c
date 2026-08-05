@@ -17,6 +17,7 @@
 #include "xv6fs.h"
 #include "pmm.h"
 #include "syscall.h"
+#include "sys_internal.h"
 #include "task.h"
 
 extern int task_execve(arch_task_exec_frame_t* frame, const char* path,
@@ -837,6 +838,23 @@ static void riscv64_fs_syscall_selftest(void) {
     if ((int64_t)frame.a0 != 0) {
         riscv64_uart_puts("  fs syscall selftest: close dir failed\n");
         return;
+    }
+
+    /* --- st_ino が実値であること -------------------------------------
+     * ここを定数で埋めると cpp がインクルードパスの重複判定 (dev+ino で比較)
+     * を誤り、/include を "duplicate" として捨てて stdio.h が見つからなくなる。
+     * Orthox 上で GCC を動かして初めて出た不具合なので、起動時に見張る。
+     * xv6fs が無いとディレクトリが 1 つも無いので、その場合は飛ばす。 */
+    if (xv6fs_is_mounted()) {
+        static const char dir_a[] = "/";
+        static const char dir_b[] = "/bin";
+        struct kstat sa, sb;
+        if (sys_stat(dir_a, &sa) == 0 && sys_stat(dir_b, &sb) == 0) {
+            if (sa.ino == sb.ino) {
+                riscv64_uart_puts("  fs syscall selftest: st_ino が一意でない\n");
+                return;
+            }
+        }
     }
 
     riscv64_uart_puts("  fs syscall selftest passed\n");

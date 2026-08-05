@@ -1187,8 +1187,15 @@ void riscv64_syscall_dispatch(riscv64_trap_frame_t* frame) {
     // exec するのが前提なので実用上は問題ないが、exec 前に子が書いた内容が親から
     // 見えない点だけ本来の vfork と異なる。親を停止させないのも同様に許容している
     // (呼び出し側は waitpid か pipe で同期するため)。
+    // **a2 以降は見ないこと。** musl の _Fork.c は
+    //   __syscall(SYS_clone, SIGCHLD, 0)
+    // と引数を 2 つしか渡さないので、a2 は直前の呼び出し (__lock) が残した値になる。
+    // 以前は a2 == 0 も条件に入れていたが、それはたまたま a2 が 0 だった
+    // ビルドでしか成立しない。実際 GCC 4.7.4 で musl を組むと a2 に残留値が入り、
+    // fork が ENOSYS で落ちた。Linux も flags に CLONE_PARENT_SETTID /
+    // CLONE_CHILD_SETTID / CLONE_SETTLS が無ければ a2..a4 を参照しない。
     if (frame->a7 == RISCV64_LINUX_SYS_CLONE &&
-        ((frame->a0 == RISCV64_LINUX_CLONE_SIGCHLD && frame->a1 == 0 && frame->a2 == 0) ||
+        ((frame->a0 == RISCV64_LINUX_CLONE_SIGCHLD && frame->a1 == 0) ||
          frame->a0 == (RISCV64_LINUX_CLONE_VM | RISCV64_LINUX_CLONE_VFORK |
                        RISCV64_LINUX_CLONE_SIGCHLD))) {
         // 子は親フレームのコピーで復帰するため、先に sepc を進めて

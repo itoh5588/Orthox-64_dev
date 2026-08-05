@@ -68,6 +68,10 @@ def main():
         for fname in sorted(files):
             if not fname.endswith((".c", ".h", ".S")):
                 continue
+            # macOS が残す AppleDouble (._foo.c) は中身がバイナリなので読まない。
+            # 拡張子だけで拾うと UnicodeDecodeError で監査ごと落ちる。
+            if fname.startswith("._"):
+                continue
             path = os.path.join(root, fname)
             in_block = False
             for lineno, line in enumerate(open(path), 1):

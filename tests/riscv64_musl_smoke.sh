@@ -28,6 +28,9 @@ if [ -f /opt/homebrew/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin ]; then
     FW_PATH=/opt/homebrew/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
 elif [ -f /usr/local/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin ]; then
     FW_PATH=/usr/local/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+elif [ -f /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin ]; then
+    # Debian/Ubuntu の qemu-system-misc はここに置く
+    FW_PATH=/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
 else
     echo "OpenSBI firmware not found" >&2
     exit 1
@@ -35,6 +38,14 @@ fi
 
 SERIAL_LOG=LOGs/riscv64-musl-serial.log
 rm -f "$SERIAL_LOG"
+
+# rootfs があれば繋ぐ。probe の BIGWRITE (xv6fs のログ分割の退行検査) は
+# 書き込める FS が要るので、無い構成では probe 側が静かに飛ばす。
+ROOTFS_IMG=out/rootfs-riscv64-xv6.img
+DRIVE_ARGS=()
+if [ -f "$ROOTFS_IMG" ]; then
+    DRIVE_ARGS=(-drive "file=$ROOTFS_IMG,if=none,format=raw,id=vblk0" -device virtio-blk-device,drive=vblk0)
+fi
 
 "$QEMU_BIN" \
     -machine virt \
@@ -45,7 +56,7 @@ rm -f "$SERIAL_LOG"
     -kernel out/kernel-riscv64.elf \
     -display none \
     -serial file:"$SERIAL_LOG" \
-    -monitor none &
+    -monitor none "${DRIVE_ARGS[@]}" &
 QEMU_PID=$!
 
 cleanup() {
@@ -70,11 +81,22 @@ echo "---------------------------------"
 grep -q "Orthox riscv64 early boot" "$SERIAL_LOG"
 grep -q "sv39 satp enabled" "$SERIAL_LOG"
 grep -q "Task system initialized." "$SERIAL_LOG"
+# 自己テストが「通った」ことまで見る。ここを見ないと、カーネルが
+# 「selftest: ... failed」を出しても素通りする (st_ino の退行検査で実際に踏んだ)。
+grep -q "fs syscall selftest passed" "$SERIAL_LOG"
 grep -q "MUSL:/" "$SERIAL_LOG"
 grep -q "^ELF$" "$SERIAL_LOG"
 grep -q "^MAP$" "$SERIAL_LOG"
 grep -q "^CHILD$" "$SERIAL_LOG"
 grep -q "^DONE$" "$SERIAL_LOG"
+# clone の引数チェックが a2 以降を見ていないこと (見ていると ENOSYS で落ちる)
+grep -q "^CLONEG-CHILD$" "$SERIAL_LOG"
+grep -q "^CLONEG-OK$" "$SERIAL_LOG"
+# 1 回で 200KB 書けること (xv6fs のログ分割が無いとカーネルパニックする)。
+# rootfs を繋いだ構成でのみ出る。
+if [ -f out/rootfs-riscv64-xv6.img ]; then
+    grep -q "^BIGWRITE-OK$" "$SERIAL_LOG"
+fi
 grep -q "bootstrap user exit" "$SERIAL_LOG"
 
 echo "riscv64 musl smoke test: PASS"

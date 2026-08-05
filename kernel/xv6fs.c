@@ -833,6 +833,17 @@ int xv6fs_is_mounted(void) {
     return g_xv6fs_devname[0] != '\0';
 }
 
+int xv6fs_ino_path(const char *path, uint64_t *out_ino) {
+    const char *lookup = (path && path[0]) ? path : "/";
+    struct xv6fs_inode *ip = xv6fs_namei(lookup);
+    if (!ip) return -1;
+    xv6fs_ilock(ip);
+    if (out_ino) *out_ino = (uint64_t)ip->inum;
+    xv6fs_iunlock(ip);
+    xv6fs_iput(ip);
+    return 0;
+}
+
 int xv6fs_stat_path(const char *path, uint32_t *out_mode,
                     uint64_t *out_size, int64_t *out_mtime,
                     uint32_t *out_rdev) {
@@ -900,14 +911,32 @@ int xv6fs_list_dir(const char *path, struct orth_dirent *dirents,
 int xv6fs_write_file(const char *path, uint64_t offset,
                      const void *buf, size_t n) {
     struct xv6fs_inode *ip = xv6fs_namei(path);
+    const uint8_t *src = (const uint8_t *)buf;
+    size_t done = 0;
+
     if (!ip) return -1;
-    xv6log_begin_op();
-    xv6fs_ilock(ip);
-    int r = xv6fs_writei(ip, buf, (uint32_t)offset, (uint32_t)n);
-    xv6fs_iunlock(ip);
-    xv6log_end_op();
+
+    /* n == 0 でも xv6fs_writei を 1 回通す (サイズ更新などの副作用を保つ) */
+    do {
+        size_t chunk = n - done;
+        int r;
+        if (chunk > (size_t)XV6FS_WRITE_CHUNK_MAX) chunk = (size_t)XV6FS_WRITE_CHUNK_MAX;
+
+        xv6log_begin_op();
+        xv6fs_ilock(ip);
+        r = xv6fs_writei(ip, src + done, (uint32_t)(offset + done), (uint32_t)chunk);
+        xv6fs_iunlock(ip);
+        xv6log_end_op();
+
+        if (r != (int)chunk) {
+            xv6fs_iput(ip);
+            return -1;
+        }
+        done += chunk;
+    } while (done < n);
+
     xv6fs_iput(ip);
-    return (r == (int)n) ? 0 : -1;
+    return 0;
 }
 
 /* mkfifo: T_FIFO inode を作成する。既存パスなら -17 (EEXIST)。 */
