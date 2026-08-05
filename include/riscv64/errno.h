@@ -17,6 +17,7 @@
 #define RISCV64_EPERM        1
 #define RISCV64_ENOENT       2
 #define RISCV64_ESRCH        3
+#define RISCV64_E2BIG        7
 #define RISCV64_EBADF        9
 #define RISCV64_ECHILD      10
 #define RISCV64_EAGAIN      11

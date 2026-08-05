@@ -10,6 +10,9 @@
 #define EXEC_COPY_PAGES      260
 #define EXEC_MAX_PATH_LEN    1024
 #define EXEC_MAX_VEC_STRINGS 128
+/* 引数が多すぎるときに返す errno。共有カーネルには errno ヘッダが無いので
+ * kernel/fs.c と同じくファイル内で定義する (Linux asm-generic の値) */
+#define E2BIG 7
 #define EXEC_MAX_VEC_STR_LEN 4096
 #define EXEC_ET_DYN_LOAD_BASE 0x400000ULL
 #define EXEC_INTERP_LOAD_BASE 0x7fc000000000ULL
@@ -85,6 +88,12 @@ static int copy_user_string_vector(char* const user_vec[], char** kernel_vec,
         kernel_vec[count] = storage[count];
         count++;
     }
+    /* **上限で打ち切ったまま成功を返さないこと。** 以前はここで黙って
+     * 終端していたので、129 個目以降が消えたまま exec が成功していた。
+     *   ar rcs libbackend.a *.o   ← 344 個渡して届くのは 126 個。
+     *                                216 個が入っていないアーカイブが出来て ar は成功する
+     * Linux と同じく E2BIG を返して呼び出し側に分割させる。 */
+    if (count == EXEC_MAX_VEC_STRINGS && user_vec[count]) return -E2BIG;
     kernel_vec[count] = 0;
     return 0;
 }
@@ -223,8 +232,17 @@ int task_prepare_initial_user_stack(arch_address_space_t address_space, struct t
     int argc = 0; if (argv) while (argv[argc]) argc++;
     int envc = 0; if (envp) while (envp[envc]) envc++;
     uint64_t env_ptrs[EXEC_MAX_VEC_STRINGS]; uint64_t arg_ptrs[EXEC_MAX_VEC_STRINGS];
-    if (argc > EXEC_MAX_VEC_STRINGS) argc = EXEC_MAX_VEC_STRINGS;
-    if (envc > EXEC_MAX_VEC_STRINGS) envc = EXEC_MAX_VEC_STRINGS;
+    /* **上限を超えたら失敗させること。** 以前はここで argc / envc を
+     * EXEC_MAX_VEC_STRINGS に詰めていたが、それは「超えた分を黙って捨てて
+     * 成功を返す」ことになる。呼び出し側は成功したと思って先に進むので、
+     * 誰も気付かないまま結果だけが欠ける。
+     *   ar rcs libbackend.a *.o     ← 344 個渡しても 126 個しか届かず、
+     *                                  216 個が消えたアーカイブが出来て ar は成功する
+     * Linux も引数が多すぎれば E2BIG を返す。 */
+    if (argc > EXEC_MAX_VEC_STRINGS || envc > EXEC_MAX_VEC_STRINGS) {
+        puts("Exec: too many argv/envp strings (E2BIG)\r\n");
+        return -E2BIG;
+    }
     uint64_t current_str_addr = t->user_stack_top;
     current_str_addr -= 16;
     uint64_t random_base = current_str_addr;
@@ -332,11 +350,19 @@ int task_execve(arch_syscall_frame_t* frame, const char* path, char* const argv[
     }
     exec_copy = (struct exec_copy_buf*)PHYS_TO_VIRT(exec_copy_phys);
     kernel_memset(exec_copy, 0, EXEC_COPY_PAGES * PAGE_SIZE);
-    if (copy_user_cstring(path, exec_copy->path, EXEC_MAX_PATH_LEN) < 0 ||
-        copy_user_string_vector(argv, exec_copy->argv, exec_copy->argv_storage) < 0 ||
-        copy_user_string_vector(envp, exec_copy->envp, exec_copy->envp_storage) < 0) {
-        pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
-        return -1;
+    {
+        /* argv / envp の複製は -E2BIG を返すことがある。-1 に潰さず通す */
+        int vec_rc = copy_user_cstring(path, exec_copy->path, EXEC_MAX_PATH_LEN) < 0 ? -1 : 0;
+        if (vec_rc >= 0) {
+            vec_rc = copy_user_string_vector(argv, exec_copy->argv, exec_copy->argv_storage);
+        }
+        if (vec_rc >= 0) {
+            vec_rc = copy_user_string_vector(envp, exec_copy->envp, exec_copy->envp_storage);
+        }
+        if (vec_rc < 0) {
+            pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+            return vec_rc;
+        }
     }
     if (fs_get_file_data(exec_copy->path, &file_addr, &file_size) < 0) {
         puts("Exec: File not found: "); puts(exec_copy->path); puts("\r\n");
@@ -380,10 +406,16 @@ int task_execve(arch_syscall_frame_t* frame, const char* path, char* const argv[
         }
     }
 
-    if (task_prepare_initial_user_stack(address_space, t, &info, &interp_info, exec_copy->argv, exec_copy->envp) < 0) {
-        pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
-        arch_vm_destroy_user_address_space(address_space);
-        return -1;
+    {
+        /* 戻り値をそのまま返す。-E2BIG を -1 に潰すと、呼び出し側は
+         * 「ファイルが無い」と区別できなくなる */
+        int stack_rc = task_prepare_initial_user_stack(address_space, t, &info, &interp_info,
+                                                       exec_copy->argv, exec_copy->envp);
+        if (stack_rc < 0) {
+            pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+            arch_vm_destroy_user_address_space(address_space);
+            return stack_rc;
+        }
     }
 
     old_cr3 = arch_task_context_get_address_space(&t->ctx);

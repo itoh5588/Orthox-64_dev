@@ -125,6 +125,25 @@ fi
     # 自作コマンド (user/riscv64-bin) がビルドされて /bin に入っているか
     printf 'orthinfo | tail -1\n'
     sleep 4
+    # exec の引数上限 (128 個)。**超えた分を黙って捨てないこと。**
+    # 以前は 129 個目以降を落として成功を返していたので、
+    #   ar rcs libbackend.a *.o   ← 344 個渡して 126 個しか届かない
+    # のように「エラーは出ないが結果が欠ける」形になっていた。
+    # 200 個渡したら E2BIG で失敗し、50 個なら通ること。
+    printf 'a=""; i=0; while [ $i -lt 200 ]; do a="$a x$i"; i=$((i+1)); done\n'
+    sleep 6
+    # **$( ... | ... ) を使わないこと。** コマンド置換の中にパイプがある形は
+    # -smp 4 で止まる (別件。日報2026-08-04 参照)。ここで使うと E2BIG の
+    # 検査のはずが別のバグを踏んで落ちる
+    printf '/bin/echo $a > /dev/null 2>/e2big.txt; echo argv200-done\n'
+    sleep 6
+    printf 'cat /e2big.txt\n'
+    sleep 4
+    printf 'b=""; i=0; while [ $i -lt 50 ]; do b="$b y$i"; i=$((i+1)); done\n'
+    sleep 6
+    # 50 個は全部届くこと。末尾の y49 が出れば切り捨てられていない
+    printf '/bin/echo $b | tail -c 4\n'
+    sleep 6
     printf 'exit\n'
     sleep 3
 ) | "$QEMU_BIN" \
@@ -146,7 +165,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for _ in {1..150}; do
+# 送信側の sleep 合計が 130 秒あるので、上限はそれより十分大きく取ること。
+# 4 hart のときはゲストが遅く、150 秒だと最後のコマンドが間に合わずに落ちる
+# (E2BIG の検査を足したときに実際に踏んだ)。
+for _ in {1..240}; do
     if grep -aq "bootstrap user exit" "$SERIAL_LOG" 2>/dev/null; then
         break
     fi
@@ -195,6 +217,11 @@ if [ -f "$ROOTFS_IMG" ]; then
     grep -aq "tab-ok" "$SERIAL_LOG"            # TAB 補完後もコマンドが通る
     grep -aq "sleep-ok" "$SERIAL_LOG"          # sleep = nanosleep のタイマー起床
     grep -aq "orthinfo : ok" "$SERIAL_LOG"     # user/riscv64-bin のビルド導線
+    # exec の引数上限。200 個なら「切り捨てて成功」ではなく E2BIG で失敗すること。
+    # 黙って切り捨てていた頃は /e2big.txt が空で、この行が出なかった
+    grep -aq "argv200-done" "$SERIAL_LOG"
+    grep -aq "Argument list too long" "$SERIAL_LOG"
+    grep -aq "^y49$" "$SERIAL_LOG"             # 上限内 (50 個) は全部届く
     # ln (linkat): /h.txt が motd の内容を持つ = ハードリンクが張れている
     [ "$(grep -ac "hello from riscv64 xv6fs rootfs" "$SERIAL_LOG")" -ge 3 ]
 fi

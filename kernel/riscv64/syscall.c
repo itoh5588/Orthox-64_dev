@@ -1171,7 +1171,12 @@ static void riscv64_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                      (char* const*)(uintptr_t)arch_syscall_arg1(frame),
                                      (char* const*)(uintptr_t)arch_syscall_arg2(frame));
                 if (rc < 0) {
-                    arch_syscall_set_return(frame, (uint64_t)(int64_t)-2); /* -ENOENT */
+                    /* 失敗の大半は「その実行ファイルが無い」なので -1 は -ENOENT に
+                     * 写す。ただし引数が多すぎる場合は task_execve が -E2BIG を
+                     * 返してくるので、それは潰さずに通す (busybox の xargs は
+                     * E2BIG を見て分割するため、ENOENT にすると分割してくれない) */
+                    int err = (rc == -RISCV64_E2BIG) ? -RISCV64_E2BIG : -RISCV64_ENOENT;
+                    arch_syscall_set_return(frame, (uint64_t)(int64_t)err);
                 }
                 /* 成功時は frame が新プロセスの初期状態に書き換わっている */
             }
