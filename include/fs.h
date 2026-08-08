@@ -124,10 +124,14 @@ typedef struct {
     int ref_count;
     /* ref_count は読み端と書き端の合計なので、これだけでは EOF も EPIPE も
      * 判定できない。1R+1W ちょうどのときしか ref_count<2 が成立しないため、
-     * dup や fork で片側が 2 本になると書き手が全滅しても reader が寝たまま
-     * になる。端ごとの本数は下の 2 つで数える。
-     * いまは kernel/riscv64/fs.c だけが使う。kernel/fs.c (x86) は従来どおり
-     * ref_count で判定しており、この 2 つを更新しない。
+     * 片側が 2 本になると書き手が全滅しても reader が寝たままになる。
+     * 端ごとの本数は下の 2 つで数える。EOF は writers==0、EPIPE は readers==0
+     * で判定すること。ref_count はページ解放の判定にだけ使う。
+     * 数え方はアーキテクチャで違う:
+     *   kernel/riscv64/fs.c  fd ごとに数える (fd->aux1 が 0=読み / 1=書き)
+     *   kernel/fs.c (x86)    file object ごとに数える (file->aux0 の
+     *                        bit0=読み手 / bit1=書き手。FIFO の O_RDWR は
+     *                        両方立つので 1 参照で 1R+1W と数える)
      * pipe_t は 1 ページ上限が厳しいので uint16_t にしてある (fd 数の上限は
      * MAX_FDS なので 16 bit で足りる)。 */
     uint16_t readers;

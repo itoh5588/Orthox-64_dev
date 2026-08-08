@@ -363,9 +363,12 @@ static int pselect_fd_ready(const file_descriptor_t* f, int want_write) {
             pipe = file ? (const pipe_t*)file->private_data : 0;
         }
         if (!pipe) return 1;
-        /* BKL 下のスナップショット読み。外れても次周期で拾う。 */
-        if (want_write) return pipe->count < PIPE_BUF_SIZE || pipe->ref_count < 2;
-        return pipe->count > 0 || pipe->ref_count < 2; /* データ有り or EOF */
+        /* BKL 下のスナップショット読み。外れても次周期で拾う。
+         * ref_count は読み端と書き端の合計なので端の全 close を検出できない。
+         * 端ごとの本数で見る (readers==0 なら write は EPIPE で即返るので
+         * ready、writers==0 なら read は EOF で即返るので ready)。 */
+        if (want_write) return pipe->count < PIPE_BUF_SIZE || pipe->readers == 0;
+        return pipe->count > 0 || pipe->writers == 0; /* データ有り or EOF */
     }
     /* コンソール・通常ファイル・キャラデバイス等は常に ready 扱い。 */
     return 1;

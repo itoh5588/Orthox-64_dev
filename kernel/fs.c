@@ -104,6 +104,16 @@ extern void puthex(uint64_t v);
 #ifndef EEXIST
 #define EEXIST 17
 #endif
+#ifndef EPIPE
+#define EPIPE 32
+#endif
+
+/* pipe を指す file object がどちらの端を持つかを file->aux0 に記録する。
+ * 匿名 pipe は読み端と書き端で別の file object なのでどちらか一方、
+ * FIFO は O_RDWR のとき両方が立つ (fs_open_install_fifo が組み立てる)。
+ * dup / fork は file object を共有するので、この値は複製されない。 */
+#define PIPE_END_READ  1U
+#define PIPE_END_WRITE 2U
 
 static void pipe_wake_task(struct task* waiter) {
     if (!waiter) return;
@@ -184,6 +194,11 @@ static void fs_release_pipe_file(fs_file_t* file) {
 
     flags = spin_lock_irqsave(&pipe->lock);
     pipe->ref_count--;
+    /* 端ごとの本数も減らす。ここで writers が 0 になれば読み手は EOF、
+     * readers が 0 になれば書き手は EPIPE を得る。両方の待ち手を起こすのは
+     * 寝ている側にその判定をやり直させるため。 */
+    if ((file->aux0 & PIPE_END_WRITE) && pipe->writers > 0) pipe->writers--;
+    if ((file->aux0 & PIPE_END_READ) && pipe->readers > 0) pipe->readers--;
     n_readers = pipe_take_waiters_locked(&pipe->read_wq, readers_to_wake, FS_WAITQ_MAX);
     n_writers = pipe_take_waiters_locked(&pipe->write_wq, writers_to_wake, FS_WAITQ_MAX);
     if (pipe->ref_count == 0) {
@@ -248,8 +263,9 @@ static const fs_file_ops_t g_chardev_file_ops = {
 /*   file->aux0: bit0=読み手 bit1=書き手                                */
 /*   file->aux1: レジストリ index                                       */
 /* pipe_t の ref_count は fifo file object 数と一致させる (レジストリは */
-/* ref を持たない) ので、書き手全 close で読み手が EOF を得る既存条件    */
-/* (count==0 && ref_count<2) が 1R+1W でそのまま成立する。              */
+/* ref を持たない)。EOF / EPIPE は ref_count ではなく pipe_t の         */
+/* readers / writers で判定する。同じ端を 2 回開くと ref_count は 2 に   */
+/* なってしまい、合計本数では端の全 close を検出できないため。          */
 /* ------------------------------------------------------------------ */
 
 #define FIFO_MAX 16
@@ -1453,6 +1469,8 @@ retry:
             pipe->write_pos = 0;
             pipe->count = 0;
             pipe->ref_count = 0;
+            pipe->readers = 0;
+            pipe->writers = 0;
             fs_waitq_init(&pipe->read_wq);
             fs_waitq_init(&pipe->write_wq);
         }
@@ -1504,11 +1522,13 @@ retry:
         return -1;
     }
     /* O_RDWR は読み手役+書き手役の 2 参照として数える。1 参照だと
-     * 既存 EOF 条件 (count==0 && ref_count<2) が成立してしまい、
      * O_RDWR で fifo を保持する GNU make のジョブサーバが空読みで
-     * 偽 EOF を受ける (POSIX では自分が書き手なのでブロックが正)。 */
+     * 偽 EOF を受ける (POSIX では自分が書き手なのでブロックが正)。
+     * 端ごとの本数も同時に増やす。こちらが EOF / EPIPE の判定に使われる。 */
     irqf = spin_lock_irqsave(&pipe->lock);
     pipe->ref_count += want_r + want_w;
+    pipe->readers = (uint16_t)(pipe->readers + want_r);
+    pipe->writers = (uint16_t)(pipe->writers + want_w);
     spin_unlock_irqrestore(&pipe->lock, irqf);
 
     file->type = FT_PIPE;
@@ -1516,7 +1536,7 @@ retry:
     file->offset = 0;
     file->ops = &g_fifo_file_ops;
     file->private_data = pipe;
-    file->aux0 = (uint32_t)(want_r | (want_w << 1));
+    file->aux0 = (want_r ? PIPE_END_READ : 0U) | (want_w ? PIPE_END_WRITE : 0U);
     file->aux1 = (uint32_t)idx;
     for (int j = 0; j < 63; j++) {
         file->path[j] = path[j];
@@ -2110,6 +2130,12 @@ int64_t fs_write(int fd, const void* buf, size_t count) {
             struct task* readers_to_wake[FS_WAITQ_MAX];
             int n_readers = 0;
             uint64_t flags = spin_lock_irqsave(&pipe->lock);
+            if (pipe->readers == 0) {
+                spin_unlock_irqrestore(&pipe->lock, flags);
+                /* 読み手が全部閉じた。ここで返さないと、バッファが埋まった
+                 * 時点で誰も読まない write_wq に入って永久に眠る。 */
+                return written > 0 ? (int64_t)written : -EPIPE;
+            }
             if (pipe->count == PIPE_BUF_SIZE) {
                 task_mark_sleeping(current);
                 fs_waitq_add(&pipe->write_wq, current);
@@ -2333,9 +2359,9 @@ int64_t fs_read(int fd, void* buf, size_t count) {
             struct task* writers_to_wake[FS_WAITQ_MAX];
             int n_writers = 0;
             uint64_t flags = spin_lock_irqsave(&pipe->lock);
-            if (pipe->count == 0 && pipe->ref_count < 2) {
+            if (pipe->count == 0 && pipe->writers == 0) {
                 spin_unlock_irqrestore(&pipe->lock, flags);
-                return 0; // 書き込み側が閉じられた
+                return 0; // 書き込み側が全部閉じられた
             }
             if (pipe->count == 0) {
                 task_mark_sleeping(current);
@@ -2537,6 +2563,8 @@ int fs_pipe(int pipefd[2]) {
     pipe->write_pos = 0;
     pipe->count = 0;
     pipe->ref_count = 2;
+    pipe->readers = 1;
+    pipe->writers = 1;
     fs_waitq_init(&pipe->read_wq);
     fs_waitq_init(&pipe->write_wq);
     spinlock_init(&pipe->lock);
@@ -2552,9 +2580,11 @@ int fs_pipe(int pipefd[2]) {
     read_file->type = FT_PIPE;
     read_file->ops = &g_pipe_file_ops;
     read_file->private_data = pipe;
+    read_file->aux0 = PIPE_END_READ;
     write_file->type = FT_PIPE;
     write_file->ops = &g_pipe_file_ops;
     write_file->private_data = pipe;
+    write_file->aux0 = PIPE_END_WRITE;
 
     current->fds[fd1].type = FT_PIPE;
     current->fds[fd1].file = read_file;

@@ -98,6 +98,7 @@ RISCV64_BOOTSTRAP_USER_SRC_ELF ?= $(RISCV64_BOOTSTRAP_USER_BUILD_ELF)
 RISCV64_BOOTSTRAP_USER_EMBED_ELF = out/bootstrap-user-riscv64.elf
 PIPE_TEST_ELF = user/pipetest.elf
 PIPE_STRESS_ELF = user/pipestress.elf
+PIPEEND_PROBE_ELF = user/pipeend_probe.elf
 SMP_STRESS_ELF = user/smpstress.elf
 SCHEDMIX_ELF = user/schedmix.elf
 REAP_TEST_ELF = user/reaptest.elf
@@ -225,7 +226,7 @@ RISCV64_OBJS = $(patsubst kernel/riscv64/%.c, $(BUILD_DIR)/riscv64/kernel/%.o, $
 
 DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/crt0.d $(USER_BUILD_DIR)/syscalls.d $(USER_BUILD_DIR)/syscall_wrap.d \
-       $(USER_BUILD_DIR)/user_test.d $(USER_BUILD_DIR)/exec_test.d $(USER_BUILD_DIR)/pipe_test.d $(USER_BUILD_DIR)/pipestress.d $(USER_BUILD_DIR)/smpstress.d $(USER_BUILD_DIR)/schedmix.d \
+       $(USER_BUILD_DIR)/user_test.d $(USER_BUILD_DIR)/exec_test.d $(USER_BUILD_DIR)/pipe_test.d $(USER_BUILD_DIR)/pipestress.d $(USER_BUILD_DIR)/pipeend_probe.d $(USER_BUILD_DIR)/smpstress.d $(USER_BUILD_DIR)/schedmix.d \
        $(USER_BUILD_DIR)/at_test.d \
        $(USER_BUILD_DIR)/sh.d $(USER_BUILD_DIR)/gcc.d $(USER_BUILD_DIR)/as.d $(USER_BUILD_DIR)/ld.d \
        $(USER_BUILD_DIR)/loop.d $(USER_BUILD_DIR)/cowtest.d $(USER_BUILD_DIR)/rotest.d \
@@ -517,7 +518,7 @@ TEST_ELFS = $(MMAP_TEST_ELF) $(REAP_TEST_ELF) $(ROBUST_TEST_ELF) $(VRAM_TEST_ELF
 
 FORCE:
 
-$(ROOTFS_IMG): FORCE busybox-ash-musl-install $(ROOTFS_FILES) $(USER_BUILD_DIR)/crt0.o $(USER_BUILD_DIR)/syscalls.o $(UDP_ECHO_TEST_ELF) $(UDP_NB_TEST_ELF) $(HTTPS_FETCH_ELF) $(TIME_TEST_ELF) $(TICKRATE_TEST_ELF) $(SHOWCPU_ELF) $(RUNQSTAT_ELF) $(TCPHELLO_ELF) $(FORKCPU_TEST_ELF) $(FORKMODE_ELF) $(PIPE_STRESS_ELF) $(SMP_STRESS_ELF) $(SCHEDMIX_ELF) $(REAP_TEST_ELF) $(SIGNAL_TEST_ELF) $(SIGMASK_TEST_ELF) $(SIGACTION_TEST_ELF) $(STATERRNO_ELF) $(PYENC_CHECK_ELF) $(MUSL_DIRCHECK_ELF) $(MUSL_FORKPROBE_ELF) $(MUSL_EXECPROBE_ELF) $(MUSL_ENVSHOW_ELF) $(VBLK_TEST_ELF) $(VBLK_STRESS_ELF) $(SOUND_TEST_ELF) $(GCC_MUSL_ELF) $(CC1_MUSL_ELF) $(AS_MUSL_ELF) $(LD_MUSL_ELF) $(MAKE_MUSL_ELF) $(KILO_ELF) $(FILE_ELF) $(VMERRNO_TEST_ELF) $(COWTEST_ELF) $(FTRUNCSAVE_TEST_ELF) $(PREADPWRITE_TEST_ELF) $(XV6_SPARSE_TEST_ELF) $(XV6_RECLAIM_TEST_ELF) $(XV6_LARGEWRITE_TEST_ELF) $(HELLO_DYN_ELF) $(DYNLINK_LIB_A_SO) $(DYNLINK_LIB_B_SO) $(DYNLINK_PLUGIN_SO) $(DYNLINK_CPP_SO) $(DYNLINK_MULTI_TLS_ELF) $(DYNLINK_DLOPEN_ELF) $(DYNLINK_MALLOC_ELF) $(BUSYBOX_ASH_DYN_ELF) $(GCC_DYN_ELF)
+$(ROOTFS_IMG): FORCE busybox-ash-musl-install $(ROOTFS_FILES) $(USER_BUILD_DIR)/crt0.o $(USER_BUILD_DIR)/syscalls.o $(UDP_ECHO_TEST_ELF) $(UDP_NB_TEST_ELF) $(HTTPS_FETCH_ELF) $(TIME_TEST_ELF) $(TICKRATE_TEST_ELF) $(SHOWCPU_ELF) $(RUNQSTAT_ELF) $(TCPHELLO_ELF) $(FORKCPU_TEST_ELF) $(FORKMODE_ELF) $(PIPE_STRESS_ELF) $(PIPEEND_PROBE_ELF) $(SMP_STRESS_ELF) $(SCHEDMIX_ELF) $(REAP_TEST_ELF) $(SIGNAL_TEST_ELF) $(SIGMASK_TEST_ELF) $(SIGACTION_TEST_ELF) $(STATERRNO_ELF) $(PYENC_CHECK_ELF) $(MUSL_DIRCHECK_ELF) $(MUSL_FORKPROBE_ELF) $(MUSL_EXECPROBE_ELF) $(MUSL_ENVSHOW_ELF) $(VBLK_TEST_ELF) $(VBLK_STRESS_ELF) $(SOUND_TEST_ELF) $(GCC_MUSL_ELF) $(CC1_MUSL_ELF) $(AS_MUSL_ELF) $(LD_MUSL_ELF) $(MAKE_MUSL_ELF) $(KILO_ELF) $(FILE_ELF) $(VMERRNO_TEST_ELF) $(COWTEST_ELF) $(FTRUNCSAVE_TEST_ELF) $(PREADPWRITE_TEST_ELF) $(XV6_SPARSE_TEST_ELF) $(XV6_RECLAIM_TEST_ELF) $(XV6_LARGEWRITE_TEST_ELF) $(HELLO_DYN_ELF) $(DYNLINK_LIB_A_SO) $(DYNLINK_LIB_B_SO) $(DYNLINK_PLUGIN_SO) $(DYNLINK_CPP_SO) $(DYNLINK_MULTI_TLS_ELF) $(DYNLINK_DLOPEN_ELF) $(DYNLINK_MALLOC_ELF) $(BUSYBOX_ASH_DYN_ELF) $(GCC_DYN_ELF)
 	@if [ "$(ROOTFS_REBUILD)" = "0" ] && [ -f "$(ROOTFS_IMG)" ]; then \
 		echo "Keeping existing $(ROOTFS_IMG) (ROOTFS_REBUILD=0)"; \
 	else \
@@ -561,6 +562,7 @@ $(ROOTFS_IMG): FORCE busybox-ash-musl-install $(ROOTFS_FILES) $(USER_BUILD_DIR)/
 		cp $(FORKCPU_TEST_ELF) rootfs/bin/forkcputest.elf; \
 		cp $(FORKMODE_ELF) rootfs/bin/forkmode.elf; \
 		cp $(PIPE_STRESS_ELF) rootfs/bin/pipestress.elf; \
+		cp $(PIPEEND_PROBE_ELF) rootfs/bin/pipeend_probe.elf; \
 		cp $(SMP_STRESS_ELF) rootfs/bin/smpstress.elf; \
 		cp $(SCHEDMIX_ELF) rootfs/bin/schedmix.elf; \
 		cp $(REAP_TEST_ELF) rootfs/bin/reaptest.elf; \
@@ -654,6 +656,11 @@ x86-kernel-smoke: $(KERNEL_ELF)
 # 失敗系の syscall が正しい errno を返すかの検証 (-1 は EPERM として顕在化する)
 x86-errno-smoke: $(KERNEL_ELF)
 	bash ./tests/x86_errno_smoke.sh
+
+# pipe / FIFO の端ごとの本数 (EOF は writers==0 / EPIPE は readers==0)。
+# rootfs.img に /bin/pipeend_probe.elf が要る (make rootfs.img で入る)
+x86-pipe-end-smoke: $(KERNEL_ELF)
+	bash ./tests/x86_pipe_end_smoke.sh
 
 run: $(ISO)
 	bash tests/run_qemu_stdio.sh
