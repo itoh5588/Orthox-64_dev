@@ -116,3 +116,15 @@ ports/python-install/
 ports/rust/
 ports/rust_stubs.c.bak
 ports/rust_stubs.c.bak2
+
+# riscv64 GCC セルフホストのビルド成果物 (計 256MB)。
+# 作り方は ports/build_*_riscv*.sh と ports/port_riscv_to_gcc47.sh にある
+ports/.prereq-build/
+ports/.prereq-riscv64/
+ports/cross-riscv64/
+ports/make-4.4.1-riscv64/
+ports/orthox-native/
+ports/*.tar.xz
+
+# rootfs.img の退避 (rootfs.img.20260705 など)。*.img には当たらない
+rootfs.img.*
