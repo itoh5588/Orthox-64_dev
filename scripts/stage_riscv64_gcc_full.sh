@@ -87,10 +87,57 @@ cp -a "$PREREQ/lib"     "$OUT/prereq/"
 mkdir -p "$OUT/ref"
 cp "$GCCBLD/gcc/cc1" "$OUT/ref/cc1" 2>/dev/null || true
 
-# --- ビルド対象の一覧を、クロス側の .o から起こす ------------------------
-# libbackend.a に入っている .o の名前がそのままビルド対象になる。
-( cd "$GCCBLD/gcc" && ls *.o 2>/dev/null | sed 's/\.o$//' ) > "$OUT/build/gcc/objlist.txt"
-echo "--- ビルド対象: $(wc -l < "$OUT/build/gcc/objlist.txt") 個"
+# --- ビルド対象の一覧を、GCC のリンク構成から起こす ----------------------
+#
+# 以前はここで `ls *.o` していた。「作るべきもの」を「クロス側で作れたもの」から
+# 逆算する形で、依存の向きが逆になっていた:
+#
+#   - クロス側が作り損ねた .o は一覧に載らず、Orthox 側でも最初から対象外に
+#     なる。欠けているのに欠けていることが分からない
+#   - objlist はリンク (ar q libbackend.a) も駆動するので、突き合わせても
+#     必ず一致する。ものさし自身で自分を測っていて検算にならない
+#   - **`ls *.o` は上位階層しか見ない。** C_OBJS に入る c-family/*.o (15 本) と
+#     common/common-targhooks.o が構造的に落ちていた
+#
+# cc1 のリンク構成は GCC の Makefile が持っている。make に展開させて取る
+# (build_cc1.sh のファイル別 -D は既にそうしている。対象の一覧だけ ls だった)。
+#
+#   OBJS                   -> libbackend.a
+#   OBJS-libcommon         -> libcommon.a
+#   OBJS-libcommon-target  -> libcommon-target.a
+#   C_OBJS                 -> cc1 に直接リンク (c-family/*.o を含む)
+#   BACKEND の .o          -> main.o
+#
+# 再帰変数なので `make -p` では展開されない ($(C_AND_OBJC_OBJS) が黙って
+# 落ちる)。ダミーの Makefile を重ねて echo させること。
+PVMK="$(mktemp)"
+printf '__orthox_objs:\n\t@echo $(OBJS) $(OBJS-libcommon) $(OBJS-libcommon-target) $(C_OBJS) $(filter %%.o,$(BACKEND))\n' > "$PVMK"
+( cd "$GCCBLD/gcc" && make -f Makefile -f "$PVMK" __orthox_objs 2>/dev/null ) \
+    | tr ' ' '\n' | grep '\.o$' | sed 's/\.o$//' | sort -u > "$OUT/build/gcc/objlist.txt"
+rm -f "$PVMK"
+
+if [ ! -s "$OUT/build/gcc/objlist.txt" ]; then
+    echo "error: objlist を Makefile から起こせなかった ($GCCBLD/gcc/Makefile)" >&2
+    exit 1
+fi
+echo "--- ビルド対象: $(wc -l < "$OUT/build/gcc/objlist.txt") 個 (Makefile のリンク構成から)"
+
+# クロス側に実在する .o と突き合わせる。ここで黙って一覧を縮めない。
+# 食い違いは「クロス側のビルドが不完全」を意味するので、報告して止める
+( cd "$GCCBLD/gcc" && find . -name '*.o' | sed 's|^\./||; s|\.o$||' ) | sort -u > "$OUT/build/gcc/.crossbuilt.txt"
+MISSING="$(comm -23 "$OUT/build/gcc/objlist.txt" "$OUT/build/gcc/.crossbuilt.txt")"
+if [ -n "$MISSING" ]; then
+    echo "警告: リンク構成にあるのにクロス側で作れていない .o がある:" >&2
+    echo "$MISSING" | sed 's/^/    /' >&2
+    echo "    (Orthox 側では作れる見込みだが、ref との比較はできない)" >&2
+fi
+rm -f "$OUT/build/gcc/.crossbuilt.txt"
+
+# 出力先のサブディレクトリを掘っておく。objlist に c-family/xxx のような
+# 名前が入るので、build_cc1.sh の -o がディレクトリ不在で落ちないように
+( cd "$OUT/build/gcc" && sed -n 's|/[^/]*$||p' objlist.txt | sort -u | while read -r d; do
+    [ -n "$d" ] && mkdir -p "$d"
+done )
 
 # --- Orthox 上で回すビルドスクリプト -------------------------------------
 # make を使わない。make は**レシピ全体を 1 つの長いコマンド文字列として
