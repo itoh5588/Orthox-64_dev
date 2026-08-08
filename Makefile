@@ -91,6 +91,7 @@ RISCV64_MUSL_PROBE_ELF = out/riscv64-musl-probe.elf
 RISCV64_PREEMPT_PROBE_ELF = out/riscv64-preempt-probe.elf
 RISCV64_SLEEP_PROBE_ELF = out/riscv64-sleep-probe.elf
 RISCV64_ERRNO_PROBE_ELF = out/riscv64-errno-probe.elf
+RISCV64_OFFSET_PROBE_ELF = out/riscv64-offset-probe.elf
 RISCV64_BOOTSTRAP_USER_BUILD_ELF = out/bootstrap-user-riscv64-default.elf
 # 埋め込み対象の外部ユーザー ELF (差し替え可能)
 RISCV64_BOOTSTRAP_USER_SRC_ELF ?= $(RISCV64_BOOTSTRAP_USER_BUILD_ELF)
@@ -367,6 +368,12 @@ $(RISCV64_ERRNO_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/r
 
 riscv64-errno-probe: $(RISCV64_ERRNO_PROBE_ELF)
 
+$(RISCV64_OFFSET_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_offset_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_offset_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+riscv64-offset-probe: $(RISCV64_OFFSET_PROBE_ELF)
+
 # user/riscv64-bin/<name>.c → rootfs の /bin/<name>。ファイルを置くだけで拾われる。
 # リンクは busybox と同じ ports/orthos-riscv64-musl-gcc.sh に任せる
 # (musl の crt1.o と riscv64-elf-gcc の libgcc をまとめてくれる。libgcc が無いと
@@ -429,6 +436,12 @@ riscv64-sleep-smoke: $(RISCV64_SLEEP_PROBE_ELF)
 	bash ./tests/riscv64_sleep_smoke.sh
 
 # 失敗系の syscall が正しい errno を返すかの検証 (-1 は EPERM として顕在化する)
+# dup / fork した fd が offset を共有するか (Linux の open file description)。
+# 探針は書き込みをするので、スクリプト側で rootfs イメージの複製に対して回す
+riscv64-offset-smoke: $(RISCV64_OFFSET_PROBE_ELF)
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_OFFSET_PROBE_ELF)
+	bash ./tests/riscv64_offset_smoke.sh
+
 riscv64-errno-smoke: $(RISCV64_ERRNO_PROBE_ELF)
 	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_ERRNO_PROBE_ELF)
 	bash ./tests/riscv64_errno_smoke.sh

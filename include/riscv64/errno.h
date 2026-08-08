@@ -27,6 +27,8 @@
 #define RISCV64_ENOTDIR     20
 #define RISCV64_EISDIR      21
 #define RISCV64_EINVAL      22
+/* open file description を作れない (x86 の kernel/fs.c も同じ場面で ENFILE) */
+#define RISCV64_ENFILE      23
 #define RISCV64_EMFILE      24
 #define RISCV64_ENOTTY      25
 #define RISCV64_ENOSPC      28

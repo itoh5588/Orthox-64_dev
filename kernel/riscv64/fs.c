@@ -24,6 +24,95 @@ struct riscv64_linux_dirent64 {
 
 /* errno 定数は include/riscv64/errno.h (syscall.c と共有) */
 
+/* ---- 共有 open file description (fs_file_t) ------------------------------
+ *
+ * dup / fork で作った fd は Linux では同じ open file description を指すので、
+ * 片方で読み書きするともう片方の offset も進む。riscv64 は fs_clone_fd() が
+ * *dst = *src の丸ごと複製で、offset が fd ごとに独立していた。
+ *
+ * 実測 (user/riscv64_offset_probe.c、日報2026-08-08):
+ *   dup-write / dup-read / dup-lseek / fork-read  すべて相手の offset が 0 のまま
+ *   separate-open だけ正しく独立
+ *
+ * x86 (kernel/fs.c) は既に fs_file_t を共有しており 5/5 一致する。構造を
+ * そちらに揃える。offset / size / data を fd から file 側へ移し、fd は
+ * 参照を持つだけにする。
+ *
+ * pipe は移行しない。offset を持たないうえ、端ごとの本数 (readers/writers) を
+ * fd の aux1 で数える作りを入れたばかりなので、触ると検証済みの部分を
+ * 作り直すことになる。fs_clone_fd() は「file があれば参照を増やす、
+ * 無ければ従来の pipe 処理」で両立する。
+ */
+static fs_file_t* fs_alloc_file(void) {
+    void* phys = pmm_alloc(1);
+    fs_file_t* file;
+    if (!phys) return 0;
+    file = (fs_file_t*)PHYS_TO_VIRT(phys);
+    for (size_t i = 0; i < sizeof(*file); i++) ((uint8_t*)file)[i] = 0;
+    file->ref_count = 1;
+    return file;
+}
+
+static void fs_file_get(fs_file_t* file) {
+    if (!file) return;
+    file->ref_count++;
+}
+
+static void fs_file_put(fs_file_t* file) {
+    if (!file) return;
+    file->ref_count--;
+    if (file->ref_count > 0) return;
+    if (file->ops && file->ops->release) file->ops->release(file);
+    pmm_free((void*)VIRT_TO_PHYS((uint64_t)file), 1);
+}
+
+/* FT_DIR の dirents ページ / FT_MODULE の読み込みバッファは open ごとの資源。
+ * fd ではなく file が持つ。以前は fs_release_fd() が desc->data を無条件に
+ * pmm_free していたので、dir fd を dup すると二重解放になり得た。 */
+static void riscv64_fs_release_dir_file(fs_file_t* file) {
+    if (file && file->private_data && file->aux0) {
+        pmm_free((void*)VIRT_TO_PHYS((uint64_t)file->private_data), (size_t)file->aux0);
+    }
+}
+
+static const fs_file_ops_t g_dir_file_ops = { .release = riscv64_fs_release_dir_file };
+/* xv6fs / module / chardev / console は file 側に解放すべき資源を持たない
+ * (xv6fs は名前で引き直す作り、module は静的領域) */
+static const fs_file_ops_t g_plain_file_ops = { .release = 0 };
+
+size_t fs_fd_offset(const file_descriptor_t* fd) {
+    if (!fd) return 0;
+    return fd->file ? fd->file->offset : fd->offset;
+}
+
+void fs_fd_set_offset(file_descriptor_t* fd, size_t offset) {
+    if (!fd) return;
+    if (fd->file) fd->file->offset = offset;
+    else fd->offset = offset;
+}
+
+file_type_t fs_fd_type(const file_descriptor_t* fd) {
+    if (!fd) return FT_UNUSED;
+    return fd->file ? fd->file->type : fd->type;
+}
+
+/* size と data も共有側に置く。fd 側は file が無いときだけ見る */
+size_t fs_fd_size(const file_descriptor_t* fd) {
+    if (!fd) return 0;
+    return fd->file ? fd->file->size : fd->size;
+}
+
+void fs_fd_set_size(file_descriptor_t* fd, size_t size) {
+    if (!fd) return;
+    if (fd->file) fd->file->size = size;
+    else fd->size = size;
+}
+
+void* fs_fd_data(const file_descriptor_t* fd) {
+    if (!fd) return 0;
+    return fd->file ? fd->file->private_data : fd->data;
+}
+
 /* file_descriptor_t の size は fd ごとの写しで、open した時点の値で止まる。
  * dup / fork で複製された fd は元の fd の書き込みを知らないため、Linux なら
  * 読める内容が EOF になる。ファイルの本当の長さは inode にしか無いので、
@@ -35,9 +124,9 @@ struct riscv64_linux_dirent64 {
 void riscv64_fs_refresh_xv6fs_size(file_descriptor_t* f) {
     uint32_t mode = 0;
     uint64_t size = 0;
-    if (!f || f->type != FT_XV6FS || f->name[0] == '\0') return;
+    if (!f || fs_fd_type(f) != FT_XV6FS || f->name[0] == '\0') return;
     if (xv6fs_stat_path(f->name, &mode, &size, 0, 0) != 0) return;
-    f->size = (size_t)size;
+    fs_fd_set_size(f, (size_t)size);
 }
 
 /* 待ち手が「寝ている」かの判定。read/write は TASK_SLEEPING で寝るが、
@@ -314,7 +403,12 @@ int sys_open(const char* path, int flags, int mode) {
             if (dev == RISCV64_DEV_CONSOLE) {
                 fs_init_console_fd(&current->fds[fd], flags);
             } else {
+                fs_file_t* file = fs_alloc_file();
+                if (!file) return -RISCV64_ENFILE;
+                file->type = FT_CHARDEV;
+                file->ops = &g_plain_file_ops;
                 current->fds[fd].type = FT_CHARDEV;
+                current->fds[fd].file = file;
                 current->fds[fd].data = 0;
                 current->fds[fd].size = 0;
                 current->fds[fd].offset = 0;
@@ -397,8 +491,21 @@ int sys_open(const char* path, int flags, int mode) {
                 pmm_free(dir_page, pages);
                 return -1;
             }
-            current->fds[fd].data = dirents;
-            current->fds[fd].size = count * sizeof(struct orth_dirent);
+            {
+                fs_file_t* file = fs_alloc_file();
+                if (!file) {
+                    pmm_free(dir_page, pages);
+                    return -RISCV64_ENFILE;
+                }
+                file->type = FT_DIR;
+                file->ops = &g_dir_file_ops;
+                file->private_data = dirents;
+                file->size = count * sizeof(struct orth_dirent);
+                file->aux0 = (uint32_t)pages;   /* release が pmm_free する枚数 */
+                current->fds[fd].file = file;
+            }
+            current->fds[fd].data = 0;
+            current->fds[fd].size = 0;
             current->fds[fd].aux0 = (uint32_t)pages;
             current->fds[fd].type = FT_DIR;
             current->fds[fd].offset = 0;
@@ -417,11 +524,20 @@ int sys_open(const char* path, int flags, int mode) {
                 if (xv6fs_truncate_file(resolved, 0) < 0) return -1;
                 xv6_size = 0;
             }
+            {
+                fs_file_t* file = fs_alloc_file();
+                if (!file) return -RISCV64_ENFILE;
+                file->type = FT_XV6FS;
+                file->ops = &g_plain_file_ops;
+                file->size = (size_t)xv6_size;
+                // O_APPEND は末尾から書き始める (以後の write でも都度末尾へ)
+                file->offset = (flags & O_APPEND) ? (size_t)xv6_size : 0;
+                current->fds[fd].file = file;
+            }
             current->fds[fd].type = FT_XV6FS;
             current->fds[fd].data = 0;
-            current->fds[fd].size = (size_t)xv6_size;
-            // O_APPEND は末尾から書き始める (以後の write でも都度末尾へ)
-            current->fds[fd].offset = (flags & O_APPEND) ? (size_t)xv6_size : 0;
+            current->fds[fd].size = 0;
+            current->fds[fd].offset = 0;
             current->fds[fd].in_use = 1;
             current->fds[fd].flags = flags;
             current->fds[fd].fd_flags = 0;
@@ -434,9 +550,18 @@ int sys_open(const char* path, int flags, int mode) {
 
     if (fs_get_file_data(resolved, &file_data, &file_size) < 0) return -RISCV64_ENOENT;
 
+    {
+        fs_file_t* file = fs_alloc_file();
+        if (!file) return -RISCV64_ENFILE;
+        file->type = FT_MODULE;
+        file->ops = &g_plain_file_ops;   /* 埋め込み ELF は静的領域。解放不要 */
+        file->private_data = file_data;
+        file->size = file_size;
+        current->fds[fd].file = file;
+    }
     current->fds[fd].type = FT_MODULE;
-    current->fds[fd].data = file_data;
-    current->fds[fd].size = file_size;
+    current->fds[fd].data = 0;
+    current->fds[fd].size = 0;
     current->fds[fd].offset = 0;
     current->fds[fd].in_use = 1;
     current->fds[fd].flags = flags;
@@ -513,14 +638,14 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
             uint32_t xv6_mode = 0;
             uint64_t xv6_size = 0;
             if (xv6fs_stat_path(f->name, &xv6_mode, &xv6_size, 0, 0) == 0) {
-                f->size = (size_t)xv6_size;
+                fs_fd_set_size(f, (size_t)xv6_size);
             }
-            f->offset = f->size;
+            fs_fd_set_offset(f, fs_fd_size(f));
         }
-        off = f->offset;
+        off = fs_fd_offset(f);
         if (xv6fs_write_file(f->name, (uint64_t)off, buf, count) < 0) return -RISCV64_ENOSPC;
-        f->offset = off + count;
-        if (f->offset > f->size) f->size = f->offset;
+        fs_fd_set_offset(f, off + count);
+        if (fs_fd_offset(f) > fs_fd_size(f)) fs_fd_set_size(f, fs_fd_offset(f));
         return (int64_t)count;
     }
     if (current->fds[fd].type != FT_CONSOLE) return -RISCV64_EBADF;
@@ -617,34 +742,38 @@ int64_t sys_read(int fd, void* buf, size_t count) {
     if (f->type == FT_XV6FS) {
         struct xv6fs_inode* ip;
         int got;
-        /* f->size は fd ごとの写しなので、他の fd が書いた分を知らない。
-         * dup / fork で複製した fd から読むと EOF 扱いになっていた
-         * (binutils の ar が一時ファイルを dup した fd で読み直すため、
-         *  74 バイト書いたアーカイブが 0 バイトになっていた)。
-         * 本物のサイズは inode にしか無いので、読む前に取り直す。 */
+        /* dup / fork した相方が書いた分は fd->file を共有しているので見える。
+         * ここで取り直すのは**別々に open した fd** が書いた分。size は
+         * open した時点の写しなので、他プロセスの追記を知らない。
+         * 本物の長さは inode にしか無い。
+         *
+         * (これが無いと binutils の ar が壊れた。ar は mkstemp した一時
+         *  ファイルを dup し、片方で書いてもう片方から読み戻す。74 バイト
+         *  書いたアーカイブが 0 バイトになっていた。この dup の経路自体は
+         *  fs_file_t の共有で塞がったが、別 open の経路は残るので取り直しは必要) */
         riscv64_fs_refresh_xv6fs_size(f);
-        if (f->offset >= f->size) return 0;
-        remaining = f->size - f->offset;
+        if (fs_fd_offset(f) >= fs_fd_size(f)) return 0;
+        remaining = fs_fd_size(f) - fs_fd_offset(f);
         to_read = (count > remaining) ? remaining : count;
         ip = xv6fs_namei(f->name);
         if (!ip) return -1;
         xv6fs_ilock(ip);
-        got = xv6fs_readi(ip, buf, (uint32_t)f->offset, (uint32_t)to_read);
+        got = xv6fs_readi(ip, buf, (uint32_t)fs_fd_offset(f), (uint32_t)to_read);
         xv6fs_iunlock(ip);
         xv6fs_iput(ip);
         if (got < 0) return -1;
-        f->offset += (size_t)got;
+        fs_fd_set_offset(f, fs_fd_offset(f) + (size_t)got);
         return (int64_t)got;
     }
-    if (f->type != FT_MODULE) return -RISCV64_EBADF;
-    if (f->offset >= f->size) return 0;
+    if (fs_fd_type(f) != FT_MODULE) return -RISCV64_EBADF;
+    if (fs_fd_offset(f) >= fs_fd_size(f)) return 0;
 
-    remaining = f->size - f->offset;
+    remaining = fs_fd_size(f) - fs_fd_offset(f);
     to_read = (count > remaining) ? remaining : count;
     for (size_t i = 0; i < to_read; i++) {
-        ((uint8_t*)buf)[i] = ((const uint8_t*)f->data)[f->offset + i];
+        ((uint8_t*)buf)[i] = ((const uint8_t*)fs_fd_data(f))[fs_fd_offset(f) + i];
     }
-    f->offset += to_read;
+    fs_fd_set_offset(f, fs_fd_offset(f) + to_read);
     return (int64_t)to_read;
 }
 
@@ -872,8 +1001,8 @@ int sys_ftruncate(int fd, uint64_t length) {
     if (f->type != FT_XV6FS || f->name[0] == '\0') return -RISCV64_EINVAL;
     if (!riscv64_fs_flags_writable(f->flags)) return -RISCV64_EBADF;
     if (xv6fs_truncate_file(f->name, length) < 0) return -RISCV64_EINVAL;
-    f->size = (size_t)length;
-    if (f->offset > f->size) f->offset = f->size;
+    fs_fd_set_size(f, (size_t)length);
+    if (fs_fd_offset(f) > fs_fd_size(f)) fs_fd_set_offset(f, fs_fd_size(f));
     return 0;
 }
 
@@ -922,13 +1051,16 @@ void fs_release_fd(file_descriptor_t* desc) {
                 pmm_free((void*)VIRT_TO_PHYS((uint64_t)pipe), 1);
             }
         }
-    } else if (desc->type == FT_DIR) {
-        if (desc->data) {
-            pmm_free((void*)VIRT_TO_PHYS((uint64_t)desc->data), (size_t)desc->aux0);
-        }
+    } else if (desc->file) {
+        /* dirents ページなどの資源は file->ops->release が持つので、
+         * 最後の参照が消えたときだけ解放される。
+         * 以前はここで desc->data を無条件に pmm_free していたため、
+         * dir fd を dup すると二重解放になり得た。 */
+        fs_file_put(desc->file);
     }
 
     desc->in_use = 0;
+    desc->file = 0;
     desc->data = 0;
     desc->size = 0;
     desc->offset = 0;
@@ -1070,6 +1202,13 @@ int sys_fcntl(int fd, int cmd, uint64_t arg) {
 int fs_clone_fd(file_descriptor_t* dst, const file_descriptor_t* src) {
     if (!dst || !src) return -1;
     *dst = *src;
+    /* 共有 open file description を持つ型は参照を増やすだけ。offset / size /
+     * data は file 側にあるので、丸ごと複製した fd の写しは使われない。
+     * これで dup / fork した fd が offset を共有する (Linux と同じ) */
+    if (src->in_use && src->file) {
+        fs_file_get(src->file);
+        return 0;
+    }
     if (src->in_use && src->type == FT_PIPE && src->data) {
         pipe_t* pipe = (pipe_t*)src->data;
         uint64_t flags = spin_lock_irqsave(&pipe->lock);
@@ -1093,7 +1232,13 @@ void fs_close_cloexec_descriptors(struct task* task) {
 }
 
 int fs_init_console_fd(file_descriptor_t* fd, int flags) {
+    fs_file_t* file;
     if (!fd) return -1;
+    file = fs_alloc_file();
+    if (!file) return -1;
+    file->type = FT_CONSOLE;
+    file->ops = &g_plain_file_ops;
+    fd->file = file;
     fd->type = FT_CONSOLE;
     fd->data = 0;
     fd->size = 0;
@@ -1134,14 +1279,14 @@ int sys_getdents(int fd, struct orth_dirent* dirp, size_t count) {
     if (!dirp) return -RISCV64_EFAULT;
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
     f = &current->fds[fd];
-    if (f->type != FT_DIR || !f->data) return -RISCV64_ENOTDIR;
-    if (f->offset >= f->size) return 0;
-    remaining = f->size - f->offset;
+    if (f->type != FT_DIR || !fs_fd_data(f)) return -RISCV64_ENOTDIR;
+    if (fs_fd_offset(f) >= fs_fd_size(f)) return 0;
+    remaining = fs_fd_size(f) - fs_fd_offset(f);
     to_copy = (count > remaining) ? remaining : count;
     for (size_t i = 0; i < to_copy; i++) {
-        ((uint8_t*)dirp)[i] = ((uint8_t*)f->data)[f->offset + i];
+        ((uint8_t*)dirp)[i] = ((uint8_t*)fs_fd_data(f))[fs_fd_offset(f) + i];
     }
-    f->offset += to_copy;
+    fs_fd_set_offset(f, fs_fd_offset(f) + to_copy);
     return (int)to_copy;
 }
 
@@ -1157,13 +1302,13 @@ int sys_getdents64(int fd, void* dirp, size_t count) {
     if (!dirp) return -RISCV64_EFAULT;
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
     f = &current->fds[fd];
-    if (f->type != FT_DIR || !f->data) return -RISCV64_ENOTDIR;
-    if (f->offset >= f->size) return 0;
+    if (f->type != FT_DIR || !fs_fd_data(f)) return -RISCV64_ENOTDIR;
+    if (fs_fd_offset(f) >= fs_fd_size(f)) return 0;
 
-    src = (struct orth_dirent*)f->data;
-    index = f->offset / sizeof(struct orth_dirent);
+    src = (struct orth_dirent*)fs_fd_data(f);
+    index = fs_fd_offset(f) / sizeof(struct orth_dirent);
 
-    while ((index + 1) * sizeof(struct orth_dirent) <= f->size) {
+    while ((index + 1) * sizeof(struct orth_dirent) <= fs_fd_size(f)) {
         struct riscv64_linux_dirent64 ent;
         size_t name_len = 0;
         size_t reclen;
@@ -1191,6 +1336,6 @@ int sys_getdents64(int fd, void* dirp, size_t count) {
         index++;
     }
 
-    f->offset = index * sizeof(struct orth_dirent);
+    fs_fd_set_offset(f, index * sizeof(struct orth_dirent));
     return (int)out_used;
 }

@@ -355,9 +355,10 @@ static int64_t riscv64_bootstrap_sys_lseek(int fd, int64_t offset, int whence) {
     if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -RISCV64_EBADF;
     f = &current->fds[fd];
     if (f->type == FT_DIR) return -RISCV64_ESPIPE;
-    /* SEEK_END と EOF 判定に使う f->size は fd ごとの写しなので、
-     * dup / fork した相方が書いた分を知らない。inode から取り直す
-     * (詳細は kernel/riscv64/fs.c の riscv64_fs_refresh_xv6fs_size) */
+    /* offset / size は共有 open file description (fd->file) 側にある。
+     * dup / fork した相方の書き込みがここに見えるのはそのため。
+     * 別々に open した fd は別の file を持つので、xv6fs は inode から
+     * 取り直す (riscv64_fs_refresh_xv6fs_size) */
     riscv64_fs_refresh_xv6fs_size(f);
 
     switch (whence) {
@@ -365,10 +366,10 @@ static int64_t riscv64_bootstrap_sys_lseek(int fd, int64_t offset, int whence) {
             base = 0;
             break;
         case 1:
-            base = (int64_t)f->offset;
+            base = (int64_t)fs_fd_offset(f);
             break;
         case 2:
-            base = (int64_t)f->size;
+            base = (int64_t)fs_fd_size(f);
             break;
         default:
             return -RISCV64_EINVAL;
@@ -377,11 +378,11 @@ static int64_t riscv64_bootstrap_sys_lseek(int fd, int64_t offset, int whence) {
     next = base + offset;
     if (next < 0) return -RISCV64_EINVAL;
     /* 書き込み用に開いた xv6fs ファイルは EOF 越えのシークを許す (穴あき書き込み) */
-    if ((uint64_t)next > f->size &&
+    if ((uint64_t)next > fs_fd_size(f) &&
         !(f->type == FT_XV6FS && ((f->flags & 3) == O_WRONLY || (f->flags & 3) == O_RDWR))) {
         return -RISCV64_EINVAL;
     }
-    f->offset = (size_t)next;
+    fs_fd_set_offset(f, (size_t)next);
     return next;
 }
 
