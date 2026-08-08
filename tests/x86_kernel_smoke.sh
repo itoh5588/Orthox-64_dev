@@ -130,7 +130,12 @@ echo "--------------------------------"
 # シェルは 1 文字ずつエコーバックするので、grep はコマンド名ではなく
 # 出力側にしか現れない文字列に当てること
 grep -aq "Task system initialized" "$SERIAL_LOG"
-grep -aq "kernel-native-build: PASS" "$SERIAL_LOG"   # ブート時の bootcmd
+# ブート時の bootcmd (OS 内でカーネルを組む)。
+# ここだけが落ちるときはカーネルの退行ではなく、rootfs.img の /kbuild が
+# 空でフルビルドになり持ち時間に間に合っていない可能性が高い。
+# その場合は make nativekernelbuildsmoke を 1 回流してから出直すこと
+# (日報2026-08-08 §5、Makefile の x86-*-smoke 手前のコメントも参照)。
+grep -aq "kernel-native-build: PASS" "$SERIAL_LOG"
 
 # 起床レイテンシ: sleep_ms(120) と sleep_ms(250) の実測
 grep -aq "tick0=" "$SERIAL_LOG"

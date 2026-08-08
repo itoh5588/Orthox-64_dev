@@ -648,6 +648,28 @@ endif
 	rm -rf iso_root
 
 
+# ★ rootfs.img を作り直したら、下の x86-*-smoke より先に
+#      make nativekernelbuildsmoke
+#    を 1 回流すこと。理由は次のとおり (日報2026-08-08 §5)。
+#
+#    /etc/bootcmd はブート時に /etc/native_kernel_build_smoke.sh を起動し、
+#    OS 内で make -j4 でカーネルを組む。イメージに /kbuild/kernel の .o が
+#    揃っていれば実質 no-op で数秒で終わるが、作り直した直後は /kbuild が
+#    空なので約 50 ファイルを OS 内の cc1 でフルコンパイルすることになる。
+#    そうなると:
+#      x86-kernel-smoke    kernel-native-build: PASS が持ち時間内に出ない
+#      x86-pipe-end-smoke  ビルドで塞がった ash に探針が届かない
+#    のどちらも時間切れで落ちる。カーネルの退行ではないので注意。
+#
+#    /kbuild は rootfs/ ステージングからは作れない (OS 内で育つ状態)。
+#    nativekernelbuildsmoke は virtio-blk 経由で root を書けるように起動する
+#    ので (kernel/init.c:196-211)、フルビルドの結果が rootfs.img に残る。
+#
+#    なお $(ROOTFS_IMG) は FORCE 依存なので、ISO を作る系のターゲット
+#    (run / persist-run / nativekernelbuildsmoke など) を叩くと rootfs.img が
+#    作り直され、この /kbuild は消える。下の x86-*-smoke 3 つはスクリプト側で
+#    ISO を組んで既存の rootfs.img をそのまま使うので、叩いても消えない。
+
 # x86 カーネルの回帰テスト。ISO はスクリプト側で組む
 # (rootfs.img は既存のものを使う。macOS では x86 ユーザーランドを再ビルドできない)
 x86-kernel-smoke: $(KERNEL_ELF)

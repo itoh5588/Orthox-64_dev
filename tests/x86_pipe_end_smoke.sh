@@ -20,6 +20,12 @@
 #
 #   make x86-pipe-end-smoke がカーネルのビルドとあわせて実行する
 #   SMP_CPUS で CPU 数を変えられる (既定 4)
+#
+# ★ rootfs.img を作り直した直後は、先に make nativekernelbuildsmoke を
+#    1 回流すこと。下の駆動部は「ブート直後の bootcmd が終わるまで 30 秒待つ」
+#    前提だが、イメージの /kbuild が空だと bootcmd の OS 内カーネルビルドが
+#    フルビルドになり、30 秒では終わらない。ビルドで塞がった ash に探針が
+#    届かず時間切れになる (日報2026-08-08 §5)。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

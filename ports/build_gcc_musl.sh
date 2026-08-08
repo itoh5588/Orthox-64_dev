@@ -9,21 +9,6 @@ XAR="$(command -v x86_64-elf-ar || command -v ar)"
 XRANLIB="$(command -v x86_64-elf-ranlib || command -v ranlib)"
 TOOLWRAP="$BUILD/.toolwrap"
 
-mkdir -p "$TOOLWRAP"
-for tool in ar ranlib nm ld as objcopy objdump readelf strip; do
-  wrapper="$TOOLWRAP/x86_64-elf-$tool"
-  if [ ! -x "$wrapper" ]; then
-    host_tool="$(command -v x86_64-elf-$tool || command -v "$tool" || true)"
-    if [ -n "$host_tool" ]; then
-      ln -sf "$host_tool" "$wrapper"
-    fi
-  fi
-done
-ln -sf "$ROOT/ports/orthos-gcc.sh" "$TOOLWRAP/x86_64-elf-gcc"
-ln -sf "$ROOT/ports/orthos-gcc.sh" "$TOOLWRAP/x86_64-elf-cc"
-ln -sf "$ROOT/ports/orthos-g++.sh" "$TOOLWRAP/x86_64-elf-g++"
-ln -sf "$ROOT/ports/orthos-g++.sh" "$TOOLWRAP/x86_64-elf-c++"
-
 export PATH="$TOOLWRAP:/opt/homebrew/opt/x86_64-elf-gcc/bin:$PATH"
 export CC="$ROOT/ports/orthos-gcc.sh"
 export CXX="$ROOT/ports/orthos-g++.sh"
@@ -47,6 +32,24 @@ if [ -f "$BUILD/Makefile" ] && ! grep -Fq "VPATH=$SRC" "$BUILD/Makefile"; then
   rm -rf "$BUILD"
   mkdir -p "$BUILD"
 fi
+
+# $TOOLWRAP は $BUILD の中にあるので、上の rm -rf より後で作ること。
+# 先に作ると消され、PATH だけが消えたディレクトリを指したまま残る
+# (GCC_FOR_TARGET が素の x86_64-elf-gcc を呼ぶ specs 生成で 127 になる)
+mkdir -p "$TOOLWRAP"
+for tool in ar ranlib nm ld as objcopy objdump readelf strip; do
+  wrapper="$TOOLWRAP/x86_64-elf-$tool"
+  if [ ! -x "$wrapper" ]; then
+    host_tool="$(command -v x86_64-elf-$tool || command -v "$tool" || true)"
+    if [ -n "$host_tool" ]; then
+      ln -sf "$host_tool" "$wrapper"
+    fi
+  fi
+done
+ln -sf "$ROOT/ports/orthos-gcc.sh" "$TOOLWRAP/x86_64-elf-gcc"
+ln -sf "$ROOT/ports/orthos-gcc.sh" "$TOOLWRAP/x86_64-elf-cc"
+ln -sf "$ROOT/ports/orthos-g++.sh" "$TOOLWRAP/x86_64-elf-g++"
+ln -sf "$ROOT/ports/orthos-g++.sh" "$TOOLWRAP/x86_64-elf-c++"
 
 cd "$BUILD"
 
