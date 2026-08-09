@@ -65,6 +65,13 @@ void aarch64_uart_puts(const char* s);
 void aarch64_uart_putchar(char c);
 void aarch64_uart_puthex64(uint64_t v);
 void aarch64_uart_set_base(uint64_t base);
+
+/* 出力の 1 単位を囲む。**この間はタスクが切り替わらない**ので、
+ * 並行に走っていても行が割れない。puts / puthex64 は自分で囲んで
+ * あるので、**複数回の呼び出しで 1 行を組むときだけ**明示的に要る。
+ * 入れ子にできる */
+void aarch64_console_begin(void);
+void aarch64_console_end(void);
 void aarch64_wait_forever(void);
 
 #endif

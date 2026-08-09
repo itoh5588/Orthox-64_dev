@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "aarch64/boot.h"
 #include "aarch64/dtb.h"
+#include "aarch64/task.h"
 #include "aarch64/vm.h"
 
 /* PL011 UART。QEMU は初期化なしでも DR に書けば出るが、実機と手順を
@@ -39,6 +40,13 @@ void aarch64_uart_set_base(uint64_t base) {
     if (base) g_uart_base = base;
 }
 
+/* 出力の 1 単位。**並行に走るタスクに行の途中を割られないようにする。**
+ * タスク層より前 (aarch64_task_init の前) から呼ばれるが、そのときは
+ * スケジューラが止まっているので数えるだけで済む */
+void aarch64_console_begin(void) { aarch64_preempt_disable(); }
+void aarch64_console_end(void)   { aarch64_preempt_enable(); }
+
+/* 1 文字は MMIO の書き込み 1 回なので、これ自体は割れようがない */
 void aarch64_uart_putchar(char c) {
     while (mmio_read32(g_uart_base + PL011_FR_OFF) & PL011_FR_TXFF) {
         /* 送信 FIFO が空くまで待つ */
@@ -46,13 +54,17 @@ void aarch64_uart_putchar(char c) {
     mmio_write32(g_uart_base + PL011_DR_OFF, (uint32_t)(unsigned char)c);
 }
 
+/* **文字列 1 本は割れない。** マルチバイト文字の途中で切り替わると
+ * 文字そのものが壊れるので、ここは囲んでおく価値がある */
 void aarch64_uart_puts(const char* s) {
     if (!s) return;
+    aarch64_console_begin();
     while (*s) {
         if (*s == '\n') aarch64_uart_putchar('\r');
         aarch64_uart_putchar(*s);
         s++;
     }
+    aarch64_console_end();
 }
 
 /* M2 以降 vm.c からも使うので外に出してある */

@@ -32,6 +32,31 @@ static uint64_t g_switches;
 static volatile int g_resched;
 static int g_sched_on;
 
+/* ---- プリエンプトを止める区間 -------------------------------------------
+ *
+ * **1 行を出している途中で切り替わると、行が割れる。**
+ *
+ *   el0 ticks : 0x0000000000000  [EL0] resumed after permission fault
+ *   bad ptr   : 0xfffffffffffffff2  ok (-EFAUL  [EL0] resumed ...
+ *
+ * カーネルの動作自体は正しく aarch64-user-ok も出るが、判定が行単位の
+ * grep なので「数が合わない」形で落ちる。実測で 12 回中 5 回。
+ * **M3c-1 でユーザータスクを 2 本並行にしたときから入っていた。**
+ *
+ * ここで止めるのは**切り替えだけ**で、割り込みは開けたまま。tick は
+ * 数え続けるので el0 ticks の判定を壊さない。印 (g_resched) も消さないので、
+ * 区間を出た後の最初の IRQ の出口で切り替わる。
+ *
+ * CPU 1 本を前提にしている。**SMP に進んだら CPU ごとに持ったうえで、
+ * 出力そのものにロックが要る** (別の CPU は止まらない)。 */
+static int g_preempt_off;
+
+/* タイマ割り込みは g_preempt_off を読むだけなので、単一 CPU では
+ * この読み書きに保護は要らない */
+void aarch64_preempt_disable(void) { g_preempt_off++; }
+void aarch64_preempt_enable(void)  { if (g_preempt_off > 0) g_preempt_off--; }
+int  aarch64_preempt_disabled(void) { return g_preempt_off != 0; }
+
 aarch64_task_t* aarch64_task_current(void) { return &g_tasks[g_current]; }
 uint64_t aarch64_task_switch_count(void)   { return g_switches; }
 uint64_t aarch64_task_counter(int id) {
@@ -135,7 +160,9 @@ void aarch64_task_yield(void) {
     int next_id;
     uint64_t daif;
 
-    if (!g_sched_on) return;
+    /* **区間の中では明示的に譲っても切り替わらない。** 譲ったつもりで
+     * 行が割れるより、区間を出るまで待たせるほうがよい */
+    if (!g_sched_on || g_preempt_off) return;
 
     /* 選んでから切り替えるまでのあいだに割り込みが入ると、
      * 同じタスクを 2 か所から動かすことになる */
@@ -165,6 +192,9 @@ void aarch64_task_on_tick(void) {
 void aarch64_task_resched_if_needed(void) {
     int next_id;
     if (!g_sched_on || !g_resched) return;
+    /* **印は消さずに戻る。** 消すと、区間の中で入った tick のぶんの
+     * 切り替えが 1 回まるごと消える */
+    if (g_preempt_off) return;
     g_resched = 0;
     next_id = aarch64_task_pick_next();
     if (next_id >= 0) aarch64_task_switch_to(next_id);

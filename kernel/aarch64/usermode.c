@@ -124,10 +124,16 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     if (!aarch64_vm_user_range_ok(aarch64_task_current()->ttbr0, buf, len, 0)) {
         return -14;                         /* -EFAULT */
     }
+    /* **1 回の write は割れない。** 別のユーザータスクの出力が途中に
+     * 差し込まれると、行単位で読む側から見て別の内容になる。
+     * (長さの上限は付けていない。EL0 が巨大な write を投げると、そのぶん
+     *  切り替えが遅れる。共有システムコール層に載せるときに区切ること) */
+    aarch64_console_begin();
     for (i = 0; i < len; i++) {
         if (p[i] == '\n') aarch64_uart_putchar('\r');
         aarch64_uart_putchar(p[i]);
     }
+    aarch64_console_end();
     return (int64_t)len;
 }
 
@@ -187,6 +193,7 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
 
     /* 想定外。**黙って戻らない。** ユーザーを再開させると同じ所で
      * 落ち続けて無限ループになる */
+    aarch64_console_begin();
     aarch64_uart_puts("\n*** aarch64 EL0 からの想定外の例外 ***\n");
     aarch64_uart_puts("  ESR : ");
     aarch64_uart_puthex64(esr);
@@ -195,6 +202,7 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
     aarch64_uart_puts("\n  ELR : ");
     aarch64_uart_puthex64(frame[FRAME_ELR]);
     aarch64_uart_puts("\naarch64-user-BAD\n");
+    aarch64_console_end();
     st->exited = 1;
     st->exit_code = (uint64_t)-1;
     /* EL0 には戻さず、カーネルの続きへ抜ける */
@@ -208,11 +216,14 @@ int aarch64_user_run_once(const char* label, uint64_t root_pa) {
     uint64_t ticks_before, ticks_after;
     user_run_state_t* st = urun();
 
+    /* **複数回の呼び出しで 1 行を組むので、明示的に囲む** */
+    aarch64_console_begin();
     aarch64_uart_puts("  --- ");
     aarch64_uart_puts(label);
     aarch64_uart_puts(" ttbr0=");
     aarch64_uart_puthex64(root_pa);
     aarch64_uart_puts("\n");
+    aarch64_console_end();
 
     /* **タスクとして走る場合、TTBR0 は切り替えのときに入れ替わっている。**
      * ここで入れ直しても同じ値になるだけだが、単体で呼ばれたときのために残す */
@@ -229,6 +240,11 @@ int aarch64_user_run_once(const char* label, uint64_t root_pa) {
                       aarch64_vm_user_stack_top_va(),
                       aarch64_user_probe_target());
     ticks_after = aarch64_timer_ticks();
+
+    /* **報告はまとめて 1 単位にする。** EL0 を走らせているあいだは切り替えを
+     * 止めていない (止めると el0 ticks の判定が意味を失う)。止めるのは
+     * 戻ってきてから報告を出しおえるまでの、この区間だけ */
+    aarch64_console_begin();
 
     aarch64_uart_puts("  svc calls : ");
     aarch64_uart_puthex64(st->svc_count);
@@ -272,6 +288,8 @@ int aarch64_user_run_once(const char* label, uint64_t root_pa) {
     aarch64_uart_puts(st->bad_ptr_ret == (uint64_t)-14
                       ? "  ok (-EFAULT で弾いた)\n"
                       : "  BAD (カーネルの VA を読ませてしまった)\n");
+
+    aarch64_console_end();
 
     return st->exited && st->exit_code == 0 &&
            (ticks_after - ticks_before) >= AARCH64_USER_MIN_TICKS &&

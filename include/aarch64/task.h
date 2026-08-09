@@ -65,6 +65,12 @@ void aarch64_task_yield(void);
 void aarch64_task_exit(void);
 void aarch64_task_on_tick(void);          /* タイマ割り込みから呼ぶ */
 void aarch64_task_resched_if_needed(void);/* IRQ の出口で呼ぶ */
+
+/* 切り替えだけを止める区間。**割り込みは開けたまま** (tick は数え続ける)。
+ * 出力の 1 行が並行に割れるのを防ぐのに使う。入れ子にできる */
+void aarch64_preempt_disable(void);
+void aarch64_preempt_enable(void);
+int  aarch64_preempt_disabled(void);
 aarch64_task_t* aarch64_task_current(void);
 uint64_t aarch64_task_switch_count(void);
 uint64_t aarch64_task_counter(int id);
