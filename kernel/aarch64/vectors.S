@@ -10,9 +10,27 @@
  *   +0x400  下位 EL (AArch64)     同期 / IRQ / FIQ / SError   ← ユーザー実行中
  *   +0x600  下位 EL (AArch32)     未使用
  *
- * M1 で要るのは「カーネル実行中の IRQ」(+0x280) だけ。残りは原因を表示して
- * 止める。**黙って無視しないこと** — 取りこぼすと原因不明のハングになる。
+ * **各エントリには分岐 1 命令だけを置き、本体は表の外に出す。**
+ *
+ * 最初は本体を表の中に直接書いていたが、**IRQ の本体が 128 バイトに
+ * 収まっていなかった** (レジスタの退避と復元で 42 命令 = 168 バイト)。
+ * 結果、+0x300 以降のエントリが 1 枠ずつ後ろへずれていた。objdump の実測:
+ *
+ *   +0x280 IRQ の本体が 0x...324 まで続く  → +0x300 (FIQ) の枠を侵食
+ *   FIQ が SError の枠へ、SError が「下位 EL 同期」の枠へ
+ *
+ * M1 で症状が出なかったのは、**使っていた入口がタイマの IRQ 1 つだけ**
+ * だったから。ずれていたのはその後ろの、まだ使っていないエントリ。
+ *
+ * 命令数を数えて収めるより、**収まりようがない形にする**ほうが確実。
+ * 以降どのエントリを実装しても表は壊れない。
  */
+
+/* 表のエントリ。128 バイト枠の先頭で本体へ飛ぶだけ */
+.macro VENTRY, target
+.align 7
+    b       \target
+.endm
 
 /* 割り込みハンドラは C を呼ぶので、C が壊してよいレジスタ (x0-x18, x30) を
  * すべて退避する。加えて戻り先 (ELR_EL1) と状態 (SPSR_EL1) も積む。
@@ -65,7 +83,8 @@
 
 /* 想定していない例外。原因を持って C に渡し、そこで止める。
  * x0 = 表のどのエントリか (見分けがつくように番号を渡す) */
-.macro UNEXPECTED, which
+.macro UNEXPECTED_BODY, name, which
+\name:
     SAVE_ALL
     mov     x0, #\which
     mrs     x1, esr_el1
@@ -80,45 +99,49 @@
 aarch64_vectors:
 
 /* --- 現在の EL、SP_EL0 を使用中 --------------------------------------- */
-.align 7
-    UNEXPECTED 0
-.align 7
-    UNEXPECTED 1
-.align 7
-    UNEXPECTED 2
-.align 7
-    UNEXPECTED 3
+    VENTRY  vec_unexpected_0
+    VENTRY  vec_unexpected_1
+    VENTRY  vec_unexpected_2
+    VENTRY  vec_unexpected_3
 
 /* --- 現在の EL、SP_ELx を使用中 (カーネル実行中) ---------------------- */
-.align 7
-    UNEXPECTED 4                /* 同期例外 */
-.align 7
-    /* IRQ。M1 で使うのはここだけ */
+    VENTRY  vec_unexpected_4    /* 同期例外 */
+    VENTRY  vec_el1_irq         /* IRQ。M1 のタイマがここ */
+    VENTRY  vec_unexpected_6    /* FIQ */
+    VENTRY  vec_unexpected_7    /* SError */
+
+/* --- 下位 EL (AArch64) から。M3 でユーザーが来たら使う ---------------- */
+    VENTRY  vec_unexpected_8
+    VENTRY  vec_unexpected_9
+    VENTRY  vec_unexpected_10
+    VENTRY  vec_unexpected_11
+
+/* --- 下位 EL (AArch32) から。32bit は使わない ------------------------- */
+    VENTRY  vec_unexpected_12
+    VENTRY  vec_unexpected_13
+    VENTRY  vec_unexpected_14
+    VENTRY  vec_unexpected_15
+
+/* ---- ここから先は表の外。長さの制限は無い ---------------------------- */
+
+vec_el1_irq:
     SAVE_ALL
     bl      aarch64_irq_handler
     RESTORE_ALL
     eret
-.align 7
-    UNEXPECTED 6                /* FIQ */
-.align 7
-    UNEXPECTED 7                /* SError */
 
-/* --- 下位 EL (AArch64) から。M3 でユーザーが来たら使う ---------------- */
-.align 7
-    UNEXPECTED 8
-.align 7
-    UNEXPECTED 9
-.align 7
-    UNEXPECTED 10
-.align 7
-    UNEXPECTED 11
-
-/* --- 下位 EL (AArch32) から。32bit は使わない ------------------------- */
-.align 7
-    UNEXPECTED 12
-.align 7
-    UNEXPECTED 13
-.align 7
-    UNEXPECTED 14
-.align 7
-    UNEXPECTED 15
+    UNEXPECTED_BODY vec_unexpected_0,  0
+    UNEXPECTED_BODY vec_unexpected_1,  1
+    UNEXPECTED_BODY vec_unexpected_2,  2
+    UNEXPECTED_BODY vec_unexpected_3,  3
+    UNEXPECTED_BODY vec_unexpected_4,  4
+    UNEXPECTED_BODY vec_unexpected_6,  6
+    UNEXPECTED_BODY vec_unexpected_7,  7
+    UNEXPECTED_BODY vec_unexpected_8,  8
+    UNEXPECTED_BODY vec_unexpected_9,  9
+    UNEXPECTED_BODY vec_unexpected_10, 10
+    UNEXPECTED_BODY vec_unexpected_11, 11
+    UNEXPECTED_BODY vec_unexpected_12, 12
+    UNEXPECTED_BODY vec_unexpected_13, 13
+    UNEXPECTED_BODY vec_unexpected_14, 14
+    UNEXPECTED_BODY vec_unexpected_15, 15
