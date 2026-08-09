@@ -24,6 +24,8 @@
  */
 #include <stdint.h>
 #include "aarch64/boot.h"
+#include "aarch64/vm.h"
+#include "aarch64/usermode.h"
 
 extern char __kernel_start[];
 extern char __kernel_end[];
@@ -39,6 +41,9 @@ extern char __user_text_start[];
 extern char __user_text_end[];
 extern char __user_data_start[];
 extern char __user_data_end[];
+
+/* EL0 の入口 (kernel/aarch64/user_blob.S)。.user_text の中にある */
+extern char aarch64_user_entry[];
 
 #define AARCH64_PAGE_SIZE   0x1000ULL
 #define AARCH64_BLOCK_SIZE  0x200000ULL          /* 2MB。L2 の 1 エントリ */
@@ -94,7 +99,9 @@ extern char __user_data_end[];
 #define TCR_SH0_INNER   (3ULL << 12)
 #define TCR_TG0_4K      (0ULL << 14)             /* TG0: 0b00 = 4KB */
 #define TCR_T1SZ(n)     (((uint64_t)(n)) << 16)
-#define TCR_EPD1        (1ULL << 23)             /* TTBR1 を歩かない */
+/* TCR_EPD1 (bit 23) は「TTBR1 を歩かない」。M2 では立てていたが、
+ * **M3b でカーネルを上位半分へ移したので外す。** 立てたままだと、
+ * 上位 VA へ飛んだ瞬間に translation fault になって沈黙する */
 #define TCR_TG1_4K      (2ULL << 30)             /* TG1: 0b10 = 4KB (TG0 と違う) */
 #define TCR_IPS_40BIT   (2ULL << 32)             /* 物理アドレス 40bit (1TB) */
 
@@ -102,7 +109,7 @@ extern char __user_data_end[];
 #define TCR_EL1_VALUE   (TCR_T0SZ(64 - AARCH64_VA_BITS) | \
                          TCR_IRGN0_WBWA | TCR_ORGN0_WBWA | TCR_SH0_INNER | \
                          TCR_TG0_4K | \
-                         TCR_T1SZ(64 - AARCH64_VA_BITS) | TCR_EPD1 | TCR_TG1_4K | \
+                         TCR_T1SZ(64 - AARCH64_VA_BITS) | TCR_TG1_4K | \
                          TCR_IPS_40BIT)
 
 /* ---- SCTLR_EL1 -----------------------------------------------------------
@@ -143,23 +150,53 @@ extern char __user_data_end[];
  * **PXN を必ず立てること。** EL1 がユーザーのコードを実行できてしまうと、
  * ユーザーが書いた命令をカーネル権限で走らせる道ができる。
  * UXN と PXN は別のビットで、片方だけでは塞げない。 */
-#define VM_USER_TEXT    (VM_ATTR_NORMAL | PTE_AP_RO_EL0 | PTE_PXN)
-#define VM_USER_RW      (VM_ATTR_NORMAL | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN)
+#define VM_USER_TEXT    (VM_ATTR_NORMAL | PTE_AP_RO_EL0 | PTE_PXN | PTE_nG)
+#define VM_USER_RW      (VM_ATTR_NORMAL | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN | PTE_nG)
+
+/* 移行のあいだだけ TTBR0 に張る恒等マッピング。**実行もできる必要がある。**
+ * MMU を入れた瞬間、PC はまだ物理を指しているので、そこが実行可能で
+ * なければ即座に落ちる。上位 VA へ飛んだ後に外す */
+#define VM_IDENT_RWX    (VM_ATTR_NORMAL | PTE_AP_RW_EL1)
+#define VM_IDENT_DEVICE (VM_ATTR_DEVICE | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN)
 
 /* ---- テーブルの置き場 ----------------------------------------------------
  *
  * M2 の時点では物理メモリ管理 (pmm) がまだ無いので、.bss に固定の枠を置く。
  * 恒等マッピングなのでここのアドレスがそのまま物理アドレスになる。
  * M3 で pmm を入れたら pmm_alloc に差し替える。 */
-#define AARCH64_VM_MAX_TABLES 24
+#define AARCH64_VM_MAX_TABLES 40
 
 static uint64_t g_tables[AARCH64_VM_MAX_TABLES][AARCH64_PTES]
     __attribute__((aligned(4096)));
 static unsigned g_tables_used;
-static uint64_t g_root_pa;
+static uint64_t g_kernel_root_pa;    /* TTBR1。カーネルの上位 VA */
+static uint64_t g_ident_root_pa;     /* TTBR0。移行のあいだだけ使う恒等 */
+static uint64_t g_user_root_pa;      /* TTBR0。上位へ飛んだ後のユーザー空間 */
+static uint64_t g_build_root_pa;     /* いま組み立て中のテーブル */
 static int g_vm_failed;
 
-static uint64_t* aarch64_vm_alloc_table(void) {
+/* ---- 物理アドレスと「いま触れるポインタ」の変換 --------------------------
+ *
+ * **ページテーブルの中身は常に物理アドレス。** 一方、それを C から触るには
+ * 「いまの世界で有効なアドレス」が要る。MMU を入れる前は物理がそのまま
+ * 使えるが、上位 VA へ飛んだ後は phys_to_virt を通す必要がある。
+ *
+ * ここを間違えると、恒等マッピングを外した瞬間にテーブルを辿れなくなる。 */
+static uint64_t* aarch64_vm_table_ptr(uint64_t table_pa) {
+    if (aarch64_vm_running_high()) {
+        return (uint64_t*)(uintptr_t)aarch64_phys_to_virt(table_pa);
+    }
+    return (uint64_t*)(uintptr_t)table_pa;
+}
+
+/* 逆向き。いま持っているポインタが指すものの物理アドレス */
+static uint64_t aarch64_vm_ptr_pa(const void* p) {
+    uint64_t a = (uint64_t)(uintptr_t)p;
+    return aarch64_vm_running_high() ? aarch64_virt_to_phys(a) : a;
+}
+
+/* 戻り値はテーブルの**物理アドレス**。0 なら失敗 */
+static uint64_t aarch64_vm_alloc_table(void) {
     uint64_t* t;
     if (g_tables_used >= AARCH64_VM_MAX_TABLES) {
         aarch64_uart_puts("  vm: table pool exhausted\n");
@@ -168,7 +205,7 @@ static uint64_t* aarch64_vm_alloc_table(void) {
     }
     t = g_tables[g_tables_used++];
     for (unsigned i = 0; i < AARCH64_PTES; i++) t[i] = 0;
-    return t;
+    return aarch64_vm_ptr_pa(t);
 }
 
 /* VA から各段のインデックスを取り出す。level 1 = bits 38:30、
@@ -177,48 +214,51 @@ static uint64_t aarch64_vm_index(uint64_t va, int level) {
     return (va >> (12 + (3 - level) * 9)) & (AARCH64_PTES - 1);
 }
 
-/* level の段のテーブルを辿り、無ければ作る */
-static uint64_t* aarch64_vm_next_table(uint64_t* table, uint64_t va, int level) {
+/* level の段のテーブルを辿り、無ければ作る。引数も戻り値も物理アドレス */
+static uint64_t aarch64_vm_next_table(uint64_t table_pa, uint64_t va, int level) {
+    uint64_t* table = aarch64_vm_table_ptr(table_pa);
     uint64_t index = aarch64_vm_index(va, level);
     uint64_t entry = table[index];
-    uint64_t* next;
+    uint64_t next_pa;
 
     if (entry & PTE_VALID) {
         /* 既にブロックが張られている所を細かく割ろうとしている。
-         * M2 の張り方では起きないが、黙って壊さず気づけるようにする */
+         * いまの張り方では起きないが、黙って壊さず気づけるようにする */
         if ((entry & PTE_TABLE) == 0) {
-            aarch64_uart_puts("  vm: block/table conflict at 0x");
+            aarch64_uart_puts("  vm: block/table conflict at ");
             aarch64_uart_puthex64(va);
             aarch64_uart_puts("\n");
             g_vm_failed = 1;
             return 0;
         }
-        return (uint64_t*)(uintptr_t)(entry & PTE_ADDR_MASK);
+        return entry & PTE_ADDR_MASK;
     }
 
-    next = aarch64_vm_alloc_table();
-    if (!next) return 0;
-    table[index] = ((uint64_t)(uintptr_t)next & PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE;
-    return next;
+    next_pa = aarch64_vm_alloc_table();
+    if (!next_pa) return 0;
+    table[index] = (next_pa & PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE;
+    return next_pa;
 }
 
 /* 4KB ページを 1 枚張る。L3 の descriptor は PTE_TABLE (0b11) が必須 */
 static void aarch64_vm_map_page(uint64_t va, uint64_t pa, uint64_t attr) {
-    uint64_t* l1 = (uint64_t*)(uintptr_t)g_root_pa;
-    uint64_t* l2 = aarch64_vm_next_table(l1, va, 1);
+    uint64_t l2_pa = aarch64_vm_next_table(g_build_root_pa, va, 1);
+    uint64_t l3_pa;
     uint64_t* l3;
-    if (!l2) return;
-    l3 = aarch64_vm_next_table(l2, va, 2);
-    if (!l3) return;
+    if (!l2_pa) return;
+    l3_pa = aarch64_vm_next_table(l2_pa, va, 2);
+    if (!l3_pa) return;
+    l3 = aarch64_vm_table_ptr(l3_pa);
     l3[aarch64_vm_index(va, 3)] = (pa & PTE_ADDR_MASK) | attr | PTE_VALID | PTE_TABLE;
 }
 
 /* 2MB ブロックを 1 つ張る。L2 の descriptor はブロックなので PTE_TABLE を
  * 立てない (0b01)。ここを 0b11 にするとテーブルとして辿られて壊れる */
 static void aarch64_vm_map_block(uint64_t va, uint64_t pa, uint64_t attr) {
-    uint64_t* l1 = (uint64_t*)(uintptr_t)g_root_pa;
-    uint64_t* l2 = aarch64_vm_next_table(l1, va, 1);
-    if (!l2) return;
+    uint64_t l2_pa = aarch64_vm_next_table(g_build_root_pa, va, 1);
+    uint64_t* l2;
+    if (!l2_pa) return;
+    l2 = aarch64_vm_table_ptr(l2_pa);
     l2[aarch64_vm_index(va, 2)] = (pa & PTE_ADDR_MASK) | attr | PTE_VALID;
 }
 
@@ -241,13 +281,25 @@ static void aarch64_vm_map_range(uint64_t va, uint64_t pa, uint64_t size, uint64
     }
 }
 
+/* **必ず 4KB ページで張る。** 後から同じ範囲に細かい権限を重ねる予定の所は
+ * こちらを使う。2MB ブロックで張ってしまうと、重ねようとした時点で
+ * 「ブロックの上にテーブルを作れない」衝突になる (実際に踏んだ) */
+static void aarch64_vm_map_pages(uint64_t va, uint64_t pa, uint64_t size, uint64_t attr) {
+    uint64_t end = va + size;
+    while (va < end && !g_vm_failed) {
+        aarch64_vm_map_page(va, pa, attr);
+        va += AARCH64_PAGE_SIZE;
+        pa += AARCH64_PAGE_SIZE;
+    }
+}
+
 static uint64_t aarch64_align_down(uint64_t v, uint64_t a) { return v & ~(a - 1); }
 static uint64_t aarch64_align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 
 /* テーブルを歩いて VA の物理アドレスを求める。**MMU が実際に何を見るかを
  * 自分で辿り直す**ので、有効化前に「思ったとおりに張れているか」を確認できる */
-uint64_t aarch64_vm_translate(uint64_t va) {
-    uint64_t* table = (uint64_t*)(uintptr_t)g_root_pa;
+uint64_t aarch64_vm_translate_in(uint64_t root_pa, uint64_t va) {
+    uint64_t* table = aarch64_vm_table_ptr(root_pa);
     for (int level = 1; level <= 3; level++) {
         uint64_t entry = table[aarch64_vm_index(va, level)];
         if ((entry & PTE_VALID) == 0) return 0;
@@ -257,92 +309,150 @@ uint64_t aarch64_vm_translate(uint64_t va) {
             uint64_t block_size = (level == 1) ? (1ULL << 30) : AARCH64_BLOCK_SIZE;
             return (entry & PTE_ADDR_MASK) | (va & (block_size - 1));
         }
-        table = (uint64_t*)(uintptr_t)(entry & PTE_ADDR_MASK);
+        table = aarch64_vm_table_ptr(entry & PTE_ADDR_MASK);
     }
     return 0;
 }
 
+/* カーネル側 (TTBR1) のテーブルを歩く。呼ぶ側の既定はこちら */
+uint64_t aarch64_vm_translate(uint64_t va) {
+    return aarch64_vm_translate_in(g_kernel_root_pa, va);
+}
+
 #define AARCH64_UART_SIZE   0x00001000ULL
 
-static void aarch64_vm_build_tables(void) {
+/* ---- TTBR1: カーネルの上位 VA (M3b) --------------------------------------
+ *
+ * **ここを組み立てているとき、C はまだ物理アドレスで走っている。**
+ * したがって __text_start などのシンボルは物理アドレスを返す。
+ * 上位 VA は「物理 + AARCH64_KERNEL_VA_OFFSET」で作る。 */
+static void aarch64_vm_build_kernel(void) {
     const aarch64_boot_info_t* b = aarch64_boot_info();
     uint64_t ram_base = b->memory_base;
     uint64_t ram_end  = b->memory_base + b->memory_size;
-    uint64_t kstart = (uint64_t)(uintptr_t)__kernel_start;
-    uint64_t kend   = aarch64_align_up((uint64_t)(uintptr_t)__kernel_end, AARCH64_PAGE_SIZE);
-    uint64_t kblk_start = aarch64_align_down(kstart, AARCH64_BLOCK_SIZE);
-    uint64_t kblk_end   = aarch64_align_up(kend, AARCH64_BLOCK_SIZE);
+    uint64_t kend_pa   = aarch64_align_up(aarch64_vm_ptr_pa(__kernel_end), AARCH64_PAGE_SIZE);
+    uint64_t kblk_start = aarch64_align_down(aarch64_vm_ptr_pa(__kernel_start), AARCH64_BLOCK_SIZE);
+    uint64_t kblk_end   = aarch64_align_up(kend_pa, AARCH64_BLOCK_SIZE);
     uint64_t virtio_size;
 
-    uint64_t* root = aarch64_vm_alloc_table();
-    if (!root) return;
-    g_root_pa = (uint64_t)(uintptr_t)root;
+    g_kernel_root_pa = aarch64_vm_alloc_table();
+    if (!g_kernel_root_pa) return;
+    g_build_root_pa = g_kernel_root_pa;
 
-    /* RAM のうちカーネルが載っている 2MB ブロックの手前と奥。ここは
-     * 大きいブロックで一気に張る (読み書き可・実行不可)。
-     * **範囲は DTB が言う実際の RAM。** 直書きの 512MB ではない */
+    /* **RAM 全域を上位 VA に張る。** これで phys_to_virt(pa) がそのまま
+     * 使えるようになり、DTB 由来の物理アドレスをカーネルから触れる。
+     * カーネルが載っている 2MB ブロックだけは後で細かく張り直す */
     if (kblk_start > ram_base) {
-        aarch64_vm_map_range(ram_base, ram_base, kblk_start - ram_base, VM_KERNEL_RW);
+        aarch64_vm_map_range(aarch64_phys_to_virt(ram_base), ram_base,
+                             kblk_start - ram_base, VM_KERNEL_RW);
     }
     if (kblk_end < ram_end) {
-        aarch64_vm_map_range(kblk_end, kblk_end, ram_end - kblk_end, VM_KERNEL_RW);
+        aarch64_vm_map_range(aarch64_phys_to_virt(kblk_end), kblk_end,
+                             ram_end - kblk_end, VM_KERNEL_RW);
     }
+    /* カーネルが載っている 2MB ブロックの中は **必ず 4KB ページで**張る。
+     * ここに後から区画ごとの権限を重ねるので、ブロックで張ると衝突する。
+     * まず .boot (イメージの先頭ページ) を張り、区画を重ね、最後に
+     * 残り (ブートスタックが載る) を張る */
+    aarch64_vm_map_pages(aarch64_phys_to_virt(kblk_start), kblk_start,
+                         aarch64_vm_ptr_pa(__kernel_start) - kblk_start, VM_KERNEL_RW);
 
-    /* カーネルが載っているブロックだけは 4KB ページで、区画ごとに権限を分ける。
-     * .text を書き込み可のままにしない / .data を実行可のままにしない。
-     * riscv64 の vm_init と同じ考え方 */
-    aarch64_vm_map_range((uint64_t)(uintptr_t)__text_start,
-                         (uint64_t)(uintptr_t)__text_start,
-                         (uint64_t)(uintptr_t)__text_end - (uint64_t)(uintptr_t)__text_start,
-                         VM_KERNEL_TEXT);
-    aarch64_vm_map_range((uint64_t)(uintptr_t)__rodata_start,
-                         (uint64_t)(uintptr_t)__rodata_start,
-                         (uint64_t)(uintptr_t)__rodata_end - (uint64_t)(uintptr_t)__rodata_start,
-                         VM_KERNEL_RO);
-    aarch64_vm_map_range((uint64_t)(uintptr_t)__data_start,
-                         (uint64_t)(uintptr_t)__data_start,
-                         (uint64_t)(uintptr_t)__data_end - (uint64_t)(uintptr_t)__data_start,
-                         VM_KERNEL_RW);
-    aarch64_vm_map_range((uint64_t)(uintptr_t)__bss_start,
-                         (uint64_t)(uintptr_t)__bss_start,
-                         (uint64_t)(uintptr_t)__bss_end - (uint64_t)(uintptr_t)__bss_start,
-                         VM_KERNEL_RW);
-    /* 同じ 2MB ブロックの残り。空けたままだと後で使えないので張っておく */
-    if (kend < kblk_end) {
-        aarch64_vm_map_range(kend, kend, kblk_end - kend, VM_KERNEL_RW);
-    }
-
-    /* EL0 のページ (M3a)。**カーネルの区画を張った後に上書きする。**
-     * .user_text / .user_data はカーネルの範囲の中にあるので、先に
-     * VM_KERNEL_RW で張られている。順序を逆にすると権限が戻ってしまう */
-    aarch64_vm_map_range((uint64_t)(uintptr_t)__user_text_start,
-                         (uint64_t)(uintptr_t)__user_text_start,
-                         (uint64_t)(uintptr_t)__user_text_end -
-                             (uint64_t)(uintptr_t)__user_text_start,
-                         VM_USER_TEXT);
-    aarch64_vm_map_range((uint64_t)(uintptr_t)__user_data_start,
-                         (uint64_t)(uintptr_t)__user_data_start,
-                         (uint64_t)(uintptr_t)__user_data_end -
-                             (uint64_t)(uintptr_t)__user_data_start,
-                         VM_USER_RW);
+    /* 区画ごとに権限を分ける。.text を書き込み可のままにしない /
+     * .data を実行可のままにしない。riscv64 の vm_init と同じ考え方。
+     * **上の一括マッピングの後に張ること。** 順序を逆にすると権限が戻る */
+    aarch64_vm_map_pages(aarch64_phys_to_virt(aarch64_vm_ptr_pa(__text_start)),
+                         aarch64_vm_ptr_pa(__text_start),
+                         (uint64_t)(__text_end - __text_start), VM_KERNEL_TEXT);
+    aarch64_vm_map_pages(aarch64_phys_to_virt(aarch64_vm_ptr_pa(__rodata_start)),
+                         aarch64_vm_ptr_pa(__rodata_start),
+                         (uint64_t)(__rodata_end - __rodata_start), VM_KERNEL_RO);
+    aarch64_vm_map_pages(aarch64_phys_to_virt(aarch64_vm_ptr_pa(__data_start)),
+                         aarch64_vm_ptr_pa(__data_start),
+                         (uint64_t)(__data_end - __data_start), VM_KERNEL_RW);
+    aarch64_vm_map_pages(aarch64_phys_to_virt(aarch64_vm_ptr_pa(__bss_start)),
+                         aarch64_vm_ptr_pa(__bss_start),
+                         (uint64_t)(__bss_end - __bss_start), VM_KERNEL_RW);
+    /* ブロックの残り。ブートスタックがここに載る */
+    aarch64_vm_map_pages(aarch64_phys_to_virt(kend_pa), kend_pa,
+                         kblk_end - kend_pa, VM_KERNEL_RW);
 
     /* MMIO。**Device 属性で張ること。** Normal で張ると UART への書き込みが
      * キャッシュに溜まって出てこない、GIC の読みが古い値を返す、という形で
      * 壊れる (QEMU では見逃せても実機で出る)。
      *
-     * アドレスは DTB 由来。**GIC は Distributor と CPU Interface を別々に
-     * 張る。** 連続しているとは限らないので 1 つの範囲にまとめない
-     * (QEMU virt は 0x08000000 と 0x08010000 で隣り合うが、Pi 4 は違う) */
-    aarch64_vm_map_range(b->gicd_base, b->gicd_base, b->gicd_size, VM_DEVICE_RW);
-    aarch64_vm_map_range(b->gicc_base, b->gicc_base, b->gicc_size, VM_DEVICE_RW);
-    aarch64_vm_map_range(b->uart_base, b->uart_base, AARCH64_UART_SIZE, VM_DEVICE_RW);
+     * アドレスは DTB 由来 = 物理なので、上位 VA に直して張る。
+     * **GIC は Distributor と CPU Interface を別々に張る。** 連続している
+     * とは限らない (QEMU virt は隣り合うが、Pi 4 は違う) */
+    aarch64_vm_map_range(aarch64_phys_to_virt(b->gicd_base), b->gicd_base,
+                         b->gicd_size, VM_DEVICE_RW);
+    aarch64_vm_map_range(aarch64_phys_to_virt(b->gicc_base), b->gicc_base,
+                         b->gicc_size, VM_DEVICE_RW);
+    aarch64_vm_map_range(aarch64_phys_to_virt(b->uart_base), b->uart_base,
+                         AARCH64_UART_SIZE, VM_DEVICE_RW);
 
-    /* virtio-mmio のスロット全域。本数と刻み幅は DTB 由来 */
     virtio_size = (uint64_t)b->virtio_mmio_count * b->virtio_mmio_stride;
     if (virtio_size < AARCH64_PAGE_SIZE) virtio_size = AARCH64_PAGE_SIZE;
-    aarch64_vm_map_range(b->first_virtio_mmio_base, b->first_virtio_mmio_base,
-                         virtio_size, VM_DEVICE_RW);
+    aarch64_vm_map_range(aarch64_phys_to_virt(b->first_virtio_mmio_base),
+                         b->first_virtio_mmio_base, virtio_size, VM_DEVICE_RW);
 }
+
+/* ---- TTBR0: 移行のあいだだけの恒等マッピング ----------------------------
+ *
+ * **MMU を入れた瞬間、PC も sp もまだ物理を指している。** そこが有効で
+ * なければ即座に迷子になる。上位 VA へ飛んだら不要になるので、飛んだ後に
+ * ユーザー用のテーブルへ差し替えて捨てる。
+ *
+ * 実行できる必要があるので PXN を立てない。 */
+static void aarch64_vm_build_ident(void) {
+    const aarch64_boot_info_t* b = aarch64_boot_info();
+    uint64_t kblk_start = aarch64_align_down(aarch64_vm_ptr_pa(__kernel_start),
+                                             AARCH64_BLOCK_SIZE);
+    /* カーネルイメージ + ブートスタック (8 CPU x 64KB) が入るだけ */
+    uint64_t kblk_end = aarch64_align_up(aarch64_vm_ptr_pa(__kernel_end) + 8 * 65536,
+                                         AARCH64_BLOCK_SIZE);
+
+    g_ident_root_pa = aarch64_vm_alloc_table();
+    if (!g_ident_root_pa) return;
+    g_build_root_pa = g_ident_root_pa;
+
+    aarch64_vm_map_range(kblk_start, kblk_start, kblk_end - kblk_start, VM_IDENT_RWX);
+    /* 移行の途中で何か言えるように UART だけ張っておく */
+    aarch64_vm_map_range(b->uart_base, b->uart_base, AARCH64_UART_SIZE, VM_IDENT_DEVICE);
+}
+
+/* ---- TTBR0: ユーザーのアドレス空間 --------------------------------------
+ *
+ * **カーネルの配置とは無関係の VA に張る。** M3a ではカーネルと同じテーブルに
+ * AP だけ変えて置いていたが、TTBR1 へ移したことで TTBR0 がまるごと空いた。
+ * これが「プロセスごとのアドレス空間」の器になる。
+ *
+ * ユーザーのコードは PC 相対だけで書いてあるので、どの VA でも動く。 */
+static void aarch64_vm_build_user(void) {
+    uint64_t text_pa = aarch64_vm_ptr_pa(__user_text_start);
+    uint64_t text_size = (uint64_t)(__user_text_end - __user_text_start);
+    uint64_t data_pa = aarch64_vm_ptr_pa(__user_data_start);
+    uint64_t data_size = (uint64_t)(__user_data_end - __user_data_start);
+
+    g_user_root_pa = aarch64_vm_alloc_table();
+    if (!g_user_root_pa) return;
+    g_build_root_pa = g_user_root_pa;
+
+    aarch64_vm_map_range(AARCH64_USER_VA_BASE, text_pa, text_size, VM_USER_TEXT);
+    aarch64_vm_map_range(AARCH64_USER_VA_BASE + text_size, data_pa, data_size, VM_USER_RW);
+}
+
+/* ユーザー空間の入口とスタックの VA。usermode.c が使う */
+uint64_t aarch64_vm_user_entry_va(void) {
+    return AARCH64_USER_VA_BASE + (uint64_t)(aarch64_user_entry - __user_text_start);
+}
+
+uint64_t aarch64_vm_user_stack_top_va(void) {
+    return AARCH64_USER_VA_BASE + (uint64_t)(__user_text_end - __user_text_start) +
+           (uint64_t)(__user_data_end - __user_data_start);
+}
+
+uint64_t aarch64_vm_user_root_pa(void) { return g_user_root_pa; }
+uint64_t aarch64_vm_kernel_root_pa(void) { return g_kernel_root_pa; }
 
 /* MMU を入れる。順序が全て:
  *
@@ -357,8 +467,11 @@ static void aarch64_mmu_enable(void) {
 
     __asm__ volatile("msr mair_el1, %0" :: "r"((uint64_t)MAIR_EL1_VALUE));
     __asm__ volatile("msr tcr_el1,  %0" :: "r"((uint64_t)TCR_EL1_VALUE));
-    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(g_root_pa));
-    __asm__ volatile("msr ttbr1_el1, %0" :: "r"(0ULL));
+    /* **TTBR0 = 恒等 (移行用) / TTBR1 = カーネルの上位 VA。**
+     * TTBR0 が無いと MMU を入れた瞬間に PC が迷子になり、
+     * TTBR1 が無いと上位 VA へ飛べない。両方要る */
+    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(g_ident_root_pa));
+    __asm__ volatile("msr ttbr1_el1, %0" :: "r"(g_kernel_root_pa));
     __asm__ volatile("isb");
 
     __asm__ volatile("tlbi vmalle1");
@@ -370,7 +483,7 @@ static void aarch64_mmu_enable(void) {
     __asm__ volatile("isb");
 }
 
-static uint64_t aarch64_read_sctlr(void) {
+uint64_t aarch64_read_sctlr(void) {
     uint64_t v;
     __asm__ volatile("mrs %0, sctlr_el1" : "=r"(v));
     return v;
@@ -390,7 +503,7 @@ static uint64_t aarch64_read_sctlr(void) {
 volatile int g_aarch64_vm_expect_fault;
 volatile uint64_t g_aarch64_vm_fault_esr;
 
-static void aarch64_vm_fault_probe(void) {
+void aarch64_vm_fault_probe(void) {
     volatile uint32_t* p = (volatile uint32_t*)(uintptr_t)AARCH64_VM_PROBE_VA;
     uint64_t esr, ec, dfsc;
 
@@ -429,21 +542,59 @@ static void aarch64_vm_fault_probe(void) {
     }
 }
 
+/* 上位 VA へ飛ぶ (entry.S)。**戻ってこない。**
+ *   x0 = 新しい sp (上位 VA)、x1 = 飛び先 (上位 VA) */
+void aarch64_vm_enter_high(uint64_t new_sp, uint64_t cont);
+
+/* リンカスクリプトの KERNEL_VA_OFFSET (entry.S) */
+uint64_t aarch64_link_va_offset(void);
+
+/* 上位 VA に着いてから続きをやる。boot.c にある */
+void aarch64_boot_continue(void);
+
+/* 恒等マッピングを捨てて、TTBR0 をユーザーのテーブルに差し替える。
+ * **これを呼んだ後、物理アドレスでは何も触れなくなる。** */
+void aarch64_vm_drop_identity(void) {
+    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(g_user_root_pa));
+    __asm__ volatile("isb");
+    __asm__ volatile("tlbi vmalle1");
+    __asm__ volatile("dsb nsh");
+    __asm__ volatile("isb");
+}
+
+/* MMU を入れて上位 VA へ移る。**戻ってこない。**
+ *
+ * ここは C がまだ物理アドレスで走っている。シンボルのアドレスを取ると
+ * 物理が返るので、上位 VA は phys_to_virt で作る。 */
 void aarch64_vm_init(void) {
     const aarch64_boot_info_t* b = aarch64_boot_info();
-    uint64_t kstart = (uint64_t)(uintptr_t)__kernel_start;
+    uint64_t kstart_pa = aarch64_vm_ptr_pa(__kernel_start);
+    uint64_t new_sp, cont;
 
-    aarch64_uart_puts("--- M2: MMU (identity, 4KB granule, VA 39bit) ---\n");
+    aarch64_uart_puts("--- M2/M3b: MMU (4KB granule, VA 39bit, TTBR1 = カーネル) ---\n");
 
-    /* カーネルの先頭が 2MB 境界に無いと、カーネルの載るブロックの張り分けが
-     * 成り立たない。リンカスクリプトを動かしたときに黙って壊れないよう見る */
-    if (kstart % AARCH64_BLOCK_SIZE) {
-        aarch64_uart_puts("  kernel start が 2MB 境界に無い\n");
-        aarch64_uart_puts("aarch64-mmu-BAD\n");
+    /* **リンカスクリプトとヘッダで VA のずらし幅が一致しているか。**
+     *
+     * ただし実測すると、**ヘッダ側だけずらした場合はここに来る前に死ぬ。**
+     * start.S も同じヘッダの値を使って __bss_start や aarch64_early_main の
+     * 物理アドレスを計算しているので、C に入る前に迷子になり、起動バナー
+     * すら出ない (逆確認で確認済み)。
+     *
+     * それでも残してあるのは、**vm.c だけが別の値を持ってしまった場合**
+     * (この関数の中で計算をいじった、など) を捕まえられるため。
+     * 起動バナーが出ないときは、ここではなく start.S の計算を疑うこと。 */
+    if (aarch64_link_va_offset() != AARCH64_KERNEL_VA_OFFSET) {
+        aarch64_uart_puts("  KERNEL_VA_OFFSET がリンカスクリプトと違う: ld=");
+        aarch64_uart_puthex64(aarch64_link_va_offset());
+        aarch64_uart_puts(" hdr=");
+        aarch64_uart_puthex64(AARCH64_KERNEL_VA_OFFSET);
+        aarch64_uart_puts("\naarch64-mmu-BAD\n");
         return;
     }
 
-    aarch64_vm_build_tables();
+    aarch64_vm_build_kernel();     /* TTBR1: カーネルの上位 VA */
+    aarch64_vm_build_ident();      /* TTBR0: 移行のあいだだけの恒等 */
+    aarch64_vm_build_user();       /* TTBR0: 上位へ飛んだ後のユーザー空間 */
     if (g_vm_failed) {
         aarch64_uart_puts("aarch64-mmu-BAD (テーブル構築に失敗)\n");
         return;
@@ -453,56 +604,65 @@ void aarch64_vm_init(void) {
     aarch64_uart_puthex64(g_tables_used);
     aarch64_uart_puts(" / ");
     aarch64_uart_puthex64(AARCH64_VM_MAX_TABLES);
-    aarch64_uart_puts("\n");
+    aarch64_uart_puts("\n  kernel VA : ");
+    aarch64_uart_puthex64(aarch64_phys_to_virt(kstart_pa));
+    aarch64_uart_puts("  (物理 ");
+    aarch64_uart_puthex64(kstart_pa);
+    aarch64_uart_puts(")\n");
 
     /* 有効化の前に、自分でテーブルを歩いて要るものが張れているかを見る。
-     * ここで 0 が出るものがあれば、MMU を入れた瞬間に沈黙する */
-    aarch64_uart_puts("  text ->pa : ");
-    aarch64_uart_puthex64(aarch64_vm_translate((uint64_t)(uintptr_t)__text_start));
-    aarch64_uart_puts("\n  uart ->pa : ");
-    aarch64_uart_puthex64(aarch64_vm_translate(b->uart_base));
-    aarch64_uart_puts("\n  gicd ->pa : ");
-    aarch64_uart_puthex64(aarch64_vm_translate(b->gicd_base));
-    aarch64_uart_puts("\n  gicc ->pa : ");
-    aarch64_uart_puthex64(aarch64_vm_translate(b->gicc_base));
-    aarch64_uart_puts("\n  ram end-1 : ");
-    aarch64_uart_puthex64(aarch64_vm_translate(b->memory_base + b->memory_size - 1));
+     * **上位 VA 側と恒等側の両方を見る。** どちらが欠けても沈黙する:
+     *   恒等が欠ける → MMU を入れた瞬間に PC が迷子
+     *   上位が欠ける → 飛んだ瞬間に迷子 */
+    aarch64_uart_puts("  ttbr1 text: ");
+    aarch64_uart_puthex64(aarch64_vm_translate_in(g_kernel_root_pa,
+                          aarch64_phys_to_virt(aarch64_vm_ptr_pa(__text_start))));
+    aarch64_uart_puts("\n  ttbr1 uart: ");
+    aarch64_uart_puthex64(aarch64_vm_translate_in(g_kernel_root_pa,
+                          aarch64_phys_to_virt(b->uart_base)));
+    aarch64_uart_puts("\n  ttbr1 gicc: ");
+    aarch64_uart_puthex64(aarch64_vm_translate_in(g_kernel_root_pa,
+                          aarch64_phys_to_virt(b->gicc_base)));
+    aarch64_uart_puts("\n  ttbr1 ram : ");
+    aarch64_uart_puthex64(aarch64_vm_translate_in(g_kernel_root_pa,
+                          aarch64_phys_to_virt(b->memory_base + b->memory_size - 1)));
+    aarch64_uart_puts("\n  ttbr0 iden: ");
+    aarch64_uart_puthex64(aarch64_vm_translate_in(g_ident_root_pa, kstart_pa));
+    aarch64_uart_puts("\n  ttbr0 user: ");
+    aarch64_uart_puthex64(aarch64_vm_translate_in(g_user_root_pa, AARCH64_USER_VA_BASE));
     aarch64_uart_puts("\n");
-    {
-        uint64_t sp;
-        __asm__ volatile("mov %0, sp" : "=r"(sp));
-        aarch64_uart_puts("  sp   ->pa : ");
-        aarch64_uart_puthex64(aarch64_vm_translate(sp));
-        aarch64_uart_puts("\n");
-    }
 
-    /* **RAM の末尾まで張れているかを見る。** DTB から取った容量でマップして
-     * いるので、ここが 0 なら「DTB の言う RAM を張り切れていない」 */
-    if (aarch64_vm_translate((uint64_t)(uintptr_t)__text_start) == 0 ||
-        aarch64_vm_translate(b->uart_base) == 0 ||
-        aarch64_vm_translate(b->gicc_base) == 0 ||
-        aarch64_vm_translate(b->memory_base + b->memory_size - 1) == 0) {
+    if (aarch64_vm_translate_in(g_kernel_root_pa,
+            aarch64_phys_to_virt(aarch64_vm_ptr_pa(__text_start))) == 0 ||
+        aarch64_vm_translate_in(g_kernel_root_pa, aarch64_phys_to_virt(b->uart_base)) == 0 ||
+        aarch64_vm_translate_in(g_kernel_root_pa, aarch64_phys_to_virt(b->gicc_base)) == 0 ||
+        aarch64_vm_translate_in(g_kernel_root_pa,
+            aarch64_phys_to_virt(b->memory_base + b->memory_size - 1)) == 0 ||
+        aarch64_vm_translate_in(g_ident_root_pa, kstart_pa) == 0 ||
+        aarch64_vm_translate_in(g_user_root_pa, AARCH64_USER_VA_BASE) == 0) {
         aarch64_uart_puts("aarch64-mmu-BAD (有効化前の確認で 0 が出た)\n");
         return;
     }
 
-    __asm__ volatile("msr daifset, #2");    /* 有効化の間は割り込みを閉じる */
+    /* 移行のあいだは割り込みを閉じる。ベクタはまだ物理を指しているので、
+     * 上位へ飛んで VBAR を張り替えるまで例外を受けない */
+    __asm__ volatile("msr daifset, #2");
     aarch64_mmu_enable();
-    __asm__ volatile("msr daifclr, #2");
 
-    /* ここに文字が出ること自体が「MMU on のまま UART に届いている」証拠 */
-    aarch64_uart_puts("  SCTLR_EL1 : ");
-    aarch64_uart_puthex64(aarch64_read_sctlr());
-    aarch64_uart_puts("\n");
+    /* ここに文字が出れば「MMU on のまま、恒等マッピングで UART に届いている」 */
+    aarch64_uart_puts("  mmu on    : ok (まだ物理アドレスで走っている)\n");
 
-    if ((aarch64_read_sctlr() & SCTLR_M) == 0) {
-        aarch64_uart_puts("aarch64-mmu-BAD (SCTLR.M が立っていない)\n");
-        return;
-    }
+    /* **新しいスタックを上位 VA に用意して飛ぶ。**
+     * いまのスタックには物理アドレスの戻り先が積まれているので、そのまま
+     * 使い続けると恒等マッピングを外した瞬間に破綻する。
+     * CPU 0 のブートスタックの頂点 (カーネルイメージ直後 + 64KB) を使う */
+    new_sp = aarch64_phys_to_virt(
+        aarch64_align_up(aarch64_vm_ptr_pa(__kernel_end), AARCH64_PAGE_SIZE) + 65536);
+    cont = aarch64_phys_to_virt((uint64_t)(uintptr_t)aarch64_boot_continue);
 
-    aarch64_vm_fault_probe();
+    aarch64_vm_enter_high(new_sp, cont);   /* 戻ってこない */
 }
 
 uint64_t aarch64_vm_root_pa(void) {
-    return g_root_pa;
+    return g_kernel_root_pa;
 }

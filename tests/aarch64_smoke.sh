@@ -66,8 +66,9 @@ run_one() {  # $1 = -machine の値、$2 = ログ、$3 = -m の値
     QEMU_PID=""
 }
 
-check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量 (16 桁 hex)
+check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$4 = RAM 末尾
     local ram_size="${3:-0x0000000020000000}"
+    local ram_last="${4:-0x000000005fffffff}"
     echo "--- AArch64 Serial Output ($1) ---"
     cat "$2"
     echo "----------------------------------"
@@ -108,22 +109,34 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量 (16
     grep -aq "aarch64-timer-ok" "$2"
     ! grep -aq "aarch64-timer-BAD" "$2"
 
-    # M2: MMU (恒等マッピングで有効化)
+    # M2 / M3b: MMU を入れて上位 VA (TTBR1) へ移る
     #
     # **恒等マッピングだけでは「MMU が効いている」証拠にならない。** VA == PA
-    # なので、MMU を入れ忘れても出力はまったく同じになる。判定は 3 本立て:
+    # なので、MMU を入れ忘れても出力はまったく同じになる。判定は 4 本立て:
     #
     #   1. SCTLR_EL1 の M / C / I が立っていること (レジスタの実測値)
     #   2. 未マップの VA を読んで translation fault が上がること (翻訳の証拠)
-    #   3. MMU on のまま tick が入り続けること (GIC を Device 属性で
-    #      張れているか。ここを落とすと MMU on の瞬間に沈黙する)
-    grep -aq "M2: MMU (identity, 4KB granule, VA 39bit)" "$2"
+    #   3. **カーネルが上位 VA で走っていること** (pc / sp / VBAR が 0xffffff80...)
+    #   4. **恒等マッピングを外した後も文字が出ること**
+    #      = カーネルが TTBR1 だけで走っている証拠
+    grep -aq "M2/M3b: MMU (4KB granule, VA 39bit, TTBR1 = カーネル)" "$2"
     # カーネルが自分で決めた値。**EL1 起動と EL2 降格で同じ値になること**が
     # 要点 (起動時の値を読んで OR していたときは別の値になっていた)
     grep -aq "SCTLR_EL1 : 0x0000000030d0181d" "$2"
-    grep -aq "uart ->pa : 0x0000000009000000" "$2"   # 恒等に張れていること
-    grep -aq "gicd ->pa : 0x0000000008000000" "$2"
-    grep -aq "gicc ->pa : 0x0000000008010000" "$2"
+    grep -aq "kernel VA : 0xffffff8040201000  (物理 0x0000000040201000)" "$2"
+    # 有効化前の自前ウォーク。上位側 (TTBR1) と恒等側 (TTBR0) の両方を見る。
+    # どちらが欠けても沈黙する: 恒等が欠ければ MMU on の瞬間、
+    # 上位が欠ければ飛んだ瞬間
+    grep -aq "ttbr1 uart: 0x0000000009000000" "$2"
+    grep -aq "ttbr1 gicc: 0x0000000008010000" "$2"
+    grep -aq "ttbr1 ram : ${ram_last}" "$2"
+    grep -aq "ttbr0 iden: 0x0000000040201000" "$2"
+    grep -aq "ttbr0 user: 0x0000000040209000" "$2"
+    # 上位 VA へ移れたこと。pc / sp / VBAR / UART が全部 0xffffff80... になる
+    grep -aq "high VA   : pc=0xffffff80.* sp=0xffffff80" "$2"
+    grep -aq "vbar/uart : 0xffffff80.* / 0xffffff8009000000" "$2"
+    # **恒等を外した後の行。** ここが出れば TTBR1 だけで走っている
+    grep -aq "恒等を外した。カーネルは TTBR1 だけで走っている" "$2"
     grep -aq "mmu probe : ESR=0x0000000096000006 (translation fault, level 2) ok" "$2"
     grep -aq "aarch64-mmu-ok" "$2"
     ! grep -aq "aarch64-mmu-BAD" "$2"
@@ -147,7 +160,12 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量 (16
     grep -aq "el0 ticks : .*  ok" "$2"
     # **translation fault では駄目。** それは「張っていない」だけで、
     # 権限で弾いた証拠にならない (DFSC=0b0011xx が permission fault)
-    grep -aq "user probe: ESR=0x000000009200000f .*(permission fault) ok" "$2"
+    # ユーザーは TTBR0 の VA (0x400000) で動く。**カーネルの配置と無関係。**
+    grep -aq "user text : 0x0000000000400000" "$2"
+    grep -aq "user sp   : 0x0000000000402000" "$2"
+    # EL0 から読ませるのはカーネルの**上位 VA**。EL0 も TTBR1 を歩けるが、
+    # AP が EL1 だけなので permission fault になる
+    grep -aq "user probe: ESR=0x000000009200000f FAR=0xffffff8040201000 (permission fault) ok" "$2"
     grep -aq "aarch64-user-ok" "$2"
     ! grep -aq "aarch64-user-BAD" "$2"
 
@@ -156,16 +174,15 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量 (16
 }
 
 run_one "virt" LOGs/aarch64-serial.log 512M
-check_one "EL1 起動" LOGs/aarch64-serial.log 0x0000000020000000
+check_one "EL1 起動" LOGs/aarch64-serial.log 0x0000000020000000 0x000000005fffffff
 
 run_one "virt,virtualization=on" LOGs/aarch64-serial-el2.log 512M
-check_one "EL2 起動 -> 降格" LOGs/aarch64-serial-el2.log 0x0000000020000000
+check_one "EL2 起動 -> 降格" LOGs/aarch64-serial-el2.log 0x0000000020000000 0x000000005fffffff
 
 # **DTB を本当に読んでいるかの確認。** RAM を 1GB にすると DTB の memory も
 # 1GB になる。直書きの 512MB のままなら追随できないので、ここで落ちる。
 # ram end-1 = 0x7fffffff まで張れていることまで見る (マップも追随している証拠)
 run_one "virt" LOGs/aarch64-serial-1g.log 1G
-check_one "RAM 1GB (DTB 追随)" LOGs/aarch64-serial-1g.log 0x0000000040000000
-grep -aq "ram end-1 : 0x000000007fffffff" LOGs/aarch64-serial-1g.log
+check_one "RAM 1GB (DTB 追随)" LOGs/aarch64-serial-1g.log 0x0000000040000000 0x000000007fffffff
 
-echo "aarch64 smoke test: PASS (M0 + M1 + M2 + M2b + M3a, EL1 / EL2 降格 / RAM 1GB の 3 通り)"
+echo "aarch64 smoke test: PASS (M0 + M1 + M2 + M2b + M3a + M3b, EL1 / EL2 降格 / RAM 1GB の 3 通り)"

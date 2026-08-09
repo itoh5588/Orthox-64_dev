@@ -48,6 +48,14 @@ static uint64_t g_gicc_base = AARCH64_QEMU_VIRT_GICC_BASE;
 static inline void w32(uint64_t a, uint32_t v) { *(volatile uint32_t*)a = v; }
 static inline uint32_t r32(uint64_t a) { return *(volatile uint32_t*)a; }
 
+/* MMU を入れて上位 VA へ移った後は、MMIO も VA で触る必要がある (M3b)。
+ * **恒等マッピングを外す前に呼ぶこと。** 外した後だと、次に GIC を
+ * 触った瞬間に落ちる */
+void aarch64_gic_set_base(uint64_t gicd, uint64_t gicc) {
+    if (gicd) g_gicd_base = gicd;
+    if (gicc) g_gicc_base = gicc;
+}
+
 void aarch64_gic_init(void) {
     const aarch64_boot_info_t* b = aarch64_boot_info();
     if (b->gicd_base) g_gicd_base = b->gicd_base;

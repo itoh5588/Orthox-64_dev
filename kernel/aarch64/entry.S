@@ -11,6 +11,44 @@
 
 .section .text
 
+/* uint64_t aarch64_link_va_offset(void)
+ *
+ * リンカスクリプトが使った KERNEL_VA_OFFSET を返す。
+ * **include/aarch64/vm.h の値と一致しているかを実行時に確かめるため。**
+ * ずれていると、MMU を入れて上位 VA へ飛んだ瞬間に沈黙する。
+ *
+ * C から直接は参照できない (値が大きすぎて adrp が届かない)。
+ * リテラルプール経由なら取れる */
+.globl aarch64_link_va_offset
+aarch64_link_va_offset:
+    ldr     x0, =KERNEL_VA_OFFSET
+    ret
+
+/* void aarch64_vm_enter_high(uint64_t new_sp, uint64_t cont)
+ *
+ * MMU を入れた直後に、**物理アドレスの世界から上位 VA の世界へ移る**。
+ * 戻ってこない。
+ *
+ * いまのスタックには物理アドレスの戻り先が積まれているので、そのまま
+ * 使い続けると恒等マッピングを外した瞬間に破綻する。**新しいスタックに
+ * 乗り換えてから飛ぶ。**
+ *
+ * x30 (戻り先) も物理のままなので、飛んだ先では ret しないこと。
+ * 呼び出し元 (aarch64_vm_init) には二度と戻らない。 */
+.globl aarch64_vm_enter_high
+aarch64_vm_enter_high:
+    mov     sp, x0
+    mov     x29, xzr        /* フレームポインタを切る。物理の鎖を残さない */
+    mov     x30, xzr        /* 戻り先も切る。ここから先で ret したら止まる */
+    br      x1
+
+/* 何もせず待つ。**上位 VA 側に置く。** start.S (.boot) からは PC 相対で
+ * 届かないので、あちらは自前のループで完結させてある */
+.globl aarch64_wait_forever
+aarch64_wait_forever:
+    wfe
+    b       aarch64_wait_forever
+
 /* void aarch64_enter_el0(uint64_t entry, uint64_t user_sp, uint64_t arg0)
  *
  *   x0 = EL0 で走らせる場所

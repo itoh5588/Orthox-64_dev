@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include "aarch64/boot.h"
 #include "aarch64/usermode.h"
+#include "aarch64/vm.h"
 
 /* SAVE_ALL が積んだフレームの並び。vectors.S と対で決まっている。
  *
@@ -49,8 +50,10 @@
  * EL0 には割り込みを開けて降りているので、戻るときも揃える */
 #define SPSR_EL1H   0x00000005ULL
 
-extern char aarch64_user_entry[];
-extern char aarch64_user_stack_top[];
+/* EL0 の入口とスタックの VA。**TTBR0 の中の VA で、カーネルの配置とは
+ * 無関係** (M3b)。M3a ではカーネルと同じテーブルの VA だった */
+uint64_t aarch64_vm_user_entry_va(void);
+uint64_t aarch64_vm_user_stack_top_va(void);
 
 uint64_t aarch64_timer_ticks(void);
 
@@ -171,9 +174,9 @@ int aarch64_user_run(void) {
 
     aarch64_uart_puts("--- M3a: EL0 + svc ---\n");
     aarch64_uart_puts("  user text : ");
-    aarch64_uart_puthex64((uint64_t)(uintptr_t)aarch64_user_entry);
+    aarch64_uart_puthex64(aarch64_vm_user_entry_va());
     aarch64_uart_puts("\n  user sp   : ");
-    aarch64_uart_puthex64((uint64_t)(uintptr_t)aarch64_user_stack_top);
+    aarch64_uart_puthex64(aarch64_vm_user_stack_top_va());
     aarch64_uart_puts("\n  probe tgt : ");
     aarch64_uart_puthex64(aarch64_user_probe_target());
     aarch64_uart_puts("  (カーネルの .text。EL0 から読めてはいけない)\n");
@@ -196,8 +199,8 @@ int aarch64_user_run(void) {
 
     ticks_before = aarch64_timer_ticks();
 
-    aarch64_enter_el0((uint64_t)(uintptr_t)aarch64_user_entry,
-                      (uint64_t)(uintptr_t)aarch64_user_stack_top,
+    aarch64_enter_el0(aarch64_vm_user_entry_va(),
+                      aarch64_vm_user_stack_top_va(),
                       aarch64_user_probe_target());
 
     ticks_after = aarch64_timer_ticks();

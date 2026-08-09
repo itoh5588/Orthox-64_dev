@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "aarch64/boot.h"
 #include "aarch64/dtb.h"
+#include "aarch64/vm.h"
 
 /* PL011 UART。QEMU は初期化なしでも DR に書けば出るが、実機と手順を
  * 揃えておく (M1 以降で割り込み受信を足すときに効く)
@@ -96,6 +97,12 @@ uint64_t aarch64_timer_freq(void);
 uint64_t aarch64_timer_ticks(void);
 uint32_t aarch64_timer_intid(void);
 void aarch64_vm_init(void);
+void aarch64_vm_fault_probe(void);
+void aarch64_vm_drop_identity(void);
+uint64_t aarch64_read_sctlr(void);
+uint64_t aarch64_vm_kernel_root_pa(void);
+uint64_t aarch64_vm_user_root_pa(void);
+void aarch64_gic_set_base(uint64_t gicd, uint64_t gicc);
 int aarch64_user_run(void);
 
 /* MMU の探針 (vm.c)。「未マップの VA を読んだら fault が上がるはず」の
@@ -289,8 +296,59 @@ void aarch64_early_main(uint64_t dtb_phys) {
         }
     }
 
-    /* ---- M2: MMU ------------------------------------------------------- */
+    /* ---- M2 / M3b: MMU を入れて上位 VA へ移る --------------------------
+     *
+     * **aarch64_vm_init は戻ってこない。** MMU を入れて上位 VA へ飛び、
+     * 下の aarch64_boot_continue から続きが始まる */
     aarch64_vm_init();
+
+    /* 失敗したときだけここに来る */
+    aarch64_uart_puts("aarch64-mmu-BAD (上位 VA へ移れなかった)\n");
+    aarch64_wait_forever();
+}
+
+/* ---- ここから上位 VA (TTBR1) で走る -------------------------------------
+ *
+ * スタックも飛び先も上位 VA。**ここから物理アドレスを直に触ってはいけない。**
+ * DTB 由来のアドレスは必ず aarch64_phys_to_virt を通すこと。 */
+void aarch64_boot_continue(void) {
+    const aarch64_boot_info_t* b = aarch64_boot_info();
+    uint64_t sp;
+
+    /* まず UART を上位 VA に乗り換える。**恒等マッピングを外す前に。**
+     * 順序を逆にすると、次の 1 文字を出そうとした瞬間に落ちる */
+    aarch64_uart_set_base(aarch64_phys_to_virt(b->uart_base));
+    aarch64_gic_set_base(aarch64_phys_to_virt(b->gicd_base),
+                         aarch64_phys_to_virt(b->gicc_base));
+
+    /* 例外ベクタも上位 VA に張り替える */
+    aarch64_vectors_init();
+
+    __asm__ volatile("mov %0, sp" : "=r"(sp));
+    aarch64_uart_puts("  high VA   : pc=");
+    aarch64_uart_puthex64((uint64_t)(uintptr_t)aarch64_boot_continue);
+    aarch64_uart_puts(" sp=");
+    put_hex64(sp);
+    aarch64_uart_puts("\n  vbar/uart : ");
+    put_hex64((uint64_t)(uintptr_t)aarch64_vectors);
+    aarch64_uart_puts(" / ");
+    put_hex64(aarch64_phys_to_virt(b->uart_base));
+    aarch64_uart_puts("\n");
+
+    /* **恒等マッピングを外す。** ここから TTBR0 はユーザー専用。
+     * この後も文字が出れば、カーネルが TTBR1 だけで走っている証拠になる */
+    aarch64_vm_drop_identity();
+    aarch64_uart_puts("  ttbr0     : ");
+    put_hex64(aarch64_vm_user_root_pa());
+    aarch64_uart_puts("  (恒等を外した。カーネルは TTBR1 だけで走っている)\n");
+
+    aarch64_uart_puts("  SCTLR_EL1 : ");
+    put_hex64(aarch64_read_sctlr());
+    aarch64_uart_puts("\n");
+
+    aarch64_vm_fault_probe();
+
+    __asm__ volatile("msr daifclr, #2");   /* 割り込みを開け直す */
 
     /* MMU を入れた後もタイマが入り続けるかを見る。**ここが本命の確認。**
      * GIC を Device 属性で張り忘れていたり、ベクタ表のあるページが張れて

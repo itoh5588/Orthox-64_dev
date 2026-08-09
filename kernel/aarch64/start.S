@@ -10,21 +10,20 @@
  * EL2 からの降格は M1 (例外ベクタ) と一緒に入れる。
  */
 
-.section .bss
-.align 16
-aarch64_boot_stacks:
-    .skip (65536 * 8)
-aarch64_boot_stacks_top:
+#include "aarch64/vm.h"
 
 .section .text.start
 .globl _start
 .extern aarch64_early_main
-.extern aarch64_wait_forever
 
 _start:
     /* QEMU は x0 に DTB の物理アドレスを渡す。真っ先に退避すること。
      * ここを潰すと DTB を二度と拾えない (最初 mpidr を x0 に読んで壊した) */
     mov     x19, x0
+
+    /* **上位 VA でリンクされたシンボルを物理に直すための差。**
+     * .boot は VA = PA、それ以外は VA = PA + この値でリンクされている */
+    ldr     x21, =AARCH64_KERNEL_VA_OFFSET
 
     /* Aff0 (CPU 番号) を取り出す。virt は Aff0 に 0,1,2... を入れる */
     mrs     x20, mpidr_el1
@@ -32,12 +31,18 @@ _start:
     cmp     x20, #8
     b.hs    2f
 
-    /* スタックは CPU ごとに 64KB。x20 番目の先頭 + 64KB が sp */
-    adrp    x1, aarch64_boot_stacks
-    add     x1, x1, :lo12:aarch64_boot_stacks
+    /* ブートスタックはカーネルイメージの直後の RAM に置く。CPU ごとに 64KB。
+     *
+     * .bss (上位 VA) に置くと .boot から届かず、.boot に置くと nobits を
+     * progbits の中に混ぜることになってイメージが 512KB 太る。
+     * イメージの外を使えばどちらも避けられる。
+     * MMU を入れた後は同じ物理が TTBR1 側にも張られるので使い続けられる */
+    ldr     x1, =__kernel_end
+    sub     x1, x1, x21         /* 物理に直す */
     mov     x2, #65536
-    madd    x1, x20, x2, x1
-    add     sp, x1, x2
+    add     x3, x20, #1
+    madd    x1, x3, x2, x1      /* base + (cpu + 1) * 64KB = この CPU の頂点 */
+    mov     sp, x1
 
     /* 起こすのは CPU 0 だけ。他は M1 まで寝かせる */
     cbnz    x20, 2f
@@ -90,24 +95,33 @@ _start:
     eret
 
 4:
+    /* ---- ここから先は「上位 VA でリンクされたもの」を触る ---------------
+     *
+     * **.boot からは PC 相対で届かない** (リンク上の距離が 2^40 ある)。
+     * 絶対アドレス (= 上位 VA) をリテラルプールから取り、
+     * AARCH64_KERNEL_VA_OFFSET (x21 に入れてある) を引いて物理に直す。
+     * 物理の並びは上位 VA の並びと同じ差でずれているので、この引き算で合う */
     /* .bss を 0 で埋める。C に入る前に済ませること */
-    adrp    x1, __bss_start
-    add     x1, x1, :lo12:__bss_start
-    adrp    x2, __bss_end
-    add     x2, x2, :lo12:__bss_end
+    ldr     x1, =__bss_start
+    sub     x1, x1, x21
+    ldr     x2, =__bss_end
+    sub     x2, x2, x21
 1:
     cmp     x1, x2
     b.hs    3f
     str     xzr, [x1], #8
     b       1b
 3:
+    /* MMU はまだ off。**C も物理アドレスで走る。**
+     * 上位 VA でリンクされた C どうしの参照は adrp (PC 相対) なので、
+     * PC が物理なら結果も物理になり、そのまま動く */
+    ldr     x2, =aarch64_early_main
+    sub     x2, x2, x21
     mov     x0, x19             /* DTB の物理アドレスを第 1 引数で渡す */
-    bl      aarch64_early_main
+    blr     x2
 
 2:
-    b       aarch64_wait_forever
-
-.globl aarch64_wait_forever
-aarch64_wait_forever:
+    /* CPU 0 以外と、C から戻ってきたとき。**ここは .boot の中で完結させる。**
+     * 上位側の aarch64_wait_forever を bl で呼ぶと届かない */
     wfe
-    b       aarch64_wait_forever
+    b       2b
