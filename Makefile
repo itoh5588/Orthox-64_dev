@@ -885,3 +885,7 @@ clean:
 
 -include $(DEPS)
 -include $(RISCV64_OBJS:.o=.d)
+# aarch64 のぶんが抜けていた。**ヘッダを変えても再ビルドされない**状態で、
+# M2b で aarch64 に初めてヘッダ (include/aarch64/) を入れたときから潜在して
+# いた。それまで aarch64 にヘッダが 1 つも無かったので表面化しなかった
+-include $(AARCH64_OBJS:.o=.d)
