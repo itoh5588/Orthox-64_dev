@@ -67,8 +67,11 @@ void aarch64_timer_init(void) {
 }
 
 /* タイマ割り込みが上がったときに呼ぶ。次回ぶんを仕込み直す */
+void aarch64_task_on_tick(void);
+
 void aarch64_timer_on_tick(void) {
     g_ticks++;
+    aarch64_task_on_tick();   /* 切り替えの印を立てる (実際の切り替えは IRQ の出口) */
     write_tval(g_interval);
     write_ctl(CNTP_CTL_ENABLE);
 }

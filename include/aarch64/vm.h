@@ -36,6 +36,8 @@ static inline uint64_t aarch64_virt_to_phys(uint64_t va) {
     return va - AARCH64_KERNEL_VA_OFFSET;
 }
 
+uint64_t aarch64_vm_user_root_pa_current(void);
+
 /* いま上位 VA で走っているか。恒等マッピングを外してよいかの判断に使う */
 static inline int aarch64_vm_running_high(void) {
     uint64_t pc;

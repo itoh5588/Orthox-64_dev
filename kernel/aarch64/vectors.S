@@ -149,9 +149,14 @@ vec_el1_sync:
 1:
     b       .
 
+/* **切り替えは IRQ の出口で行う** (aarch64_task_resched_if_needed)。
+ * ハンドラの途中で切り替えると、まだ積んでいないものが出る。
+ * ここまで来れば SAVE_ALL が済んでいるので、戻ってきたときに続きから
+ * 再開できる */
 vec_el1_irq:
     SAVE_ALL
     bl      aarch64_irq_handler
+    bl      aarch64_task_resched_if_needed
     RESTORE_ALL
     eret
 
@@ -175,6 +180,7 @@ vec_el0_sync:
 vec_el0_irq:
     SAVE_ALL
     bl      aarch64_irq_handler
+    bl      aarch64_task_resched_if_needed
     RESTORE_ALL
     eret
 

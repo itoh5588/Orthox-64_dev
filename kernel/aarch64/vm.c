@@ -560,6 +560,9 @@ int aarch64_vm_user_range_ok(uint64_t root_pa, uint64_t va, uint64_t len, int wr
 }
 
 uint64_t aarch64_vm_user_root_pa(void) { return g_user_root_pa; }
+
+/* task.c が 0 番タスクの初期値に使う */
+uint64_t aarch64_vm_user_root_pa_current(void) { return g_user_root_pa; }
 uint64_t aarch64_vm_kernel_root_pa(void) { return g_kernel_root_pa; }
 
 /* MMU を入れる。順序が全て:
@@ -739,9 +742,14 @@ void aarch64_vm_init(void) {
                           aarch64_phys_to_virt(b->memory_base + b->memory_size - 1)));
     aarch64_uart_puts("\n  ttbr0 iden: ");
     aarch64_uart_puthex64(aarch64_vm_translate_in(g_ident_root_pa, kstart_pa));
+    /* **ユーザー空間の入口が、イメージの .user_text を指していること。**
+     * 値そのものはコードの大きさで動くので、期待値を書かずにここで照合する
+     * (スモークに物理アドレスを直書きすると、行が増えるたびに落ちる) */
     aarch64_uart_puts("\n  ttbr0 user: ");
     aarch64_uart_puthex64(aarch64_vm_translate_in(g_user_root_pa, AARCH64_USER_VA_BASE));
-    aarch64_uart_puts("\n");
+    aarch64_uart_puts(aarch64_vm_translate_in(g_user_root_pa, AARCH64_USER_VA_BASE) ==
+                      aarch64_vm_ptr_pa(__user_text_start)
+                      ? "  ok (.user_text を指している)\n" : "  BAD\n");
 
     if (aarch64_vm_translate_in(g_kernel_root_pa,
             aarch64_phys_to_virt(aarch64_vm_ptr_pa(__text_start))) == 0 ||

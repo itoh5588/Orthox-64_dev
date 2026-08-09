@@ -25,6 +25,7 @@
 #include "aarch64/boot.h"
 #include "aarch64/usermode.h"
 #include "aarch64/vm.h"
+#include "aarch64/task.h"
 
 /* SAVE_ALL が積んだフレームの並び。vectors.S と対で決まっている。
  *
@@ -68,16 +69,32 @@ void aarch64_enter_el0(uint64_t entry, uint64_t user_sp, uint64_t arg0);
  * ことになる。例外ハンドラが戻り先をここに差し替えて eret する */
 void aarch64_user_abort_landing(void);
 
-static int g_user_exited;
-static uint64_t g_user_exit_code;
-static uint64_t g_svc_count;
-static uint64_t g_bad_ptr_ret;   /* 悪いポインタを渡したときの write の戻り値 */
+/* ---- 実行ごとの状態は **タスクごとに持つ** (M3c-1) ----------------------
+ *
+ * M3b までは 1 本ずつ順番に走らせていたので単一のグローバルで足りていた。
+ * **タスクにして並行にした瞬間に壊れた。** 2 つのユーザータスクが
+ * 探針のフラグを取り合い、片方の fault がもう片方に消されて
+ * 「想定外の例外」になった。
+ *
+ * 並行にすると、単一のグローバルは必ず壊れる。 */
+typedef struct user_run_state {
+    int      exited;
+    uint64_t exit_code;
+    uint64_t svc_count;
+    uint64_t bad_ptr_ret;       /* 悪いポインタを渡したときの write の戻り値 */
+    volatile int expect_fault;  /* 「触ったら落ちるはず」の探針 */
+    volatile uint64_t fault_esr;
+    volatile uint64_t fault_far;
+} user_run_state_t;
 
-/* 「EL0 からカーネルのページを触ったら落ちるはず」の探針。
- * M2 の MMU 探針と同じ形で、想定内なら命令 1 つぶん進めて再開させる */
-static volatile int g_expect_user_fault;
-static volatile uint64_t g_user_fault_esr;
-static volatile uint64_t g_user_fault_far;
+static user_run_state_t g_urun[AARCH64_MAX_TASKS];
+
+static user_run_state_t* urun(void) {
+    aarch64_task_t* me = aarch64_task_current();
+    int id = me ? me->id : 0;
+    if (id < 0 || id >= AARCH64_MAX_TASKS) id = 0;
+    return &g_urun[id];
+}
 
 /* 触らせるカーネルのアドレス。カーネルの .text の先頭。
  * **張ってはあるが AP は EL1 だけ**なので、EL0 から読むと permission fault
@@ -104,7 +121,7 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     const char* p = (const char*)(uintptr_t)buf;
     uint64_t i;
     if (fd != 1 && fd != 2) return -9;      /* -EBADF */
-    if (!aarch64_vm_user_range_ok(aarch64_vm_user_root_pa(), buf, len, 0)) {
+    if (!aarch64_vm_user_range_ok(aarch64_task_current()->ttbr0, buf, len, 0)) {
         return -14;                         /* -EFAULT */
     }
     for (i = 0; i < len; i++) {
@@ -116,18 +133,19 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
 
 static void aarch64_svc(uint64_t* frame) {
     uint64_t nr = frame[8];      /* x8 = システムコール番号 */
+    user_run_state_t* st = urun();
 
-    g_svc_count++;
+    st->svc_count++;
 
     switch (nr) {
     case AARCH64_NR_WRITE:
         frame[0] = (uint64_t)sys_write(frame[0], frame[1], frame[2]);
-        /* カーネルの VA を渡された回 (4 回目) の戻り値を取っておく */
-        if ((int64_t)frame[0] < 0) g_bad_ptr_ret = frame[0];
+        /* カーネルの VA を渡された回の戻り値を取っておく */
+        if ((int64_t)frame[0] < 0) st->bad_ptr_ret = frame[0];
         break;
     case AARCH64_NR_EXIT:
-        g_user_exited = 1;
-        g_user_exit_code = frame[0];
+        st->exited = 1;
+        st->exit_code = frame[0];
         break;
     default:
         aarch64_uart_puts("  [EL1] 未実装のシステムコール: ");
@@ -145,10 +163,11 @@ static void aarch64_svc(uint64_t* frame) {
  * ここに来る。ESR の EC で振り分ける */
 void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
     uint64_t ec = (esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
+    user_run_state_t* st = urun();
 
     if (ec == ESR_EC_SVC64) {
         aarch64_svc(frame);
-        if (g_user_exited) {
+        if (st->exited) {
             /* exit されたので EL0 へは戻さない。戻り先を差し替えて
              * カーネルの続きへ抜ける */
             frame[FRAME_ELR] = (uint64_t)(uintptr_t)aarch64_user_abort_landing;
@@ -157,11 +176,11 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
         return;
     }
 
-    if ((ec == ESR_EC_DABT_LOW || ec == ESR_EC_IABT_LOW) && g_expect_user_fault) {
+    if ((ec == ESR_EC_DABT_LOW || ec == ESR_EC_IABT_LOW) && st->expect_fault) {
         /* 想定内。記録して、落ちた命令の次から再開させる */
-        g_expect_user_fault = 0;
-        g_user_fault_esr = esr;
-        g_user_fault_far = far;
+        st->expect_fault = 0;
+        st->fault_esr = esr;
+        st->fault_far = far;
         frame[FRAME_ELR] += 4;
         return;
     }
@@ -176,8 +195,8 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
     aarch64_uart_puts("\n  ELR : ");
     aarch64_uart_puthex64(frame[FRAME_ELR]);
     aarch64_uart_puts("\naarch64-user-BAD\n");
-    g_user_exited = 1;
-    g_user_exit_code = (uint64_t)-1;
+    st->exited = 1;
+    st->exit_code = (uint64_t)-1;
     /* EL0 には戻さず、カーネルの続きへ抜ける */
     frame[FRAME_ELR] = (uint64_t)(uintptr_t)aarch64_user_abort_landing;
     frame[FRAME_SPSR] = SPSR_EL1H;
@@ -185,8 +204,9 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
 
 /* 1 つのアドレス空間でユーザーを 1 回走らせる。
  * 戻り値: 成功なら 1 */
-static int aarch64_user_run_once(const char* label, uint64_t root_pa) {
+int aarch64_user_run_once(const char* label, uint64_t root_pa) {
     uint64_t ticks_before, ticks_after;
+    user_run_state_t* st = urun();
 
     aarch64_uart_puts("  --- ");
     aarch64_uart_puts(label);
@@ -194,13 +214,15 @@ static int aarch64_user_run_once(const char* label, uint64_t root_pa) {
     aarch64_uart_puthex64(root_pa);
     aarch64_uart_puts("\n");
 
+    /* **タスクとして走る場合、TTBR0 は切り替えのときに入れ替わっている。**
+     * ここで入れ直しても同じ値になるだけだが、単体で呼ばれたときのために残す */
     aarch64_vm_switch_user_space(root_pa);
 
-    g_user_exited = 0;
-    g_svc_count = 0;
-    g_user_fault_esr = 0;
-    g_bad_ptr_ret = 0;
-    g_expect_user_fault = 1;
+    st->exited = 0;
+    st->svc_count = 0;
+    st->fault_esr = 0;
+    st->bad_ptr_ret = 0;
+    st->expect_fault = 1;
 
     ticks_before = aarch64_timer_ticks();
     aarch64_enter_el0(aarch64_vm_user_entry_va(),
@@ -209,10 +231,10 @@ static int aarch64_user_run_once(const char* label, uint64_t root_pa) {
     ticks_after = aarch64_timer_ticks();
 
     aarch64_uart_puts("  svc calls : ");
-    aarch64_uart_puthex64(g_svc_count);
+    aarch64_uart_puthex64(st->svc_count);
     aarch64_uart_puts("  marker    : ");
-    aarch64_uart_puthex64(g_user_exit_code);
-    aarch64_uart_puts(g_user_exit_code == 0 ? "  ok (私物のデータ)\n"
+    aarch64_uart_puthex64(st->exit_code);
+    aarch64_uart_puts(st->exit_code == 0 ? "  ok (私物のデータ)\n"
                                             : "  BAD (前の空間の値が見えている)\n");
 
     /* --- EL0 実行中に tick が入ったか -----------------------------------
@@ -224,15 +246,15 @@ static int aarch64_user_run_once(const char* label, uint64_t root_pa) {
 
     /* --- EL0 からカーネルのページを読んで落ちたか ------------------------ */
     aarch64_uart_puts("  user probe: ");
-    if (g_user_fault_esr == 0) {
+    if (st->fault_esr == 0) {
         aarch64_uart_puts("BAD (EL0 からカーネルの .text が読めた)\n");
     } else {
-        uint64_t ec = (g_user_fault_esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
-        uint64_t dfsc = g_user_fault_esr & ESR_DFSC_MASK;
+        uint64_t ec = (st->fault_esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
+        uint64_t dfsc = st->fault_esr & ESR_DFSC_MASK;
         aarch64_uart_puts("ESR=");
-        aarch64_uart_puthex64(g_user_fault_esr);
+        aarch64_uart_puthex64(st->fault_esr);
         aarch64_uart_puts(" FAR=");
-        aarch64_uart_puthex64(g_user_fault_far);
+        aarch64_uart_puthex64(st->fault_far);
         /* DFSC が 0b0011xx なら permission fault。**translation fault
          * (0b0001xx) では駄目。** それは「張っていない」だけで、
          * 権限で弾いた証拠にならない */
@@ -246,22 +268,46 @@ static int aarch64_user_run_once(const char* label, uint64_t root_pa) {
     /* --- カーネルの VA を write に渡したときの戻り値 ---------------------
      * **-14 (-EFAULT) でなければ、カーネルの中身が漏れている。** */
     aarch64_uart_puts("  bad ptr   : ");
-    aarch64_uart_puthex64(g_bad_ptr_ret);
-    aarch64_uart_puts(g_bad_ptr_ret == (uint64_t)-14
+    aarch64_uart_puthex64(st->bad_ptr_ret);
+    aarch64_uart_puts(st->bad_ptr_ret == (uint64_t)-14
                       ? "  ok (-EFAULT で弾いた)\n"
                       : "  BAD (カーネルの VA を読ませてしまった)\n");
 
-    return g_user_exited && g_user_exit_code == 0 &&
+    return st->exited && st->exit_code == 0 &&
            (ticks_after - ticks_before) >= AARCH64_USER_MIN_TICKS &&
-           g_user_fault_esr != 0 && g_bad_ptr_ret == (uint64_t)-14 &&
-           g_svc_count == 5;
+           st->fault_esr != 0 && st->bad_ptr_ret == (uint64_t)-14 &&
+           st->svc_count == 5;
+}
+
+/* ---- M3c-1: タスクとして走らせる ---------------------------------------
+ *
+ * ここまでは aarch64_user_run が EL0 を「呼び出して戻る」形だった。
+ * M3c-1 では**タスクにして、タイマ割り込みで切り替えながら**走らせる。 */
+static const char* g_task_label[AARCH64_MAX_TASKS];
+static int g_task_ok[AARCH64_MAX_TASKS];
+
+/* カーネルスレッド。譲りながらカウンタを回すだけ */
+static void aarch64_kthread_body(void) {
+    aarch64_task_t* me = aarch64_task_current();
+    for (int i = 0; i < 200; i++) {
+        me->counter++;
+        aarch64_task_yield();
+    }
+}
+
+/* ユーザータスク。自分のアドレス空間で EL0 を走らせる */
+static void aarch64_utask_body(void) {
+    aarch64_task_t* me = aarch64_task_current();
+    g_task_ok[me->id] = aarch64_user_run_once(g_task_label[me->id], me->ttbr0);
+    me->counter++;
 }
 
 int aarch64_user_run(void) {
     uint64_t space_a, space_b;
-    int ok;
+    int k1, k2, u1, u2;
+    int ok = 1;
 
-    aarch64_uart_puts("--- M3a/M3b: EL0 + svc + プロセスごとのアドレス空間 ---\n");
+    aarch64_uart_puts("--- M3a/M3b/M3c: EL0 + アドレス空間 + コンテキストスイッチ ---\n");
     aarch64_uart_puts("  user text : ");
     aarch64_uart_puthex64(aarch64_vm_user_entry_va());
     aarch64_uart_puts("\n  user sp   : ");
@@ -281,9 +327,6 @@ int aarch64_user_run(void) {
         aarch64_uart_puts("  (比較用。EL1 で同じだけ空回しした)\n");
     }
 
-    /* **同じプログラムを別々のアドレス空間で 2 回走らせる。**
-     * テキストは共有、データは私物。2 回目も marker が 0 で読めれば、
-     * データが本当に分離されている */
     space_a = aarch64_vm_create_user_space();
     space_b = aarch64_vm_create_user_space();
     if (!space_a || !space_b || space_a == space_b) {
@@ -292,8 +335,46 @@ int aarch64_user_run(void) {
         return 0;
     }
 
-    ok  = aarch64_user_run_once("空間 A", space_a);
-    ok &= aarch64_user_run_once("空間 B", space_b);
+    aarch64_task_init();
+
+    /* カーネルスレッド 2 本。譲り合ってカウンタを回す */
+    k1 = aarch64_task_create(aarch64_kthread_body, 0);
+    k2 = aarch64_task_create(aarch64_kthread_body, 0);
+
+    /* ユーザータスク 2 本。**それぞれ別のアドレス空間** */
+    g_task_label[3] = "空間 A";
+    g_task_label[4] = "空間 B";
+    u1 = aarch64_task_create(aarch64_utask_body, space_a);
+    u2 = aarch64_task_create(aarch64_utask_body, space_b);
+
+    if (k1 < 0 || k2 < 0 || u1 < 0 || u2 < 0) {
+        aarch64_uart_puts("  タスクを作れなかった\n");
+        aarch64_uart_puts("aarch64-user-BAD\n");
+        return 0;
+    }
+
+    /* 全部終わるまで譲り続ける。**自分 (0 番) もタスクの 1 つ** */
+    while (aarch64_task_state(k1) != AARCH64_TASK_DONE ||
+           aarch64_task_state(k2) != AARCH64_TASK_DONE ||
+           aarch64_task_state(u1) != AARCH64_TASK_DONE ||
+           aarch64_task_state(u2) != AARCH64_TASK_DONE) {
+        aarch64_task_yield();
+    }
+
+    aarch64_uart_puts("  kthreads  : ");
+    aarch64_uart_puthex64(aarch64_task_counter(k1));
+    aarch64_uart_puts(" / ");
+    aarch64_uart_puthex64(aarch64_task_counter(k2));
+    aarch64_uart_puts(aarch64_task_counter(k1) == 200 && aarch64_task_counter(k2) == 200
+                      ? "  ok (両方最後まで回った)\n" : "  BAD\n");
+    if (aarch64_task_counter(k1) != 200 || aarch64_task_counter(k2) != 200) ok = 0;
+
+    aarch64_uart_puts("  switches  : ");
+    aarch64_uart_puthex64(aarch64_task_switch_count());
+    aarch64_uart_puts(aarch64_task_switch_count() > 0 ? "  ok\n" : "  BAD\n");
+    if (aarch64_task_switch_count() == 0) ok = 0;
+
+    if (!g_task_ok[u1] || !g_task_ok[u2]) ok = 0;
 
     if (ok) {
         aarch64_uart_puts("aarch64-user-ok\n");

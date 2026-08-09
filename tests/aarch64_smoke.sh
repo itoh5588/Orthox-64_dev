@@ -55,7 +55,7 @@ run_one() {  # $1 = -machine の値、$2 = ログ、$3 = -m の値
         -nographic \
         -kernel "$KERNEL" < /dev/null > "$log" 2>&1 &
     QEMU_PID=$!
-    for _ in {1..30}; do
+    for _ in {1..60}; do
         if grep -aqE "aarch64-user-(ok|BAD)" "$log" 2>/dev/null; then
             break
         fi
@@ -131,7 +131,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     grep -aq "ttbr1 gicc: 0x0000000008010000" "$2"
     grep -aq "ttbr1 ram : ${ram_last}" "$2"
     grep -aq "ttbr0 iden: 0x0000000040201000" "$2"
-    grep -aq "ttbr0 user: 0x0000000040209000" "$2"
+    grep -aq "ttbr0 user: .*  ok (.user_text を指している)" "$2"
     # 上位 VA へ移れたこと。pc / sp / VBAR / UART が全部 0xffffff80... になる
     grep -aq "high VA   : pc=0xffffff80.* sp=0xffffff80" "$2"
     grep -aq "vbar/uart : 0xffffff80.* / 0xffffff8009000000" "$2"
@@ -156,13 +156,11 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     #   5. **カーネルの VA を write に渡すと -EFAULT で弾かれる**
     #      アドレス空間を分けただけでは防げない (カーネル自身は上位 VA を
     #      読めてしまう)。ポインタの検査が要る
-    grep -aq "M3a/M3b: EL0 + svc + プロセスごとのアドレス空間" "$2"
+    grep -aq "M3a/M3b/M3c: EL0 + アドレス空間 + コンテキストスイッチ" "$2"
     # ユーザーは TTBR0 の VA (0x400000) で動く。**カーネルの配置と無関係。**
     grep -aq "user text : 0x0000000000400000" "$2"
     grep -aq "user sp   : 0x0000000000403000" "$2"
-    # 空間を 2 つ作って、それぞれで走らせている
-    [ "$(grep -ac -- "--- 空間 A ttbr0=" "$2")" = "1" ]
-    [ "$(grep -ac -- "--- 空間 B ttbr0=" "$2")" = "1" ]
+    # 同じプログラムが 2 回走っている
     [ "$(grep -ac "\[EL0\] hello from user mode" "$2")" = "2" ]
     [ "$(grep -ac "\[EL0\] resumed after permission fault" "$2")" = "2" ]
     # **2 回とも marker が 0** = データが私物
@@ -175,6 +173,19 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     [ "$(grep -ac "user probe: ESR=0x000000009200000f FAR=0xffffff8040201000 (permission fault) ok" "$2")" = "2" ]
     # -14 = -EFAULT
     [ "$(grep -ac "bad ptr   : 0xfffffffffffffff2  ok (-EFAULT で弾いた)" "$2")" = "2" ]
+    # M3c-1: コンテキストスイッチとプリエンプション
+    #
+    #   カーネルスレッド 2 本が両方 200 周する = 譲り合いが成立している
+    #   切り替え回数が 0 でない            = 実際に切り替わっている
+    #
+    # **ユーザータスク 2 本は並行に走る。** 出力が交錯すること自体が、
+    # タイマ割り込みで切り替わっている証拠 (どちらも hello を出してから
+    # 片方が終わる)
+    grep -aq "kthreads  : 0x00000000000000c8 / 0x00000000000000c8  ok (両方最後まで回った)" "$2"
+    grep -aq "switches  : .*  ok" "$2"
+    [ "$(grep -ac -- "--- 空間 A ttbr0=" "$2")" = "1" ]
+    [ "$(grep -ac -- "--- 空間 B ttbr0=" "$2")" = "1" ]
+
     grep -aq "aarch64-user-ok" "$2"
     ! grep -aq "aarch64-user-BAD" "$2"
 
@@ -194,4 +205,4 @@ check_one "EL2 起動 -> 降格" LOGs/aarch64-serial-el2.log 0x0000000020000000 
 run_one "virt" LOGs/aarch64-serial-1g.log 1G
 check_one "RAM 1GB (DTB 追随)" LOGs/aarch64-serial-1g.log 0x0000000040000000 0x000000007fffffff
 
-echo "aarch64 smoke test: PASS (M0 + M1 + M2 + M2b + M3a + M3b, EL1 / EL2 降格 / RAM 1GB の 3 通り)"
+echo "aarch64 smoke test: PASS (M0 + M1 + M2 + M2b + M3a + M3b + M3c, EL1 / EL2 降格 / RAM 1GB の 3 通り)"
