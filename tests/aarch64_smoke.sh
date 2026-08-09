@@ -332,7 +332,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     # 想定外の例外を踏んでいないこと
     must_not "aarch64-exception-BAD" "$2"
 }
-
+run_all() {
 run_one "virt" LOGs/aarch64-serial.log 512M
 check_one "EL1 起動" LOGs/aarch64-serial.log 0x0000000020000000 0x000000005fffffff
 
@@ -383,3 +383,110 @@ must_not "xv6bio: disk" LOGs/aarch64-serial-disk.log
 grep -aq "aarch64-fs-none" LOGs/aarch64-serial.log
 
 echo "aarch64 smoke test: PASS (M0-M4, EL1 / EL2 降格 / RAM 1GB / virtio-blk の 4 通り)"
+}
+
+# ==========================================================================
+# --self-test : **判定そのものが火を噴くかを確かめる**
+#
+# 日報2026-08-09 追9-6 で、否定判定 15 か所が全部空振りしていたことが
+# 分かった (`! grep` は set -e の対象外)。must_not に直したが、
+# **直したこと自体も確かめないと同じことが起きる** (追7-6 の一段先)。
+#
+# カーネルを 15 通りに壊すのは高くつく。**検査の実効性を見るなら、
+# 入力のほうを作ればよい** — 通ったログに禁止文字列を 1 行足して、
+# 落ちることを見る。
+#
+# 前提 (無傷のログが通ること) は直前の run_all が証明している。
+# そこが落ちていればスモークはそこで終わっているので、ここには来ない。
+# ==========================================================================
+SELFTEST_LOG=LOGs/aarch64-selftest-inject.log
+
+# check_one を回して終了コードだけ返す。**サブシェルで回す** —
+# 中で exit されても呼び出し側は続けられる
+selftest_check_one() {   # $1 = ログ
+    ( check_one "self-test" "$1" 0x0000000020000000 0x000000005fffffff ) \
+        > /dev/null 2>&1
+}
+
+selftest_must_not() {    # $1 = パターン, $2 = ログ
+    ( must_not "$1" "$2" ) > /dev/null 2>&1
+}
+
+SELFTEST_PASS=0
+SELFTEST_FAIL=0
+
+selftest_probe() {  # $1 = 説明, $2 = 注入する行, $3 = 元ログ, $4 = 空なら check_one / 非空ならその must_not パターン
+    cp "$3" "$SELFTEST_LOG"
+    printf '%s\n' "$2" >> "$SELFTEST_LOG"
+    local ok=0
+    if [ -z "${4:-}" ]; then
+        selftest_check_one "$SELFTEST_LOG" && ok=1
+    else
+        selftest_must_not "$4" "$SELFTEST_LOG" && ok=1
+    fi
+    if [ "$ok" = 1 ]; then
+        echo "  [空振り] $1"
+        SELFTEST_FAIL=$((SELFTEST_FAIL + 1))
+    else
+        echo "  [捕捉  ] $1"
+        SELFTEST_PASS=$((SELFTEST_PASS + 1))
+    fi
+}
+
+self_test() {
+    local good_el1=LOGs/aarch64-serial.log
+    local good_disk=LOGs/aarch64-serial-disk.log
+
+    echo
+    echo "=== --self-test: 否定判定が本当に火を噴くか ==="
+
+    # 「無傷のログが通ること」は前提だが、**ここで確かめても必ず通る。**
+    # 直前の run_all が同じログを同じ引数で check_one に通しており、
+    # 落ちていればそこで終わっているため。番人を置いても火を噴く機会が
+    # 無いので置かない (日報2026-08-09 追2-6 と同じ形。逆確認で実際に、
+    # positive 判定を壊しても run_all が先に落ちることを確かめた)
+
+    # check_one の中の 13 か所
+    selftest_probe "bss zero  : BAD"               "  bss zero  : BAD"                    "$good_el1"
+    selftest_probe "aarch64-dtb-BAD"               "aarch64-dtb-BAD"                      "$good_el1"
+    selftest_probe "(既定値)"                       "  uart      : 0x9000000  (既定値)"     "$good_el1"
+    selftest_probe "aarch64-timer-BAD"             "aarch64-timer-BAD"                    "$good_el1"
+    selftest_probe "aarch64-mmu-BAD"               "aarch64-mmu-BAD"                      "$good_el1"
+    selftest_probe "aarch64-shared-BAD"            "aarch64-shared-BAD"                   "$good_el1"
+    selftest_probe "行の分断 ([EL0] が行頭でない)"  "  el0 ticks : 0x14  [EL0] resumed"     "$good_el1"
+    selftest_probe "BAD (前の空間の値が見えている)" "  marker : 0x1  BAD (前の空間の値が見えている)" "$good_el1"
+    selftest_probe "aarch64-user-BAD"              "aarch64-user-BAD"                     "$good_el1"
+    selftest_probe "aarch64-sched-BAD"             "aarch64-sched-BAD"                    "$good_el1"
+    selftest_probe "aarch64-fs-BAD"                "aarch64-fs-BAD"                       "$good_el1"
+    selftest_probe "aarch64-virtio-BAD"            "aarch64-virtio-BAD"                   "$good_el1"
+    selftest_probe "aarch64-exception-BAD"         "aarch64-exception-BAD"                "$good_el1"
+
+    # ディスク付きの回だけで見ている 2 か所 (check_one の外)
+    selftest_probe "M4 判定: aarch64-virtio-BAD"   "aarch64-virtio-BAD"  "$good_disk" "aarch64-virtio-BAD"
+    selftest_probe "M4-3 判定: xv6bio: disk"       "xv6bio: disk read error: dev=vblk0 block=1 ret=2" \
+                                                   "$good_disk" "xv6bio: disk"
+
+    rm -f "$SELFTEST_LOG"
+    echo "  捕捉 $SELFTEST_PASS / 空振り $SELFTEST_FAIL"
+    if [ "$SELFTEST_FAIL" != 0 ]; then
+        echo "*** 見張っていない判定がある" >&2
+        exit 1
+    fi
+    echo "aarch64 smoke self-test: PASS (否定判定 $SELFTEST_PASS か所すべてが火を噴く)"
+}
+
+case "${1:-}" in
+    --self-test)
+        # **まず通常どおり回して、緑のログを作ってから注入する。**
+        # 古いログを使うと「いつのログか」が分からなくなる
+        run_all
+        self_test
+        ;;
+    "")
+        run_all
+        ;;
+    *)
+        echo "usage: $0 [--self-test]" >&2
+        exit 2
+        ;;
+esac

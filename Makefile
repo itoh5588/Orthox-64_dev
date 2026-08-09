@@ -345,6 +345,12 @@ aarch64-run: $(AARCH64_KERNEL_ELF)
 aarch64-smoke: $(AARCH64_KERNEL_ELF)
 	bash ./tests/aarch64_smoke.sh
 
+# **判定そのものが火を噴くかを確かめる。** 通常どおり回してから、
+# 通ったログに禁止文字列を注入して、否定判定が全部落ちることを見る
+# (日報2026-08-09 追9-6: `! grep` は set -e の対象外で 15 か所が空振りしていた)
+aarch64-smoke-selftest: $(AARCH64_KERNEL_ELF)
+	bash ./tests/aarch64_smoke.sh --self-test
+
 $(RISCV64_KERNEL_ELF): $(RISCV64_OBJS)
 	@mkdir -p $(@D)
 	$(LD) $(RISCV64_LDFLAGS) $(RISCV64_OBJS) -o $@
