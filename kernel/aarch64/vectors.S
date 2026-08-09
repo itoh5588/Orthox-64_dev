@@ -58,6 +58,9 @@
     str     x1, [sp, #16 * 16]
 .endm
 
+/* 積んだ ELR の位置。SAVE_ALL が x30 と対で積むので、その 8 バイト先 */
+#define SAVED_ELR_OFF (16 * 15 + 8)
+
 .macro RESTORE_ALL
     ldr     x1, [sp, #16 * 16]
     msr     spsr_el1, x1
@@ -105,7 +108,7 @@ aarch64_vectors:
     VENTRY  vec_unexpected_3
 
 /* --- 現在の EL、SP_ELx を使用中 (カーネル実行中) ---------------------- */
-    VENTRY  vec_unexpected_4    /* 同期例外 */
+    VENTRY  vec_el1_sync        /* 同期例外。M2 の MMU 探針で使う */
     VENTRY  vec_el1_irq         /* IRQ。M1 のタイマがここ */
     VENTRY  vec_unexpected_6    /* FIQ */
     VENTRY  vec_unexpected_7    /* SError */
@@ -124,6 +127,28 @@ aarch64_vectors:
 
 /* ---- ここから先は表の外。長さの制限は無い ---------------------------- */
 
+/* カーネル実行中の同期例外。M1 では無条件に止めていたが、M2 で
+ * 「わざと未マップの VA を読んで translation fault を確かめる」探針を
+ * 入れたので、**想定内のものだけ復帰できる**ようにした。
+ *
+ * C 側 (aarch64_sync_exception) が 1 を返したときだけ、例外を起こした命令の
+ * 次から再開する。既定は 0 = ここで止まる。想定外の同期例外を黙って
+ * 読み飛ばすと原因不明の暴走になる */
+vec_el1_sync:
+    SAVE_ALL
+    mrs     x0, esr_el1
+    mrs     x1, elr_el1
+    mrs     x2, far_el1
+    bl      aarch64_sync_exception
+    cbz     w0, 1f
+    ldr     x1, [sp, #SAVED_ELR_OFF]
+    add     x1, x1, #4          /* AArch64 の命令は 4 バイト固定 */
+    str     x1, [sp, #SAVED_ELR_OFF]
+    RESTORE_ALL
+    eret
+1:
+    b       .
+
 vec_el1_irq:
     SAVE_ALL
     bl      aarch64_irq_handler
@@ -134,7 +159,6 @@ vec_el1_irq:
     UNEXPECTED_BODY vec_unexpected_1,  1
     UNEXPECTED_BODY vec_unexpected_2,  2
     UNEXPECTED_BODY vec_unexpected_3,  3
-    UNEXPECTED_BODY vec_unexpected_4,  4
     UNEXPECTED_BODY vec_unexpected_6,  6
     UNEXPECTED_BODY vec_unexpected_7,  7
     UNEXPECTED_BODY vec_unexpected_8,  8

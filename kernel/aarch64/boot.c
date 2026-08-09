@@ -45,7 +45,8 @@ void aarch64_uart_puts(const char* s) {
     }
 }
 
-static void put_hex64(uint64_t v) {
+/* M2 以降 vm.c からも使うので外に出してある */
+void aarch64_uart_puthex64(uint64_t v) {
     static const char digits[] = "0123456789abcdef";
     char buf[19];
     int i;
@@ -56,6 +57,10 @@ static void put_hex64(uint64_t v) {
     }
     buf[18] = '\0';
     aarch64_uart_puts(buf);
+}
+
+static void put_hex64(uint64_t v) {
+    aarch64_uart_puthex64(v);
 }
 
 static uint64_t read_current_el(void) {
@@ -84,6 +89,12 @@ void aarch64_timer_init(void);
 void aarch64_timer_on_tick(void);
 uint64_t aarch64_timer_freq(void);
 uint64_t aarch64_timer_ticks(void);
+void aarch64_vm_init(void);
+
+/* MMU の探針 (vm.c)。「未マップの VA を読んだら fault が上がるはず」の
+ * やりとりに使う。上がった fault はここで拾って呼び出し元に返す */
+extern volatile int g_aarch64_vm_expect_fault;
+extern volatile uint64_t g_aarch64_vm_fault_esr;
 
 static void aarch64_vectors_init(void) {
     __asm__ volatile("msr vbar_el1, %0" :: "r"((uint64_t)aarch64_vectors));
@@ -189,6 +200,30 @@ void aarch64_early_main(uint64_t dtb_phys) {
         }
     }
 
+    /* ---- M2: MMU ------------------------------------------------------- */
+    aarch64_vm_init();
+
+    /* MMU を入れた後もタイマが入り続けるかを見る。**ここが本命の確認。**
+     * GIC を Device 属性で張り忘れていたり、ベクタ表のあるページが張れて
+     * いなければ、tick が止まるか例外で沈黙する */
+    {
+        uint64_t before = aarch64_timer_ticks();
+        uint64_t want = before + 5;
+        uint64_t spin = 0;
+        while (aarch64_timer_ticks() < want) {
+            __asm__ volatile("wfi");
+            if (++spin > 1000) break;
+        }
+        aarch64_uart_puts("  post ticks: ");
+        put_hex64(aarch64_timer_ticks());
+        aarch64_uart_puts("\n");
+        if (aarch64_timer_ticks() >= want) {
+            aarch64_uart_puts("aarch64-mmu-ok\n");
+        } else {
+            aarch64_uart_puts("aarch64-mmu-BAD (MMU on で tick が止まった)\n");
+        }
+    }
+
     aarch64_wait_forever();
 }
 
@@ -204,6 +239,30 @@ void aarch64_irq_handler(void) {
     if (intid < 1020U) {
         aarch64_gic_complete(iar);
     }
+}
+
+/* カーネル実行中の同期例外 (ベクタ +0x200)。M1 までは無条件に止めていたが、
+ * M2 で「わざと未マップの VA を読んで fault を確かめる」探針を入れたので、
+ * 想定内のものだけ復帰できるようにする。
+ *
+ * 戻り値 0 = 復帰しない (止まる) / 1 = 例外を起こした命令の次から再開。
+ * **既定は 0。** 想定外の例外を黙って読み飛ばすと、原因不明の暴走になる */
+int aarch64_sync_exception(uint64_t esr, uint64_t elr, uint64_t far) {
+    if (g_aarch64_vm_expect_fault) {
+        g_aarch64_vm_expect_fault = 0;
+        g_aarch64_vm_fault_esr = esr;
+        return 1;
+    }
+
+    aarch64_uart_puts("\n*** aarch64 sync exception ***\n");
+    aarch64_uart_puts("  ESR    : ");
+    put_hex64(esr);
+    aarch64_uart_puts("\n  ELR    : ");
+    put_hex64(elr);
+    aarch64_uart_puts("\n  FAR    : ");
+    put_hex64(far);
+    aarch64_uart_puts("\naarch64-exception-BAD\n");
+    return 0;
 }
 
 /* 想定していない例外。**黙って戻らない。** 取りこぼすと原因不明のハングに

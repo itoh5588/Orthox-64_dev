@@ -54,7 +54,7 @@ run_one() {  # $1 = -machine の値、$2 = ログ
         -kernel "$KERNEL" < /dev/null > "$log" 2>&1 &
     QEMU_PID=$!
     for _ in {1..30}; do
-        if grep -aqE "aarch64-timer-(ok|BAD)" "$log" 2>/dev/null; then
+        if grep -aqE "aarch64-mmu-(ok|BAD)" "$log" 2>/dev/null; then
             break
         fi
         sleep 1
@@ -87,6 +87,25 @@ check_one() {  # $1 = 見出し、$2 = ログ
     grep -aq "aarch64-timer-ok" "$2"
     ! grep -aq "aarch64-timer-BAD" "$2"
 
+    # M2: MMU (恒等マッピングで有効化)
+    #
+    # **恒等マッピングだけでは「MMU が効いている」証拠にならない。** VA == PA
+    # なので、MMU を入れ忘れても出力はまったく同じになる。判定は 3 本立て:
+    #
+    #   1. SCTLR_EL1 の M / C / I が立っていること (レジスタの実測値)
+    #   2. 未マップの VA を読んで translation fault が上がること (翻訳の証拠)
+    #   3. MMU on のまま tick が入り続けること (GIC を Device 属性で
+    #      張れているか。ここを落とすと MMU on の瞬間に沈黙する)
+    grep -aq "M2: MMU (identity, 4KB granule, VA 39bit)" "$2"
+    # カーネルが自分で決めた値。**EL1 起動と EL2 降格で同じ値になること**が
+    # 要点 (起動時の値を読んで OR していたときは別の値になっていた)
+    grep -aq "SCTLR_EL1 : 0x0000000030d0181d" "$2"
+    grep -aq "uart ->pa : 0x0000000009000000" "$2"   # 恒等に張れていること
+    grep -aq "gic  ->pa : 0x0000000008000000" "$2"
+    grep -aq "mmu probe : ESR=0x0000000096000006 (translation fault, level 2) ok" "$2"
+    grep -aq "aarch64-mmu-ok" "$2"
+    ! grep -aq "aarch64-mmu-BAD" "$2"
+
     # 想定外の例外を踏んでいないこと
     ! grep -aq "aarch64-exception-BAD" "$2"
 }
@@ -97,4 +116,4 @@ check_one "EL1 起動" LOGs/aarch64-serial.log
 run_one "virt,virtualization=on" LOGs/aarch64-serial-el2.log
 check_one "EL2 起動 -> 降格" LOGs/aarch64-serial-el2.log
 
-echo "aarch64 smoke test: PASS (M0 + M1, EL1 起動と EL2 降格の 2 通り)"
+echo "aarch64 smoke test: PASS (M0 + M1 + M2, EL1 起動と EL2 降格の 2 通り)"
