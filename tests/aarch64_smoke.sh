@@ -48,7 +48,7 @@ trap cleanup EXIT
 QEMU_PID=$!
 
 for _ in {1..30}; do
-    if grep -aq "aarch64-boot-ok" "$SERIAL_LOG" 2>/dev/null; then
+    if grep -aqE "aarch64-timer-(ok|BAD)" "$SERIAL_LOG" 2>/dev/null; then
         break
     fi
     sleep 1
@@ -58,10 +58,23 @@ echo "--- AArch64 Serial Output ---"
 cat "$SERIAL_LOG"
 echo "-----------------------------"
 
+# M0: 起動して PL011 に出る
 grep -aq "Orthox-64 aarch64 boot" "$SERIAL_LOG"
 grep -aqE "CurrentEL : EL[12]" "$SERIAL_LOG"   # virt は EL1、virtualization=on なら EL2
 grep -aq "bss zero  : ok" "$SERIAL_LOG"        # start.S のゼロ埋めが効いていること
 ! grep -aq "bss zero  : BAD" "$SERIAL_LOG"
 grep -aq "aarch64-boot-ok" "$SERIAL_LOG"
 
-echo "aarch64 smoke test: PASS"
+# M1: 例外ベクタ + GIC + generic timer で tick が入る
+#
+# tick が入らないと boot.c の待ち合わせが空回りして timer-BAD になる。
+# 「止まったまま」と区別できる形にしてある。
+grep -aq "timer freq: 0x0000000003b9aca0" "$SERIAL_LOG"   # 62.5MHz (QEMU virt の実測値)
+grep -aq "aarch64-timer-ok" "$SERIAL_LOG"
+! grep -aq "aarch64-timer-BAD" "$SERIAL_LOG"
+
+# 想定外の例外を踏んでいないこと。踏むと原因不明のハングになるので、
+# ベクタ表は黙って無視せず報告して止める作りにしてある
+! grep -aq "aarch64-exception-BAD" "$SERIAL_LOG"
+
+echo "aarch64 smoke test: PASS (M0 + M1)"

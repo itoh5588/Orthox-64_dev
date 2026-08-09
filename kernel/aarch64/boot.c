@@ -70,6 +70,53 @@ static uint64_t read_mpidr(void) {
     return v;
 }
 
+/* 非セキュア物理タイマの割り込み番号。DTB の timer interrupts が
+ * <1 14 0x104> = PPI 番号 14 で、PPI の INTID は +16 なので 30 */
+#define AARCH64_IRQ_TIMER 30
+
+extern char aarch64_vectors[];
+
+void aarch64_gic_init(void);
+void aarch64_gic_enable_irq(unsigned intid);
+uint32_t aarch64_gic_claim(void);
+void aarch64_gic_complete(uint32_t iar);
+void aarch64_timer_init(void);
+void aarch64_timer_on_tick(void);
+uint64_t aarch64_timer_freq(void);
+uint64_t aarch64_timer_ticks(void);
+
+static void aarch64_vectors_init(void) {
+    __asm__ volatile("msr vbar_el1, %0" :: "r"((uint64_t)aarch64_vectors));
+    __asm__ volatile("isb");
+}
+
+/* QEMU に ELF を -kernel で渡すと x0 に DTB のアドレスが来ない (実測。
+ * -dtb を足しても変わらない)。Linux の boot protocol は Image 形式向けで、
+ * ELF は「素のバイナリ」として扱われるため。
+ *
+ * DTB 自体はメモリのどこかに置かれているはずなので、FDT のマジック
+ * (0xd00dfeed, ビッグエンディアン) を目印に候補を当たる。
+ * 見つからなければ 0 を返す。呼ぶ側は直書きのアドレスに退くこと。 */
+#define FDT_MAGIC 0xd00dfeedU
+
+static uint32_t be32(uint32_t v) {
+    return ((v & 0x000000ffU) << 24) | ((v & 0x0000ff00U) << 8) |
+           ((v & 0x00ff0000U) >> 8)  | ((v & 0xff000000U) >> 24);
+}
+
+static uint64_t find_dtb(uint64_t hint) {
+    static const uint64_t candidates[] = {
+        0x40000000UL,   /* RAM 先頭。QEMU virt が Linux 起動で置く場所 */
+        0x48000000UL,   /* RAM 先頭 + 128MB */
+        0x44000000UL,
+    };
+    if (hint && be32(mmio_read32(hint)) == FDT_MAGIC) return hint;
+    for (unsigned i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (be32(mmio_read32(candidates[i])) == FDT_MAGIC) return candidates[i];
+    }
+    return 0;
+}
+
 void aarch64_wait_forever(void);
 
 void aarch64_early_main(uint64_t dtb_phys) {
@@ -83,9 +130,20 @@ void aarch64_early_main(uint64_t dtb_phys) {
     put_hex64(read_mpidr());
     aarch64_uart_puts("\n");
 
-    aarch64_uart_puts("  DTB       : ");
+    aarch64_uart_puts("  x0 (DTB?) : ");
     put_hex64(dtb_phys);
     aarch64_uart_puts("\n");
+
+    {
+        uint64_t dtb = find_dtb(dtb_phys);
+        aarch64_uart_puts("  DTB found : ");
+        if (dtb) {
+            put_hex64(dtb);
+        } else {
+            aarch64_uart_puts("none (アドレス直書きで進む)");
+        }
+        aarch64_uart_puts("\n");
+    }
 
     /* .bss が実際に 0 で埋まっているかを見る。start.S の埋め方を間違えると
      * ここから先の C が静かに壊れるので、先に確かめておく */
@@ -97,5 +155,66 @@ void aarch64_early_main(uint64_t dtb_phys) {
     }
 
     aarch64_uart_puts("aarch64-boot-ok\n");
+
+    /* ---- M1: 例外ベクタ + GIC + generic timer -------------------------- */
+    aarch64_vectors_init();
+    aarch64_gic_init();
+    aarch64_gic_enable_irq(AARCH64_IRQ_TIMER);
+    aarch64_timer_init();
+
+    aarch64_uart_puts("  timer freq: ");
+    put_hex64(aarch64_timer_freq());
+    aarch64_uart_puts("\n");
+
+    /* 割り込みを通す (DAIF の I ビットを落とす)。riscv64 の sstatus.SIE 相当 */
+    __asm__ volatile("msr daifclr, #2");
+
+    /* tick が入ることを確かめる。入らなければここで止まったままになるので、
+     * 「動いた」と「止まった」が区別できる */
+    {
+        uint64_t want = 10;     /* 10ms x 10 = 100ms ぶん */
+        uint64_t spin = 0;
+        while (aarch64_timer_ticks() < want) {
+            /* wfi で寝ると割り込みで起きる。空回しより素直 */
+            __asm__ volatile("wfi");
+            if (++spin > 1000) break;   /* 保険。無限に待たない */
+        }
+        aarch64_uart_puts("  ticks     : ");
+        put_hex64(aarch64_timer_ticks());
+        aarch64_uart_puts("\n");
+        if (aarch64_timer_ticks() >= want) {
+            aarch64_uart_puts("aarch64-timer-ok\n");
+        } else {
+            aarch64_uart_puts("aarch64-timer-BAD (tick が入らない)\n");
+        }
+    }
+
     aarch64_wait_forever();
+}
+
+/* 例外ベクタから呼ばれる。IRQ の入口 */
+void aarch64_irq_handler(void) {
+    uint32_t iar = aarch64_gic_claim();
+    uint32_t intid = iar & 0x3ffU;
+
+    if (intid == AARCH64_IRQ_TIMER) {
+        aarch64_timer_on_tick();
+    }
+    /* 1023 は「上がっていなかった」を意味する偽物。EOI してはいけない */
+    if (intid < 1020U) {
+        aarch64_gic_complete(iar);
+    }
+}
+
+/* 想定していない例外。**黙って戻らない。** 取りこぼすと原因不明のハングに
+ * なるので、どの入口で何が起きたかを出してから止める */
+void aarch64_unexpected_exception(uint64_t which, uint64_t esr, uint64_t elr) {
+    aarch64_uart_puts("\n*** aarch64 unexpected exception ***\n");
+    aarch64_uart_puts("  vector : ");
+    put_hex64(which);
+    aarch64_uart_puts("\n  ESR    : ");
+    put_hex64(esr);
+    aarch64_uart_puts("\n  ELR    : ");
+    put_hex64(elr);
+    aarch64_uart_puts("\naarch64-exception-BAD\n");
 }
