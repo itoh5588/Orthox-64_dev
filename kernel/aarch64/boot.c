@@ -97,6 +97,9 @@ uint64_t aarch64_timer_freq(void);
 uint64_t aarch64_timer_ticks(void);
 uint32_t aarch64_timer_intid(void);
 void aarch64_vm_init(void);
+void aarch64_pmm_init(void);
+uint64_t aarch64_pmm_total(void);
+uint64_t aarch64_pmm_used(void);
 void aarch64_vm_fault_probe(void);
 void aarch64_vm_drop_identity(void);
 uint64_t aarch64_read_sctlr(void);
@@ -262,6 +265,15 @@ void aarch64_early_main(uint64_t dtb_phys) {
      * 見てマップするので、ここで確定していないと直書きのままになる */
     aarch64_boot_capture(dtb_phys);
     aarch64_boot_info_dump();
+
+    /* **DTB の後、MMU の前。** pmm は DTB が言う RAM の広さを要るし、
+     * vm はページテーブルを pmm から取る */
+    aarch64_pmm_init();
+    aarch64_uart_puts("  pmm       : ");
+    put_hex64(aarch64_pmm_total());
+    aarch64_uart_puts(" ページ (使用 ");
+    put_hex64(aarch64_pmm_used());
+    aarch64_uart_puts(")\n");
 
     /* ---- M1: 例外ベクタ + GIC + generic timer -------------------------- */
     aarch64_vectors_init();

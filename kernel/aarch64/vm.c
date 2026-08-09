@@ -161,13 +161,13 @@ extern char aarch64_user_entry[];
 
 /* ---- テーブルの置き場 ----------------------------------------------------
  *
- * M2 の時点では物理メモリ管理 (pmm) がまだ無いので、.bss に固定の枠を置く。
- * 恒等マッピングなのでここのアドレスがそのまま物理アドレスになる。
- * M3 で pmm を入れたら pmm_alloc に差し替える。 */
-#define AARCH64_VM_MAX_TABLES 40
+ * **pmm から取る。** M2 の時点では pmm が無かったので .bss に固定の枠を
+ * 置いていたが、プロセスごとにテーブルを作るようになると枚数が読めない。 */
+uint64_t aarch64_pmm_alloc(uint64_t pages);
+void aarch64_pmm_free(uint64_t pa, uint64_t pages);
+uint64_t aarch64_pmm_total(void);
+uint64_t aarch64_pmm_used(void);
 
-static uint64_t g_tables[AARCH64_VM_MAX_TABLES][AARCH64_PTES]
-    __attribute__((aligned(4096)));
 static unsigned g_tables_used;
 static uint64_t g_kernel_root_pa;    /* TTBR1。カーネルの上位 VA */
 static uint64_t g_ident_root_pa;     /* TTBR0。移行のあいだだけ使う恒等 */
@@ -195,17 +195,17 @@ static uint64_t aarch64_vm_ptr_pa(const void* p) {
     return aarch64_vm_running_high() ? aarch64_virt_to_phys(a) : a;
 }
 
-/* 戻り値はテーブルの**物理アドレス**。0 なら失敗 */
+/* 戻り値はテーブルの**物理アドレス**。0 なら失敗。
+ * pmm が 0 埋めして返すので、ここでの初期化は要らない */
 static uint64_t aarch64_vm_alloc_table(void) {
-    uint64_t* t;
-    if (g_tables_used >= AARCH64_VM_MAX_TABLES) {
-        aarch64_uart_puts("  vm: table pool exhausted\n");
+    uint64_t pa = aarch64_pmm_alloc(1);
+    if (!pa) {
+        aarch64_uart_puts("  vm: テーブル用のページを確保できない\n");
         g_vm_failed = 1;
         return 0;
     }
-    t = g_tables[g_tables_used++];
-    for (unsigned i = 0; i < AARCH64_PTES; i++) t[i] = 0;
-    return aarch64_vm_ptr_pa(t);
+    g_tables_used++;
+    return pa;
 }
 
 /* VA から各段のインデックスを取り出す。level 1 = bits 38:30、
@@ -602,9 +602,9 @@ void aarch64_vm_init(void) {
 
     aarch64_uart_puts("  tables    : ");
     aarch64_uart_puthex64(g_tables_used);
-    aarch64_uart_puts(" / ");
-    aarch64_uart_puthex64(AARCH64_VM_MAX_TABLES);
-    aarch64_uart_puts("\n  kernel VA : ");
+    aarch64_uart_puts("  (pmm から確保。空き ");
+    aarch64_uart_puthex64(aarch64_pmm_total() - aarch64_pmm_used());
+    aarch64_uart_puts(" ページ)\n  kernel VA : ");
     aarch64_uart_puthex64(aarch64_phys_to_virt(kstart_pa));
     aarch64_uart_puts("  (物理 ");
     aarch64_uart_puthex64(kstart_pa);

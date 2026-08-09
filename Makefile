@@ -294,7 +294,7 @@ AARCH64_CC = $(RISCV64_CC)
 AARCH64_KERNEL_ELF = out/kernel-aarch64.elf
 AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer.c \
 	kernel/aarch64/dtb.c \
-	kernel/aarch64/vm.c kernel/aarch64/usermode.c
+	kernel/aarch64/vm.c kernel/aarch64/usermode.c kernel/aarch64/pmm.c
 AARCH64_ASM_SRCS = kernel/aarch64/start.S kernel/aarch64/vectors.S \
 	kernel/aarch64/entry.S kernel/aarch64/user_blob.S
 AARCH64_CFLAGS = --target=aarch64-none-elf -mgeneral-regs-only \
