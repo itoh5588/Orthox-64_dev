@@ -307,19 +307,8 @@ void smp_send_resched_ipi(uint32_t cpu_id) {
     (void)cpu_id;
 }
 
-/* ---- コンソールの fd (M3c-2b) --------------------------------------------
- *
- * **まだ VFS を繋いでいない。** task_init が fds[0..2] を作ろうとするが、
- * aarch64 には fs.c を取り込んでいないので実体が無い。
- *
- * 0 (成功) を返すと「使える fd がある」ことになり、read/write が
- * 何も繋がっていない fd を触る。**失敗を返して、無いことを伝える。**
- * 呼ぶ側 (init_console_fds) は戻り値を捨てるが、fd は 0 のまま残る */
-int fs_init_console_fd(file_descriptor_t* fd, int flags) {
-    (void)fd;
-    (void)flags;
-    return -1;
-}
+/* コンソールの fd は kernel/fs.c の本物を使う (C-1a)。
+ * M3c-2b では -1 を返すスタブを置いていたが、fs.c を取り込んだので外した */
 
 /* ---- 譲る (M3c-2b) -------------------------------------------------------
  *
@@ -413,6 +402,7 @@ done:
  * ========================================================================== */
 #include "storage.h"
 #include "xv6fs.h"
+#include "fs.h"
 
 /* スモークがイメージに入れておくファイル。**中身まで照合する。**
  * 「読めた」だけでは、別のブロックを返していても気づけない */
@@ -420,6 +410,9 @@ done:
 #define FS_PROBE_TEXT  "ORTHOX-AARCH64-XV6FS-OK"
 #define FS_WRITE_PATH  "/written-by-kernel.txt"
 #define FS_WRITE_TEXT  "written-by-aarch64-kernel"
+/* VFS / fd 層を通す経路の確認 (C-1a)。**xv6fs 直叩きとは別の道** */
+#define FS_FD_PATH     "/via-vfs.txt"
+#define FS_FD_TEXT     "through-fs_open-and-fs_write"
 
 static int fs_streq(const char* a, const char* b, unsigned n) {
     for (unsigned i = 0; i < n; i++) {
@@ -458,7 +451,9 @@ int aarch64_fs_selftest(void) {
     puts("--- M4-3: xv6fs (virtio-blk の上) ---\n");
     aarch64_console_end();
 
-    storage_init();
+    /* **fs_init が storage_init も呼ぶ。** ramfs / fifo / VFS の
+     * マウントテーブルもここで初期化される (C-1a) */
+    fs_init();
 
     if (!aarch64_virtio_blk_present()) {
         /* ディスクを付けずに起動した回。**「無い」と「壊れた」を混ぜない** */
@@ -504,6 +499,43 @@ int aarch64_fs_selftest(void) {
                                     fs_streq(g_fs_buf, FS_WRITE_TEXT,
                                              sizeof(FS_WRITE_TEXT)), &ok);
         }
+    }
+
+    /* 4. **VFS / fd 層を通す (C-1a)。**
+     *
+     * ここまでは xv6fs を直接叩いていた。共有層の fs_open / fs_write /
+     * fs_read / fs_close は、**タスクの fd テーブルとマウントの解決**を
+     * 挟む。ユーザープログラムが通るのはこちらの経路なので、
+     * 直叩きが通ったことは、こちらが通る証拠にならない */
+    {
+        int fd = fs_open(FS_FD_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        int64_t n64;
+        report("  fd open   :", fd >= 0, &ok);
+        if (fd >= 0) {
+            n64 = fs_write(fd, FS_FD_TEXT, fs_strlen(FS_FD_TEXT));
+            report("  fd write  :", n64 == (int64_t)fs_strlen(FS_FD_TEXT), &ok);
+            report("  fd close  :", fs_close(fd) == 0, &ok);
+        }
+        /* **開き直して読む。** 同じ fd のバッファから読み返しただけでは、
+         * ディスクに届いた証拠にならない */
+        fd = fs_open(FS_FD_PATH, O_RDONLY, 0);
+        if (fd >= 0) {
+            for (unsigned i = 0; i < sizeof(g_fs_buf); i++) g_fs_buf[i] = 0;
+            n64 = fs_read(fd, g_fs_buf, sizeof(g_fs_buf) - 1);
+            report("  fd read   :", n64 == (int64_t)fs_strlen(FS_FD_TEXT) &&
+                                    fs_streq(g_fs_buf, FS_FD_TEXT,
+                                             sizeof(FS_FD_TEXT)), &ok);
+            fs_close(fd);
+        } else {
+            report("  fd read   :", 0, &ok);
+        }
+    }
+
+    /* 5. **タスクのコンソール fd が本物になったこと。**
+     * M3c-2b までは fs_init_console_fd が -1 を返すスタブだった */
+    {
+        struct task* cur = get_current_task();
+        report("  console fd:", cur && cur->fds[1].in_use, &ok);
     }
 
 done:

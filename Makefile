@@ -295,7 +295,8 @@ AARCH64_KERNEL_ELF = out/kernel-aarch64.elf
 AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer.c \
 	kernel/aarch64/dtb.c \
 	kernel/aarch64/vm.c kernel/aarch64/usermode.c kernel/aarch64/pmm.c \
-	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/runtime.c
+	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/runtime.c \
+	kernel/aarch64/stubs.c
 # 共有層のうち、**いま繋がるものだけ**を取り込む (M3c-2a)。
 # どれが入るかは推測せず、llvm-nm -u で未解決シンボルを実測して決めた。
 #
@@ -309,7 +310,8 @@ AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer
 #                            構文チェックだけで「入る」と判断しないこと
 AARCH64_SHARED_C_SRCS = kernel/cstring.c kernel/cstdio.c kernel/vfs.c kernel/storage.c \
 	kernel/task.c kernel/sched.c kernel/wait.c \
-	kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c
+	kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c \
+	kernel/fs.c kernel/elf.c kernel/task_exec.c kernel/task_fork.c
 AARCH64_ASM_SRCS = kernel/aarch64/start.S kernel/aarch64/vectors.S \
 	kernel/aarch64/entry.S kernel/aarch64/user_blob.S kernel/aarch64/switch.S
 AARCH64_CFLAGS = --target=aarch64-none-elf -mgeneral-regs-only \

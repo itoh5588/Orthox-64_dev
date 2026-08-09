@@ -372,6 +372,16 @@ grep -aq "  read file :  ok" LOGs/aarch64-serial-disk.log
 # 書けること = ログと bitmap が効いている。読み戻しまで見る
 grep -aq "  write     :  ok" LOGs/aarch64-serial-disk.log
 grep -aq "  read back :  ok" LOGs/aarch64-serial-disk.log
+# **VFS / fd 層を通す経路 (C-1a)。** xv6fs 直叩きが通ったことは、
+# タスクの fd テーブルとマウント解決を挟むこちらが通る証拠にならない。
+# ユーザープログラムが通るのはこちらの道
+grep -aq "  fd open   :  ok" LOGs/aarch64-serial-disk.log
+grep -aq "  fd write  :  ok" LOGs/aarch64-serial-disk.log
+grep -aq "  fd close  :  ok" LOGs/aarch64-serial-disk.log
+# **開き直して読む。** 同じ fd から読み返すだけではディスクに届いた証拠にならない
+grep -aq "  fd read   :  ok" LOGs/aarch64-serial-disk.log
+# コンソール fd が本物であること (M3c-2b までは -1 を返すスタブだった)
+grep -aq "  console fd:  ok" LOGs/aarch64-serial-disk.log
 grep -aq "aarch64-fs-ok" LOGs/aarch64-serial-disk.log
 # **戻り値の約束を守っていること。** storage の受け口が「読めたブロック数」を
 # 返すと、xv6bio は ret != 0 をエラーとして記録するが**動きは正しいまま**。
