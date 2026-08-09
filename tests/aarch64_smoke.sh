@@ -141,31 +141,40 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     grep -aq "aarch64-mmu-ok" "$2"
     ! grep -aq "aarch64-mmu-BAD" "$2"
 
-    # M3a: EL0 に降りて svc で戻る
+    # M3a / M3b-2: EL0 + svc + プロセスごとのアドレス空間
     #
-    # 判定は 3 本立て。**どれか 1 つでは足りない**:
+    # 判定は 5 本立て。**どれか 1 つでは足りない**:
     #
-    #   1. EL0 から write が届く      → 遷移と svc の往復が成立している
-    #   2. EL0 実行中に tick が入る   → 「下位 EL の IRQ」ベクタ (+0x480) が
-    #      効いている。M2 まではカーネル実行中の IRQ (+0x280) しか通っていない
+    #   1. EL0 から write が届く      遷移と svc の往復が成立している
+    #   2. EL0 実行中に tick が入る   「下位 EL の IRQ」ベクタ (+0x480) が効いている
     #   3. EL0 からカーネルの .text を読むと permission fault になる
-    #      → **アドレス空間を分けていないので、AP だけが EL0 を締め出している。**
-    #        ここが上がらなければユーザーからカーネルが素通し
-    grep -aq "M3a: EL0 + svc" "$2"
-    grep -aq "\[EL0\] hello from user mode" "$2"
-    grep -aq "\[EL0\] resumed after permission fault" "$2"   # 落ちた後の再開
-    grep -aq "svc calls : 0x0000000000000003" "$2"             # write x2 + exit
-    grep -aq "exit code : 0x0000000000000000" "$2"
-    # 行末は "\r\n" (UART が \n の前に \r を出す) なので $ で留めない
-    grep -aq "el0 ticks : .*  ok" "$2"
-    # **translation fault では駄目。** それは「張っていない」だけで、
-    # 権限で弾いた証拠にならない (DFSC=0b0011xx が permission fault)
+    #      **translation fault では駄目。** それは「張っていない」だけで、
+    #      権限で弾いた証拠にならない
+    #   4. **別々のアドレス空間で 2 回走らせて、marker が 2 回とも 0**
+    #      データが空間ごとに私物になっている証拠。共有されていたら
+    #      2 回目は 1 になる
+    #   5. **カーネルの VA を write に渡すと -EFAULT で弾かれる**
+    #      アドレス空間を分けただけでは防げない (カーネル自身は上位 VA を
+    #      読めてしまう)。ポインタの検査が要る
+    grep -aq "M3a/M3b: EL0 + svc + プロセスごとのアドレス空間" "$2"
     # ユーザーは TTBR0 の VA (0x400000) で動く。**カーネルの配置と無関係。**
     grep -aq "user text : 0x0000000000400000" "$2"
-    grep -aq "user sp   : 0x0000000000402000" "$2"
+    grep -aq "user sp   : 0x0000000000403000" "$2"
+    # 空間を 2 つ作って、それぞれで走らせている
+    [ "$(grep -ac -- "--- 空間 A ttbr0=" "$2")" = "1" ]
+    [ "$(grep -ac -- "--- 空間 B ttbr0=" "$2")" = "1" ]
+    [ "$(grep -ac "\[EL0\] hello from user mode" "$2")" = "2" ]
+    [ "$(grep -ac "\[EL0\] resumed after permission fault" "$2")" = "2" ]
+    # **2 回とも marker が 0** = データが私物
+    [ "$(grep -ac "marker    : 0x0000000000000000  ok (私物のデータ)" "$2")" = "2" ]
+    ! grep -aq "BAD (前の空間の値が見えている)" "$2"
+    [ "$(grep -ac "svc calls : 0x0000000000000005" "$2")" = "2" ]
+    [ "$(grep -ac "el0 ticks : .*  ok" "$2")" = "2" ]
     # EL0 から読ませるのはカーネルの**上位 VA**。EL0 も TTBR1 を歩けるが、
     # AP が EL1 だけなので permission fault になる
-    grep -aq "user probe: ESR=0x000000009200000f FAR=0xffffff8040201000 (permission fault) ok" "$2"
+    [ "$(grep -ac "user probe: ESR=0x000000009200000f FAR=0xffffff8040201000 (permission fault) ok" "$2")" = "2" ]
+    # -14 = -EFAULT
+    [ "$(grep -ac "bad ptr   : 0xfffffffffffffff2  ok (-EFAULT で弾いた)" "$2")" = "2" ]
     grep -aq "aarch64-user-ok" "$2"
     ! grep -aq "aarch64-user-BAD" "$2"
 

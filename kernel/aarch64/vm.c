@@ -161,12 +161,11 @@ extern char aarch64_user_entry[];
 
 /* ---- テーブルの置き場 ----------------------------------------------------
  *
- * **pmm から取る。** M2 の時点では pmm が無かったので .bss に固定の枠を
- * 置いていたが、プロセスごとにテーブルを作るようになると枚数が読めない。 */
+ * **pmm から取る (M3b-2)。** M2 の時点では pmm が無かったので .bss に
+ * 固定の枠を置いていたが、プロセスごとにテーブルを作るようになると
+ * 枚数が読めない。 */
 uint64_t aarch64_pmm_alloc(uint64_t pages);
 void aarch64_pmm_free(uint64_t pa, uint64_t pages);
-uint64_t aarch64_pmm_total(void);
-uint64_t aarch64_pmm_used(void);
 
 static unsigned g_tables_used;
 static uint64_t g_kernel_root_pa;    /* TTBR1。カーネルの上位 VA */
@@ -372,6 +371,17 @@ static void aarch64_vm_build_kernel(void) {
     aarch64_vm_map_pages(aarch64_phys_to_virt(aarch64_vm_ptr_pa(__bss_start)),
                          aarch64_vm_ptr_pa(__bss_start),
                          (uint64_t)(__bss_end - __bss_start), VM_KERNEL_RW);
+    /* **EL0 のページもカーネル側に張る。** カーネルがイメージを読んで
+     * プロセスごとのデータページへ写すので、上位 VA から見えている必要が
+     * ある (張り忘れて、空間を作る途中で translation fault になった)。
+     * ここでの権限はカーネル用。EL0 に見せるのは TTBR0 側の張り方で決まる */
+    aarch64_vm_map_pages(aarch64_phys_to_virt(aarch64_vm_ptr_pa(__user_text_start)),
+                         aarch64_vm_ptr_pa(__user_text_start),
+                         (uint64_t)(__user_text_end - __user_text_start), VM_KERNEL_RO);
+    aarch64_vm_map_pages(aarch64_phys_to_virt(aarch64_vm_ptr_pa(__user_data_start)),
+                         aarch64_vm_ptr_pa(__user_data_start),
+                         (uint64_t)(__user_data_end - __user_data_start), VM_KERNEL_RW);
+
     /* ブロックの残り。ブートスタックがここに載る */
     aarch64_vm_map_pages(aarch64_phys_to_virt(kend_pa), kend_pa,
                          kblk_end - kend_pa, VM_KERNEL_RW);
@@ -422,11 +432,65 @@ static void aarch64_vm_build_ident(void) {
 
 /* ---- TTBR0: ユーザーのアドレス空間 --------------------------------------
  *
- * **カーネルの配置とは無関係の VA に張る。** M3a ではカーネルと同じテーブルに
- * AP だけ変えて置いていたが、TTBR1 へ移したことで TTBR0 がまるごと空いた。
- * これが「プロセスごとのアドレス空間」の器になる。
+ * **カーネルの配置とは無関係の VA に張る。** カーネルを TTBR1 へ移したことで
+ * TTBR0 がまるごと空いた。これが「プロセスごとのアドレス空間」の器になる。
  *
- * ユーザーのコードは PC 相対だけで書いてあるので、どの VA でも動く。 */
+ * ユーザーのコードは PC 相対だけで書いてあるので、どの VA でも動く。
+ *
+ * **テキストは共有、データは私物。** 実際の fork/exec と同じ形にしてある:
+ *   .user_text  イメージの物理ページをそのまま張る (読み取り専用なので共有可)
+ *   .user_data  pmm から取ったページにイメージから写して張る (空間ごとに別)
+ *
+ * データを共有してしまうと、片方のプロセスが書いた値がもう片方から見える。
+ * それが起きていないことは usermode.c が実測で確かめる。 */
+static void aarch64_vm_copy(uint64_t dst_pa, uint64_t src_pa, uint64_t size) {
+    uint8_t* d = (uint8_t*)(uintptr_t)aarch64_phys_to_virt(dst_pa);
+    const uint8_t* s = (const uint8_t*)(uintptr_t)aarch64_phys_to_virt(src_pa);
+    for (uint64_t i = 0; i < size; i++) d[i] = s[i];
+}
+
+/* 新しいユーザーアドレス空間を作る。戻り値は TTBR0 に入れる物理アドレス。
+ * **上位 VA へ移った後に呼ぶこと** (pmm のページを phys_to_virt で触るため) */
+uint64_t aarch64_vm_create_user_space(void) {
+    uint64_t text_pa = aarch64_vm_ptr_pa(__user_text_start);
+    uint64_t text_size = (uint64_t)(__user_text_end - __user_text_start);
+    uint64_t data_src_pa = aarch64_vm_ptr_pa(__user_data_start);
+    uint64_t data_size = (uint64_t)(__user_data_end - __user_data_start);
+    uint64_t data_pages = data_size / AARCH64_PAGE_SIZE;
+    uint64_t root_pa, data_pa;
+    uint64_t saved_root = g_build_root_pa;
+
+    root_pa = aarch64_pmm_alloc(1);
+    if (!root_pa) return 0;
+    data_pa = aarch64_pmm_alloc(data_pages);
+    if (!data_pa) { aarch64_pmm_free(root_pa, 1); return 0; }
+
+    /* イメージの中身を私物のページへ写す。**ここを忘れると、初期値の
+     * 入った変数が 0 のまま始まる** */
+    aarch64_vm_copy(data_pa, data_src_pa, data_size);
+
+    g_build_root_pa = root_pa;
+    g_tables_used++;
+    aarch64_vm_map_range(AARCH64_USER_VA_BASE, text_pa, text_size, VM_USER_TEXT);
+    aarch64_vm_map_range(AARCH64_USER_VA_BASE + text_size, data_pa, data_size, VM_USER_RW);
+    g_build_root_pa = saved_root;
+
+    return root_pa;
+}
+
+/* TTBR0 を差し替える。**ASID はまだ使っていない**ので、TLB を全部捨てる。
+ * ASID を入れると差し替えのたびに全部捨てずに済む (M3c 以降) */
+void aarch64_vm_switch_user_space(uint64_t root_pa) {
+    g_user_root_pa = root_pa;
+    __asm__ volatile("msr ttbr0_el1, %0" :: "r"(root_pa));
+    __asm__ volatile("isb");
+    __asm__ volatile("tlbi vmalle1");
+    __asm__ volatile("dsb nsh");
+    __asm__ volatile("isb");
+}
+
+/* 起動時に 1 つだけ作る器 (恒等を外すときに TTBR0 へ入れるもの)。
+ * 上位 VA へ移る前に呼ばれるので、pmm のページを物理で触る */
 static void aarch64_vm_build_user(void) {
     uint64_t text_pa = aarch64_vm_ptr_pa(__user_text_start);
     uint64_t text_size = (uint64_t)(__user_text_end - __user_text_start);
@@ -449,6 +513,50 @@ uint64_t aarch64_vm_user_entry_va(void) {
 uint64_t aarch64_vm_user_stack_top_va(void) {
     return AARCH64_USER_VA_BASE + (uint64_t)(__user_text_end - __user_text_start) +
            (uint64_t)(__user_data_end - __user_data_start);
+}
+
+/* ---- ユーザーが渡してきたポインタの検査 ---------------------------------
+ *
+ * **アドレス空間を分けたので、これができるようになった。** M3a では
+ * カーネルと同じテーブルだったので「ユーザーのものか」を区別できなかった。
+ *
+ * 見るのは 3 つ:
+ *   1. TTBR0 の範囲 (上位半分でない) こと。**カーネルの VA を渡されない**
+ *   2. ページが張られていること
+ *   3. AP が EL0 に開いていること (書き込みなら書けること)
+ *
+ * AP[1] (bit 6) が EL0 からのアクセス可否、AP[2] (bit 7) が読み取り専用。 */
+static uint64_t aarch64_vm_leaf(uint64_t root_pa, uint64_t va) {
+    uint64_t* table = aarch64_vm_table_ptr(root_pa);
+    for (int level = 1; level <= 3; level++) {
+        uint64_t entry = table[aarch64_vm_index(va, level)];
+        if ((entry & PTE_VALID) == 0) return 0;
+        if (level == 3) return entry;
+        if ((entry & PTE_TABLE) == 0) return entry;   /* ブロック */
+        table = aarch64_vm_table_ptr(entry & PTE_ADDR_MASK);
+    }
+    return 0;
+}
+
+int aarch64_vm_user_range_ok(uint64_t root_pa, uint64_t va, uint64_t len, int write) {
+    uint64_t end;
+
+    if (len == 0) return 1;
+    if (!root_pa) return 0;
+
+    /* 上位半分 = カーネル。**ユーザーから渡されてはいけない。**
+     * 桁あふれもここで弾く */
+    end = va + len;
+    if (end < va) return 0;
+    if ((va >> (AARCH64_VA_BITS - 1)) != 0 || (end >> (AARCH64_VA_BITS - 1)) != 0) return 0;
+
+    for (uint64_t p = va & ~(AARCH64_PAGE_SIZE - 1ULL); p < end; p += AARCH64_PAGE_SIZE) {
+        uint64_t entry = aarch64_vm_leaf(root_pa, p);
+        if (!entry) return 0;
+        if ((entry & (1ULL << 6)) == 0) return 0;              /* EL0 から触れない */
+        if (write && (entry & (1ULL << 7)) != 0) return 0;     /* 読み取り専用 */
+    }
+    return 1;
 }
 
 uint64_t aarch64_vm_user_root_pa(void) { return g_user_root_pa; }
@@ -544,6 +652,9 @@ void aarch64_vm_fault_probe(void) {
 
 /* 上位 VA へ飛ぶ (entry.S)。**戻ってこない。**
  *   x0 = 新しい sp (上位 VA)、x1 = 飛び先 (上位 VA) */
+uint64_t aarch64_pmm_total(void);
+uint64_t aarch64_pmm_used(void);
+
 void aarch64_vm_enter_high(uint64_t new_sp, uint64_t cont);
 
 /* リンカスクリプトの KERNEL_VA_OFFSET (entry.S) */

@@ -54,6 +54,10 @@
  * 無関係** (M3b)。M3a ではカーネルと同じテーブルの VA だった */
 uint64_t aarch64_vm_user_entry_va(void);
 uint64_t aarch64_vm_user_stack_top_va(void);
+uint64_t aarch64_vm_create_user_space(void);
+void aarch64_vm_switch_user_space(uint64_t root_pa);
+uint64_t aarch64_vm_user_root_pa(void);
+int aarch64_vm_user_range_ok(uint64_t root_pa, uint64_t va, uint64_t len, int write);
 
 uint64_t aarch64_timer_ticks(void);
 
@@ -67,6 +71,7 @@ void aarch64_user_abort_landing(void);
 static int g_user_exited;
 static uint64_t g_user_exit_code;
 static uint64_t g_svc_count;
+static uint64_t g_bad_ptr_ret;   /* 悪いポインタを渡したときの write の戻り値 */
 
 /* 「EL0 からカーネルのページを触ったら落ちるはず」の探針。
  * M2 の MMU 探針と同じ形で、想定内なら命令 1 つぶん進めて再開させる */
@@ -88,13 +93,20 @@ uint64_t aarch64_user_probe_target(void) {
  *
  * M3a で実装するのは write と exit だけ。共有のシステムコール層を乗せるのは
  * M3c (riscv64 の kernel/riscv64/syscall.c は 1379 行ある)。 */
-/* **ユーザーのポインタを検査していない。** M3a はアドレス空間を分けて
- * いないので、不正なポインタを渡されるとカーネル側で落ちる。検査は
- * アドレス空間を分ける M3b で、テーブルを歩いて確かめる形で入れる */
+/* **ユーザーのポインタは必ず検査する (M3b-2)。**
+ * アドレス空間を分けたので「いまのプロセスの TTBR0 に、EL0 が読める形で
+ * 張られているか」をテーブルを歩いて確かめられるようになった。
+ *
+ * 検査しないと、ユーザーがカーネルの VA を渡すだけでカーネルの中身が
+ * そのまま UART に出る。**アドレス空間を分けただけでは防げない**
+ * (カーネル自身は上位 VA を読めてしまうため) */
 static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len) {
     const char* p = (const char*)(uintptr_t)buf;
     uint64_t i;
     if (fd != 1 && fd != 2) return -9;      /* -EBADF */
+    if (!aarch64_vm_user_range_ok(aarch64_vm_user_root_pa(), buf, len, 0)) {
+        return -14;                         /* -EFAULT */
+    }
     for (i = 0; i < len; i++) {
         if (p[i] == '\n') aarch64_uart_putchar('\r');
         aarch64_uart_putchar(p[i]);
@@ -110,6 +122,8 @@ static void aarch64_svc(uint64_t* frame) {
     switch (nr) {
     case AARCH64_NR_WRITE:
         frame[0] = (uint64_t)sys_write(frame[0], frame[1], frame[2]);
+        /* カーネルの VA を渡された回 (4 回目) の戻り値を取っておく */
+        if ((int64_t)frame[0] < 0) g_bad_ptr_ret = frame[0];
         break;
     case AARCH64_NR_EXIT:
         g_user_exited = 1;
@@ -169,64 +183,46 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
     frame[FRAME_SPSR] = SPSR_EL1H;
 }
 
-int aarch64_user_run(void) {
+/* 1 つのアドレス空間でユーザーを 1 回走らせる。
+ * 戻り値: 成功なら 1 */
+static int aarch64_user_run_once(const char* label, uint64_t root_pa) {
     uint64_t ticks_before, ticks_after;
 
-    aarch64_uart_puts("--- M3a: EL0 + svc ---\n");
-    aarch64_uart_puts("  user text : ");
-    aarch64_uart_puthex64(aarch64_vm_user_entry_va());
-    aarch64_uart_puts("\n  user sp   : ");
-    aarch64_uart_puthex64(aarch64_vm_user_stack_top_va());
-    aarch64_uart_puts("\n  probe tgt : ");
-    aarch64_uart_puthex64(aarch64_user_probe_target());
-    aarch64_uart_puts("  (カーネルの .text。EL0 から読めてはいけない)\n");
+    aarch64_uart_puts("  --- ");
+    aarch64_uart_puts(label);
+    aarch64_uart_puts(" ttbr0=");
+    aarch64_uart_puthex64(root_pa);
+    aarch64_uart_puts("\n");
+
+    aarch64_vm_switch_user_space(root_pa);
 
     g_user_exited = 0;
     g_svc_count = 0;
     g_user_fault_esr = 0;
+    g_bad_ptr_ret = 0;
     g_expect_user_fault = 1;
 
-    /* **先に EL1 で同じだけ空回しして比べる。** これをやらないと、EL0 で
-     * tick が入らなかったときに「EL0 の IRQ ベクタが効いていない」のか
-     * 「そもそもタイマが止まっている」のかが分けられない */
-    {
-        uint64_t t0 = aarch64_timer_ticks();
-        for (volatile uint64_t i = 0; i < AARCH64_USER_SPIN; i++) { }
-        aarch64_uart_puts("  el1 ticks : ");
-        aarch64_uart_puthex64(aarch64_timer_ticks() - t0);
-        aarch64_uart_puts("  (比較用。EL1 で同じだけ空回しした)\n");
-    }
-
     ticks_before = aarch64_timer_ticks();
-
     aarch64_enter_el0(aarch64_vm_user_entry_va(),
                       aarch64_vm_user_stack_top_va(),
                       aarch64_user_probe_target());
-
     ticks_after = aarch64_timer_ticks();
 
     aarch64_uart_puts("  svc calls : ");
     aarch64_uart_puthex64(g_svc_count);
-    aarch64_uart_puts("\n  exit code : ");
+    aarch64_uart_puts("  marker    : ");
     aarch64_uart_puthex64(g_user_exit_code);
-    aarch64_uart_puts("\n");
+    aarch64_uart_puts(g_user_exit_code == 0 ? "  ok (私物のデータ)\n"
+                                            : "  BAD (前の空間の値が見えている)\n");
 
-    /* --- 判定 1: EL0 実行中に tick が入ったか -----------------------------
-     * **これは「下位 EL の IRQ」ベクタ (+0x480) が効いている証拠。**
-     * M2 まではカーネル実行中の IRQ (+0x280) しか通っていない。
-     * ここが 0 だと、EL0 に降りた瞬間にタイマが止まる作りになっている */
+    /* --- EL0 実行中に tick が入ったか -----------------------------------
+     * **「下位 EL の IRQ」ベクタ (+0x480) が効いている証拠。** */
     aarch64_uart_puts("  el0 ticks : ");
-    aarch64_uart_puthex64(ticks_before);
-    aarch64_uart_puts(" -> ");
-    aarch64_uart_puthex64(ticks_after);
-    aarch64_uart_puts("  diff ");
     aarch64_uart_puthex64(ticks_after - ticks_before);
     aarch64_uart_puts((ticks_after - ticks_before) >= AARCH64_USER_MIN_TICKS
                       ? "  ok\n" : "  BAD (EL0 で tick が入らない)\n");
 
-    /* --- 判定 2: EL0 からカーネルのページを読んで落ちたか ------------------
-     * **アドレス空間を分けていないので、AP だけが EL0 を締め出している。**
-     * ここが上がらなければ、ユーザーからカーネルが素通しになっている */
+    /* --- EL0 からカーネルのページを読んで落ちたか ------------------------ */
     aarch64_uart_puts("  user probe: ");
     if (g_user_fault_esr == 0) {
         aarch64_uart_puts("BAD (EL0 からカーネルの .text が読めた)\n");
@@ -247,9 +243,59 @@ int aarch64_user_run(void) {
         }
     }
 
-    if (g_user_exited && g_user_exit_code == 0 &&
-        (ticks_after - ticks_before) >= AARCH64_USER_MIN_TICKS &&
-        g_user_fault_esr != 0 && g_svc_count == 3) {
+    /* --- カーネルの VA を write に渡したときの戻り値 ---------------------
+     * **-14 (-EFAULT) でなければ、カーネルの中身が漏れている。** */
+    aarch64_uart_puts("  bad ptr   : ");
+    aarch64_uart_puthex64(g_bad_ptr_ret);
+    aarch64_uart_puts(g_bad_ptr_ret == (uint64_t)-14
+                      ? "  ok (-EFAULT で弾いた)\n"
+                      : "  BAD (カーネルの VA を読ませてしまった)\n");
+
+    return g_user_exited && g_user_exit_code == 0 &&
+           (ticks_after - ticks_before) >= AARCH64_USER_MIN_TICKS &&
+           g_user_fault_esr != 0 && g_bad_ptr_ret == (uint64_t)-14 &&
+           g_svc_count == 5;
+}
+
+int aarch64_user_run(void) {
+    uint64_t space_a, space_b;
+    int ok;
+
+    aarch64_uart_puts("--- M3a/M3b: EL0 + svc + プロセスごとのアドレス空間 ---\n");
+    aarch64_uart_puts("  user text : ");
+    aarch64_uart_puthex64(aarch64_vm_user_entry_va());
+    aarch64_uart_puts("\n  user sp   : ");
+    aarch64_uart_puthex64(aarch64_vm_user_stack_top_va());
+    aarch64_uart_puts("\n  probe tgt : ");
+    aarch64_uart_puthex64(aarch64_user_probe_target());
+    aarch64_uart_puts("  (カーネルの .text。EL0 から読めてはいけない)\n");
+
+    /* **先に EL1 で同じだけ空回しして比べる。** これをやらないと、EL0 で
+     * tick が入らなかったときに「EL0 の IRQ ベクタが効いていない」のか
+     * 「そもそもタイマが止まっている」のかが分けられない */
+    {
+        uint64_t t0 = aarch64_timer_ticks();
+        for (volatile uint64_t i = 0; i < AARCH64_USER_SPIN; i++) { }
+        aarch64_uart_puts("  el1 ticks : ");
+        aarch64_uart_puthex64(aarch64_timer_ticks() - t0);
+        aarch64_uart_puts("  (比較用。EL1 で同じだけ空回しした)\n");
+    }
+
+    /* **同じプログラムを別々のアドレス空間で 2 回走らせる。**
+     * テキストは共有、データは私物。2 回目も marker が 0 で読めれば、
+     * データが本当に分離されている */
+    space_a = aarch64_vm_create_user_space();
+    space_b = aarch64_vm_create_user_space();
+    if (!space_a || !space_b || space_a == space_b) {
+        aarch64_uart_puts("  アドレス空間を 2 つ作れなかった\n");
+        aarch64_uart_puts("aarch64-user-BAD\n");
+        return 0;
+    }
+
+    ok  = aarch64_user_run_once("空間 A", space_a);
+    ok &= aarch64_user_run_once("空間 B", space_b);
+
+    if (ok) {
         aarch64_uart_puts("aarch64-user-ok\n");
         return 1;
     }
