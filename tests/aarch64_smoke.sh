@@ -80,7 +80,7 @@ run_one() {  # $1 = -machine、$2 = ログ、$3 = -m、$4 = 非空ならディ�
         "${drive_args[@]}" \
         -kernel "$KERNEL" < /dev/null > "$log" 2>&1 &
     QEMU_PID=$!
-    for _ in {1..60}; do
+    for _ in {1..120}; do
         if grep -aqE "aarch64-user-(ok|BAD)" "$log" 2>/dev/null; then
             break
         fi
@@ -89,6 +89,16 @@ run_one() {  # $1 = -machine、$2 = ログ、$3 = -m、$4 = 非空ならディ�
     kill "$QEMU_PID" 2>/dev/null || true
     wait "$QEMU_PID" 2>/dev/null || true
     QEMU_PID=""
+
+    # **打ち切りを黙って見逃さない。** マーカーが出ないまま止めた場合、
+    # 以降の判定は「中身が違う」ではなく「途中で切れた」で落ちる。
+    # それを取り違えると、存在しないバグを探すことになる
+    if ! grep -aqE "aarch64-user-(ok|BAD)" "$log" 2>/dev/null; then
+        echo "*** 実行が終わる前に打ち切られた ($log)" >&2
+        echo "*** 最後の 5 行:" >&2
+        tail -5 "$log" >&2
+        exit 1
+    fi
 }
 
 check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$4 = RAM 末尾
@@ -122,6 +132,9 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     grep -aq "gic cpu   : 0x0000000008010000 size 0x0000000000010000  (dtb)" "$2"
     grep -aq "virtio    : 0x000000000a000000 x 0x0000000000000020 stride 0x0000000000000200  (dtb)" "$2"
     grep -aq "timer irq : 0x000000000000001e  (dtb)" "$2"   # PPI 14 + 16 = 30
+    # **スロット i の INTID = base + i が DTB で確かめられていること。**
+    # 確かめずに決め打ちすると、別のデバイスの割り込みを待つ
+    grep -aq "virtio irq: 0x0000000000000030  (dtb、base + スロット番号で確認済み)" "$2"
     ! grep -aq "(既定値)" "$2"     # 1 つでも既定値に落ちていたら失格
 
     # M1: 例外ベクタ + GIC + generic timer で tick が入る
@@ -244,6 +257,11 @@ grep -aq "read lba0 : \"ORTHOX-AARCH64-M4-SEC000\"  ok" LOGs/aarch64-serial-disk
 # LBA 0 と違う中身が返ること = LBA が効いている
 grep -aq "read lba1 : \"ORTHOX-AARCH64-M4-SEC001\"  ok (LBA が効いている)" LOGs/aarch64-serial-disk.log
 grep -aq "write/read: ok (書いたものが読み戻せた)" LOGs/aarch64-serial-disk.log
+# **読み書きが通っただけでは、割り込みで完了した証拠にならない。**
+# ポーリングでも同じ結果になる。待ちを割り込みの印だけにしてあるので、
+# 回数が 0 でなければ本当に割り込みで抜けている
+grep -aq "intid     : 0x000000000000004f  (割り込みで完了を待つ)" LOGs/aarch64-serial-disk.log
+grep -aq "irq count : .*  ok (割り込みで完了した)" LOGs/aarch64-serial-disk.log
 grep -aq "aarch64-virtio-ok" LOGs/aarch64-serial-disk.log
 ! grep -aq "aarch64-virtio-BAD" LOGs/aarch64-serial-disk.log
 

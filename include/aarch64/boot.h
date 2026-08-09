@@ -37,6 +37,10 @@ typedef struct aarch64_boot_info {
     uint32_t dtb_size;
     uint32_t virtio_mmio_count;
     uint32_t timer_intid;   /* 非セキュア物理タイマ。QEMU virt では 30 */
+    /* virtio-mmio スロットの割り込み。**スロット i の INTID = base + i**。
+     * この関係が成り立つことを DTB で確かめてからでないと使えないので、
+     * flags の VIRTIO_IRQ_OK が立っているときだけ有効 */
+    uint32_t virtio_mmio_irq_base;
     uint32_t cpu_count;
     uint32_t flags;
 } aarch64_boot_info_t;
@@ -49,6 +53,7 @@ typedef struct aarch64_boot_info {
 #define AARCH64_BOOT_FLAG_GIC_FROM_DTB    (1U << 5)
 #define AARCH64_BOOT_FLAG_VIRTIO_FROM_DTB (1U << 6)
 #define AARCH64_BOOT_FLAG_TIMER_FROM_DTB  (1U << 7)
+#define AARCH64_BOOT_FLAG_VIRTIO_IRQ_OK   (1U << 8)  /* base + i が成り立つ */
 
 /* 直書きの既定値で埋めてから DTB で上書きする。
  * DTB が無くても QEMU virt では動き続ける */

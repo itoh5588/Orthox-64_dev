@@ -32,6 +32,13 @@
 #include "aarch64/vm.h"
 
 uint64_t aarch64_pmm_alloc(uint64_t pages);
+void aarch64_gic_enable_irq(unsigned intid);
+uint64_t aarch64_timer_ticks(void);
+
+/* 割り込みを待つ上限。**時間は tick で測る。**
+ * wfi で寝ると「回した回数」は割り込みが来た回数にしかならないので、
+ * 時間の目安にならない (逆確認で、上限 100 万回が実質 3 時間になった) */
+#define VBLK_IRQ_TIMEOUT_TICKS 300   /* 10ms x 300 = 3 秒 */
 
 /* virtio-mmio レジスタ (virtio spec 4.2.2、legacy は 4.2.4) */
 #define VIRTIO_MMIO_MAGIC_VALUE      0x000
@@ -71,6 +78,10 @@ static struct virtio_blk_req* g_hdr;    /* 上位 VA */
 static uint64_t g_hdr_pa;
 static uint8_t* g_status;
 static uint64_t g_capacity;             /* セクタ数 */
+static uint32_t g_intid;                /* 完了割り込みの INTID。0 = ポーリング */
+static uint32_t g_slot;                 /* 見つけたスロット番号 */
+static volatile uint32_t g_irq_done;    /* 割り込みが上がった印 */
+static uint64_t g_irq_count;            /* 割り込みで完了した回数 */
 
 static void mmio_w32(uint32_t off, uint32_t v) {
     *(volatile uint32_t*)(g_base + off) = v;
@@ -87,6 +98,17 @@ static void vblk_memset(void* p, uint8_t v, uint64_t n) {
 uint64_t aarch64_virtio_blk_capacity(void) { return g_capacity; }
 int aarch64_virtio_blk_present(void) { return g_base != 0; }
 uint64_t aarch64_virtio_blk_base_pa(void) { return g_base_pa; }
+uint32_t aarch64_virtio_blk_intid(void) { return g_intid; }
+uint64_t aarch64_virtio_blk_irq_count(void) { return g_irq_count; }
+
+/* 完了割り込み。**ここで印を立てるだけ。** used->idx はデバイスが直接
+ * 書いているので、待ち手に「見に行ってよい」と伝えれば足りる */
+void aarch64_virtio_blk_irq(void) {
+    if (!g_base) return;
+    mmio_w32(VIRTIO_MMIO_INTERRUPT_ACK, mmio_r32(VIRTIO_MMIO_INTERRUPT_STATUS));
+    g_irq_count++;
+    g_irq_done = 1;
+}
 
 /* legacy のキュー設定。**リングの物理アドレスをページ番号で渡す** */
 static int vblk_queue_setup(void) {
@@ -161,22 +183,33 @@ static int vblk_rw(uint32_t type, uint64_t sector, void* buf, uint32_t sectors) 
     q->desc[2].next = 0;
 
     used_idx = q->used->idx;
+    g_irq_done = 0;
     q->avail->ring[q->avail->idx % q->queue_size] = 0;
     __sync_synchronize();
     q->avail->idx++;
     __sync_synchronize();
     mmio_w32(VIRTIO_MMIO_QUEUE_NOTIFY, 0);
 
-    /* ポーリングで待つ。**無限には待たない。** デバイスが応答しないときに
-     * 沈黙するのではなく、失敗として返せるようにする */
-    while (q->used->idx == used_idx) {
-        __sync_synchronize();
-        if (++spin > 100000000ULL) return -2;   /* 応答なし */
+    if (g_intid) {
+        /* **割り込みの印だけで抜ける。** used->idx のポーリングを併用すると、
+         * 割り込みが来なくても通ってしまい「割り込みで完了している」証拠に
+         * ならない。来なければ時間切れで失敗として返す */
+        uint64_t deadline = aarch64_timer_ticks() + VBLK_IRQ_TIMEOUT_TICKS;
+        while (!g_irq_done) {
+            __asm__ volatile("wfi");
+            if (aarch64_timer_ticks() > deadline) return -2;   /* 割り込みが来ない */
+        }
+        (void)spin;
+    } else {
+        /* 割り込み番号が確かめられなかったときの退避経路 */
+        while (q->used->idx == used_idx) {
+            __sync_synchronize();
+            if (++spin > 100000000ULL) return -2;
+        }
+        mmio_w32(VIRTIO_MMIO_INTERRUPT_ACK, mmio_r32(VIRTIO_MMIO_INTERRUPT_STATUS));
     }
+    __sync_synchronize();
     q->last_used_idx = q->used->idx;
-
-    /* 割り込みは使っていないが、状態は片づけておく */
-    mmio_w32(VIRTIO_MMIO_INTERRUPT_ACK, mmio_r32(VIRTIO_MMIO_INTERRUPT_STATUS));
 
     return (*g_status == VIRTIO_BLK_S_OK) ? 0 : -1;
 }
@@ -211,6 +244,7 @@ int aarch64_virtio_blk_init(void) {
 
         g_base = base;
         g_base_pa = pa;
+        g_slot = i;
         break;
     }
     if (!g_base) return -1;
@@ -238,6 +272,14 @@ int aarch64_virtio_blk_init(void) {
 
     mmio_w32(VIRTIO_MMIO_STATUS,
              VIRTIO_STATUS_ACK | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
+
+    /* **完了割り込みを有効にする。** スロット i の INTID = base + i が
+     * DTB で確かめられているときだけ。確かめられていなければポーリングに
+     * 退く (別のデバイスの割り込みを待つより、遅いほうがまし) */
+    if (b->flags & AARCH64_BOOT_FLAG_VIRTIO_IRQ_OK) {
+        g_intid = b->virtio_mmio_irq_base + g_slot;
+        aarch64_gic_enable_irq(g_intid);
+    }
 
     /* 容量は config 空間の先頭 (セクタ数、64bit) */
     g_capacity = (uint64_t)mmio_r32(VIRTIO_MMIO_CONFIG) |
@@ -291,7 +333,10 @@ void aarch64_virtio_blk_selftest(void) {
     aarch64_uart_puthex64(aarch64_virtio_blk_base_pa());
     aarch64_uart_puts("  (DTB 由来のスロットを走査して発見)\n  capacity  : ");
     aarch64_uart_puthex64(aarch64_virtio_blk_capacity());
-    aarch64_uart_puts(" セクタ\n");
+    aarch64_uart_puts(" セクタ\n  intid     : ");
+    aarch64_uart_puthex64(aarch64_virtio_blk_intid());
+    aarch64_uart_puts(aarch64_virtio_blk_intid() ? "  (割り込みで完了を待つ)\n"
+                                                 : "  (ポーリングに退いた)\n");
 
     /* --- 1. LBA 0 を読む --- */
     rc = aarch64_virtio_blk_read(0, g_probe_buf, 1);
@@ -350,6 +395,21 @@ void aarch64_virtio_blk_selftest(void) {
         aarch64_uart_puts(same ? "ok (書いたものが読み戻せた)\n"
                                : "BAD (書き戻しが一致しない)\n");
         if (!same) ok = 0;
+    }
+
+    /* --- 4. 割り込みで完了しているか -------------------------------------
+     * **読み書きが通っただけでは、割り込みで完了した証拠にならない。**
+     * ポーリングでも同じ結果になる。上で待ちを割り込みの印だけにしてある
+     * ので、回数が 0 でなければ本当に割り込みで抜けている */
+    aarch64_uart_puts("  irq count : ");
+    aarch64_uart_puthex64(aarch64_virtio_blk_irq_count());
+    if (aarch64_virtio_blk_intid() && aarch64_virtio_blk_irq_count() >= 4) {
+        aarch64_uart_puts("  ok (割り込みで完了した)\n");
+    } else if (!aarch64_virtio_blk_intid()) {
+        aarch64_uart_puts("  (ポーリングなので 0)\n");
+    } else {
+        aarch64_uart_puts("  BAD (割り込みが上がっていない)\n");
+        ok = 0;
     }
 
     aarch64_uart_puts(ok ? "aarch64-virtio-ok\n" : "aarch64-virtio-BAD\n");

@@ -113,6 +113,8 @@ int aarch64_virtio_blk_write(uint64_t lba, const void* buf, uint32_t sectors);
 uint64_t aarch64_virtio_blk_capacity(void);
 uint64_t aarch64_virtio_blk_base_pa(void);
 void aarch64_virtio_blk_selftest(void);
+uint32_t aarch64_virtio_blk_intid(void);
+void aarch64_virtio_blk_irq(void);
 
 /* MMU の探針 (vm.c)。「未マップの VA を読んだら fault が上がるはず」の
  * やりとりに使う。上がった fault はここで拾って呼び出し元に返す */
@@ -225,6 +227,14 @@ static void aarch64_boot_info_dump(void) {
     aarch64_uart_puts("  timer irq : ");
     put_hex64(b->timer_intid);
     put_src(AARCH64_BOOT_FLAG_TIMER_FROM_DTB);
+
+    /* **スロット i の INTID = base + i が成り立つと確かめられたときだけ
+     * 有効。** 確かめずに決め打ちすると、別のデバイスの割り込みを待つ */
+    aarch64_uart_puts("  virtio irq: ");
+    put_hex64(b->virtio_mmio_irq_base);
+    aarch64_uart_puts((b->flags & AARCH64_BOOT_FLAG_VIRTIO_IRQ_OK)
+                      ? "  (dtb、base + スロット番号で確認済み)\n"
+                      : "  (確かめられない。ポーリングに退く)\n");
 
     aarch64_uart_puts("  cpus      : ");
     put_hex64(b->cpu_count);
@@ -405,6 +415,8 @@ void aarch64_irq_handler(void) {
 
     if (intid == aarch64_timer_intid()) {
         aarch64_timer_on_tick();
+    } else if (intid && intid == aarch64_virtio_blk_intid()) {
+        aarch64_virtio_blk_irq();
     }
     /* 1023 は「上がっていなかった」を意味する偽物。EOI してはいけない */
     if (intid < 1020U) {

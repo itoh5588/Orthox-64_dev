@@ -185,6 +185,11 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
     /* virtio-mmio は本数が多く並ぶので、まとめてから確定させる */
     uint64_t virtio_min = 0, virtio_max = 0;
     uint32_t virtio_count = 0;
+    /* **スロットごとの割り込み番号。** 最小アドレスと最大アドレスの
+     * ノードのぶんだけ覚えておき、後で「差 == 本数-1」を確かめる。
+     * 成り立てば「スロット i の INTID = base + i」と言える */
+    uint32_t virtio_irq_at_min = 0, virtio_irq_at_max = 0;
+    int virtio_irq_seen = 0;
 
     if (!aarch64_dtb_valid(dtb_pa)) return;
 
@@ -275,8 +280,23 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
              * ループの後で (max - min) / (本数 - 1) から出す */
             if (n->is_virtio && n->reg_data &&
                 reg_entry(n->reg_data, n->reg_len, ac, sc, 0, &base, &size) && base != 0) {
-                if (virtio_count == 0 || base < virtio_min) virtio_min = base;
-                if (virtio_count == 0 || base > virtio_max) virtio_max = base;
+                /* interrupts = <type num flags>。type 0 = SPI で、
+                 * SPI の INTID は番号 + 32 (PPI が +16 なのと同じ理屈) */
+                uint32_t intid = 0;
+                int have_irq = 0;
+                if (n->intr_data && n->intr_len >= 12U &&
+                    aarch64_dtb_read_be32(n->intr_data) == 0U) {
+                    intid = aarch64_dtb_read_be32(n->intr_data + 4) + 32U;
+                    have_irq = 1;
+                }
+                if (virtio_count == 0 || base < virtio_min) {
+                    virtio_min = base;
+                    if (have_irq) { virtio_irq_at_min = intid; virtio_irq_seen |= 1; }
+                }
+                if (virtio_count == 0 || base > virtio_max) {
+                    virtio_max = base;
+                    if (have_irq) { virtio_irq_at_max = intid; virtio_irq_seen |= 2; }
+                }
                 virtio_count++;
             }
 
@@ -359,5 +379,15 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
             info->virtio_mmio_stride = (virtio_max - virtio_min) / (virtio_count - 1);
         }
         info->flags |= AARCH64_BOOT_FLAG_VIRTIO_FROM_DTB;
+
+        /* **「スロット i の INTID = base + i」が本当に成り立つかを確かめる。**
+         * 成り立たない並べ方をしている環境で、勝手に決め打ちしないため。
+         * 確かめずに使うと、まったく別のデバイスの割り込みを待つことになる */
+        if (virtio_irq_seen == 3 && virtio_count > 1 &&
+            virtio_irq_at_max > virtio_irq_at_min &&
+            (virtio_irq_at_max - virtio_irq_at_min) == (virtio_count - 1)) {
+            info->virtio_mmio_irq_base = virtio_irq_at_min;
+            info->flags |= AARCH64_BOOT_FLAG_VIRTIO_IRQ_OK;
+        }
     }
 }
