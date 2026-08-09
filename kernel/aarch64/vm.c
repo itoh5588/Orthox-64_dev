@@ -49,28 +49,8 @@ extern char aarch64_user_entry[];
 #define AARCH64_BLOCK_SIZE  0x200000ULL          /* 2MB。L2 の 1 エントリ */
 #define AARCH64_PTES        512
 
-/* ---- descriptor のビット -------------------------------------------------
- *
- * bit[1:0] が形を決める。ここが AArch64 の踏みやすいところ:
- *
- *   L1 / L2   0b01 = ブロック (そこで翻訳を終える) / 0b11 = 次の段のテーブル
- *   L3        **0b11 のみ有効**。0b01 は invalid 扱いになる
- *
- * つまり「テーブル」と「L3 のページ」が同じ 0b11 で、「ブロック」だけが 0b01。 */
-#define PTE_VALID       (1ULL << 0)
-#define PTE_TABLE       (1ULL << 1)   /* L1/L2 では次段テーブル、L3 ではページ */
-#define PTE_ATTRINDX(n) (((uint64_t)(n)) << 2)
-#define PTE_AP_RW_EL1   (0ULL << 6)   /* AP[2:1]=00 EL1 で読み書き、EL0 は不可 */
-#define PTE_AP_RW_EL0   (1ULL << 6)   /* AP=01 EL1/EL0 とも読み書き */
-#define PTE_AP_RO_EL1   (2ULL << 6)   /* AP=10 EL1 で読み取りのみ、EL0 は不可 */
-#define PTE_AP_RO_EL0   (3ULL << 6)   /* AP=11 EL1/EL0 とも読み取りのみ */
-#define PTE_SH_INNER    (3ULL << 8)   /* Inner Shareable。Normal メモリに付ける */
-#define PTE_AF          (1ULL << 10)  /* Access Flag。**必須** */
-#define PTE_nG          (1ULL << 11)  /* 0 = global。カーネル領域は 0 のまま */
-#define PTE_PXN         (1ULL << 53)  /* EL1 からの実行禁止 */
-#define PTE_UXN         (1ULL << 54)  /* EL0 からの実行禁止 */
-
-#define PTE_ADDR_MASK   0x0000fffffffff000ULL
+/* descriptor のビット (PTE_*) と MAIR の枠は include/aarch64/vm.h に移した
+ * (M3c-2a)。共有層向けの arch_vm_* が同じビットを組み立てるため */
 
 /* ---- MAIR_EL1 の枠 -------------------------------------------------------
  *
@@ -81,8 +61,7 @@ extern char aarch64_user_entry[];
  * 読み込みが古い値を返す、といった形で壊れる。QEMU では見逃せても実機で出る。 */
 #define MAIR_ATTR_DEVICE_nGnRnE 0x00ULL
 #define MAIR_ATTR_NORMAL_WB     0xffULL
-#define MAIR_IDX_DEVICE 0
-#define MAIR_IDX_NORMAL 1
+/* MAIR_IDX_DEVICE / MAIR_IDX_NORMAL は include/aarch64/vm.h */
 #define MAIR_EL1_VALUE  ((MAIR_ATTR_DEVICE_nGnRnE << (8 * MAIR_IDX_DEVICE)) | \
                          (MAIR_ATTR_NORMAL_WB     << (8 * MAIR_IDX_NORMAL)))
 
@@ -133,13 +112,13 @@ extern char aarch64_user_entry[];
 #define SCTLR_EL1_VALUE (SCTLR_RES1 | SCTLR_M | SCTLR_C | SCTLR_SA | SCTLR_SA0 | SCTLR_I)
 
 /* ---- 属性の組み合わせ (呼ぶ側はこれを使う) ------------------------------ */
-#define VM_ATTR_NORMAL  (PTE_ATTRINDX(MAIR_IDX_NORMAL) | PTE_SH_INNER | PTE_AF)
-#define VM_ATTR_DEVICE  (PTE_ATTRINDX(MAIR_IDX_DEVICE) | PTE_AF)
+#define VM_ATTR_NORMAL  (AARCH64_PTE_ATTRINDX(MAIR_IDX_NORMAL) | AARCH64_PTE_SH_INNER | AARCH64_PTE_AF)
+#define VM_ATTR_DEVICE  (AARCH64_PTE_ATTRINDX(MAIR_IDX_DEVICE) | AARCH64_PTE_AF)
 
-#define VM_KERNEL_TEXT  (VM_ATTR_NORMAL | PTE_AP_RO_EL1 | PTE_UXN)
-#define VM_KERNEL_RO    (VM_ATTR_NORMAL | PTE_AP_RO_EL1 | PTE_UXN | PTE_PXN)
-#define VM_KERNEL_RW    (VM_ATTR_NORMAL | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN)
-#define VM_DEVICE_RW    (VM_ATTR_DEVICE | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN)
+#define VM_KERNEL_TEXT  (VM_ATTR_NORMAL | AARCH64_PTE_AP_RO_EL1 | AARCH64_PTE_UXN)
+#define VM_KERNEL_RO    (VM_ATTR_NORMAL | AARCH64_PTE_AP_RO_EL1 | AARCH64_PTE_UXN | AARCH64_PTE_PXN)
+#define VM_KERNEL_RW    (VM_ATTR_NORMAL | AARCH64_PTE_AP_RW_EL1 | AARCH64_PTE_UXN | AARCH64_PTE_PXN)
+#define VM_DEVICE_RW    (VM_ATTR_DEVICE | AARCH64_PTE_AP_RW_EL1 | AARCH64_PTE_UXN | AARCH64_PTE_PXN)
 
 /* ---- EL0 から使えるページ (M3a) -----------------------------------------
  *
@@ -150,14 +129,14 @@ extern char aarch64_user_entry[];
  * **PXN を必ず立てること。** EL1 がユーザーのコードを実行できてしまうと、
  * ユーザーが書いた命令をカーネル権限で走らせる道ができる。
  * UXN と PXN は別のビットで、片方だけでは塞げない。 */
-#define VM_USER_TEXT    (VM_ATTR_NORMAL | PTE_AP_RO_EL0 | PTE_PXN | PTE_nG)
-#define VM_USER_RW      (VM_ATTR_NORMAL | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN | PTE_nG)
+#define VM_USER_TEXT    (VM_ATTR_NORMAL | AARCH64_PTE_AP_RO_EL0 | AARCH64_PTE_PXN | AARCH64_PTE_nG)
+#define VM_USER_RW      (VM_ATTR_NORMAL | AARCH64_PTE_AP_RW_EL0 | AARCH64_PTE_UXN | AARCH64_PTE_PXN | AARCH64_PTE_nG)
 
 /* 移行のあいだだけ TTBR0 に張る恒等マッピング。**実行もできる必要がある。**
  * MMU を入れた瞬間、PC はまだ物理を指しているので、そこが実行可能で
  * なければ即座に落ちる。上位 VA へ飛んだ後に外す */
-#define VM_IDENT_RWX    (VM_ATTR_NORMAL | PTE_AP_RW_EL1)
-#define VM_IDENT_DEVICE (VM_ATTR_DEVICE | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN)
+#define VM_IDENT_RWX    (VM_ATTR_NORMAL | AARCH64_PTE_AP_RW_EL1)
+#define VM_IDENT_DEVICE (VM_ATTR_DEVICE | AARCH64_PTE_AP_RW_EL1 | AARCH64_PTE_UXN | AARCH64_PTE_PXN)
 
 /* ---- テーブルの置き場 ----------------------------------------------------
  *
@@ -220,26 +199,45 @@ static uint64_t aarch64_vm_next_table(uint64_t table_pa, uint64_t va, int level)
     uint64_t entry = table[index];
     uint64_t next_pa;
 
-    if (entry & PTE_VALID) {
+    if (entry & AARCH64_PTE_VALID) {
         /* 既にブロックが張られている所を細かく割ろうとしている。
          * いまの張り方では起きないが、黙って壊さず気づけるようにする */
-        if ((entry & PTE_TABLE) == 0) {
+        if ((entry & AARCH64_PTE_TABLE) == 0) {
             aarch64_uart_puts("  vm: block/table conflict at ");
             aarch64_uart_puthex64(va);
             aarch64_uart_puts("\n");
             g_vm_failed = 1;
             return 0;
         }
-        return entry & PTE_ADDR_MASK;
+        return entry & AARCH64_PTE_ADDR_MASK;
     }
 
     next_pa = aarch64_vm_alloc_table();
     if (!next_pa) return 0;
-    table[index] = (next_pa & PTE_ADDR_MASK) | PTE_VALID | PTE_TABLE;
+    table[index] = (next_pa & AARCH64_PTE_ADDR_MASK) | AARCH64_PTE_VALID | AARCH64_PTE_TABLE;
     return next_pa;
 }
 
-/* 4KB ページを 1 枚張る。L3 の descriptor は PTE_TABLE (0b11) が必須 */
+/* **作らずに**辿る。無ければ 0。unmap / 属性の差し替えで使う。
+ * aarch64_vm_next_table は無ければ作ってしまうので、外す側には使えない */
+static uint64_t aarch64_vm_walk_existing(uint64_t table_pa, uint64_t va, int level) {
+    uint64_t* table = aarch64_vm_table_ptr(table_pa);
+    uint64_t entry = table[aarch64_vm_index(va, level)];
+    if ((entry & AARCH64_PTE_VALID) == 0) return 0;
+    if ((entry & AARCH64_PTE_TABLE) == 0) return 0;   /* ブロック。細かくは辿れない */
+    return entry & AARCH64_PTE_ADDR_MASK;
+}
+
+/* 1 ページ分の TLB を捨てる。**引数は VA の bits[55:12]。**
+ * tlbi vae1 はページ番号を取るので、そのまま VA を渡すと別の所を捨てる */
+static void aarch64_vm_flush_va(uint64_t va) {
+    __asm__ volatile("dsb ishst");
+    __asm__ volatile("tlbi vaae1is, %0" :: "r"(va >> 12));
+    __asm__ volatile("dsb ish");
+    __asm__ volatile("isb");
+}
+
+/* 4KB ページを 1 枚張る。L3 の descriptor は AARCH64_PTE_TABLE (0b11) が必須 */
 static void aarch64_vm_map_page(uint64_t va, uint64_t pa, uint64_t attr) {
     uint64_t l2_pa = aarch64_vm_next_table(g_build_root_pa, va, 1);
     uint64_t l3_pa;
@@ -248,17 +246,17 @@ static void aarch64_vm_map_page(uint64_t va, uint64_t pa, uint64_t attr) {
     l3_pa = aarch64_vm_next_table(l2_pa, va, 2);
     if (!l3_pa) return;
     l3 = aarch64_vm_table_ptr(l3_pa);
-    l3[aarch64_vm_index(va, 3)] = (pa & PTE_ADDR_MASK) | attr | PTE_VALID | PTE_TABLE;
+    l3[aarch64_vm_index(va, 3)] = (pa & AARCH64_PTE_ADDR_MASK) | attr | AARCH64_PTE_VALID | AARCH64_PTE_TABLE;
 }
 
-/* 2MB ブロックを 1 つ張る。L2 の descriptor はブロックなので PTE_TABLE を
+/* 2MB ブロックを 1 つ張る。L2 の descriptor はブロックなので AARCH64_PTE_TABLE を
  * 立てない (0b01)。ここを 0b11 にするとテーブルとして辿られて壊れる */
 static void aarch64_vm_map_block(uint64_t va, uint64_t pa, uint64_t attr) {
     uint64_t l2_pa = aarch64_vm_next_table(g_build_root_pa, va, 1);
     uint64_t* l2;
     if (!l2_pa) return;
     l2 = aarch64_vm_table_ptr(l2_pa);
-    l2[aarch64_vm_index(va, 2)] = (pa & PTE_ADDR_MASK) | attr | PTE_VALID;
+    l2[aarch64_vm_index(va, 2)] = (pa & AARCH64_PTE_ADDR_MASK) | attr | AARCH64_PTE_VALID;
 }
 
 /* 範囲を張る。2MB に揃っている所はブロックで、それ以外は 4KB ページで。
@@ -301,14 +299,14 @@ uint64_t aarch64_vm_translate_in(uint64_t root_pa, uint64_t va) {
     uint64_t* table = aarch64_vm_table_ptr(root_pa);
     for (int level = 1; level <= 3; level++) {
         uint64_t entry = table[aarch64_vm_index(va, level)];
-        if ((entry & PTE_VALID) == 0) return 0;
-        if (level == 3) return (entry & PTE_ADDR_MASK) | (va & 0xfffULL);
-        if ((entry & PTE_TABLE) == 0) {
+        if ((entry & AARCH64_PTE_VALID) == 0) return 0;
+        if (level == 3) return (entry & AARCH64_PTE_ADDR_MASK) | (va & 0xfffULL);
+        if ((entry & AARCH64_PTE_TABLE) == 0) {
             /* ブロック。ここで翻訳が終わる */
             uint64_t block_size = (level == 1) ? (1ULL << 30) : AARCH64_BLOCK_SIZE;
-            return (entry & PTE_ADDR_MASK) | (va & (block_size - 1));
+            return (entry & AARCH64_PTE_ADDR_MASK) | (va & (block_size - 1));
         }
-        table = aarch64_vm_table_ptr(entry & PTE_ADDR_MASK);
+        table = aarch64_vm_table_ptr(entry & AARCH64_PTE_ADDR_MASK);
     }
     return 0;
 }
@@ -530,10 +528,10 @@ static uint64_t aarch64_vm_leaf(uint64_t root_pa, uint64_t va) {
     uint64_t* table = aarch64_vm_table_ptr(root_pa);
     for (int level = 1; level <= 3; level++) {
         uint64_t entry = table[aarch64_vm_index(va, level)];
-        if ((entry & PTE_VALID) == 0) return 0;
+        if ((entry & AARCH64_PTE_VALID) == 0) return 0;
         if (level == 3) return entry;
-        if ((entry & PTE_TABLE) == 0) return entry;   /* ブロック */
-        table = aarch64_vm_table_ptr(entry & PTE_ADDR_MASK);
+        if ((entry & AARCH64_PTE_TABLE) == 0) return entry;   /* ブロック */
+        table = aarch64_vm_table_ptr(entry & AARCH64_PTE_ADDR_MASK);
     }
     return 0;
 }
@@ -564,6 +562,116 @@ uint64_t aarch64_vm_user_root_pa(void) { return g_user_root_pa; }
 /* task.c が 0 番タスクの初期値に使う */
 uint64_t aarch64_vm_user_root_pa_current(void) { return g_user_root_pa; }
 uint64_t aarch64_vm_kernel_root_pa(void) { return g_kernel_root_pa; }
+
+/* ==========================================================================
+ * 共有層から見たアドレス空間の操作 (M3c-2a)
+ *
+ * 上の aarch64_vm_* は「起動時に自分で組み立てる」ための道具で、root は
+ * g_build_root_pa という単一のグローバルで持っていた。共有層は
+ * **どのアドレス空間か**を毎回渡してくるので、その形に合わせる。
+ *
+ * root を引数で受けて g_build_root_pa を差し替えるだけの薄い層にしてある。
+ * **単一 CPU 前提。** SMP では g_build_root_pa 自体がおかしくなるので、
+ * root を引数で持ち回す形に直すこと。
+ * ========================================================================== */
+
+/* g_build_root_pa を借りるための入れ物。**必ず戻すこと** */
+#define WITH_ROOT(root, body) do {              \
+        uint64_t saved__ = g_build_root_pa;     \
+        g_build_root_pa = (root);               \
+        body;                                   \
+        g_build_root_pa = saved__;              \
+    } while (0)
+
+void aarch64_vm_activate_address_space(uint64_t root_pa) {
+    aarch64_vm_switch_user_space(root_pa);
+}
+
+arch_address_space_t arch_vm_kernel_address_space(void) {
+    return g_kernel_root_pa;
+}
+
+/* **空のテーブルを 1 枚返すだけ。** riscv64 / x86 はここでカーネル領域の
+ * 写しを入れているが、AArch64 はカーネルが TTBR1 に居るので要らない。
+ * これが「TTBR が 2 本ある」ことの実際の利得 (日報2026-08-09 追2-5) */
+arch_address_space_t arch_vm_create_user_address_space(void) {
+    uint64_t root_pa = aarch64_pmm_alloc(1);
+    if (!root_pa) return 0;
+    g_tables_used++;
+    return root_pa;
+}
+
+/* fork 用。まだ中身を写していない。**呼ばれたら分かるように 0 を返す。**
+ * 黙って空の空間を返すと、子プロセスが何も張られていない空間で走り出して
+ * 原因不明のアボートになる */
+arch_address_space_t arch_vm_clone_address_space(arch_address_space_t address_space) {
+    (void)address_space;
+    aarch64_uart_puts("  vm: arch_vm_clone_address_space は未実装 (M3c-2b)\n");
+    return 0;
+}
+
+/* テーブルの解放。**まだページそのものは返していない。**
+ * (日報2026-08-09 の未実施表「タスク・テーブルの後始末」) */
+void arch_vm_destroy_user_address_space(arch_address_space_t address_space) {
+    if (!address_space) return;
+    aarch64_pmm_free(address_space, 1);
+}
+
+void arch_vm_map_page(arch_address_space_t address_space, uint64_t vaddr,
+                      uint64_t paddr, uint64_t flags) {
+    if (!address_space) return;
+    WITH_ROOT(address_space, aarch64_vm_map_page(vaddr, paddr, flags));
+}
+
+/* **必ず 4KB ページで張る。** 共有層が張るのはユーザーのページで、
+ * 後から権限を重ねられる必要がある。2MB ブロックにすると
+ * 「ブロックの上にテーブルを作れない」衝突になる (日報2026-08-09 追2-5) */
+void arch_vm_map_range(arch_address_space_t address_space, uint64_t vaddr,
+                       uint64_t paddr, uint64_t size, uint64_t flags) {
+    if (!address_space) return;
+    WITH_ROOT(address_space, aarch64_vm_map_pages(vaddr, paddr, size, flags));
+}
+
+uint64_t arch_vm_get_phys(arch_address_space_t address_space, uint64_t vaddr) {
+    if (!address_space) return 0;
+    return aarch64_vm_translate_in(address_space, vaddr);
+}
+
+/* L3 の descriptor を無効にする。**TLB を捨てるところまでやる。**
+ * 捨てないと、外したはずのページが読めたままになる */
+void arch_vm_unmap_page(arch_address_space_t address_space, uint64_t vaddr) {
+    uint64_t l2_pa, l3_pa;
+    uint64_t* l3;
+
+    if (!address_space) return;
+    l2_pa = aarch64_vm_walk_existing(address_space, vaddr, 1);
+    if (!l2_pa) return;
+    l3_pa = aarch64_vm_walk_existing(l2_pa, vaddr, 2);
+    if (!l3_pa) return;
+    l3 = aarch64_vm_table_ptr(l3_pa);
+    l3[aarch64_vm_index(vaddr, 3)] = 0;
+    aarch64_vm_flush_va(vaddr);
+}
+
+/* 属性だけ差し替える。物理アドレスはそのまま */
+void arch_vm_update_page_flags(arch_address_space_t address_space, uint64_t vaddr,
+                               uint64_t flags) {
+    uint64_t l2_pa, l3_pa, entry;
+    uint64_t* l3;
+    uint64_t index;
+
+    if (!address_space) return;
+    l2_pa = aarch64_vm_walk_existing(address_space, vaddr, 1);
+    if (!l2_pa) return;
+    l3_pa = aarch64_vm_walk_existing(l2_pa, vaddr, 2);
+    if (!l3_pa) return;
+    l3 = aarch64_vm_table_ptr(l3_pa);
+    index = aarch64_vm_index(vaddr, 3);
+    entry = l3[index];
+    if ((entry & AARCH64_PTE_VALID) == 0) return;
+    l3[index] = (entry & AARCH64_PTE_ADDR_MASK) | flags | AARCH64_PTE_VALID | AARCH64_PTE_TABLE;
+    aarch64_vm_flush_va(vaddr);
+}
 
 /* MMU を入れる。順序が全て:
  *

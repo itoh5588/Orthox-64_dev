@@ -128,3 +128,91 @@ void aarch64_pmm_free(uint64_t pa, uint64_t pages) {
 uint64_t aarch64_pmm_base(void)  { return g_base_pa; }
 uint64_t aarch64_pmm_total(void) { return g_pages; }
 uint64_t aarch64_pmm_used(void)  { return g_used; }
+
+/* ==========================================================================
+ * 共有層から見た形 (M3c-2a)
+ *
+ * include/pmm.h が要求する形に合わせる。**戻り値は物理アドレスを void* に
+ * 入れたもの** (riscv64 と同じ)。触るときは呼ぶ側が PHYS_TO_VIRT を通す。
+ *
+ * **g_hhdm_offset を設定するのがここでの要点。** riscv64 は 0 で済んで
+ * いた (カーネルが恒等マッピングに居るため) が、aarch64 のカーネルは
+ * TTBR1 の上位 VA に居るので、物理 → VA の変換に値が要る。
+ * 0 のままだと、共有層が PHYS_TO_VIRT した先で必ず落ちる。
+ *
+ * 参照カウントは fork の copy-on-write などで使う。M3c-1 までの
+ * aarch64_pmm_* はカウントを持っていないので、**こちら側で持つ**。
+ * ========================================================================== */
+#include "pmm.h"
+#include "vmm.h"
+
+_Static_assert(PAGE_SIZE == AARCH64_PAGE_SIZE,
+               "共有層の PAGE_SIZE と aarch64 のページサイズがずれている");
+
+static uint16_t g_refcount[AARCH64_PMM_MAX_PAGES];
+
+static uint64_t pmm_page_index(uint64_t pa, int* ok) {
+    *ok = 0;
+    if (!pa || pa < g_base_pa) return 0;
+    uint64_t page = (pa - g_base_pa) / AARCH64_PAGE_SIZE;
+    if (page >= g_pages) return 0;
+    *ok = 1;
+    return page;
+}
+
+void pmm_init(void) {
+    /* **カーネルが上位 VA に居ることを共有層に伝える。**
+     * これを 0 のままにすると PHYS_TO_VIRT が物理を返し、
+     * 恒等マッピングを外した後は必ず落ちる */
+    g_hhdm_offset = AARCH64_KERNEL_VA_OFFSET;
+    for (uint64_t i = 0; i < AARCH64_PMM_MAX_PAGES; i++) g_refcount[i] = 0;
+    aarch64_pmm_init();
+}
+
+void* pmm_alloc(size_t pages) {
+    uint64_t pa = aarch64_pmm_alloc((uint64_t)pages);
+    if (!pa) return 0;
+    for (size_t i = 0; i < pages; i++) {
+        int ok;
+        uint64_t page = pmm_page_index(pa + (uint64_t)i * AARCH64_PAGE_SIZE, &ok);
+        if (ok) g_refcount[page] = 1;
+    }
+    return (void*)(uintptr_t)pa;
+}
+
+/* **カウントが 0 になったときだけ本当に返す。** 共有層は同じページを
+ * 複数の空間に張ってから片方ずつ手放すので、無条件に返すと
+ * まだ使われているページを配り直すことになる */
+void pmm_free(void* addr, size_t pages) {
+    uint64_t base = (uint64_t)(uintptr_t)addr;
+    for (size_t i = 0; i < pages; i++) {
+        int ok;
+        uint64_t pa = base + (uint64_t)i * AARCH64_PAGE_SIZE;
+        uint64_t page = pmm_page_index(pa, &ok);
+        if (!ok) continue;
+        if (g_refcount[page] > 0) {
+            g_refcount[page]--;
+            if (g_refcount[page] == 0) aarch64_pmm_free(pa, 1);
+        }
+    }
+}
+
+void pmm_incref(void* addr) {
+    int ok;
+    uint64_t page = pmm_page_index((uint64_t)(uintptr_t)addr, &ok);
+    if (ok && g_refcount[page] < 0xffffU) g_refcount[page]++;
+}
+
+uint16_t pmm_get_ref(void* addr) {
+    int ok;
+    uint64_t page = pmm_page_index((uint64_t)(uintptr_t)addr, &ok);
+    return ok ? g_refcount[page] : 0;
+}
+
+/* ISA DMA は x86 (16MB 未満 + 64KB 境界) の話。**aarch64 では使わない。**
+ * 0 を返して「無い」と伝える */
+void* pmm_get_isa_dma_page(void) { return 0; }
+
+uint64_t pmm_get_allocated_pages(void) { return g_used; }
+uint64_t pmm_get_free_pages(void)      { return g_pages - g_used; }
+uint64_t pmm_get_total_pages(void)     { return g_pages; }

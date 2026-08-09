@@ -33,8 +33,17 @@
 .endm
 
 /* 割り込みハンドラは C を呼ぶので、C が壊してよいレジスタ (x0-x18, x30) を
- * すべて退避する。加えて戻り先 (ELR_EL1) と状態 (SPSR_EL1) も積む。
- * 34 本 x 8 バイト = 272 バイト (16 バイト境界を保つ) */
+ * すべて退避する。加えて戻り先 (ELR_EL1)、状態 (SPSR_EL1)、
+ * **ユーザーの sp (SP_EL0)** も積む。
+ * 34 本 x 8 バイト = 272 バイト (16 バイト境界を保つ)
+ *
+ * **include/aarch64/trap.h の aarch64_trap_frame_t と対で決まっている。**
+ * どちらかを変えたらもう一方も変えること。
+ *
+ * SP_EL0 は M3c-2a で足した。EL0 と EL1 で sp が別レジスタなので、
+ * riscv64 のように「フレームの sp」が自動では入らない。入れておかないと
+ * execve / fork がユーザーのスタックを組み替えられない。
+ * 272 バイトのうち 264 が元から余っていたので、枠は増えていない */
 .macro SAVE_ALL
     sub     sp, sp, #272
     stp     x0,  x1,  [sp, #16 * 0]
@@ -55,15 +64,17 @@
     mrs     x0, elr_el1
     stp     x30, x0,  [sp, #16 * 15]
     mrs     x1, spsr_el1
-    str     x1, [sp, #16 * 16]
+    mrs     x2, sp_el0
+    stp     x1, x2,   [sp, #16 * 16]
 .endm
 
 /* 積んだ ELR の位置。SAVE_ALL が x30 と対で積むので、その 8 バイト先 */
 #define SAVED_ELR_OFF (16 * 15 + 8)
 
 .macro RESTORE_ALL
-    ldr     x1, [sp, #16 * 16]
+    ldp     x1, x2,   [sp, #16 * 16]
     msr     spsr_el1, x1
+    msr     sp_el0, x2          /* 書き戻すので、C がフレームで変えられる */
     ldp     x30, x0,  [sp, #16 * 15]
     msr     elr_el1, x0
     ldp     x0,  x1,  [sp, #16 * 0]

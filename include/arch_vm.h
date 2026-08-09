@@ -13,6 +13,16 @@ static inline uint64_t arch_vm_user_page_flags(int writable, int executable) {
     return flags;
 }
 
+#elif defined(__aarch64__)
+#include "aarch64/vm.h"
+
+/* AArch64 は「読み書き可否」と「実行可否」が別のビットで、しかも
+ * **EL0 の実行禁止 (UXN) と EL1 の実行禁止 (PXN) が別**。
+ * 組み立ては aarch64_vm_user_page_attr に集めてある (PXN は常に立てる) */
+static inline uint64_t arch_vm_user_page_flags(int writable, int executable) {
+    return aarch64_vm_user_page_attr(writable, executable);
+}
+
 #elif defined(__x86_64__)
 #include "x86_64/vm.h"
 #include "vmm.h"

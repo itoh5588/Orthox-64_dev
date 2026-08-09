@@ -295,7 +295,19 @@ AARCH64_KERNEL_ELF = out/kernel-aarch64.elf
 AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer.c \
 	kernel/aarch64/dtb.c \
 	kernel/aarch64/vm.c kernel/aarch64/usermode.c kernel/aarch64/pmm.c \
-	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c
+	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/runtime.c
+# 共有層のうち、**いま繋がるものだけ**を取り込む (M3c-2a)。
+# どれが入るかは推測せず、llvm-nm -u で未解決シンボルを実測して決めた。
+#
+#   cstring / cstdio / vfs   外部要求ゼロ
+#   storage                  memcpy だけ (cstring が出す)
+#   task / sched / wait      共有タスク層が要る          -> M3c-2b
+#   xv6bio / xv6log / xv6fs  storage の登録と wait が要る -> M4-3
+#   **kassert は使えない**   cli / hlt を直書きしている (x86 専用)。
+#                            kernel_panic は runtime.c に置いた。
+#                            -fsyntax-only では通り -c で落ちるので、
+#                            構文チェックだけで「入る」と判断しないこと
+AARCH64_SHARED_C_SRCS = kernel/cstring.c kernel/cstdio.c kernel/vfs.c kernel/storage.c
 AARCH64_ASM_SRCS = kernel/aarch64/start.S kernel/aarch64/vectors.S \
 	kernel/aarch64/entry.S kernel/aarch64/user_blob.S kernel/aarch64/switch.S
 AARCH64_CFLAGS = --target=aarch64-none-elf -mgeneral-regs-only \
@@ -303,9 +315,14 @@ AARCH64_CFLAGS = --target=aarch64-none-elf -mgeneral-regs-only \
 	-mcmodel=small -O2 -Wall -Wextra -Iinclude -MMD -MP
 AARCH64_LDFLAGS = -nostdlib -static -m aarch64elf -T scripts/kernel-aarch64.ld
 AARCH64_OBJS = $(patsubst kernel/aarch64/%.c, $(BUILD_DIR)/aarch64/kernel/%.o, $(AARCH64_C_SRCS)) \
+	$(patsubst kernel/%.c, $(BUILD_DIR)/aarch64/shared/%.o, $(AARCH64_SHARED_C_SRCS)) \
 	$(patsubst kernel/aarch64/%.S, $(BUILD_DIR)/aarch64/kernel/%_asm.o, $(AARCH64_ASM_SRCS))
 
 $(BUILD_DIR)/aarch64/kernel/%.o: kernel/aarch64/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/aarch64/shared/%.o: kernel/%.c
 	@mkdir -p $(@D)
 	$(AARCH64_CC) $(AARCH64_CFLAGS) -c $< -o $@
 

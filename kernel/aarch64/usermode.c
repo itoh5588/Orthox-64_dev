@@ -34,9 +34,10 @@
  *   frame[31]     ELR_EL1   例外からの戻り先
  *   frame[32]     SPSR_EL1  戻り先の状態
  */
-#define FRAME_X30   30
-#define FRAME_ELR   31
-#define FRAME_SPSR  32
+#define FRAME_X30    30
+#define FRAME_ELR    31
+#define FRAME_SPSR   32
+#define FRAME_SP_EL0 33   /* ユーザーの sp。M3c-2a で SAVE_ALL に足した */
 
 /* ESR_EL1 の Exception Class */
 #define ESR_EC_SHIFT    26
@@ -85,6 +86,15 @@ typedef struct user_run_state {
     volatile int expect_fault;  /* 「触ったら落ちるはず」の探針 */
     volatile uint64_t fault_esr;
     volatile uint64_t fault_far;
+    /* SP_EL0 の探針 (M3c-2a)。**フレームに足しただけでは、それが
+     * ハードウェアに効いている証拠にならない。** SP_EL0 は例外で自動的に
+     * 保たれるので、save も restore も外して通ってしまう (逆確認で実証)。
+     * そこでカーネル側から意図的に動かし、次の svc で戻ってくるかを見る */
+    uint64_t sp_probe_saved;    /* 1 回目の svc で SAVE_ALL が積んでいた値 */
+    uint64_t sp_probe_expect;
+    int sp_probe_state;         /* 0 未実施 / 1 ずらした / 2 判定済み */
+    int sp_probe_save_ok;       /* 積んだ値が真値と一致したか */
+    int sp_probe_ok;
 } user_run_state_t;
 
 static user_run_state_t g_urun[AARCH64_MAX_TASKS];
@@ -142,6 +152,33 @@ static void aarch64_svc(uint64_t* frame) {
     user_run_state_t* st = urun();
 
     st->svc_count++;
+
+    /* ---- SP_EL0 の探針 --------------------------------------------------
+     * **読みと書きを別々に確かめる。** 片方だけだと素通りする:
+     *
+     *   1 回目  SAVE_ALL が積んだ値が、**独立に分かっている真値** (ユーザーの
+     *           スタック上端) と一致するか。ユーザーは sp を触らないので、
+     *           最初の svc の時点では上端のままのはず。
+     *           ここを「前に積んだ値」と比べる形にしていたら、SAVE_ALL から
+     *           sp_el0 を外しても通ってしまった (逆確認で実証)。
+     *           カーネルスタックの同じ枠に前回の値が残るため
+     *   2 回目  1 回目でずらした値が返ってくるか。**RESTORE_ALL が
+     *           ハードウェアに書き戻している証拠**
+     *
+     * ずらす量は 16 の倍数 (SCTLR_EL1.SA0 でスタック整列チェックが有効)。
+     * 判定した後は元に戻すので、ユーザーからは何も起きていないように見える */
+    if (st->sp_probe_state == 0) {
+        st->sp_probe_saved = frame[FRAME_SP_EL0];
+        st->sp_probe_save_ok = (st->sp_probe_saved == aarch64_vm_user_stack_top_va());
+        st->sp_probe_expect = st->sp_probe_saved - 16;
+        frame[FRAME_SP_EL0] -= 16;
+        st->sp_probe_state = 1;
+    } else if (st->sp_probe_state == 1) {
+        st->sp_probe_ok = st->sp_probe_save_ok &&
+                          (frame[FRAME_SP_EL0] == st->sp_probe_expect);
+        frame[FRAME_SP_EL0] += 16;
+        st->sp_probe_state = 2;
+    }
 
     switch (nr) {
     case AARCH64_NR_WRITE:
@@ -234,6 +271,10 @@ int aarch64_user_run_once(const char* label, uint64_t root_pa) {
     st->fault_esr = 0;
     st->bad_ptr_ret = 0;
     st->expect_fault = 1;
+    st->sp_probe_state = 0;
+    st->sp_probe_save_ok = 0;
+    st->sp_probe_ok = 0;
+    st->sp_probe_saved = 0;
 
     ticks_before = aarch64_timer_ticks();
     aarch64_enter_el0(aarch64_vm_user_entry_va(),
@@ -289,12 +330,20 @@ int aarch64_user_run_once(const char* label, uint64_t root_pa) {
                       ? "  ok (-EFAULT で弾いた)\n"
                       : "  BAD (カーネルの VA を読ませてしまった)\n");
 
+    /* --- SP_EL0 がフレーム経由で効いているか (M3c-2a) --------------------
+     * **execve / fork がユーザーのスタックを組み替える経路そのもの。**
+     * ここが効いていないと、共有層は sp を差し替えたつもりで差し替わらない */
+    aarch64_uart_puts("  sp probe  : ");
+    aarch64_uart_puthex64(st->sp_probe_saved);
+    aarch64_uart_puts(st->sp_probe_ok ? "  ok (SP_EL0 がフレーム経由で効く)\n"
+                                      : "  BAD (フレームの sp_el0 が届いていない)\n");
+
     aarch64_console_end();
 
     return st->exited && st->exit_code == 0 &&
            (ticks_after - ticks_before) >= AARCH64_USER_MIN_TICKS &&
            st->fault_esr != 0 && st->bad_ptr_ret == (uint64_t)-14 &&
-           st->svc_count == 5;
+           st->sp_probe_ok && st->svc_count == 5;
 }
 
 /* ---- M3c-1: タスクとして走らせる ---------------------------------------

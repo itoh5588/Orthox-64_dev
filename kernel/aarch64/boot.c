@@ -14,6 +14,8 @@
 #include "aarch64/dtb.h"
 #include "aarch64/task.h"
 #include "aarch64/vm.h"
+#include "pmm.h"
+#include "vmm.h"
 
 /* PL011 UART。QEMU は初期化なしでも DR に書けば出るが、実機と手順を
  * 揃えておく (M1 以降で割り込み受信を足すときに効く)
@@ -125,6 +127,7 @@ int aarch64_virtio_blk_write(uint64_t lba, const void* buf, uint32_t sectors);
 uint64_t aarch64_virtio_blk_capacity(void);
 uint64_t aarch64_virtio_blk_base_pa(void);
 void aarch64_virtio_blk_selftest(void);
+int aarch64_shared_layer_selftest(void);
 uint32_t aarch64_virtio_blk_intid(void);
 void aarch64_virtio_blk_irq(void);
 
@@ -296,12 +299,23 @@ void aarch64_early_main(uint64_t dtb_phys) {
 
     /* **DTB の後、MMU の前。** pmm は DTB が言う RAM の広さを要るし、
      * vm はページテーブルを pmm から取る */
-    aarch64_pmm_init();
+    /* **共有層の名前のほうを呼ぶ (M3c-2a)。** 中で aarch64_pmm_init を
+     * 呼んだうえで g_hhdm_offset を入れる。aarch64_pmm_init を直接
+     * 呼ぶと、共有層が物理 → VA の変換に使う値が 0 のままになる */
+    pmm_init();
     aarch64_uart_puts("  pmm       : ");
     put_hex64(aarch64_pmm_total());
     aarch64_uart_puts(" ページ (使用 ");
     put_hex64(aarch64_pmm_used());
     aarch64_uart_puts(")\n");
+
+    /* **0 のまま進んでいないことを出させる。** 値が正しいことと、
+     * 設定されたことは別 (日報2026-08-09 追-7)。共有層はここを使って
+     * 物理 → VA を作るので、0 のままだと恒等を外した瞬間に落ちる */
+    aarch64_uart_puts("  hhdm      : ");
+    put_hex64(g_hhdm_offset);
+    aarch64_uart_puts(g_hhdm_offset == AARCH64_KERNEL_VA_OFFSET
+                      ? "  ok\n" : "  BAD (共有層の物理→VA が壊れる)\n");
 
     /* ---- M1: 例外ベクタ + GIC + generic timer -------------------------- */
     aarch64_vectors_init();
@@ -410,6 +424,9 @@ void aarch64_boot_continue(void) {
             aarch64_uart_puts("aarch64-mmu-BAD (MMU on で tick が止まった)\n");
         }
     }
+
+    /* ---- M3c-2a: 共有層 (pmm.h / arch_vm_*) ----------------------------- */
+    aarch64_shared_layer_selftest();
 
     /* ---- M4: virtio-mmio (virtio-blk) ---------------------------------- */
     aarch64_virtio_blk_selftest();

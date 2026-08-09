@@ -179,6 +179,23 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     grep -aq "aarch64-mmu-ok" "$2"
     ! grep -aq "aarch64-mmu-BAD" "$2"
 
+    # M3c-2a: 共有層 (pmm.h / arch_vm_*)
+    #
+    # **コンパイルが通ったことは動く証拠にならない。** 実際に共有層が使う
+    # 経路だけを見る。とくに 2 つ:
+    #
+    #   hhdm      g_hhdm_offset が入っていること。**0 のままでも起動も
+    #             タイマも MMU も通る**ので、出させないと気づけない
+    #             (日報2026-08-09 追-7 と同じ形)
+    #   free x1   参照カウントが効いていること。1 回目の pmm_free で
+    #             返してしまうと、まだ使われているページを配り直す
+    grep -aq "hhdm      : 0xffffff8000000000  ok" "$2"
+    grep -aq "map/get   :  ok" "$2"     # arch_vm_map_page -> get_phys が往復する
+    grep -aq "unmap     :  ok" "$2"     # 外した後は 0 を返す
+    grep -aq "free x1   :  ok" "$2"     # 参照カウントが効いている
+    grep -aq "aarch64-shared-ok" "$2"
+    ! grep -aq "aarch64-shared-BAD" "$2"
+
     # M3a / M3b-2: EL0 + svc + プロセスごとのアドレス空間
     #
     # 判定は 5 本立て。**どれか 1 つでは足りない**:
@@ -218,6 +235,11 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     [ "$(grep -ac "user probe: ESR=0x000000009200000f FAR=0xffffff8040201000 (permission fault) ok" "$2")" = "2" ]
     # -14 = -EFAULT
     [ "$(grep -ac "bad ptr   : 0xfffffffffffffff2  ok (-EFAULT で弾いた)" "$2")" = "2" ]
+    # M3c-2a: フレームの sp_el0 が SP_EL0 に届いていること。
+    # **SP_EL0 は例外で自動的に保たれる**ので、save も restore も外したまま
+    # でも他の判定は全部通る (逆確認で実証)。カーネル側から意図的に
+    # ずらして戻ってくるかを見て初めて効いている証拠になる
+    [ "$(grep -ac "sp probe  : .*  ok (SP_EL0 がフレーム経由で効く)" "$2")" = "2" ]
     # M3c-1: コンテキストスイッチとプリエンプション
     #
     #   カーネルスレッド 2 本が両方 200 周する = 譲り合いが成立している

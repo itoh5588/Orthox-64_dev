@@ -180,6 +180,22 @@ void aarch64_task_exit(void) {
     for (;;) aarch64_task_yield();
 }
 
+/* ---- 共有タスク層の受け口 (M3c-2a) --------------------------------------
+ *
+ * まだ共有層は載せていないが、arch_task_* の inline がこの 2 つを呼ぶので
+ * 実体を置いておく。M3c-2b で共有層を繋ぐときにそのまま使える。 */
+static struct cpu_local* g_cpu_local;
+static uint64_t g_kernel_sp;
+
+struct cpu_local* aarch64_task_get_cpu_local_impl(void) { return g_cpu_local; }
+void aarch64_task_set_cpu_local_impl(struct cpu_local* cpu) { g_cpu_local = cpu; }
+
+/* **AArch64 では例外で自動的に SP_EL1 に切り替わる**ので、riscv64 が
+ * sscratch を手で入れ替えていたところは覚えておくだけでよい。
+ * 実際に使うのは、EL0 へ降りる前に SP_EL1 をこの値にする所 (M3c-2b) */
+void aarch64_trap_set_kernel_stack(uint64_t kernel_sp) { g_kernel_sp = kernel_sp; }
+uint64_t aarch64_trap_kernel_stack(void) { return g_kernel_sp; }
+
 /* タイマ割り込みから呼ぶ。**ここでは切り替えない。**
  * 割り込みハンドラの途中で切り替えると、まだ積んでいないものが出る。
  * 印だけ立てて、出口 (aarch64_task_resched_if_needed) で切り替える */
