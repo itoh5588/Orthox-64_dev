@@ -33,6 +33,24 @@ SECTIONS
         __data_end = .;
     }
 
+    /* EL0 で動くコードとデータ (M3a)。**カーネルの区画とは別に置く。**
+     * 同じページにカーネルのものが混ざっていると、ユーザー権限を与えた
+     * 瞬間にカーネルの中身まで EL0 から見えてしまう。
+     * ページ境界で切り分けるために、専用の区画にして 4KB に揃える */
+    .user_text : ALIGN(0x1000) {
+        __user_text_start = .;
+        *(.user_text)
+        . = ALIGN(0x1000);
+        __user_text_end = .;
+    }
+
+    .user_data : ALIGN(0x1000) {
+        __user_data_start = .;
+        *(.user_data)
+        . = ALIGN(0x1000);
+        __user_data_end = .;
+    }
+
     .bss : ALIGN(0x1000) {
         __bss_start = .;
         *(.bss .bss.*)

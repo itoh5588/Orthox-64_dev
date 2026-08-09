@@ -7,7 +7,9 @@
  *   1. ベースレジスタが 2 本ある (TTBR0_EL1 = 下位側 / TTBR1_EL1 = 上位側)。
  *      ここでは カーネルが 0x40200000 = 下位側に居るので TTBR0 だけを使い、
  *      TTBR1 は TCR_EL1.EPD1 = 1 で「歩かない」ことにしてある。
- *      カーネルを上位半分へ移すのは M2b (リンク先の変更を伴う)。
+ *      **カーネルを上位半分へ移すのは M3b。** リンク先の変更を伴ううえ、
+ *      それをやるまで「プロセスごとに TTBR0 を差し替える」ができない
+ *      (差し替えた瞬間、例外で戻ってきたときカーネルが見えなくなる)。
  *
  *   2. descriptor に AF (Access Flag, bit 10) がある。**立て忘れると
  *      アクセスした瞬間に例外**になる。riscv64 の PTE には無いビット。
@@ -33,6 +35,10 @@ extern char __data_start[];
 extern char __data_end[];
 extern char __bss_start[];
 extern char __bss_end[];
+extern char __user_text_start[];
+extern char __user_text_end[];
+extern char __user_data_start[];
+extern char __user_data_end[];
 
 #define AARCH64_PAGE_SIZE   0x1000ULL
 #define AARCH64_BLOCK_SIZE  0x200000ULL          /* 2MB。L2 の 1 エントリ */
@@ -50,8 +56,9 @@ extern char __bss_end[];
 #define PTE_TABLE       (1ULL << 1)   /* L1/L2 では次段テーブル、L3 ではページ */
 #define PTE_ATTRINDX(n) (((uint64_t)(n)) << 2)
 #define PTE_AP_RW_EL1   (0ULL << 6)   /* AP[2:1]=00 EL1 で読み書き、EL0 は不可 */
-#define PTE_AP_RW_EL0   (1ULL << 6)   /* AP=01 EL0 からも読み書き (M3 で使う) */
-#define PTE_AP_RO_EL1   (2ULL << 6)   /* AP=10 EL1 で読み取りのみ */
+#define PTE_AP_RW_EL0   (1ULL << 6)   /* AP=01 EL1/EL0 とも読み書き */
+#define PTE_AP_RO_EL1   (2ULL << 6)   /* AP=10 EL1 で読み取りのみ、EL0 は不可 */
+#define PTE_AP_RO_EL0   (3ULL << 6)   /* AP=11 EL1/EL0 とも読み取りのみ */
 #define PTE_SH_INNER    (3ULL << 8)   /* Inner Shareable。Normal メモリに付ける */
 #define PTE_AF          (1ULL << 10)  /* Access Flag。**必須** */
 #define PTE_nG          (1ULL << 11)  /* 0 = global。カーネル領域は 0 のまま */
@@ -126,6 +133,18 @@ extern char __bss_end[];
 #define VM_KERNEL_RO    (VM_ATTR_NORMAL | PTE_AP_RO_EL1 | PTE_UXN | PTE_PXN)
 #define VM_KERNEL_RW    (VM_ATTR_NORMAL | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN)
 #define VM_DEVICE_RW    (VM_ATTR_DEVICE | PTE_AP_RW_EL1 | PTE_UXN | PTE_PXN)
+
+/* ---- EL0 から使えるページ (M3a) -----------------------------------------
+ *
+ * M3a ではアドレス空間を分けていない。カーネルと同じテーブルに、
+ * **AP (権限ビット) だけを変えて**張る。分けるには TTBR1 でカーネルを
+ * 上位半分へ移すのが先で、それは M3b。
+ *
+ * **PXN を必ず立てること。** EL1 がユーザーのコードを実行できてしまうと、
+ * ユーザーが書いた命令をカーネル権限で走らせる道ができる。
+ * UXN と PXN は別のビットで、片方だけでは塞げない。 */
+#define VM_USER_TEXT    (VM_ATTR_NORMAL | PTE_AP_RO_EL0 | PTE_PXN)
+#define VM_USER_RW      (VM_ATTR_NORMAL | PTE_AP_RW_EL0 | PTE_UXN | PTE_PXN)
 
 /* ---- テーブルの置き場 ----------------------------------------------------
  *
@@ -292,6 +311,20 @@ static void aarch64_vm_build_tables(void) {
     if (kend < kblk_end) {
         aarch64_vm_map_range(kend, kend, kblk_end - kend, VM_KERNEL_RW);
     }
+
+    /* EL0 のページ (M3a)。**カーネルの区画を張った後に上書きする。**
+     * .user_text / .user_data はカーネルの範囲の中にあるので、先に
+     * VM_KERNEL_RW で張られている。順序を逆にすると権限が戻ってしまう */
+    aarch64_vm_map_range((uint64_t)(uintptr_t)__user_text_start,
+                         (uint64_t)(uintptr_t)__user_text_start,
+                         (uint64_t)(uintptr_t)__user_text_end -
+                             (uint64_t)(uintptr_t)__user_text_start,
+                         VM_USER_TEXT);
+    aarch64_vm_map_range((uint64_t)(uintptr_t)__user_data_start,
+                         (uint64_t)(uintptr_t)__user_data_start,
+                         (uint64_t)(uintptr_t)__user_data_end -
+                             (uint64_t)(uintptr_t)__user_data_start,
+                         VM_USER_RW);
 
     /* MMIO。**Device 属性で張ること。** Normal で張ると UART への書き込みが
      * キャッシュに溜まって出てこない、GIC の読みが古い値を返す、という形で

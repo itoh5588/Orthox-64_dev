@@ -56,7 +56,7 @@ run_one() {  # $1 = -machine の値、$2 = ログ、$3 = -m の値
         -kernel "$KERNEL" < /dev/null > "$log" 2>&1 &
     QEMU_PID=$!
     for _ in {1..30}; do
-        if grep -aqE "aarch64-mmu-(ok|BAD)" "$log" 2>/dev/null; then
+        if grep -aqE "aarch64-user-(ok|BAD)" "$log" 2>/dev/null; then
             break
         fi
         sleep 1
@@ -128,6 +128,29 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量 (16
     grep -aq "aarch64-mmu-ok" "$2"
     ! grep -aq "aarch64-mmu-BAD" "$2"
 
+    # M3a: EL0 に降りて svc で戻る
+    #
+    # 判定は 3 本立て。**どれか 1 つでは足りない**:
+    #
+    #   1. EL0 から write が届く      → 遷移と svc の往復が成立している
+    #   2. EL0 実行中に tick が入る   → 「下位 EL の IRQ」ベクタ (+0x480) が
+    #      効いている。M2 まではカーネル実行中の IRQ (+0x280) しか通っていない
+    #   3. EL0 からカーネルの .text を読むと permission fault になる
+    #      → **アドレス空間を分けていないので、AP だけが EL0 を締め出している。**
+    #        ここが上がらなければユーザーからカーネルが素通し
+    grep -aq "M3a: EL0 + svc" "$2"
+    grep -aq "\[EL0\] hello from user mode" "$2"
+    grep -aq "\[EL0\] resumed after permission fault" "$2"   # 落ちた後の再開
+    grep -aq "svc calls : 0x0000000000000003" "$2"             # write x2 + exit
+    grep -aq "exit code : 0x0000000000000000" "$2"
+    # 行末は "\r\n" (UART が \n の前に \r を出す) なので $ で留めない
+    grep -aq "el0 ticks : .*  ok" "$2"
+    # **translation fault では駄目。** それは「張っていない」だけで、
+    # 権限で弾いた証拠にならない (DFSC=0b0011xx が permission fault)
+    grep -aq "user probe: ESR=0x000000009200000f .*(permission fault) ok" "$2"
+    grep -aq "aarch64-user-ok" "$2"
+    ! grep -aq "aarch64-user-BAD" "$2"
+
     # 想定外の例外を踏んでいないこと
     ! grep -aq "aarch64-exception-BAD" "$2"
 }
@@ -145,4 +168,4 @@ run_one "virt" LOGs/aarch64-serial-1g.log 1G
 check_one "RAM 1GB (DTB 追随)" LOGs/aarch64-serial-1g.log 0x0000000040000000
 grep -aq "ram end-1 : 0x000000007fffffff" LOGs/aarch64-serial-1g.log
 
-echo "aarch64 smoke test: PASS (M0 + M1 + M2 + M2b, EL1 / EL2 降格 / RAM 1GB の 3 通り)"
+echo "aarch64 smoke test: PASS (M0 + M1 + M2 + M2b + M3a, EL1 / EL2 降格 / RAM 1GB の 3 通り)"

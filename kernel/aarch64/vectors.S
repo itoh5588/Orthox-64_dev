@@ -113,11 +113,11 @@ aarch64_vectors:
     VENTRY  vec_unexpected_6    /* FIQ */
     VENTRY  vec_unexpected_7    /* SError */
 
-/* --- 下位 EL (AArch64) から。M3 でユーザーが来たら使う ---------------- */
-    VENTRY  vec_unexpected_8
-    VENTRY  vec_unexpected_9
-    VENTRY  vec_unexpected_10
-    VENTRY  vec_unexpected_11
+/* --- 下位 EL (AArch64) = EL0 から。M3a で実装した ---------------------- */
+    VENTRY  vec_el0_sync        /* svc と、ユーザーが起こしたアボート */
+    VENTRY  vec_el0_irq         /* **EL0 実行中のタイマはここに来る** */
+    VENTRY  vec_unexpected_10   /* FIQ */
+    VENTRY  vec_unexpected_11   /* SError */
 
 /* --- 下位 EL (AArch32) から。32bit は使わない ------------------------- */
     VENTRY  vec_unexpected_12
@@ -155,14 +155,35 @@ vec_el1_irq:
     RESTORE_ALL
     eret
 
+/* EL0 からの同期例外。svc (システムコール) と、ユーザーが起こしたアボートの
+ * 両方がここに来る。ESR の EC で C 側が振り分ける。
+ *
+ * **積んだフレームの先頭を C に渡す。** システムコールは x0-x7 を引数として
+ * 読み、x0 に戻り値を書き戻す必要があるので、フレームを直接触らせる。
+ * 戻り先 (ELR) を書き替えれば「EL0 に戻さずカーネルへ抜ける」もできる */
+vec_el0_sync:
+    SAVE_ALL
+    mov     x0, sp              /* フレームの先頭 = 保存した x0 の位置 */
+    mrs     x1, esr_el1
+    mrs     x2, far_el1
+    bl      aarch64_lower_el_sync
+    RESTORE_ALL
+    eret
+
+/* EL0 実行中の IRQ。**カーネル実行中の IRQ (+0x280) とは別の入口。**
+ * ここを実装しないと、EL0 に降りた瞬間にタイマが取りこぼされる */
+vec_el0_irq:
+    SAVE_ALL
+    bl      aarch64_irq_handler
+    RESTORE_ALL
+    eret
+
     UNEXPECTED_BODY vec_unexpected_0,  0
     UNEXPECTED_BODY vec_unexpected_1,  1
     UNEXPECTED_BODY vec_unexpected_2,  2
     UNEXPECTED_BODY vec_unexpected_3,  3
     UNEXPECTED_BODY vec_unexpected_6,  6
     UNEXPECTED_BODY vec_unexpected_7,  7
-    UNEXPECTED_BODY vec_unexpected_8,  8
-    UNEXPECTED_BODY vec_unexpected_9,  9
     UNEXPECTED_BODY vec_unexpected_10, 10
     UNEXPECTED_BODY vec_unexpected_11, 11
     UNEXPECTED_BODY vec_unexpected_12, 12

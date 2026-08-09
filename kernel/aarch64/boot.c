@@ -96,6 +96,7 @@ uint64_t aarch64_timer_freq(void);
 uint64_t aarch64_timer_ticks(void);
 uint32_t aarch64_timer_intid(void);
 void aarch64_vm_init(void);
+int aarch64_user_run(void);
 
 /* MMU の探針 (vm.c)。「未マップの VA を読んだら fault が上がるはず」の
  * やりとりに使う。上がった fault はここで拾って呼び出し元に返す */
@@ -311,6 +312,9 @@ void aarch64_early_main(uint64_t dtb_phys) {
             aarch64_uart_puts("aarch64-mmu-BAD (MMU on で tick が止まった)\n");
         }
     }
+
+    /* ---- M3a: EL0 に降りて svc で戻る ---------------------------------- */
+    aarch64_user_run();
 
     aarch64_wait_forever();
 }
