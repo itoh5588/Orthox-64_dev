@@ -1,10 +1,13 @@
 /*
  * GICv2 (Generic Interrupt Controller)。riscv64 の PLIC に相当する。
  *
- * アドレスは QEMU が吐いた DTB の実測値:
+ * アドレスは DTB の intc から取る (M2b)。QEMU virt の実測値:
  *   intc@8000000  reg[0] = 0x08000000 size 0x10000  Distributor
  *                 reg[1] = 0x08010000 size 0x10000  CPU Interface
  *   compatible = arm,cortex-a15-gic (GICv2)
+ *
+ * **reg[1] を落とすと CPU Interface が無いまま進む。** Pi 4 は GIC-400 で
+ * 名乗り方もアドレスも違うので、直書きでは動かない。
  *
  * 使い方は PLIC とほぼ同じ:
  *   1. Distributor で割り込みを有効化する
@@ -18,23 +21,38 @@
  *   32-    SPI  共有。UART や virtio
  */
 #include <stdint.h>
+#include "aarch64/boot.h"
 
-#define GICD_BASE   0x08000000UL
-#define GICC_BASE   0x08010000UL
+/* **アドレスは直書きしない。** DTB の intc から reg[0] / reg[1] を取る
+ * (M2b)。QEMU virt と Pi 4 では位置が違う */
+#define GICD_CTLR_OFF        0x000
+#define GICD_ISENABLER_OFF   0x100   /* 32 本ずつ 1 レジスタ */
+#define GICD_IPRIORITYR_OFF  0x400   /* 4 本ずつ 1 レジスタ */
 
-#define GICD_CTLR        (GICD_BASE + 0x000)
-#define GICD_ISENABLER   (GICD_BASE + 0x100)   /* 32 本ずつ 1 レジスタ */
-#define GICD_IPRIORITYR  (GICD_BASE + 0x400)   /* 4 本ずつ 1 レジスタ */
+#define GICC_CTLR_OFF   0x000
+#define GICC_PMR_OFF    0x004        /* 優先度マスク */
+#define GICC_IAR_OFF    0x00C        /* 割り込み番号の取得 */
+#define GICC_EOIR_OFF   0x010        /* 完了通知 */
 
-#define GICC_CTLR   (GICC_BASE + 0x000)
-#define GICC_PMR    (GICC_BASE + 0x004)        /* 優先度マスク */
-#define GICC_IAR    (GICC_BASE + 0x00C)        /* 割り込み番号の取得 */
-#define GICC_EOIR   (GICC_BASE + 0x010)        /* 完了通知 */
+static uint64_t g_gicd_base = AARCH64_QEMU_VIRT_GICD_BASE;
+static uint64_t g_gicc_base = AARCH64_QEMU_VIRT_GICC_BASE;
+
+#define GICD_CTLR        (g_gicd_base + GICD_CTLR_OFF)
+#define GICD_ISENABLER   (g_gicd_base + GICD_ISENABLER_OFF)
+#define GICD_IPRIORITYR  (g_gicd_base + GICD_IPRIORITYR_OFF)
+#define GICC_CTLR        (g_gicc_base + GICC_CTLR_OFF)
+#define GICC_PMR         (g_gicc_base + GICC_PMR_OFF)
+#define GICC_IAR         (g_gicc_base + GICC_IAR_OFF)
+#define GICC_EOIR        (g_gicc_base + GICC_EOIR_OFF)
 
 static inline void w32(uint64_t a, uint32_t v) { *(volatile uint32_t*)a = v; }
 static inline uint32_t r32(uint64_t a) { return *(volatile uint32_t*)a; }
 
 void aarch64_gic_init(void) {
+    const aarch64_boot_info_t* b = aarch64_boot_info();
+    if (b->gicd_base) g_gicd_base = b->gicd_base;
+    if (b->gicc_base) g_gicc_base = b->gicc_base;
+
     /* CPU Interface: 優先度マスクを最も緩く (0xF0 = すべて通す)。
      * ここを 0 のままにすると「有効にしたのに一度も上がらない」になる */
     w32(GICC_PMR, 0xF0);

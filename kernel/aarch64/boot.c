@@ -94,11 +94,8 @@ void aarch64_timer_init(void);
 void aarch64_timer_on_tick(void);
 uint64_t aarch64_timer_freq(void);
 uint64_t aarch64_timer_ticks(void);
+uint32_t aarch64_timer_intid(void);
 void aarch64_vm_init(void);
-
-/* 非セキュア物理タイマの割り込み番号。DTB から取れているが、まだ使っていない
- * (次のコミットで vm / gic / timer に配線する) */
-#define AARCH64_IRQ_TIMER 30
 
 /* MMU の探針 (vm.c)。「未マップの VA を読んだら fault が上がるはず」の
  * やりとりに使う。上がった fault はここで拾って呼び出し元に返す */
@@ -261,7 +258,7 @@ void aarch64_early_main(uint64_t dtb_phys) {
     /* ---- M1: 例外ベクタ + GIC + generic timer -------------------------- */
     aarch64_vectors_init();
     aarch64_gic_init();
-    aarch64_gic_enable_irq(AARCH64_IRQ_TIMER);
+    aarch64_gic_enable_irq(aarch64_timer_intid());
     aarch64_timer_init();
 
     aarch64_uart_puts("  timer freq: ");
@@ -323,7 +320,7 @@ void aarch64_irq_handler(void) {
     uint32_t iar = aarch64_gic_claim();
     uint32_t intid = iar & 0x3ffU;
 
-    if (intid == AARCH64_IRQ_TIMER) {
+    if (intid == aarch64_timer_intid()) {
         aarch64_timer_on_tick();
     }
     /* 1023 は「上がっていなかった」を意味する偽物。EOI してはいけない */

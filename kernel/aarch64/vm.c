@@ -21,11 +21,7 @@
  * VA == PA ならその心配が無い。
  */
 #include <stdint.h>
-
-void aarch64_uart_puts(const char* s);
-void aarch64_uart_putchar(char c);
-void aarch64_uart_puthex64(uint64_t v);
-void aarch64_wait_forever(void);
+#include "aarch64/boot.h"
 
 extern char __kernel_start[];
 extern char __kernel_end[];
@@ -247,36 +243,30 @@ uint64_t aarch64_vm_translate(uint64_t va) {
     return 0;
 }
 
-/* ---- QEMU virt の実測値 (kernel/aarch64/boot.c 冒頭と同じ出どころ) ------ */
-#define AARCH64_RAM_BASE    0x40000000ULL
-#define AARCH64_RAM_SIZE    0x20000000ULL   /* 512MB */
-#define AARCH64_GIC_BASE    0x08000000ULL   /* Distributor + CPU Interface */
-#define AARCH64_GIC_SIZE    0x00020000ULL
-#define AARCH64_UART_BASE   0x09000000ULL
 #define AARCH64_UART_SIZE   0x00001000ULL
-#define AARCH64_VIRTIO_BASE 0x0a000000ULL
-#define AARCH64_VIRTIO_SIZE 0x00004000ULL   /* 0x200 x 32 スロット */
 
 static void aarch64_vm_build_tables(void) {
+    const aarch64_boot_info_t* b = aarch64_boot_info();
+    uint64_t ram_base = b->memory_base;
+    uint64_t ram_end  = b->memory_base + b->memory_size;
     uint64_t kstart = (uint64_t)(uintptr_t)__kernel_start;
     uint64_t kend   = aarch64_align_up((uint64_t)(uintptr_t)__kernel_end, AARCH64_PAGE_SIZE);
     uint64_t kblk_start = aarch64_align_down(kstart, AARCH64_BLOCK_SIZE);
     uint64_t kblk_end   = aarch64_align_up(kend, AARCH64_BLOCK_SIZE);
+    uint64_t virtio_size;
 
     uint64_t* root = aarch64_vm_alloc_table();
     if (!root) return;
     g_root_pa = (uint64_t)(uintptr_t)root;
 
     /* RAM のうちカーネルが載っている 2MB ブロックの手前と奥。ここは
-     * 大きいブロックで一気に張る (読み書き可・実行不可) */
-    if (kblk_start > AARCH64_RAM_BASE) {
-        aarch64_vm_map_range(AARCH64_RAM_BASE, AARCH64_RAM_BASE,
-                             kblk_start - AARCH64_RAM_BASE, VM_KERNEL_RW);
+     * 大きいブロックで一気に張る (読み書き可・実行不可)。
+     * **範囲は DTB が言う実際の RAM。** 直書きの 512MB ではない */
+    if (kblk_start > ram_base) {
+        aarch64_vm_map_range(ram_base, ram_base, kblk_start - ram_base, VM_KERNEL_RW);
     }
-    if (kblk_end < AARCH64_RAM_BASE + AARCH64_RAM_SIZE) {
-        aarch64_vm_map_range(kblk_end, kblk_end,
-                             AARCH64_RAM_BASE + AARCH64_RAM_SIZE - kblk_end,
-                             VM_KERNEL_RW);
+    if (kblk_end < ram_end) {
+        aarch64_vm_map_range(kblk_end, kblk_end, ram_end - kblk_end, VM_KERNEL_RW);
     }
 
     /* カーネルが載っているブロックだけは 4KB ページで、区画ごとに権限を分ける。
@@ -305,13 +295,20 @@ static void aarch64_vm_build_tables(void) {
 
     /* MMIO。**Device 属性で張ること。** Normal で張ると UART への書き込みが
      * キャッシュに溜まって出てこない、GIC の読みが古い値を返す、という形で
-     * 壊れる (QEMU では見逃せても実機で出る) */
-    aarch64_vm_map_range(AARCH64_GIC_BASE, AARCH64_GIC_BASE,
-                         AARCH64_GIC_SIZE, VM_DEVICE_RW);
-    aarch64_vm_map_range(AARCH64_UART_BASE, AARCH64_UART_BASE,
-                         AARCH64_UART_SIZE, VM_DEVICE_RW);
-    aarch64_vm_map_range(AARCH64_VIRTIO_BASE, AARCH64_VIRTIO_BASE,
-                         AARCH64_VIRTIO_SIZE, VM_DEVICE_RW);
+     * 壊れる (QEMU では見逃せても実機で出る)。
+     *
+     * アドレスは DTB 由来。**GIC は Distributor と CPU Interface を別々に
+     * 張る。** 連続しているとは限らないので 1 つの範囲にまとめない
+     * (QEMU virt は 0x08000000 と 0x08010000 で隣り合うが、Pi 4 は違う) */
+    aarch64_vm_map_range(b->gicd_base, b->gicd_base, b->gicd_size, VM_DEVICE_RW);
+    aarch64_vm_map_range(b->gicc_base, b->gicc_base, b->gicc_size, VM_DEVICE_RW);
+    aarch64_vm_map_range(b->uart_base, b->uart_base, AARCH64_UART_SIZE, VM_DEVICE_RW);
+
+    /* virtio-mmio のスロット全域。本数と刻み幅は DTB 由来 */
+    virtio_size = (uint64_t)b->virtio_mmio_count * b->virtio_mmio_stride;
+    if (virtio_size < AARCH64_PAGE_SIZE) virtio_size = AARCH64_PAGE_SIZE;
+    aarch64_vm_map_range(b->first_virtio_mmio_base, b->first_virtio_mmio_base,
+                         virtio_size, VM_DEVICE_RW);
 }
 
 /* MMU を入れる。順序が全て:
@@ -400,6 +397,7 @@ static void aarch64_vm_fault_probe(void) {
 }
 
 void aarch64_vm_init(void) {
+    const aarch64_boot_info_t* b = aarch64_boot_info();
     uint64_t kstart = (uint64_t)(uintptr_t)__kernel_start;
 
     aarch64_uart_puts("--- M2: MMU (identity, 4KB granule, VA 39bit) ---\n");
@@ -429,9 +427,13 @@ void aarch64_vm_init(void) {
     aarch64_uart_puts("  text ->pa : ");
     aarch64_uart_puthex64(aarch64_vm_translate((uint64_t)(uintptr_t)__text_start));
     aarch64_uart_puts("\n  uart ->pa : ");
-    aarch64_uart_puthex64(aarch64_vm_translate(AARCH64_UART_BASE));
-    aarch64_uart_puts("\n  gic  ->pa : ");
-    aarch64_uart_puthex64(aarch64_vm_translate(AARCH64_GIC_BASE));
+    aarch64_uart_puthex64(aarch64_vm_translate(b->uart_base));
+    aarch64_uart_puts("\n  gicd ->pa : ");
+    aarch64_uart_puthex64(aarch64_vm_translate(b->gicd_base));
+    aarch64_uart_puts("\n  gicc ->pa : ");
+    aarch64_uart_puthex64(aarch64_vm_translate(b->gicc_base));
+    aarch64_uart_puts("\n  ram end-1 : ");
+    aarch64_uart_puthex64(aarch64_vm_translate(b->memory_base + b->memory_size - 1));
     aarch64_uart_puts("\n");
     {
         uint64_t sp;
@@ -441,8 +443,12 @@ void aarch64_vm_init(void) {
         aarch64_uart_puts("\n");
     }
 
+    /* **RAM の末尾まで張れているかを見る。** DTB から取った容量でマップして
+     * いるので、ここが 0 なら「DTB の言う RAM を張り切れていない」 */
     if (aarch64_vm_translate((uint64_t)(uintptr_t)__text_start) == 0 ||
-        aarch64_vm_translate(AARCH64_UART_BASE) == 0) {
+        aarch64_vm_translate(b->uart_base) == 0 ||
+        aarch64_vm_translate(b->gicc_base) == 0 ||
+        aarch64_vm_translate(b->memory_base + b->memory_size - 1) == 0) {
         aarch64_uart_puts("aarch64-mmu-BAD (有効化前の確認で 0 が出た)\n");
         return;
     }

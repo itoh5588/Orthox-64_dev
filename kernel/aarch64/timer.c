@@ -10,9 +10,11 @@
  * CVAL (絶対時刻) ではなく TVAL (相対) を使う。tick ごとに間隔を書き直す
  * だけで済み、riscv64 の「現在時刻 + 間隔を書く」より 1 手少ない。
  *
- * 割り込みは GIC の PPI 30 で上がる (DTB 実測)。
+ * 割り込み番号は DTB の timer ノードの interrupts から取る (M2b)。
+ * QEMU virt では <1 14 0x104> = PPI 14 → INTID 30。
  */
 #include <stdint.h>
+#include "aarch64/boot.h"
 
 #define TICK_HZ 100     /* 10ms 刻み。x86 / riscv64 の SCHED_TICK_MS と揃える */
 
@@ -42,6 +44,13 @@ uint64_t aarch64_timer_freq(void) {
 
 uint64_t aarch64_timer_ticks(void) {
     return g_ticks;
+}
+
+/* 非セキュア物理タイマの INTID。GIC に有効化を頼むときに使う */
+uint32_t aarch64_timer_intid(void) {
+    const aarch64_boot_info_t* b = aarch64_boot_info();
+    if (b->timer_intid) return b->timer_intid;
+    return AARCH64_TIMER_PPI_DEFAULT + AARCH64_PPI_INTID_BASE;
 }
 
 void aarch64_timer_init(void) {
