@@ -75,6 +75,7 @@ kernel-output.img
 # Private / internal files (root-level only; book-reader/ keeps its own CLAUDE.md)
 /CLAUDE.md
 RISCV-virt-Porting-Plan.md
+AArch64-virt-Porting-Plan.md
 SMP-Design.md
 future.md
 send_keys.py

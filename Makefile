@@ -286,6 +286,42 @@ $(BUILD_DIR)/kernel/%.o: kernel/%.S
 	@mkdir -p $(@D)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
+# ---- AArch64 (QEMU virt) ------------------------------------------------
+# 日報2026-08-02 の段取り 1。virtio-mmio が使えるので M4 で
+# kernel/riscv64/virtio_blk_mmio.c を流用できる。Pi 固有の話は出さない。
+# アドレスは QEMU が吐いた DTB の実測値 (kernel/aarch64/boot.c 冒頭に記録)
+AARCH64_CC = $(RISCV64_CC)
+AARCH64_KERNEL_ELF = out/kernel-aarch64.elf
+AARCH64_C_SRCS = kernel/aarch64/boot.c
+AARCH64_ASM_SRCS = kernel/aarch64/start.S
+AARCH64_CFLAGS = --target=aarch64-none-elf -mgeneral-regs-only \
+	-ffreestanding -fno-stack-protector -fno-stack-check -fno-lto -fno-PIE \
+	-mcmodel=small -O2 -Wall -Wextra -Iinclude -MMD -MP
+AARCH64_LDFLAGS = -nostdlib -static -m aarch64elf -T scripts/kernel-aarch64.ld
+AARCH64_OBJS = $(patsubst kernel/aarch64/%.c, $(BUILD_DIR)/aarch64/kernel/%.o, $(AARCH64_C_SRCS)) \
+	$(patsubst kernel/aarch64/%.S, $(BUILD_DIR)/aarch64/kernel/%_asm.o, $(AARCH64_ASM_SRCS))
+
+$(BUILD_DIR)/aarch64/kernel/%.o: kernel/aarch64/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/aarch64/kernel/%_asm.o: kernel/aarch64/%.S
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_CFLAGS) -c $< -o $@
+
+$(AARCH64_KERNEL_ELF): $(AARCH64_OBJS)
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_LDFLAGS) $(AARCH64_OBJS) -o $@
+
+aarch64-kernel: $(AARCH64_KERNEL_ELF)
+
+aarch64-run: $(AARCH64_KERNEL_ELF)
+	qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 512M -smp 1 \
+		-nographic -kernel $(AARCH64_KERNEL_ELF)
+
+aarch64-smoke: $(AARCH64_KERNEL_ELF)
+	bash ./tests/aarch64_smoke.sh
+
 $(RISCV64_KERNEL_ELF): $(RISCV64_OBJS)
 	@mkdir -p $(@D)
 	$(LD) $(RISCV64_LDFLAGS) $(RISCV64_OBJS) -o $@
