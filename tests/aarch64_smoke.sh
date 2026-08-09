@@ -44,15 +44,40 @@ trap cleanup EXIT
 #
 # 降格を入れる前は 2 通り目で ticks が 0 になった (EL2 では VBAR_EL1 の表が
 # 使われないため)。実機が無くても EL2 経路を検証できる。
-run_one() {  # $1 = -machine の値、$2 = ログ、$3 = -m の値
-    local machine="$1" log="$2" mem="${3:-512M}"
+# M4 の確認用ディスク。**新しい名前を使う。** out/rootfs-*.img には触らない
+# (日報2026-08-09 D: rootfs-gcc-selfhost.img を消さないこと)
+TEST_DISK=out/aarch64-test-disk.img
+make_test_disk() {
+    mkdir -p out
+    rm -f "$TEST_DISK"
+    # 1MB。LBA 0 と LBA 1 に**別々の**既知の文字列を置く。
+    # 別々にするのは「LBA を無視して同じ場所を読んでいる」を弾くため
+    python3 - "$TEST_DISK" <<'PYEOF'
+import sys
+size = 1024 * 1024
+buf = bytearray(size)
+buf[0:24]     = b"ORTHOX-AARCH64-M4-SEC000"
+buf[512:536]  = b"ORTHOX-AARCH64-M4-SEC001"
+open(sys.argv[1], "wb").write(buf)
+PYEOF
+}
+
+run_one() {  # $1 = -machine、$2 = ログ、$3 = -m、$4 = 非空ならディスクを付ける
+    local machine="$1" log="$2" mem="${3:-512M}" disk="${4:-}"
+    local drive_args=()
     rm -f "$log"
+    if [ -n "$disk" ]; then
+        make_test_disk
+        drive_args=(-drive "file=$TEST_DISK,if=none,format=raw,id=vblk0"
+                    -device virtio-blk-device,drive=vblk0)
+    fi
     "$QEMU_BIN" \
         -machine "$machine" \
         -cpu cortex-a72 \
         -m "$mem" \
         -smp 1 \
         -nographic \
+        "${drive_args[@]}" \
         -kernel "$KERNEL" < /dev/null > "$log" 2>&1 &
     QEMU_PID=$!
     for _ in {1..60}; do
@@ -189,6 +214,10 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     grep -aq "aarch64-user-ok" "$2"
     ! grep -aq "aarch64-user-BAD" "$2"
 
+    # M4: virtio-blk。**デバイスの有無で結果が変わるので、ここでは
+    # 「壊れていない」ことだけを見る。** 中身の判定はディスク付きの回で行う
+    ! grep -aq "aarch64-virtio-BAD" "$2"
+
     # 想定外の例外を踏んでいないこと
     ! grep -aq "aarch64-exception-BAD" "$2"
 }
@@ -205,4 +234,17 @@ check_one "EL2 起動 -> 降格" LOGs/aarch64-serial-el2.log 0x0000000020000000 
 run_one "virt" LOGs/aarch64-serial-1g.log 1G
 check_one "RAM 1GB (DTB 追随)" LOGs/aarch64-serial-1g.log 0x0000000040000000 0x000000007fffffff
 
-echo "aarch64 smoke test: PASS (M0 + M1 + M2 + M2b + M3a + M3b + M3c, EL1 / EL2 降格 / RAM 1GB の 3 通り)"
+# M4: virtio-blk を付けて起動する。**付けない 3 通りでは
+# aarch64-virtio-none になる** (デバイスが無いことを正しく検出している)
+run_one "virt" LOGs/aarch64-serial-disk.log 512M with-disk
+check_one "virtio-blk 付き" LOGs/aarch64-serial-disk.log 0x0000000020000000 0x000000005fffffff
+echo "--- M4 の判定 ---"
+# **「見つかった」だけでは証拠にならない。** 読んだ中身まで見る
+grep -aq "read lba0 : \"ORTHOX-AARCH64-M4-SEC000\"  ok" LOGs/aarch64-serial-disk.log
+# LBA 0 と違う中身が返ること = LBA が効いている
+grep -aq "read lba1 : \"ORTHOX-AARCH64-M4-SEC001\"  ok (LBA が効いている)" LOGs/aarch64-serial-disk.log
+grep -aq "write/read: ok (書いたものが読み戻せた)" LOGs/aarch64-serial-disk.log
+grep -aq "aarch64-virtio-ok" LOGs/aarch64-serial-disk.log
+! grep -aq "aarch64-virtio-BAD" LOGs/aarch64-serial-disk.log
+
+echo "aarch64 smoke test: PASS (M0-M4, EL1 / EL2 降格 / RAM 1GB / virtio-blk の 4 通り)"

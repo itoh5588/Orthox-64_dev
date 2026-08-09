@@ -107,6 +107,12 @@ uint64_t aarch64_vm_kernel_root_pa(void);
 uint64_t aarch64_vm_user_root_pa(void);
 void aarch64_gic_set_base(uint64_t gicd, uint64_t gicc);
 int aarch64_user_run(void);
+int aarch64_virtio_blk_init(void);
+int aarch64_virtio_blk_read(uint64_t lba, void* buf, uint32_t sectors);
+int aarch64_virtio_blk_write(uint64_t lba, const void* buf, uint32_t sectors);
+uint64_t aarch64_virtio_blk_capacity(void);
+uint64_t aarch64_virtio_blk_base_pa(void);
+void aarch64_virtio_blk_selftest(void);
 
 /* MMU の探針 (vm.c)。「未マップの VA を読んだら fault が上がるはず」の
  * やりとりに使う。上がった fault はここで拾って呼び出し元に返す */
@@ -383,7 +389,10 @@ void aarch64_boot_continue(void) {
         }
     }
 
-    /* ---- M3a: EL0 に降りて svc で戻る ---------------------------------- */
+    /* ---- M4: virtio-mmio (virtio-blk) ---------------------------------- */
+    aarch64_virtio_blk_selftest();
+
+    /* ---- M3a/M3b/M3c: EL0 + アドレス空間 + 切り替え -------------------- */
     aarch64_user_run();
 
     aarch64_wait_forever();
