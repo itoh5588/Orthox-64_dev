@@ -42,6 +42,54 @@ _start:
     /* 起こすのは CPU 0 だけ。他は M1 まで寝かせる */
     cbnz    x20, 2f
 
+    /* ---- EL2 で起動していたら EL1 へ降りる --------------------------------
+     *
+     * QEMU virt は既定 (virtualization=off) だと EL1 から始まるが、
+     * **Raspberry Pi 4 のファームウェアは EL2 で起動する**。
+     *
+     * EL2 のままだと例外は VBAR_EL2 を見るので、VBAR_EL1 に登録した表が
+     * 使われず、タイマ割り込みを取りこぼす。実測:
+     *
+     *   -machine virt,virtualization=on  → CurrentEL: EL2、ticks: 0 (timer-BAD)
+     *
+     * QEMU で再現できるので、実機が無くても検証できる。 */
+    mrs     x0, CurrentEL
+    lsr     x0, x0, #2
+    cmp     x0, #2
+    b.ne    4f                  /* 既に EL1 なら何もしない */
+
+    /* EL1 は AArch64 (HCR_EL2.RW = 1)。ここを 0 のままにすると EL1 が
+     * AArch32 扱いになり、eret した瞬間に迷子になる */
+    movz    x0, #0x8000, lsl #16
+    msr     hcr_el2, x0
+
+    /* SCTLR_EL1 は RES1 ビットを立てた最小値。MMU とキャッシュは off
+     * (0x30d00800 = bit 11,20,22,23,28,29)。M2 で MMU を入れるときに触る */
+    movz    x0, #0x0800
+    movk    x0, #0x30d0, lsl #16
+    msr     sctlr_el1, x0
+
+    /* EL1 から物理カウンタ / 物理タイマを触れるようにする。
+     * ここを開けないと CNTP_* が trap して generic timer が動かない */
+    mrs     x0, cnthctl_el2
+    orr     x0, x0, #3          /* EL1PCTEN | EL1PCEN */
+    msr     cnthctl_el2, x0
+    msr     cntvoff_el2, xzr    /* 仮想カウンタのオフセットを 0 に */
+
+    /* 戻り先の状態: EL1h (SP_EL1 を使う) / DAIF は全マスク。
+     * 割り込みは C 側が daifclr で開ける */
+    movz    x0, #0x03c5
+    msr     spsr_el2, x0
+
+    /* EL1 での sp は SP_EL1。いま組んだスタックをそのまま引き継ぐ */
+    mov     x0, sp
+    msr     sp_el1, x0
+
+    adr     x0, 4f
+    msr     elr_el2, x0
+    eret
+
+4:
     /* .bss を 0 で埋める。C に入る前に済ませること */
     adrp    x1, __bss_start
     add     x1, x1, :lo12:__bss_start
