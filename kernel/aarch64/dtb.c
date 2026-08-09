@@ -1,0 +1,363 @@
+/*
+ * Devicetree (FDT) パーサ。
+ *
+ * **アドレスを直書きしたままだと Raspberry Pi 4 で必ず破綻する。** RAM も
+ * PL011 も GIC も、QEMU virt とは全部違う場所にある。ここで DTB から取る。
+ *
+ * 作りは kernel/riscv64/boot.c の riscv64_dtb_scan を土台にしているが、
+ * **2 点だけ変えてある**。どちらも実測で痛い目を見た所:
+ *
+ *   1. #address-cells / #size-cells を実際に読む。
+ *      riscv64 版は reg の長さから「2 セル / 2 セル だろう」と推測している。
+ *      QEMU virt では当たるが、Pi 4 の DT はノードによって違うので破綻する。
+ *
+ *   2. reg の 2 組目以降も読む。
+ *      日報2026-08-09 §1 で、GIC の reg の 1 組目 (Distributor) しか読まず
+ *      **CPU Interface (reg[1]) を取りこぼした**。GIC は 2 組そろって初めて
+ *      使える。「読んだ」で満足せず、必要な項目が全部取れたかまで見る。
+ *
+ * DTB の中身はすべてビッグエンディアン。AArch64 はリトルエンディアンで
+ * 動かすので、読むたびに並べ替える。
+ */
+#include <stdint.h>
+#include "aarch64/boot.h"
+#include "aarch64/dtb.h"
+
+uint32_t aarch64_dtb_read_be32(const void* addr) {
+    const uint8_t* p = (const uint8_t*)addr;
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8)  | ((uint32_t)p[3]);
+}
+
+uint64_t aarch64_dtb_read_be64(const void* addr) {
+    const uint8_t* p = (const uint8_t*)addr;
+    return ((uint64_t)aarch64_dtb_read_be32(p) << 32) |
+           (uint64_t)aarch64_dtb_read_be32(p + 4);
+}
+
+int aarch64_dtb_valid(uint64_t dtb_pa) {
+    if (!dtb_pa) return 0;
+    return aarch64_dtb_read_be32((const void*)(uintptr_t)dtb_pa) == AARCH64_FDT_MAGIC;
+}
+
+uint32_t aarch64_dtb_total_size(uint64_t dtb_pa) {
+    const aarch64_fdt_header_t* h = (const aarch64_fdt_header_t*)(uintptr_t)dtb_pa;
+    if (!aarch64_dtb_valid(dtb_pa)) return 0;
+    return aarch64_dtb_read_be32(&h->totalsize);
+}
+
+/* QEMU に ELF を -kernel で渡すと x0 に DTB のアドレスが来ない (実測。
+ * -dtb を足しても変わらない)。Linux の boot protocol は Image 形式向けで、
+ * ELF は「素のバイナリ」として扱われるため。
+ *
+ * **実機の Pi 4 のファームウェアは x0 で渡す。** つまりマジックの走査は
+ * QEMU 用の回避策で、実機では素直に x0 を使える。x0 を先に見るのはそのため。 */
+uint64_t aarch64_dtb_find(uint64_t hint) {
+    static const uint64_t candidates[] = {
+        0x40000000ULL,   /* RAM 先頭。QEMU virt が Linux 起動で置く場所 */
+        0x48000000ULL,   /* RAM 先頭 + 128MB */
+        0x44000000ULL,
+    };
+    if (aarch64_dtb_valid(hint)) return hint;
+    for (unsigned i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (aarch64_dtb_valid(candidates[i])) return candidates[i];
+    }
+    return 0;
+}
+
+static uint32_t align_up4(uint32_t v) { return (v + 3U) & ~3U; }
+
+static int str_eq(const char* a, const char* b) {
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++; b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+/* compatible は "a\0b\0c\0" と NUL 区切りで複数入っている。
+ * どれか 1 つでも一致すればよい */
+static int compatible_has(const char* data, uint32_t len, const char* needle) {
+    uint32_t i = 0;
+    if (!data || !needle) return 0;
+    while (i < len) {
+        const char* entry = data + i;
+        uint32_t entry_len = 0;
+        while (i + entry_len < len && entry[entry_len] != '\0') entry_len++;
+        if (i + entry_len >= len) break;
+        if (str_eq(entry, needle)) return 1;
+        i += entry_len + 1U;
+    }
+    return 0;
+}
+
+/* reg は「アドレス cells 個 + サイズ cells 個」を 1 組として繰り返す。
+ * **組の数はノードによって違う** (GIC は 2 組)。index 番目の組を取り出す。
+ * 戻り値: 取れたら 1 */
+static int reg_entry(const uint8_t* data, uint32_t len,
+                     uint32_t addr_cells, uint32_t size_cells,
+                     uint32_t index, uint64_t* out_base, uint64_t* out_size) {
+    uint32_t stride_cells = addr_cells + size_cells;
+    uint32_t stride_bytes = stride_cells * 4U;
+    uint32_t off;
+
+    if (!data || stride_bytes == 0) return 0;
+    if (addr_cells == 0 || addr_cells > 2 || size_cells > 2) return 0;
+
+    off = index * stride_bytes;
+    if (off + stride_bytes > len) return 0;
+
+    *out_base = (addr_cells == 2) ? aarch64_dtb_read_be64(data + off)
+                                  : (uint64_t)aarch64_dtb_read_be32(data + off);
+    off += addr_cells * 4U;
+
+    if (size_cells == 0) {
+        *out_size = 0;
+    } else {
+        *out_size = (size_cells == 2) ? aarch64_dtb_read_be64(data + off)
+                                      : (uint64_t)aarch64_dtb_read_be32(data + off);
+    }
+    return 1;
+}
+
+/* ノード名が "name@address" の "name" 部分と一致するか */
+static int node_name_is(const char* node, const char* name) {
+    while (*name) {
+        if (*node != *name) return 0;
+        node++; name++;
+    }
+    return *node == '\0' || *node == '@';
+}
+
+/* 木の深さごとに #address-cells / #size-cells を覚えておく。
+ * 子ノードの reg は**親の**セル数で解釈するので、親の値が要る */
+#define MAX_DEPTH 16
+
+/* いま見ているノードについて溜めておくもの。END_NODE で確定させる。
+ *
+ * **深さごとに持つこと。** 1 組しか持たずに書いていて実際に落ちた:
+ * QEMU virt の intc@8000000 には子ノード v2m@8020000 があり、子の
+ * BEGIN_NODE で親の compatible と reg が消え、親の END_NODE に着いたときに
+ * 何も残っていなかった。GIC だけ「既定値」のまま進んでいた
+ * (値が既定値と同じだったので出力は正しく見えた。フラグを持たせて
+ * いなければ気づけない)。
+ *
+ * kernel/riscv64/boot.c の riscv64_dtb_scan は 1 組しか持っていないが、
+ * あちらが拾う uart / virtio / memory は子ノードを持たないので露見しない。 */
+typedef struct dtb_node_state {
+    int is_uart;
+    int is_gic;
+    int is_virtio;
+    int is_memory;
+    int is_timer;
+    int is_cpu;
+    const uint8_t* reg_data;
+    uint32_t reg_len;
+    const uint8_t* intr_data;
+    uint32_t intr_len;
+} dtb_node_state_t;
+
+static void node_state_clear(dtb_node_state_t* n) {
+    n->is_uart = n->is_gic = n->is_virtio = 0;
+    n->is_memory = n->is_timer = n->is_cpu = 0;
+    n->reg_data = 0;
+    n->reg_len = 0;
+    n->intr_data = 0;
+    n->intr_len = 0;
+}
+
+void aarch64_dtb_scan(uint64_t dtb_pa) {
+    const aarch64_fdt_header_t* header = (const aarch64_fdt_header_t*)(uintptr_t)dtb_pa;
+    aarch64_boot_info_t* info = aarch64_boot_info_mut();
+    uint32_t struct_off, struct_size, strings_off;
+    const uint8_t* struct_base;
+    const char* strings_base;
+    uint32_t off = 0;
+    int depth = 0;
+
+    /* 既定は 2/2。DT の仕様上の既定は 2/1 だが、ルートで必ず明示されるので
+     * ここに落ちてくることは通常無い */
+    uint32_t addr_cells[MAX_DEPTH];
+    uint32_t size_cells[MAX_DEPTH];
+
+    dtb_node_state_t nodes[MAX_DEPTH];
+
+    /* virtio-mmio は本数が多く並ぶので、まとめてから確定させる */
+    uint64_t virtio_min = 0, virtio_max = 0;
+    uint32_t virtio_count = 0;
+
+    if (!aarch64_dtb_valid(dtb_pa)) return;
+
+    for (int i = 0; i < MAX_DEPTH; i++) {
+        addr_cells[i] = 2;
+        size_cells[i] = 2;
+        node_state_clear(&nodes[i]);
+    }
+
+    struct_off   = aarch64_dtb_read_be32(&header->off_dt_struct);
+    struct_size  = aarch64_dtb_read_be32(&header->size_dt_struct);
+    strings_off  = aarch64_dtb_read_be32(&header->off_dt_strings);
+    struct_base  = (const uint8_t*)(uintptr_t)(dtb_pa + struct_off);
+    strings_base = (const char*)(uintptr_t)(dtb_pa + strings_off);
+
+    while (off + 4U <= struct_size) {
+        uint32_t token = aarch64_dtb_read_be32(struct_base + off);
+        off += 4U;
+
+        if (token == AARCH64_FDT_BEGIN_NODE) {
+            const char* node_name = (const char*)(struct_base + off);
+            while (off < struct_size && struct_base[off] != 0) off++;
+            off++;
+            off = align_up4(off);
+
+            if (depth + 1 < MAX_DEPTH) {
+                /* 明示が無ければ親を引き継ぐ。DT の規則どおり */
+                addr_cells[depth + 1] = addr_cells[depth];
+                size_cells[depth + 1] = size_cells[depth];
+            }
+            depth++;
+
+            /* **深さごとの枠を使う。** 子ノードに入っても親の状態が消えない */
+            if (depth < MAX_DEPTH) {
+                node_state_clear(&nodes[depth]);
+                nodes[depth].is_cpu = node_name_is(node_name, "cpu");
+            }
+            continue;
+        }
+
+        if (token == AARCH64_FDT_END_NODE) {
+            /* **reg の解釈は親のセル数で行う。** 自分のセル数ではない */
+            int parent = (depth >= 1 && depth - 1 < MAX_DEPTH) ? depth - 1 : 0;
+            uint32_t ac = addr_cells[parent];
+            uint32_t sc = size_cells[parent];
+            uint64_t base = 0, size = 0;
+            const dtb_node_state_t* n;
+
+            if (depth <= 0 || depth >= MAX_DEPTH) {
+                if (depth > 0) depth--;
+                continue;
+            }
+            n = &nodes[depth];
+
+            if (n->is_memory && n->reg_data &&
+                reg_entry(n->reg_data, n->reg_len, ac, sc, 0, &base, &size) &&
+                base != 0 && size != 0 && info->memory_size == 0) {
+                info->memory_base = base;
+                info->memory_size = size;
+                info->flags |= AARCH64_BOOT_FLAG_MEMORY_FROM_DTB;
+            }
+
+            if (n->is_uart && n->reg_data &&
+                reg_entry(n->reg_data, n->reg_len, ac, sc, 0, &base, &size) && base != 0) {
+                info->uart_base = base;
+                info->flags |= AARCH64_BOOT_FLAG_UART_FROM_DTB;
+            }
+
+            /* GIC は **2 組そろって初めて使える**。1 組目 = Distributor、
+             * 2 組目 = CPU Interface。日報2026-08-09 §1 で落とした所 */
+            if (n->is_gic && n->reg_data) {
+                uint64_t db = 0, ds = 0, cb = 0, cs = 0;
+                if (reg_entry(n->reg_data, n->reg_len, ac, sc, 0, &db, &ds) && db != 0) {
+                    info->gicd_base = db;
+                    if (ds) info->gicd_size = ds;
+                    if (reg_entry(n->reg_data, n->reg_len, ac, sc, 1, &cb, &cs) && cb != 0) {
+                        info->gicc_base = cb;
+                        if (cs) info->gicc_size = cs;
+                        info->flags |= AARCH64_BOOT_FLAG_GIC_FROM_DTB;
+                    }
+                    /* 2 組目が無ければ GIC_FROM_DTB は立てない。
+                     * 「1 組しか取れなかった」を成功にしないため */
+                }
+            }
+
+            /* **DTB に並ぶ順は昇順とは限らない** (QEMU virt は上のアドレスから
+             * 並べる)。順に依存しないよう最小と最大だけ覚えておき、刻み幅は
+             * ループの後で (max - min) / (本数 - 1) から出す */
+            if (n->is_virtio && n->reg_data &&
+                reg_entry(n->reg_data, n->reg_len, ac, sc, 0, &base, &size) && base != 0) {
+                if (virtio_count == 0 || base < virtio_min) virtio_min = base;
+                if (virtio_count == 0 || base > virtio_max) virtio_max = base;
+                virtio_count++;
+            }
+
+            /* timer の interrupts は <type num flags> の 3 セル x 4 本
+             * (secure / non-secure physical / virtual / hyp)。
+             * 2 本目 (index 1) が非セキュア物理タイマ。
+             * type 1 = PPI で、PPI の INTID は番号 + 16 */
+            if (n->is_timer && n->intr_data && n->intr_len >= 24U) {
+                uint32_t type = aarch64_dtb_read_be32(n->intr_data + 12);
+                uint32_t num  = aarch64_dtb_read_be32(n->intr_data + 16);
+                if (type == 1U) {
+                    info->timer_intid = num + AARCH64_PPI_INTID_BASE;
+                    info->flags |= AARCH64_BOOT_FLAG_TIMER_FROM_DTB;
+                }
+            }
+
+            if (n->is_cpu) info->cpu_count++;
+
+            depth--;
+            continue;
+        }
+
+        if (token == AARCH64_FDT_PROP) {
+            uint32_t len, nameoff;
+            const uint8_t* data;
+            const char* prop_name;
+
+            if (off + 8U > struct_size) break;
+            len     = aarch64_dtb_read_be32(struct_base + off);
+            nameoff = aarch64_dtb_read_be32(struct_base + off + 4U);
+            off += 8U;
+            if (off + align_up4(len) > struct_size) break;
+            data = struct_base + off;
+            prop_name = strings_base + nameoff;
+
+            if (depth <= 0 || depth >= MAX_DEPTH) {
+                off += align_up4(len);
+                continue;   /* ルート直前や深すぎるノード。読み飛ばす */
+            }
+
+            if (str_eq(prop_name, "#address-cells") && len >= 4U) {
+                addr_cells[depth] = aarch64_dtb_read_be32(data);
+            } else if (str_eq(prop_name, "#size-cells") && len >= 4U) {
+                size_cells[depth] = aarch64_dtb_read_be32(data);
+            } else if (str_eq(prop_name, "compatible")) {
+                const char* c = (const char*)data;
+                dtb_node_state_t* n = &nodes[depth];
+                if (compatible_has(c, len, "arm,pl011")) n->is_uart = 1;
+                if (compatible_has(c, len, "virtio,mmio")) n->is_virtio = 1;
+                if (compatible_has(c, len, "arm,armv8-timer") ||
+                    compatible_has(c, len, "arm,armv7-timer")) n->is_timer = 1;
+                /* GICv2 の名乗り方はいくつかある。QEMU virt は
+                 * cortex-a15-gic、**Pi 4 は gic-400** */
+                if (compatible_has(c, len, "arm,cortex-a15-gic") ||
+                    compatible_has(c, len, "arm,gic-400") ||
+                    compatible_has(c, len, "arm,arm11mp-gic")) n->is_gic = 1;
+            } else if (str_eq(prop_name, "device_type")) {
+                if (len >= 7U && str_eq((const char*)data, "memory")) nodes[depth].is_memory = 1;
+            } else if (str_eq(prop_name, "reg")) {
+                nodes[depth].reg_data = data;
+                nodes[depth].reg_len = len;
+            } else if (str_eq(prop_name, "interrupts")) {
+                nodes[depth].intr_data = data;
+                nodes[depth].intr_len = len;
+            }
+
+            off += align_up4(len);
+            continue;
+        }
+
+        if (token == AARCH64_FDT_NOP) continue;
+        if (token == AARCH64_FDT_END) break;
+        break;      /* 知らないトークン。壊れた DTB を読み進めない */
+    }
+
+    if (virtio_count > 0) {
+        info->first_virtio_mmio_base = virtio_min;
+        info->virtio_mmio_count = virtio_count;
+        if (virtio_count > 1) {
+            info->virtio_mmio_stride = (virtio_max - virtio_min) / (virtio_count - 1);
+        }
+        info->flags |= AARCH64_BOOT_FLAG_VIRTIO_FROM_DTB;
+    }
+}
