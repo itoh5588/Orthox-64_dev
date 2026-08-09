@@ -266,6 +266,134 @@ done:
     return ok;
 }
 
+/* ==========================================================================
+ * SMP (M3c-2b) — **CPU 1 本しか無い**
+ *
+ * riscv64 は SBI HSM で副 hart を起こす (kernel/riscv64/smp.c 187 行)。
+ * aarch64 は PSCI (HVC/SMC 経由) を使うことになるが、まだ入れていない。
+ * ここでは「1 本しか無い」を正しく答えるだけにする。
+ *
+ * **0 を返して誤魔化さない。** cpu 0 の情報は本物を返し、範囲外は 0。
+ * ========================================================================== */
+#include "smp.h"
+#include "task.h"
+
+static struct smp_cpu_info g_cpus[1];
+static int g_cpus_ready;
+
+const struct smp_cpu_info* smp_get_cpu_info(uint32_t cpu_index) {
+    if (cpu_index != 0) return 0;
+    if (!g_cpus_ready) {
+        g_cpus[0].cpu_index = 0;
+        g_cpus[0].processor_id = 0;
+        g_cpus[0].lapic_id = 0;
+        g_cpus[0].is_bsp = 1;
+        g_cpus[0].started = 1;
+        g_cpus_ready = 1;
+    }
+    return &g_cpus[0];
+}
+
+uint32_t smp_get_started_cpu_count(void) { return 1; }
+
+/* **自分にしか送りようが無い。** 自 CPU への resched は
+ * task_request_resched がフラグを立てるので、ここで何かする必要は無い。
+ * 他 CPU が現れたら PSCI と GIC の SGI が要る */
+void smp_send_resched_ipi(uint32_t cpu_id) {
+    (void)cpu_id;
+}
+
+/* ---- コンソールの fd (M3c-2b) --------------------------------------------
+ *
+ * **まだ VFS を繋いでいない。** task_init が fds[0..2] を作ろうとするが、
+ * aarch64 には fs.c を取り込んでいないので実体が無い。
+ *
+ * 0 (成功) を返すと「使える fd がある」ことになり、read/write が
+ * 何も繋がっていない fd を触る。**失敗を返して、無いことを伝える。**
+ * 呼ぶ側 (init_console_fds) は戻り値を捨てるが、fd は 0 のまま残る */
+int fs_init_console_fd(file_descriptor_t* fd, int flags) {
+    (void)fd;
+    (void)flags;
+    return -1;
+}
+
+/* ---- 譲る (M3c-2b) -------------------------------------------------------
+ *
+ * riscv64 と同じく、**BKL を全部手放してから schedule()、戻ったら取り直す。**
+ * 持ったまま切り替えると、次のタスクが同じロックを待って進めなくなる */
+void kernel_yield(void) {
+    uint32_t depth = g_kernel_lock_depth;
+    for (uint32_t i = 0; i < depth; i++) kernel_lock_exit();
+    schedule();
+    for (uint32_t i = 0; i < depth; i++) kernel_lock_enter();
+}
+
+/* ==========================================================================
+ * 共有タスク層の自己診断 (M3c-2b)
+ *
+ * **リンクが通ったことは、動く証拠にならない。** 確かめるのは
+ * 「共有スケジューラで実際に切り替わって戻ってくる」ことだけ。
+ *
+ * 寝て起きる 1 往復に、確かめたいものが全部入っている:
+ *
+ *   schedule()            走行中のタスクを降ろして idle を選ぶ
+ *   arch_context_switch   aarch64_context_switch に繋がっている
+ *   cpu_local             current_task / idle_task が引ける
+ *   task_on_timer_tick    タイマ割り込みが共有層に届いている
+ *   task_poll_sleep_wakeups  期限が来たタスクを起こす
+ *   task_consume_resched  IRQ の出口で schedule() が呼ばれる
+ *
+ * **どれか 1 つでも欠けたら戻ってこない。** 逆に言えば、戻ってきた時点で
+ * 全部繋がっている。経過時間を見るのは「即座に戻ってきた」= 切り替えて
+ * いない場合を弾くため。
+ * ========================================================================== */
+#define SHARED_SLEEP_MS 50
+
+int aarch64_shared_task_selftest(void) {
+    struct task* cur;
+    uint64_t t0, t1, elapsed;
+    int ok = 1;
+
+    aarch64_console_begin();
+    puts("--- M3c-2b: 共有スケジューラ (kernel/sched.c) ---\n");
+    aarch64_console_end();
+
+    /* **乗り換えは task_init の前。** 後にすると、その隙のタイマ割り込みが
+     * M3c-1 の器を叩き、まだ器のタスクが居る前提で切り替えようとする */
+    aarch64_task_use_shared_scheduler();
+    task_init();
+
+    cur = get_current_task();
+    report("  current   :", cur != 0, &ok);
+    if (!cur) goto done;
+
+    report("  cpu local :", get_cpu_local() != 0, &ok);
+    report("  idle task :", get_cpu_local() && get_cpu_local()->idle_task != 0, &ok);
+
+    /* **ここが本体。** 期限付きで寝て、タイマに起こしてもらう */
+    t0 = arch_time_now_ms();
+    task_mark_io_wait_until(cur, t0 + SHARED_SLEEP_MS);
+    kernel_yield();
+    t1 = arch_time_now_ms();
+    elapsed = t1 - t0;
+
+    aarch64_console_begin();
+    puts("  sleep     : ");
+    puthex(elapsed);
+    /* 即座に戻ってきたら切り替えていない。**しきい値は境界に乗せない** —
+     * 要求 50ms に対して 40ms 以上を合格とする (日報2026-08-09 追2-3) */
+    puts(elapsed >= (SHARED_SLEEP_MS - 10) ? " ms  ok (寝て、タイマに起こされた)\n"
+                                           : " ms  BAD (切り替わっていない)\n");
+    aarch64_console_end();
+    if (elapsed < (SHARED_SLEEP_MS - 10)) ok = 0;
+
+done:
+    aarch64_console_begin();
+    puts(ok ? "aarch64-sched-ok\n" : "aarch64-sched-BAD\n");
+    aarch64_console_end();
+    return ok;
+}
+
 /* ---- まだ無いもの --------------------------------------------------------
  *
  * **黙って成功を返さない。** 「何もしない」で正しいものだけをここに置く。

@@ -9,6 +9,9 @@
  * riscv64 で sscratch を使って手で入れ替えていた所が、ハードウェアで済む。
  */
 
+#include "aarch64/task.h"
+#include "aarch64/trap.h"
+
 .section .text
 
 /* uint64_t aarch64_link_va_offset(void)
@@ -112,6 +115,56 @@ aarch64_enter_el0:
     mov     x30, xzr
 
     eret
+
+/* void aarch64_task_enter_initial_user_context(const struct arch_task_context* ctx)
+ *
+ * 共有タスク層が「最初にユーザーへ降りる」ときに呼ぶ (M3c-2b)。
+ * riscv64 の riscv64_task_enter_initial_user_context に相当する。**戻らない。**
+ *
+ * 上の aarch64_enter_el0 と違い、**フレームに組み立てられた全レジスタを
+ * そのまま復元する**。execve が引数を x0-x2 に、sp を SP_EL0 に仕込んで
+ * あるので、ここで作り直してはいけない。
+ *
+ * x0 が ctx。user_frame の先頭へ進めてから読む。 */
+.globl aarch64_task_enter_initial_user_context
+aarch64_task_enter_initial_user_context:
+    add     x0, x0, #AARCH64_TASKCTX_USER_FRAME
+
+    ldr     x1, [x0, #AARCH64_FRAME_ELR]
+    msr     elr_el1, x1
+    ldr     x1, [x0, #AARCH64_FRAME_SPSR]
+    msr     spsr_el1, x1
+    ldr     x1, [x0, #AARCH64_FRAME_SP_EL0]
+    msr     sp_el0, x1
+
+    /* **x0 を最後に読む。** 途中で潰すとフレームの場所を見失う。
+     * ldp は base と dest が重なると未定義なので、x0 だけ ldr で拾う */
+    ldr     x1,  [x0, #8 * 1]
+    ldp     x2,  x3,  [x0, #16 * 1]
+    ldp     x4,  x5,  [x0, #16 * 2]
+    ldp     x6,  x7,  [x0, #16 * 3]
+    ldp     x8,  x9,  [x0, #16 * 4]
+    ldp     x10, x11, [x0, #16 * 5]
+    ldp     x12, x13, [x0, #16 * 6]
+    ldp     x14, x15, [x0, #16 * 7]
+    ldp     x16, x17, [x0, #16 * 8]
+    ldp     x18, x19, [x0, #16 * 9]
+    ldp     x20, x21, [x0, #16 * 10]
+    ldp     x22, x23, [x0, #16 * 11]
+    ldp     x24, x25, [x0, #16 * 12]
+    ldp     x26, x27, [x0, #16 * 13]
+    ldp     x28, x29, [x0, #16 * 14]
+    ldr     x30, [x0, #8 * 30]
+    ldr     x0,  [x0, #8 * 0]
+    eret
+
+/* fork した子が最初に走り出す場所 (M3c-2b)。
+ * **まだ経路が繋がっていない** (task_fork.c を取り込んでいない)。
+ * 呼ばれたら分かるように止める。黙って先へ進めると、子が親の続きを
+ * カーネル権限で走らせることになる */
+.globl aarch64_task_fork_child_return
+aarch64_task_fork_child_return:
+    b       .
 
 /* EL0 を終えたときの着地点。
  *

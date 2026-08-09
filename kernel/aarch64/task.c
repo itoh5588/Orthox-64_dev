@@ -15,9 +15,12 @@
 #include "aarch64/boot.h"
 #include "aarch64/task.h"
 #include "aarch64/vm.h"
+#include "task.h"
 
 uint64_t aarch64_pmm_alloc(uint64_t pages);
 void aarch64_vm_switch_user_space(uint64_t root_pa);
+void task_on_timer_tick(void);
+int  task_consume_resched(void);
 
 /* カーネルスタックは 16KB。**タスクごとに別。**
  * EL0 実行中に割り込みが入ると CPU が SP_EL1 にフレームを積むので、
@@ -196,10 +199,90 @@ void aarch64_task_set_cpu_local_impl(struct cpu_local* cpu) { g_cpu_local = cpu;
 void aarch64_trap_set_kernel_stack(uint64_t kernel_sp) { g_kernel_sp = kernel_sp; }
 uint64_t aarch64_trap_kernel_stack(void) { return g_kernel_sp; }
 
+/* ---- 共有スケジューラへの乗り換え (M3c-2b) -------------------------------
+ *
+ * **2 つのスケジューラを同時に動かさない。** M3c-1 の器 (g_sched_on) と
+ * 共有層 (kernel/sched.c) が同じ CPU を取り合うと、どちらの前提も壊れる。
+ * 乗り換えたら M3c-1 側は止める。 */
+static int g_shared_sched;
+
+void aarch64_task_use_shared_scheduler(void) {
+    g_sched_on = 0;      /* M3c-1 の器を止める */
+    g_shared_sched = 1;
+}
+
+int aarch64_task_shared_scheduler_on(void) { return g_shared_sched; }
+
+/* 共有層が呼ぶ名前。**TTBR0 の差し替えをここでやる。**
+ * riscv64 は .S の中で satp を書いているが、あちらは root_pa が
+ * ctx の offset 0 にある。aarch64 は regs を先頭に置いたので C で挟む。
+ *
+ * カーネルは TTBR1 に居るので、**TTBR0 を差し替えても自分の足元は動かない。**
+ * 切り替えの前後どちらでもよいが、切り替えてしまうと「次のタスクの文脈で
+ * 前のタスクの空間」という瞬間ができるので先にやる */
+void arch_context_switch(struct arch_task_context* next, struct arch_task_context* prev) {
+    if (!next || !prev) return;
+    if (next->root_pa && next->root_pa != prev->root_pa) {
+        aarch64_vm_activate_address_space(next->root_pa);
+    }
+    aarch64_context_switch(&next->regs, &prev->regs);
+}
+
+/* ---- 共有層が要求するフレームの組み立て (M3c-2b) ------------------------ */
+
+/* 最初にユーザーへ降りるときのフレーム。**0 で埋めてから必要な所だけ書く。**
+ * 埋め残すと、カーネルスタックのごみがそのまま EL0 のレジスタに入る */
+void aarch64_task_prepare_initial_user_frame(aarch64_trap_frame_t* frame,
+                                             const struct arch_task_user_state* state) {
+    if (!frame) return;
+    for (unsigned i = 0; i < 31; i++) frame->x[i] = 0;
+    frame->elr = 0;
+    frame->spsr = AARCH64_SPSR_EL0T;   /* EL0t。DAIF は全部 0 = 割り込みを開ける */
+    frame->sp_el0 = 0;
+    if (!state) return;
+    frame->elr = state->entry_pc;
+    frame->sp_el0 = state->user_sp;
+    frame->x[0] = state->arg0;
+    frame->x[1] = state->arg1;
+    frame->x[2] = state->arg2;
+}
+
+void aarch64_task_prepare_execve_frame(aarch64_trap_frame_t* frame,
+                                       const struct arch_task_user_state* state) {
+    aarch64_task_prepare_initial_user_frame(frame, state);
+}
+
+/* fork の子は「システムコールから 0 を返した」形で再開する */
+void aarch64_task_prepare_fork_return_frame(aarch64_trap_frame_t* frame,
+                                            const aarch64_trap_frame_t* parent_frame) {
+    if (!frame || !parent_frame) return;
+    *frame = *parent_frame;
+    frame->x[0] = 0;   /* 子は fork() が 0 を返す */
+}
+
+void aarch64_task_store_user_frame(struct arch_task_context* ctx,
+                                   const aarch64_trap_frame_t* frame) {
+    if (!ctx || !frame) return;
+    ctx->user_frame = *frame;
+}
+
+void aarch64_task_prepare_kernel_resume(struct arch_task_context* ctx,
+                                        uint64_t kernel_sp,
+                                        uint64_t entry_pc) {
+    if (!ctx) return;
+    for (unsigned i = 0; i < sizeof(ctx->regs) / sizeof(uint64_t); i++) {
+        ((uint64_t*)&ctx->regs)[i] = 0;
+    }
+    ctx->regs.x30 = entry_pc;
+    ctx->regs.sp = kernel_sp;
+    ctx->kernel_sp = kernel_sp;
+}
+
 /* タイマ割り込みから呼ぶ。**ここでは切り替えない。**
  * 割り込みハンドラの途中で切り替えると、まだ積んでいないものが出る。
  * 印だけ立てて、出口 (aarch64_task_resched_if_needed) で切り替える */
 void aarch64_task_on_tick(void) {
+    if (g_shared_sched) { task_on_timer_tick(); return; }
     if (g_sched_on) g_resched = 1;
 }
 
@@ -207,6 +290,16 @@ void aarch64_task_on_tick(void) {
  * ここで切り替えれば、戻ってきたときに続きから再開できる */
 void aarch64_task_resched_if_needed(void) {
     int next_id;
+
+    /* 共有層に乗り換えた後は、こちらが切り替える。
+     * **区間の中では保留する**のは M3c-1 と同じ。印は task_request_resched
+     * が cpu_local に持っているので、消さずに戻れば次の出口で切り替わる */
+    if (g_shared_sched) {
+        if (g_preempt_off) return;
+        if (task_consume_resched()) schedule();
+        return;
+    }
+
     if (!g_sched_on || !g_resched) return;
     /* **印は消さずに戻る。** 消すと、区間の中で入った tick のぶんの
      * 切り替えが 1 回まるごと消える */

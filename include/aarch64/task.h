@@ -28,6 +28,11 @@
 #define AARCH64_CTX_SP   96
 #define AARCH64_CTX_SIZE 112
 
+/* struct arch_task_context の中で user_frame がどこから始まるか (M3c-2b)。
+ * .S から使うので __ASSEMBLER__ の外に置く。**C 側で _Static_assert して
+ * いるので、struct を変えたらビルドが落ちる** */
+#define AARCH64_TASKCTX_USER_FRAME 128
+
 #ifndef __ASSEMBLER__
 
 #include <stdint.h>
@@ -107,6 +112,22 @@ struct arch_task_context {
 
 _Static_assert(__builtin_offsetof(struct arch_task_context, regs) == 0,
                "switch.S は regs が offset 0 にあることを前提にしている");
+_Static_assert(__builtin_offsetof(struct arch_task_context, user_frame) ==
+                   AARCH64_TASKCTX_USER_FRAME,
+               "entry.S の AARCH64_TASKCTX_USER_FRAME とずれている");
+
+/* 共有スケジューラ (kernel/sched.c) が呼ぶ名前。
+ * **regs が offset 0 なので aarch64_context_switch にそのまま渡せる**が、
+ * TTBR0 の差し替えが要るので C の薄い層を挟む (riscv64 は .S の中で
+ * satp を書いている。あちらは root_pa が offset 0 にあるため) */
+void arch_context_switch(struct arch_task_context* next, struct arch_task_context* prev);
+
+/* 共有タスク層へ乗り換える (M3c-2b)。呼ぶと、タイマ割り込みは
+ * task_on_timer_tick を叩き、IRQ の出口は schedule() を呼ぶようになる。
+ * **M3c-1 の自前の器は同時に止める。** 2 つのスケジューラが同じ CPU を
+ * 取り合うと、どちらの前提も成り立たない */
+void aarch64_task_use_shared_scheduler(void);
+int  aarch64_task_shared_scheduler_on(void);
 
 typedef aarch64_trap_frame_t arch_task_exec_frame_t;
 

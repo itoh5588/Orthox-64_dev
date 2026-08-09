@@ -81,7 +81,7 @@ run_one() {  # $1 = -machine、$2 = ログ、$3 = -m、$4 = 非空ならディ�
         -kernel "$KERNEL" < /dev/null > "$log" 2>&1 &
     QEMU_PID=$!
     for _ in {1..120}; do
-        if grep -aqE "aarch64-user-(ok|BAD)" "$log" 2>/dev/null; then
+        if grep -aqE "aarch64-sched-(ok|BAD)" "$log" 2>/dev/null; then
             break
         fi
         sleep 1
@@ -90,10 +90,14 @@ run_one() {  # $1 = -machine、$2 = ログ、$3 = -m、$4 = 非空ならディ�
     wait "$QEMU_PID" 2>/dev/null || true
     QEMU_PID=""
 
+    # 終了マーカーは **最後に出るもの** にすること。途中の行にすると、
+    # その後ろの出力を待たずに QEMU を止めてしまう
+    # (M3c-2b で共有スケジューラの検査を aarch64-user-ok の後ろに足した)
+    #
     # **打ち切りを黙って見逃さない。** マーカーが出ないまま止めた場合、
     # 以降の判定は「中身が違う」ではなく「途中で切れた」で落ちる。
     # それを取り違えると、存在しないバグを探すことになる
-    if ! grep -aqE "aarch64-user-(ok|BAD)" "$log" 2>/dev/null; then
+    if ! grep -aqE "aarch64-sched-(ok|BAD)" "$log" 2>/dev/null; then
         echo "*** 実行が終わる前に打ち切られた ($log)" >&2
         echo "*** 最後の 5 行:" >&2
         tail -5 "$log" >&2
@@ -255,6 +259,19 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
 
     grep -aq "aarch64-user-ok" "$2"
     ! grep -aq "aarch64-user-BAD" "$2"
+
+    # M3c-2b: 共有スケジューラ (kernel/sched.c) で実際に切り替わること
+    #
+    # **寝て起きる 1 往復に、確かめたいものが全部入っている。**
+    # schedule / arch_context_switch / cpu_local / task_on_timer_tick /
+    # task_poll_sleep_wakeups / task_consume_resched のどれか 1 つでも
+    # 欠けたら戻ってこない (逆確認で、実際に止まることを確認した)
+    grep -aq "Task system initialized." "$2"
+    grep -aq "  current   :  ok" "$2"
+    grep -aq "  idle task :  ok" "$2"
+    grep -aq "  sleep     : .*  ok (寝て、タイマに起こされた)" "$2"
+    grep -aq "aarch64-sched-ok" "$2"
+    ! grep -aq "aarch64-sched-BAD" "$2"
 
     # M4: virtio-blk。**デバイスの有無で結果が変わるので、ここでは
     # 「壊れていない」ことだけを見る。** 中身の判定はディスク付きの回で行う
