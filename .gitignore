@@ -129,3 +129,6 @@ ports/*.tar.xz
 
 # rootfs.img の退避 (rootfs.img.20260705 など)。*.img には当たらない
 rootfs.img.*
+
+# aarch64 スモークが作る xv6fs イメージの種 (tests/aarch64_smoke.sh)
+out/aarch64-test-fs/

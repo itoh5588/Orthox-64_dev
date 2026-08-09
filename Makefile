@@ -308,7 +308,8 @@ AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer
 #                            -fsyntax-only では通り -c で落ちるので、
 #                            構文チェックだけで「入る」と判断しないこと
 AARCH64_SHARED_C_SRCS = kernel/cstring.c kernel/cstdio.c kernel/vfs.c kernel/storage.c \
-	kernel/task.c kernel/sched.c kernel/wait.c
+	kernel/task.c kernel/sched.c kernel/wait.c \
+	kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c
 AARCH64_ASM_SRCS = kernel/aarch64/start.S kernel/aarch64/vectors.S \
 	kernel/aarch64/entry.S kernel/aarch64/user_blob.S kernel/aarch64/switch.S
 AARCH64_CFLAGS = --target=aarch64-none-elf -mgeneral-regs-only \

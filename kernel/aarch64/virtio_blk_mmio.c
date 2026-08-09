@@ -101,6 +101,28 @@ uint64_t aarch64_virtio_blk_base_pa(void) { return g_base_pa; }
 uint32_t aarch64_virtio_blk_intid(void) { return g_intid; }
 uint64_t aarch64_virtio_blk_irq_count(void) { return g_irq_count; }
 
+int aarch64_virtio_blk_read(uint64_t lba, void* buf, uint32_t sectors);
+int aarch64_virtio_blk_write(uint64_t lba, const void* buf, uint32_t sectors);
+
+/* ---- storage 層の受け口 (M4-3) ------------------------------------------
+ *
+ * **単位が違う。** storage 層は「ブロック」を数え、virtio-blk は 512 バイト
+ * のセクタを数える。xv6fs は BSIZE=1024 なので、storage_register_device に
+ * 512 を渡してブロック = セクタに揃えてある (xv6bio が 2 セクタずつ読む)。
+ *
+ * **戻り値は「成功なら 0」。** ブロック数ではない (xv6bio が ret != 0 を
+ * エラーとして扱う)。count を返すと、読めているのに毎回エラーログが出て
+ * マウントが静かに失敗する。riscv64 の受け口も 0 を返している */
+int aarch64_virtio_blk_storage_read(void* ctx, uint64_t lba, void* buf, size_t count) {
+    (void)ctx;
+    return aarch64_virtio_blk_read(lba, buf, (uint32_t)count);
+}
+
+int aarch64_virtio_blk_storage_write(void* ctx, uint64_t lba, const void* buf, size_t count) {
+    (void)ctx;
+    return aarch64_virtio_blk_write(lba, buf, (uint32_t)count);
+}
+
 /* 完了割り込み。**ここで印を立てるだけ。** used->idx はデバイスが直接
  * 書いているので、待ち手に「見に行ってよい」と伝えれば足りる */
 void aarch64_virtio_blk_irq(void) {
@@ -374,13 +396,21 @@ void aarch64_virtio_blk_selftest(void) {
         ok = 0;
     }
 
-    /* --- 3. 書いて読み戻す --- */
-    for (unsigned i = 0; i < VBLK_SECTOR_SIZE; i++) g_probe_buf[i] = (uint8_t)(i & 0xff);
-    g_probe_buf[0] = 'W'; g_probe_buf[1] = 'R'; g_probe_buf[2] = '!';
-    rc = aarch64_virtio_blk_write(4, g_probe_buf, 1);
-    if (rc == 0) {
-        vblk_memset(g_probe_buf2, 0, VBLK_SECTOR_SIZE);
-        rc = aarch64_virtio_blk_read(4, g_probe_buf2, 1);
+    /* --- 3. 書いて読み戻す ---
+     *
+     * **書き先はディスクの最終セクタ。** M4-3 で同じディスクに xv6fs を
+     * 載せたので、前のように LBA 4 へ書くとファイルシステムを壊す
+     * (BSIZE=1024 なので LBA 4 は block 2 = ログ領域)。
+     * スモークが作るイメージは、fs の後ろに余白を付けてある */
+    {
+        uint64_t probe_lba = g_capacity ? (g_capacity - 1) : 4;
+        for (unsigned i = 0; i < VBLK_SECTOR_SIZE; i++) g_probe_buf[i] = (uint8_t)(i & 0xff);
+        g_probe_buf[0] = 'W'; g_probe_buf[1] = 'R'; g_probe_buf[2] = '!';
+        rc = aarch64_virtio_blk_write(probe_lba, g_probe_buf, 1);
+        if (rc == 0) {
+            vblk_memset(g_probe_buf2, 0, VBLK_SECTOR_SIZE);
+            rc = aarch64_virtio_blk_read(probe_lba, g_probe_buf2, 1);
+        }
     }
     aarch64_uart_puts("  write/read: ");
     if (rc != 0) {

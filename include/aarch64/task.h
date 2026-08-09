@@ -26,6 +26,7 @@
 #define AARCH64_CTX_X27  64
 #define AARCH64_CTX_X29  80
 #define AARCH64_CTX_SP   96
+#define AARCH64_CTX_DAIF 104
 #define AARCH64_CTX_SIZE 112
 
 /* struct arch_task_context の中で user_frame がどこから始まるか (M3c-2b)。
@@ -42,7 +43,13 @@ typedef struct aarch64_context {
     uint64_t x29;       /* fp */
     uint64_t x30;       /* lr。ここに仕込んだ場所から走り始める */
     uint64_t sp;        /* SP_EL1 */
-    uint64_t pad;       /* 16 バイト境界を保つ */
+    /* **割り込みの開け閉めもタスクの状態 (M4-3 で足した)。**
+     * idle は arch_task_idle_wait_once の最後で I を閉じてから譲るので、
+     * 復元しないと、起こされた側が割り込みを閉じたまま走り出す。
+     * そのままディスクを待つと、完了割り込みが来ず永久に回る
+     * (M4-3 のマウントで実際に踏んだ。daif=0x3c0 を実測)。
+     * 16 バイト境界のために元から余っていた枠を使っている */
+    uint64_t daif;
 } aarch64_context_t;
 
 #define AARCH64_TASK_FREE    0
@@ -60,6 +67,15 @@ typedef struct aarch64_task {
 } aarch64_task_t;
 
 #define AARCH64_MAX_TASKS 8
+
+/* 新しいタスクの DAIF の初期値。**いまのマスクから I だけ開けたもの。**
+ * 0 (全部開ける) にしないのは、D / A / F の扱いを起動時の判断
+ * (start.S の降格や boot.c) から勝手に変えないため */
+static inline uint64_t aarch64_daif_for_new_task(void) {
+    uint64_t daif;
+    __asm__ volatile("mrs %0, daif" : "=r"(daif));
+    return daif & ~(1ULL << 7);   /* I を開ける */
+}
 
 /* 次に走らせるものへ切り替える。**戻ってきたときは自分の番** */
 void aarch64_context_switch(aarch64_context_t* next, aarch64_context_t* prev);
@@ -216,6 +232,9 @@ static inline void arch_task_context_init_kernel_entry(struct arch_task_context*
     ctx->kernel_sp = stack_ptr;
     ctx->regs.x30 = entry;
     ctx->regs.sp = stack_ptr;
+    /* **割り込みを開けた状態で走り出す。** 0 埋めのままだと D / A / F まで
+     * 開いてしまうので、いまのマスクを土台にする */
+    ctx->regs.daif = aarch64_daif_for_new_task();
     arch_task_context_set_address_space(ctx, address_space);
     arch_task_context_init_fp_state(ctx);
 }

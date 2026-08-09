@@ -109,6 +109,7 @@ int aarch64_task_create(void (*entry)(void), uint64_t ttbr0) {
     g_tasks[id].ctx.x19 = (uint64_t)(uintptr_t)entry;
     g_tasks[id].ctx.x30 = (uint64_t)(uintptr_t)aarch64_task_trampoline;
     g_tasks[id].ctx.sp  = stack_top;
+    g_tasks[id].ctx.daif = aarch64_daif_for_new_task();
     g_tasks[id].ttbr0 = ttbr0;
     g_tasks[id].kstack_pa = stack_pa;
     g_tasks[id].counter = 0;
@@ -275,6 +276,7 @@ void aarch64_task_prepare_kernel_resume(struct arch_task_context* ctx,
     }
     ctx->regs.x30 = entry_pc;
     ctx->regs.sp = kernel_sp;
+    ctx->regs.daif = aarch64_daif_for_new_task();
     ctx->kernel_sp = kernel_sp;
 }
 

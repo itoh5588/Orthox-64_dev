@@ -26,6 +26,10 @@ uint64_t g_hhdm_offset;
 
 uint64_t aarch64_timer_freq(void);
 uint64_t aarch64_timer_ticks(void);
+int aarch64_virtio_blk_present(void);
+uint64_t aarch64_virtio_blk_capacity(void);
+int aarch64_virtio_blk_storage_read(void* ctx, uint64_t lba, void* buf, size_t count);
+int aarch64_virtio_blk_storage_write(void* ctx, uint64_t lba, const void* buf, size_t count);
 
 /* ---- 時刻 ----------------------------------------------------------------
  *
@@ -390,6 +394,121 @@ int aarch64_shared_task_selftest(void) {
 done:
     aarch64_console_begin();
     puts(ok ? "aarch64-sched-ok\n" : "aarch64-sched-BAD\n");
+    aarch64_console_end();
+    return ok;
+}
+
+/* ==========================================================================
+ * M4-3: virtio-blk を storage 層に登録して xv6fs をマウントする
+ *
+ * **task_init の後に呼ぶこと。** xv6fs は sleeplock (wait_event) を使うので、
+ * 待てるタスクが居ないと成立しない。riscv64 も同じ順序。
+ *
+ * 確かめるのは 4 つ:
+ *   1. マウントできること
+ *   2. **イメージに入れておいた既知のファイルが読めること**
+ *      マウントできただけでは、中身を辿れる証拠にならない
+ *   3. 新しいファイルを書いて読み戻せること (ログと bitmap が効いている)
+ *   4. 書いたものが**再マウントなしで**見えること
+ * ========================================================================== */
+#include "storage.h"
+#include "xv6fs.h"
+
+/* スモークがイメージに入れておくファイル。**中身まで照合する。**
+ * 「読めた」だけでは、別のブロックを返していても気づけない */
+#define FS_PROBE_PATH  "/aarch64-m4.txt"
+#define FS_PROBE_TEXT  "ORTHOX-AARCH64-XV6FS-OK"
+#define FS_WRITE_PATH  "/written-by-kernel.txt"
+#define FS_WRITE_TEXT  "written-by-aarch64-kernel"
+
+static int fs_streq(const char* a, const char* b, unsigned n) {
+    for (unsigned i = 0; i < n; i++) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == 0) return 1;
+    }
+    return 1;
+}
+
+static unsigned fs_strlen(const char* s) {
+    unsigned n = 0;
+    while (s[n]) n++;
+    return n;
+}
+
+/* path を読んで buf に入れる。戻り値は読めたバイト数、負なら失敗 */
+static int fs_read_path(const char* path, char* buf, unsigned cap) {
+    struct xv6fs_inode* ip = xv6fs_namei(path);
+    int n;
+    if (!ip) return -1;
+    xv6fs_ilock(ip);
+    n = xv6fs_readi(ip, buf, 0, cap - 1);
+    xv6fs_iunlockput(ip);
+    if (n < 0) return -1;
+    buf[n] = 0;
+    return n;
+}
+
+static char g_fs_buf[128];
+
+int aarch64_fs_selftest(void) {
+    int ok = 1;
+    int n;
+
+    aarch64_console_begin();
+    puts("--- M4-3: xv6fs (virtio-blk の上) ---\n");
+    aarch64_console_end();
+
+    storage_init();
+
+    if (!aarch64_virtio_blk_present()) {
+        /* ディスクを付けずに起動した回。**「無い」と「壊れた」を混ぜない** */
+        aarch64_console_begin();
+        puts("  device    : 見つからない (-drive を付けずに起動した)\n");
+        puts("aarch64-fs-none\n");
+        aarch64_console_end();
+        return 1;
+    }
+
+    if (storage_register_device("vblk0", 512, aarch64_virtio_blk_capacity(),
+                                aarch64_virtio_blk_storage_read,
+                                aarch64_virtio_blk_storage_write, 0, 0) < 0) {
+        report("  register  :", 0, &ok);
+        goto done;
+    }
+    report("  register  :", 1, &ok);
+
+    report("  mount     :", xv6fs_mount_storage("vblk0") == 0, &ok);
+    if (!xv6fs_is_mounted()) goto done;
+
+    /* 2. イメージに入れておいた既知のファイル。**中身まで照合する** */
+    n = fs_read_path(FS_PROBE_PATH, g_fs_buf, sizeof(g_fs_buf));
+    report("  read file :", n > 0 && fs_streq(g_fs_buf, FS_PROBE_TEXT,
+                                              sizeof(FS_PROBE_TEXT)), &ok);
+
+    /* 3. 書いて読み戻す。**ログと bitmap が効いていないとここで落ちる** */
+    {
+        struct xv6fs_inode* ip = 0;
+        int rc = xv6fs_create_file(FS_WRITE_PATH, 0644, &ip);
+        if (ip) xv6fs_iunlockput(ip);
+        report("  create    :", rc == 0, &ok);
+        if (rc == 0) {
+            /* **xv6fs_write_file は成功で 0 を返す。** バイト数ではない。
+             * 最初 strlen と比べて BAD を出したが、直後の read back が
+             * ok だったので「コードではなく判定が間違っている」と分かった。
+             * **戻り値の約束は推測せず、呼ぶ先を読んで確かめる** */
+            rc = xv6fs_write_file(FS_WRITE_PATH, 0, FS_WRITE_TEXT,
+                                  fs_strlen(FS_WRITE_TEXT));
+            report("  write     :", rc == 0, &ok);
+            n = fs_read_path(FS_WRITE_PATH, g_fs_buf, sizeof(g_fs_buf));
+            report("  read back :", n == (int)fs_strlen(FS_WRITE_TEXT) &&
+                                    fs_streq(g_fs_buf, FS_WRITE_TEXT,
+                                             sizeof(FS_WRITE_TEXT)), &ok);
+        }
+    }
+
+done:
+    aarch64_console_begin();
+    puts(ok ? "aarch64-fs-ok\n" : "aarch64-fs-BAD\n");
     aarch64_console_end();
     return ok;
 }

@@ -28,6 +28,10 @@ aarch64_context_switch:
     stp     x29, x30, [x1, #AARCH64_CTX_X29]
     mov     x9, sp
     str     x9, [x1, #AARCH64_CTX_SP]
+    /* **割り込みの開け閉めもタスクごと。** 復元しないと、idle に
+     * 閉じられたまま起こされて、以後どの割り込みも受け取れなくなる */
+    mrs     x9, daif
+    str     x9, [x1, #AARCH64_CTX_DAIF]
 
     /* 次のものを x0 が指す枠から復元 */
     ldp     x19, x20, [x0, #AARCH64_CTX_X19]
@@ -38,6 +42,8 @@ aarch64_context_switch:
     ldp     x29, x30, [x0, #AARCH64_CTX_X29]
     ldr     x9, [x0, #AARCH64_CTX_SP]
     mov     sp, x9
+    ldr     x9, [x0, #AARCH64_CTX_DAIF]
+    msr     daif, x9
 
     /* x30 に入っている場所へ「戻る」。新しいタスクなら入口へ飛ぶ */
     ret

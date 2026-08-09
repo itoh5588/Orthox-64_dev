@@ -47,18 +47,39 @@ trap cleanup EXIT
 # M4 の確認用ディスク。**新しい名前を使う。** out/rootfs-*.img には触らない
 # (日報2026-08-09 D: rootfs-gcc-selfhost.img を消さないこと)
 TEST_DISK=out/aarch64-test-disk.img
+TEST_FSDIR=out/aarch64-test-fs
+#
+# **1 枚のディスクで M4-1/2 (生の read/write) と M4-3 (xv6fs) の両方を見る。**
+# 別々にすると、ドライバが 2 台目を選べないので回を分けることになる。
+# 同居できるのは、xv6fs の block 0 (= LBA 0-1) がブートブロックで
+# 未使用だから。そこに生の目印を置いても fs は壊れない。
+#
+#   LBA 0-1    xv6fs の block 0 (未使用) に M4-1/2 の目印を焼く
+#   block 1-   xv6fs の superblock 以降
+#   末尾       fs の外に 64KB の余白。**書き込み探針はここへ書く**
+#              (以前は LBA 4 に書いていた = block 2 = ログ領域を壊す)
+XV6FS_TEST_BLOCKS=4096          # 1KB ブロック x 4096 = 4MB
+XV6FS_TEST_SLACK=65536          # fs の後ろの余白
 make_test_disk() {
     mkdir -p out
+    rm -rf "$TEST_FSDIR"
+    mkdir -p "$TEST_FSDIR"
+    # **カーネルが中身まで照合する既知のファイル。**
+    # 「読めた」だけでは、別のブロックを返していても気づけない
+    printf 'ORTHOX-AARCH64-XV6FS-OK' > "$TEST_FSDIR/aarch64-m4.txt"
     rm -f "$TEST_DISK"
-    # 1MB。LBA 0 と LBA 1 に**別々の**既知の文字列を置く。
-    # 別々にするのは「LBA を無視して同じ場所を読んでいる」を弾くため
-    python3 - "$TEST_DISK" <<'PYEOF'
+    XV6FS_FSSIZE=$XV6FS_TEST_BLOCKS XV6FS_NINODES=256 \
+        python3 scripts/build_rootfs_xv6fs.py "$TEST_FSDIR" "$TEST_DISK" > /dev/null
+    python3 - "$TEST_DISK" "$XV6FS_TEST_SLACK" <<'PYEOF'
 import sys
-size = 1024 * 1024
-buf = bytearray(size)
-buf[0:24]     = b"ORTHOX-AARCH64-M4-SEC000"
-buf[512:536]  = b"ORTHOX-AARCH64-M4-SEC001"
-open(sys.argv[1], "wb").write(buf)
+path, slack = sys.argv[1], int(sys.argv[2])
+buf = bytearray(open(path, "rb").read())
+# block 0 (LBA 0-1) は xv6fs では未使用。生の目印を焼く。
+# 別々の文字列にするのは「LBA を無視して同じ場所を読んでいる」を弾くため
+buf[0:24]    = b"ORTHOX-AARCH64-M4-SEC000"
+buf[512:536] = b"ORTHOX-AARCH64-M4-SEC001"
+buf += bytearray(slack)          # fs の外の余白。書き込み探針の行き先
+open(path, "wb").write(buf)
 PYEOF
 }
 
@@ -81,7 +102,7 @@ run_one() {  # $1 = -machine、$2 = ログ、$3 = -m、$4 = 非空ならディ�
         -kernel "$KERNEL" < /dev/null > "$log" 2>&1 &
     QEMU_PID=$!
     for _ in {1..120}; do
-        if grep -aqE "aarch64-sched-(ok|BAD)" "$log" 2>/dev/null; then
+        if grep -aqE "aarch64-fs-(ok|BAD|none)" "$log" 2>/dev/null; then
             break
         fi
         sleep 1
@@ -92,15 +113,42 @@ run_one() {  # $1 = -machine、$2 = ログ、$3 = -m、$4 = 非空ならディ�
 
     # 終了マーカーは **最後に出るもの** にすること。途中の行にすると、
     # その後ろの出力を待たずに QEMU を止めてしまう
-    # (M3c-2b で共有スケジューラの検査を aarch64-user-ok の後ろに足した)
+    # (M3c-2b / M4-3 で判定を末尾に足すたびにここを動かしている)
     #
     # **打ち切りを黙って見逃さない。** マーカーが出ないまま止めた場合、
     # 以降の判定は「中身が違う」ではなく「途中で切れた」で落ちる。
     # それを取り違えると、存在しないバグを探すことになる
-    if ! grep -aqE "aarch64-sched-(ok|BAD)" "$log" 2>/dev/null; then
+    if ! grep -aqE "aarch64-fs-(ok|BAD|none)" "$log" 2>/dev/null; then
         echo "*** 実行が終わる前に打ち切られた ($log)" >&2
         echo "*** 最後の 5 行:" >&2
         tail -5 "$log" >&2
+        exit 1
+    fi
+}
+
+# **否定判定はこの関数を通すこと。**
+#
+# `! grep ...` は set -e の対象外 (POSIX: "return value is being inverted
+# with !")。**15 か所すべてが、何が出ていても素通りしていた。**
+# 最小再現で確かめた:
+#
+#   set -e; ! grep -q hit file   # パターンが有っても次の行へ進む
+#
+# 「出てはいけないもの」を見張るつもりの行が、1 つも見張っていなかった。
+must_not() {   # $1 = 固定文字列, $2 = ログ, $3 = 説明 (任意)
+    if grep -aqF -- "$1" "$2"; then
+        echo "*** 出てはいけないものが出た: $1  ($2)" >&2
+        [ -n "${3:-}" ] && echo "*** $3" >&2
+        grep -aF -- "$1" "$2" | head -3 | sed 's/^/***   /' >&2
+        exit 1
+    fi
+}
+
+must_not_re() {  # $1 = 拡張正規表現, $2 = ログ, $3 = 説明 (任意)
+    if grep -aqE -- "$1" "$2"; then
+        echo "*** 出てはいけないものが出た (regex): $1  ($2)" >&2
+        [ -n "${3:-}" ] && echo "*** $3" >&2
+        grep -aE -- "$1" "$2" | head -3 | sed 's/^/***   /' >&2
         exit 1
     fi
 }
@@ -117,7 +165,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     # EL2 で始まっても降格して EL1 に居ること。EL2 のままだと tick を取りこぼす
     grep -aq "CurrentEL : EL1" "$2"
     grep -aq "bss zero  : ok" "$2"        # start.S のゼロ埋めが効いていること
-    ! grep -aq "bss zero  : BAD" "$2"
+    must_not "bss zero  : BAD" "$2"
     grep -aq "aarch64-boot-ok" "$2"
 
     # M2b: DTB
@@ -128,7 +176,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     # 状態を潰されて GIC だけ既定値のまま進んでいた。
     # そこで **どこから来た値かを (dtb) / (既定値) で出させて判定する。**
     grep -aq "aarch64-dtb-ok" "$2"
-    ! grep -aq "aarch64-dtb-BAD" "$2"
+    must_not "aarch64-dtb-BAD" "$2"
     grep -aq "memory    : 0x0000000040000000 size ${ram_size}  (dtb)" "$2"
     grep -aq "uart      : 0x0000000009000000  (dtb)" "$2"
     # GIC は reg[0] と reg[1] の**両方**が取れて初めて (dtb) になる
@@ -139,7 +187,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     # **スロット i の INTID = base + i が DTB で確かめられていること。**
     # 確かめずに決め打ちすると、別のデバイスの割り込みを待つ
     grep -aq "virtio irq: 0x0000000000000030  (dtb、base + スロット番号で確認済み)" "$2"
-    ! grep -aq "(既定値)" "$2"     # 1 つでも既定値に落ちていたら失格
+    must_not "(既定値)" "$2"     # 1 つでも既定値に落ちていたら失格
 
     # M1: 例外ベクタ + GIC + generic timer で tick が入る
     #
@@ -149,7 +197,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     # 別々の壊れ方をするので、まとめて外さずに 1 つずつ確かめてある
     grep -aq "timer freq: 0x0000000003b9aca0" "$2"   # 62.5MHz (QEMU virt の実測値)
     grep -aq "aarch64-timer-ok" "$2"
-    ! grep -aq "aarch64-timer-BAD" "$2"
+    must_not "aarch64-timer-BAD" "$2"
 
     # M2 / M3b: MMU を入れて上位 VA (TTBR1) へ移る
     #
@@ -181,7 +229,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     grep -aq "恒等を外した。カーネルは TTBR1 だけで走っている" "$2"
     grep -aq "mmu probe : ESR=0x0000000096000006 (translation fault, level 2) ok" "$2"
     grep -aq "aarch64-mmu-ok" "$2"
-    ! grep -aq "aarch64-mmu-BAD" "$2"
+    must_not "aarch64-mmu-BAD" "$2"
 
     # M3c-2a: 共有層 (pmm.h / arch_vm_*)
     #
@@ -198,7 +246,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     grep -aq "unmap     :  ok" "$2"     # 外した後は 0 を返す
     grep -aq "free x1   :  ok" "$2"     # 参照カウントが効いている
     grep -aq "aarch64-shared-ok" "$2"
-    ! grep -aq "aarch64-shared-BAD" "$2"
+    must_not "aarch64-shared-BAD" "$2"
 
     # M3a / M3b-2: EL0 + svc + プロセスごとのアドレス空間
     #
@@ -222,7 +270,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     # 「数が合わない」という遠回りな落ち方しかせず、原因が読めない。
     # EL0 の出力は必ず行頭 (空白の後) から始まるので、その前に何か
     # 出ていたら行が割れている
-    ! grep -aqE '[^ ].*\[EL0\]' "$2"
+    must_not_re '[^ ].*\[EL0\]' "$2" "並行に走る 2 本の出力が 1 行の途中で混ざっている"
     # ユーザーは TTBR0 の VA (0x400000) で動く。**カーネルの配置と無関係。**
     grep -aq "user text : 0x0000000000400000" "$2"
     grep -aq "user sp   : 0x0000000000403000" "$2"
@@ -231,7 +279,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     [ "$(grep -ac "\[EL0\] resumed after permission fault" "$2")" = "2" ]
     # **2 回とも marker が 0** = データが私物
     [ "$(grep -ac "marker    : 0x0000000000000000  ok (私物のデータ)" "$2")" = "2" ]
-    ! grep -aq "BAD (前の空間の値が見えている)" "$2"
+    must_not "BAD (前の空間の値が見えている)" "$2"
     [ "$(grep -ac "svc calls : 0x0000000000000005" "$2")" = "2" ]
     [ "$(grep -ac "el0 ticks : .*  ok" "$2")" = "2" ]
     # EL0 から読ませるのはカーネルの**上位 VA**。EL0 も TTBR1 を歩けるが、
@@ -258,7 +306,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     [ "$(grep -ac -- "--- 空間 B ttbr0=" "$2")" = "1" ]
 
     grep -aq "aarch64-user-ok" "$2"
-    ! grep -aq "aarch64-user-BAD" "$2"
+    must_not "aarch64-user-BAD" "$2"
 
     # M3c-2b: 共有スケジューラ (kernel/sched.c) で実際に切り替わること
     #
@@ -271,14 +319,18 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     grep -aq "  idle task :  ok" "$2"
     grep -aq "  sleep     : .*  ok (寝て、タイマに起こされた)" "$2"
     grep -aq "aarch64-sched-ok" "$2"
-    ! grep -aq "aarch64-sched-BAD" "$2"
+    must_not "aarch64-sched-BAD" "$2"
+
+    # M4-3: xv6fs。ディスクの有無で結果が変わるので、ここでは
+    # 「壊れていない」ことだけを見る。中身の判定はディスク付きの回で行う
+    must_not "aarch64-fs-BAD" "$2"
 
     # M4: virtio-blk。**デバイスの有無で結果が変わるので、ここでは
     # 「壊れていない」ことだけを見る。** 中身の判定はディスク付きの回で行う
-    ! grep -aq "aarch64-virtio-BAD" "$2"
+    must_not "aarch64-virtio-BAD" "$2"
 
     # 想定外の例外を踏んでいないこと
-    ! grep -aq "aarch64-exception-BAD" "$2"
+    must_not "aarch64-exception-BAD" "$2"
 }
 
 run_one "virt" LOGs/aarch64-serial.log 512M
@@ -309,6 +361,25 @@ grep -aq "write/read: ok (書いたものが読み戻せた)" LOGs/aarch64-seria
 grep -aq "intid     : 0x000000000000004f  (割り込みで完了を待つ)" LOGs/aarch64-serial-disk.log
 grep -aq "irq count : .*  ok (割り込みで完了した)" LOGs/aarch64-serial-disk.log
 grep -aq "aarch64-virtio-ok" LOGs/aarch64-serial-disk.log
-! grep -aq "aarch64-virtio-BAD" LOGs/aarch64-serial-disk.log
+must_not "aarch64-virtio-BAD" LOGs/aarch64-serial-disk.log
+
+echo "--- M4-3 の判定 (xv6fs) ---"
+# **マウントできただけでは、中身を辿れる証拠にならない。**
+# イメージに入れておいた既知のファイルを、中身まで照合させる
+grep -aq "xv6fs: mounted vblk0" LOGs/aarch64-serial-disk.log
+grep -aq "  mount     :  ok" LOGs/aarch64-serial-disk.log
+grep -aq "  read file :  ok" LOGs/aarch64-serial-disk.log
+# 書けること = ログと bitmap が効いている。読み戻しまで見る
+grep -aq "  write     :  ok" LOGs/aarch64-serial-disk.log
+grep -aq "  read back :  ok" LOGs/aarch64-serial-disk.log
+grep -aq "aarch64-fs-ok" LOGs/aarch64-serial-disk.log
+# **戻り値の約束を守っていること。** storage の受け口が「読めたブロック数」を
+# 返すと、xv6bio は ret != 0 をエラーとして記録するが**動きは正しいまま**。
+# 判定はすべて ok のまま通り、エラーログだけが 8 行出る (逆確認で実測)。
+# ここを見ないと、間違った約束のまま先へ進む
+must_not "xv6bio: disk" LOGs/aarch64-serial-disk.log
+# ディスクを付けない 3 通りでは aarch64-fs-none になること
+# (「無い」と「壊れた」を混ぜない)
+grep -aq "aarch64-fs-none" LOGs/aarch64-serial.log
 
 echo "aarch64 smoke test: PASS (M0-M4, EL1 / EL2 降格 / RAM 1GB / virtio-blk の 4 通り)"

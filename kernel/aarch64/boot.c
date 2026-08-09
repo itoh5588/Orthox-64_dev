@@ -129,6 +129,7 @@ uint64_t aarch64_virtio_blk_base_pa(void);
 void aarch64_virtio_blk_selftest(void);
 int aarch64_shared_layer_selftest(void);
 int aarch64_shared_task_selftest(void);
+int aarch64_fs_selftest(void);
 uint32_t aarch64_virtio_blk_intid(void);
 void aarch64_virtio_blk_irq(void);
 
@@ -439,6 +440,11 @@ void aarch64_boot_continue(void) {
      * **M3c-1 の器を使う検査が全部終わってから。** 乗り換えると
      * aarch64_task_* の器は止まる */
     aarch64_shared_task_selftest();
+
+    /* ---- M4-3: xv6fs ---------------------------------------------------
+     * **task_init の後。** xv6fs は sleeplock を使うので、待てるタスクが
+     * 居ないと成立しない */
+    aarch64_fs_selftest();
 
     aarch64_wait_forever();
 }
