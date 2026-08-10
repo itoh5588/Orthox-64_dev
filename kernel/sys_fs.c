@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "fs.h"
+#include "xv6fs.h"
 #include "lapic.h"
 #include "sys_internal.h"
 #include "task.h"
@@ -439,4 +440,45 @@ int64_t sys_pselect6(int nfds, uint64_t* readfds, uint64_t* writefds,
         }
         sys_sleep_ms(10);
     }
+}
+
+/* ---- dup / linkat (C-1a で共有側にも足した) -----------------------------
+ *
+ * もとは kernel/riscv64/fs.c にしか無かった。共有の syscall 層
+ * (kernel/linux_syscall.c) が呼ぶので、共有側にも置く。
+ * riscv64 は自前の fs.c を使い続けるので衝突しない。 */
+int sys_dup(int oldfd) {
+    struct task* current = get_current_task();
+    int newfd = -1;
+    if (!current) return -1;
+    if (oldfd < 0 || oldfd >= MAX_FDS || !current->fds[oldfd].in_use) return -9;   /* EBADF */
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (!current->fds[i].in_use) { newfd = i; break; }
+    }
+    if (newfd == -1) return -24;   /* EMFILE */
+    if (fs_clone_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -9;
+    current->fds[newfd].fd_flags = 0;
+    return newfd;
+}
+
+/* flags の 0x80000 は O_CLOEXEC (asm-generic) */
+int sys_dup3(int oldfd, int newfd, int flags) {
+    struct task* current = get_current_task();
+    if (!current) return -1;
+    if (oldfd < 0 || oldfd >= MAX_FDS || !current->fds[oldfd].in_use) return -9;
+    if (newfd < 0 || newfd >= MAX_FDS) return -9;
+    /* **dup3 は old == new をエラーにする** (dup2 は成功させる) */
+    if (oldfd == newfd) return -22;   /* EINVAL */
+    if (current->fds[newfd].in_use) fs_release_fd(&current->fds[newfd]);
+    if (fs_clone_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -9;
+    current->fds[newfd].fd_flags = (flags & 0x80000) ? FD_CLOEXEC : 0;
+    return newfd;
+}
+
+int sys_linkat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags) {
+    (void)olddirfd; (void)newdirfd;
+    (void)flags;   /* AT_SYMLINK_FOLLOW: xv6fs に symlink が無いので無視してよい */
+    if (!oldpath || !newpath || oldpath[0] == '\0' || newpath[0] == '\0') return -2;
+    if (!xv6fs_is_mounted()) return -30;   /* EROFS */
+    return xv6fs_link_path(oldpath, newpath) == 0 ? 0 : -1;
 }

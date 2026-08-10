@@ -144,6 +144,8 @@ void arch_context_switch(struct arch_task_context* next, struct arch_task_contex
  * 取り合うと、どちらの前提も成り立たない */
 void aarch64_task_use_shared_scheduler(void);
 int  aarch64_task_shared_scheduler_on(void);
+void aarch64_use_shared_syscalls_on(void);
+int  aarch64_use_shared_syscalls(void);
 
 typedef aarch64_trap_frame_t arch_task_exec_frame_t;
 

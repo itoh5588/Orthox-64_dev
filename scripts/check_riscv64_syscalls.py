@@ -11,7 +11,7 @@
 正として突き合わせる。
 
 チェック内容:
-  1. include/riscv64/linux_syscalls.h の各値が musl の __NR_* と一致するか
+  1. include/linux_syscalls.h の各値が musl の __NR_* と一致するか
   2. 同じ番号を 2 つの名前に割り当てていないか
   3. kernel/riscv64/ にレガシー SYS_* の参照が残っていないか (コメントは除く)
 
@@ -22,7 +22,7 @@ import re
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-HDR = os.path.join(REPO, "include/riscv64/linux_syscalls.h")
+HDR = os.path.join(REPO, "include/linux_syscalls.h")
 MUSL = os.path.join(REPO, "ports/musl-install-riscv64/include/bits/syscall.h")
 SRC_DIR = os.path.join(REPO, "kernel/riscv64")
 
@@ -44,7 +44,7 @@ def main():
         musl[m.group(1)] = int(m.group(2))
 
     ours = {}
-    for m in re.finditer(r"#define\s+RISCV64_LINUX_SYS_(\w+)\s+(\d+)", open(HDR).read()):
+    for m in re.finditer(r"#define\s+LINUX_SYS_(\w+)\s+(\d+)", open(HDR).read()):
         ours[m.group(1).lower()] = int(m.group(2))
 
     # 1. musl の表と一致するか
@@ -100,7 +100,7 @@ def main():
                         out.append(code[i:start])
                         in_block = True
                         i = start + 2
-                code = re.sub(r"RISCV64_LINUX_SYS_\w+", "", "".join(out))
+                code = re.sub(r"LINUX_SYS_\w+", "", "".join(out))
                 if legacy.search(code):
                     rel = os.path.relpath(path, REPO)
                     errors += fail("%s:%d にレガシー SYS_* が残っている: %s"

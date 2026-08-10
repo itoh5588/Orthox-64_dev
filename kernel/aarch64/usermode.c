@@ -26,6 +26,7 @@
 #include "aarch64/usermode.h"
 #include "aarch64/vm.h"
 #include "aarch64/task.h"
+#include "linux_syscall.h"
 
 /* SAVE_ALL が積んだフレームの並び。vectors.S と対で決まっている。
  *
@@ -209,6 +210,13 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
     user_run_state_t* st = urun();
 
     if (ec == ESR_EC_SVC64) {
+        /* **共有システムコール層へ渡す (P1)。**
+         * M3a の自前 aarch64_svc は、共有層が来るまでの足場だった。
+         * いまは kernel/linux_syscall.c が受ける (riscv64 と同じ実装) */
+        if (aarch64_use_shared_syscalls()) {
+            linux_syscall_dispatch((arch_syscall_frame_t*)frame);
+            return;
+        }
         aarch64_svc(frame);
         if (st->exited) {
             /* exit されたので EL0 へは戻さない。戻り先を差し替えて

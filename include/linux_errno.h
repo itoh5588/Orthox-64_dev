@@ -1,5 +1,5 @@
-#ifndef ORTHOX_RISCV64_ERRNO_H
-#define ORTHOX_RISCV64_ERRNO_H
+#ifndef ORTHOX_LINUX_ERRNO_H
+#define ORTHOX_LINUX_ERRNO_H
 
 /*
  * riscv64 の syscall 戻り値で使う errno 定数 (Linux asm-generic の値)。
@@ -14,27 +14,27 @@
  * tests/riscv64_errno_smoke.sh が代表的な失敗系を見張っている。
  */
 
-#define RISCV64_EPERM        1
-#define RISCV64_ENOENT       2
-#define RISCV64_ESRCH        3
-#define RISCV64_E2BIG        7
-#define RISCV64_EBADF        9
-#define RISCV64_ECHILD      10
-#define RISCV64_EAGAIN      11
-#define RISCV64_ENOMEM      12
-#define RISCV64_EFAULT      14
-#define RISCV64_EEXIST      17
-#define RISCV64_ENOTDIR     20
-#define RISCV64_EISDIR      21
-#define RISCV64_EINVAL      22
+#define LINUX_EPERM        1
+#define LINUX_ENOENT       2
+#define LINUX_ESRCH        3
+#define LINUX_E2BIG        7
+#define LINUX_EBADF        9
+#define LINUX_ECHILD      10
+#define LINUX_EAGAIN      11
+#define LINUX_ENOMEM      12
+#define LINUX_EFAULT      14
+#define LINUX_EEXIST      17
+#define LINUX_ENOTDIR     20
+#define LINUX_EISDIR      21
+#define LINUX_EINVAL      22
 /* open file description を作れない (x86 の kernel/fs.c も同じ場面で ENFILE) */
-#define RISCV64_ENFILE      23
-#define RISCV64_EMFILE      24
-#define RISCV64_ENOTTY      25
-#define RISCV64_ENOSPC      28
-#define RISCV64_ESPIPE      29
-#define RISCV64_EROFS       30
-#define RISCV64_ENOSYS      38
-#define RISCV64_ENOTEMPTY   39
+#define LINUX_ENFILE      23
+#define LINUX_EMFILE      24
+#define LINUX_ENOTTY      25
+#define LINUX_ENOSPC      28
+#define LINUX_ESPIPE      29
+#define LINUX_EROFS       30
+#define LINUX_ENOSYS      38
+#define LINUX_ENOTEMPTY   39
 
-#endif /* ORTHOX_RISCV64_ERRNO_H */
+#endif /* ORTHOX_LINUX_ERRNO_H */

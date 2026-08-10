@@ -6,7 +6,7 @@
 #include "riscv64/elf.h"
 #include "riscv64/entry.h"
 #include "riscv64/plic.h"
-#include "riscv64/linux_syscalls.h"
+#include "linux_syscalls.h"
 #include "riscv64/syscall.h"
 #include "riscv64/task.h"
 #include "riscv64/trap.h"
@@ -605,7 +605,7 @@ static void riscv64_syscall_dispatch_selftest(void) {
     frame.sstatus = ctx->user_frame.sstatus;
     frame.a0 = (uint64_t)(uintptr_t)cwd_buf;
     frame.a1 = sizeof(cwd_buf);
-    frame.a7 = RISCV64_LINUX_SYS_GETCWD;
+    frame.a7 = LINUX_SYS_GETCWD;
 
     riscv64_syscall_dispatch(&frame);
 
@@ -624,7 +624,7 @@ static void riscv64_syscall_dispatch_selftest(void) {
     frame.sepc = 0x0000000040003000ULL;
     frame.sp = 0x000000007ffff000ULL;
     frame.sstatus = ctx->user_frame.sstatus;
-    frame.a7 = RISCV64_LINUX_SYS_GETPID;
+    frame.a7 = LINUX_SYS_GETPID;
 
     riscv64_syscall_dispatch(&frame);
 
@@ -642,7 +642,7 @@ static void riscv64_syscall_dispatch_selftest(void) {
     frame.a0 = 1;
     frame.a1 = (uint64_t)(uintptr_t)write_buf;
     frame.a2 = 4;
-    frame.a7 = RISCV64_LINUX_SYS_WRITE;
+    frame.a7 = LINUX_SYS_WRITE;
 
     riscv64_syscall_dispatch(&frame);
 
@@ -689,7 +689,7 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.sp = 0x000000007ffff000ULL;
     frame.sstatus = ctx->user_frame.sstatus;
     frame.a0 = (uint64_t)(uintptr_t)root_path;
-    frame.a7 = RISCV64_LINUX_SYS_CHDIR;
+    frame.a7 = LINUX_SYS_CHDIR;
     riscv64_syscall_dispatch(&frame);
     if ((int64_t)frame.a0 != 0) {
         riscv64_uart_puts("  fs syscall selftest: chdir failed\n");
@@ -701,11 +701,11 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.sp = 0x000000007ffff000ULL;
     frame.sstatus = ctx->user_frame.sstatus;
     /* riscv64 に stat(2) は無いので newfstatat(AT_FDCWD, ...) で見る */
-    frame.a0 = (uint64_t)(int64_t)RISCV64_LINUX_AT_FDCWD;
+    frame.a0 = (uint64_t)(int64_t)LINUX_AT_FDCWD;
     frame.a1 = (uint64_t)(uintptr_t)bootstrap_path;
     frame.a2 = (uint64_t)(uintptr_t)&st;
     frame.a3 = 0;
-    frame.a7 = RISCV64_LINUX_SYS_NEWFSTATAT;
+    frame.a7 = LINUX_SYS_NEWFSTATAT;
     riscv64_syscall_dispatch(&frame);
     if ((int64_t)frame.a0 != 0 || (st.st_mode & 0170000U) != KSTAT_MODE_FILE || st.st_size < 4) {
         riscv64_uart_puts("  fs syscall selftest: newfstatat failed\n");
@@ -717,11 +717,11 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.sp = 0x000000007ffff000ULL;
     frame.sstatus = ctx->user_frame.sstatus;
     /* riscv64 に open(2) は無いので openat(AT_FDCWD, ...) を使う */
-    frame.a0 = (uint64_t)(int64_t)RISCV64_LINUX_AT_FDCWD;
+    frame.a0 = (uint64_t)(int64_t)LINUX_AT_FDCWD;
     frame.a1 = (uint64_t)(uintptr_t)root_path;
     frame.a2 = O_DIRECTORY;
     frame.a3 = 0;
-    frame.a7 = RISCV64_LINUX_SYS_OPENAT;
+    frame.a7 = LINUX_SYS_OPENAT;
     riscv64_syscall_dispatch(&frame);
     dirfd = (int)frame.a0;
     if (dirfd < 3) {
@@ -737,7 +737,7 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.a1 = (uint64_t)(uintptr_t)relative_bootstrap;
     frame.a2 = 0;
     frame.a3 = 0;
-    frame.a7 = RISCV64_LINUX_SYS_OPENAT;
+    frame.a7 = LINUX_SYS_OPENAT;
     riscv64_syscall_dispatch(&frame);
     fd = (int)frame.a0;
     if (fd < 3) {
@@ -751,7 +751,7 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.sstatus = ctx->user_frame.sstatus;
     frame.a0 = (uint64_t)fd;
     frame.a1 = (uint64_t)(uintptr_t)&st2;
-    frame.a7 = RISCV64_LINUX_SYS_FSTAT;
+    frame.a7 = LINUX_SYS_FSTAT;
     riscv64_syscall_dispatch(&frame);
     if ((int64_t)frame.a0 != 0 || st2.st_size != st.st_size || st2.st_mode != st.st_mode) {
         riscv64_uart_puts("  fs syscall selftest: fstat failed\n");
@@ -766,7 +766,7 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.a1 = (uint64_t)(uintptr_t)relative_bootstrap;
     frame.a2 = (uint64_t)(uintptr_t)&st2;
     frame.a3 = 0;
-    frame.a7 = RISCV64_LINUX_SYS_NEWFSTATAT;
+    frame.a7 = LINUX_SYS_NEWFSTATAT;
     riscv64_syscall_dispatch(&frame);
     if ((int64_t)frame.a0 != 0 || st2.st_size != st.st_size || st2.st_mode != st.st_mode) {
         riscv64_uart_puts("  fs syscall selftest: fstatat failed\n");
@@ -778,7 +778,7 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.sp = 0x000000007ffff000ULL;
     frame.sstatus = ctx->user_frame.sstatus;
     frame.a0 = (uint64_t)dirfd;
-    frame.a7 = RISCV64_LINUX_SYS_FCHDIR;
+    frame.a7 = LINUX_SYS_FCHDIR;
     riscv64_syscall_dispatch(&frame);
     if ((int64_t)frame.a0 != 0) {
         riscv64_uart_puts("  fs syscall selftest: fchdir failed\n");
@@ -789,11 +789,11 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.sepc = 0x0000000040005020ULL;
     frame.sp = 0x000000007ffff000ULL;
     frame.sstatus = ctx->user_frame.sstatus;
-    frame.a0 = (uint64_t)(int64_t)RISCV64_LINUX_AT_FDCWD;
+    frame.a0 = (uint64_t)(int64_t)LINUX_AT_FDCWD;
     frame.a1 = (uint64_t)(uintptr_t)bootstrap_path;
     frame.a2 = 0;
     frame.a3 = 0;
-    frame.a7 = RISCV64_LINUX_SYS_OPENAT;
+    frame.a7 = LINUX_SYS_OPENAT;
     riscv64_syscall_dispatch(&frame);
     fd = (int)frame.a0;
     if (fd < 3) {
@@ -808,7 +808,7 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.a0 = (uint64_t)fd;
     frame.a1 = (uint64_t)(uintptr_t)read_buf;
     frame.a2 = 4;
-    frame.a7 = RISCV64_LINUX_SYS_READ;
+    frame.a7 = LINUX_SYS_READ;
     riscv64_syscall_dispatch(&frame);
     if ((int64_t)frame.a0 != 4 || read_buf[0] != 0x7f || read_buf[1] != 'E' ||
         read_buf[2] != 'L' || read_buf[3] != 'F') {
@@ -821,7 +821,7 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.sp = 0x000000007ffff000ULL;
     frame.sstatus = ctx->user_frame.sstatus;
     frame.a0 = (uint64_t)fd;
-    frame.a7 = RISCV64_LINUX_SYS_CLOSE;
+    frame.a7 = LINUX_SYS_CLOSE;
     riscv64_syscall_dispatch(&frame);
     if ((int64_t)frame.a0 != 0) {
         riscv64_uart_puts("  fs syscall selftest: close failed\n");
@@ -833,7 +833,7 @@ static void riscv64_fs_syscall_selftest(void) {
     frame.sp = 0x000000007ffff000ULL;
     frame.sstatus = ctx->user_frame.sstatus;
     frame.a0 = (uint64_t)dirfd;
-    frame.a7 = RISCV64_LINUX_SYS_CLOSE;
+    frame.a7 = LINUX_SYS_CLOSE;
     riscv64_syscall_dispatch(&frame);
     if ((int64_t)frame.a0 != 0) {
         riscv64_uart_puts("  fs syscall selftest: close dir failed\n");

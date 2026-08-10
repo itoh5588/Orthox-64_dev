@@ -71,7 +71,8 @@ RISCV64_C_SRCS = \
 	kernel/riscv64/entry.c kernel/riscv64/fs.c kernel/riscv64/net_socket.c \
 	kernel/riscv64/plic.c kernel/riscv64/pmm.c kernel/riscv64/runtime.c \
 	kernel/riscv64/smp.c kernel/riscv64/task.c kernel/riscv64/trap.c \
-	kernel/riscv64/syscall.c kernel/riscv64/virtio_blk_mmio.c kernel/riscv64/vm.c
+	kernel/riscv64/syscall.c kernel/riscv64/virtio_blk_mmio.c kernel/riscv64/vm.c \
+	kernel/linux_syscall.c
 
 SHARED_C_SRCS = \
 	kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c \

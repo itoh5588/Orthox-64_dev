@@ -214,6 +214,13 @@ void aarch64_task_use_shared_scheduler(void) {
 
 int aarch64_task_shared_scheduler_on(void) { return g_shared_sched; }
 
+/* svc を共有システムコール層へ流すかどうか (P1)。
+ * **M3a の自前検査が終わってから切り替える。** あちらは独自の
+ * write/exit を前提にしていて、共有層の exit は戻ってこない */
+static int g_shared_syscalls;
+void aarch64_use_shared_syscalls_on(void) { g_shared_syscalls = 1; }
+int  aarch64_use_shared_syscalls(void)    { return g_shared_syscalls; }
+
 /* 共有層が呼ぶ名前。**TTBR0 の差し替えをここでやる。**
  * riscv64 は .S の中で satp を書いているが、あちらは root_pa が
  * ctx の offset 0 にある。aarch64 は regs を先頭に置いたので C で挟む。

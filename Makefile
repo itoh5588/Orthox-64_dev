@@ -181,6 +181,7 @@ RISCV64_C_SRCS = kernel/riscv64/boot.c kernel/riscv64/bootstrap_user.c kernel/ri
 	kernel/riscv64/runtime.c kernel/riscv64/smp.c kernel/riscv64/task.c kernel/riscv64/trap.c kernel/riscv64/syscall.c \
 	kernel/riscv64/virtio_blk_mmio.c kernel/riscv64/vm.c
 RISCV64_SHARED_C_SRCS = kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c \
+	kernel/linux_syscall.c \
 	kernel/wait.c kernel/elf.c kernel/cstring.c kernel/cstdio.c \
 	kernel/storage.c kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c
 RISCV64_ASM_SRCS = kernel/riscv64/start.S kernel/riscv64/trap.S kernel/riscv64/entry.S
@@ -296,7 +297,7 @@ AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer
 	kernel/aarch64/dtb.c \
 	kernel/aarch64/vm.c kernel/aarch64/usermode.c kernel/aarch64/pmm.c \
 	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/runtime.c \
-	kernel/aarch64/stubs.c
+	kernel/aarch64/stubs.c kernel/aarch64/syscall.c
 # 共有層のうち、**いま繋がるものだけ**を取り込む (M3c-2a)。
 # どれが入るかは推測せず、llvm-nm -u で未解決シンボルを実測して決めた。
 #
@@ -311,7 +312,8 @@ AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer
 AARCH64_SHARED_C_SRCS = kernel/cstring.c kernel/cstdio.c kernel/vfs.c kernel/storage.c \
 	kernel/task.c kernel/sched.c kernel/wait.c \
 	kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c \
-	kernel/fs.c kernel/elf.c kernel/task_exec.c kernel/task_fork.c
+	kernel/fs.c kernel/elf.c kernel/task_exec.c kernel/task_fork.c \
+	kernel/linux_syscall.c kernel/sys_fs.c
 AARCH64_ASM_SRCS = kernel/aarch64/start.S kernel/aarch64/vectors.S \
 	kernel/aarch64/entry.S kernel/aarch64/user_blob.S kernel/aarch64/switch.S
 AARCH64_CFLAGS = --target=aarch64-none-elf -mgeneral-regs-only \
