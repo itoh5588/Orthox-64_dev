@@ -67,6 +67,10 @@ make_test_disk() {
     # **カーネルが中身まで照合する既知のファイル。**
     # 「読めた」だけでは、別のブロックを返していても気づけない
     printf 'ORTHOX-AARCH64-XV6FS-OK' > "$TEST_FSDIR/aarch64-m4.txt"
+    # **最初のユーザープログラム (P1)。** カーネルに埋め込まず、
+    # ディスクから読ませる — ELF の読み込み経路ごと確かめるため
+    mkdir -p "$TEST_FSDIR/bin"
+    cp out/aarch64-hello.elf "$TEST_FSDIR/bin/hello"
     rm -f "$TEST_DISK"
     XV6FS_FSSIZE=$XV6FS_TEST_BLOCKS XV6FS_NINODES=256 \
         python3 scripts/build_rootfs_xv6fs.py "$TEST_FSDIR" "$TEST_DISK" > /dev/null

@@ -346,13 +346,23 @@ aarch64-run: $(AARCH64_KERNEL_ELF)
 	qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 512M -smp 1 \
 		-nographic -kernel $(AARCH64_KERNEL_ELF)
 
-aarch64-smoke: $(AARCH64_KERNEL_ELF)
+# aarch64 の最小ユーザープログラム (P1)。libc 無し。
+# **ELF を読んで EL0 で走らせ、svc が共有システムコール層に届く**ことの確認用
+AARCH64_USER_HELLO = out/aarch64-hello.elf
+$(AARCH64_USER_HELLO): user/aarch64_hello.S scripts/user-aarch64.ld
+	@mkdir -p $(@D) $(BUILD_DIR)/aarch64/user
+	$(AARCH64_CC) --target=aarch64-none-elf -ffreestanding -fno-PIE -c $< -o $(BUILD_DIR)/aarch64/user/hello.o
+	$(LD) -nostdlib -static -m aarch64elf -T scripts/user-aarch64.ld $(BUILD_DIR)/aarch64/user/hello.o -o $@
+
+aarch64-user-bin: $(AARCH64_USER_HELLO)
+
+aarch64-smoke: $(AARCH64_KERNEL_ELF) $(AARCH64_USER_HELLO)
 	bash ./tests/aarch64_smoke.sh
 
 # **判定そのものが火を噴くかを確かめる。** 通常どおり回してから、
 # 通ったログに禁止文字列を注入して、否定判定が全部落ちることを見る
 # (日報2026-08-09 追9-6: `! grep` は set -e の対象外で 15 か所が空振りしていた)
-aarch64-smoke-selftest: $(AARCH64_KERNEL_ELF)
+aarch64-smoke-selftest: $(AARCH64_KERNEL_ELF) $(AARCH64_USER_HELLO)
 	bash ./tests/aarch64_smoke.sh --self-test
 
 $(RISCV64_KERNEL_ELF): $(RISCV64_OBJS)

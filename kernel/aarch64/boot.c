@@ -130,6 +130,7 @@ void aarch64_virtio_blk_selftest(void);
 int aarch64_shared_layer_selftest(void);
 int aarch64_shared_task_selftest(void);
 int aarch64_fs_selftest(void);
+int aarch64_first_user_task(void);
 uint32_t aarch64_virtio_blk_intid(void);
 void aarch64_virtio_blk_irq(void);
 
@@ -445,6 +446,9 @@ void aarch64_boot_continue(void) {
      * **task_init の後。** xv6fs は sleeplock を使うので、待てるタスクが
      * 居ないと成立しない */
     aarch64_fs_selftest();
+
+    /* ---- P1: ディスクの ELF を EL0 で走らせる -------------------------- */
+    aarch64_first_user_task();
 
     aarch64_wait_forever();
 }

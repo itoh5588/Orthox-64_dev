@@ -475,6 +475,11 @@ int aarch64_fs_selftest(void) {
     report("  mount     :", xv6fs_mount_storage("vblk0") == 0, &ok);
     if (!xv6fs_is_mounted()) goto done;
 
+    /* **root を xv6fs に切り替える。** これを忘れると fs.c は
+     * ROOT_SOURCE_MODULE のまま探しに行き、exec が「File not found」に
+     * なる (実際に踏んだ)。マウントできたことと、root として使うことは別 */
+    report("  root=xv6fs:", fs_mount_xv6fs_root() == 0, &ok);
+
     /* 2. イメージに入れておいた既知のファイル。**中身まで照合する** */
     n = fs_read_path(FS_PROBE_PATH, g_fs_buf, sizeof(g_fs_buf));
     report("  read file :", n > 0 && fs_streq(g_fs_buf, FS_PROBE_TEXT,
@@ -543,6 +548,52 @@ done:
     puts(ok ? "aarch64-fs-ok\n" : "aarch64-fs-BAD\n");
     aarch64_console_end();
     return ok;
+}
+
+/* ==========================================================================
+ * P1: 最初のユーザープロセス
+ *
+ * **ディスクの ELF を読んで EL0 で走らせる。** カーネルに埋め込まない
+ * (riscv64 は埋め込みの器も持っているが、こちらは ELF の読み込み経路ごと
+ *  確かめたいので最初からディスクから読む)。
+ *
+ * riscv64 の riscv64_first_user_task_bootstrap_continue と同じ形:
+ *   task_execve(&frame, path, argv, envp) -> task_main()
+ * ========================================================================== */
+
+int task_execve(arch_task_exec_frame_t* frame, const char* path,
+                char* const argv[], char* const envp[]);
+void task_main(void);
+
+#define AARCH64_INIT_PATH "/bin/hello"
+
+int aarch64_first_user_task(void) {
+    static char* argv[] = { (char*)AARCH64_INIT_PATH, 0 };
+    static char* envp[] = { 0 };
+    arch_task_exec_frame_t frame;
+
+    aarch64_console_begin();
+    puts("--- P1: 最初のユーザープロセス ---\n");
+    puts("  exec      : " AARCH64_INIT_PATH "\n");
+    aarch64_console_end();
+
+    if (!get_current_task()) {
+        puts("  BAD (current task がいない)\naarch64-init-BAD\n");
+        return 0;
+    }
+
+    /* **svc をここで共有層に切り替える。** M3a の自前検査より後にする
+     * (あちらは独自の write/exit を前提にしている) */
+    aarch64_use_shared_syscalls_on();
+
+    if (task_execve(&frame, AARCH64_INIT_PATH, argv, envp) < 0) {
+        puts("  exec      : BAD (execve が失敗)\naarch64-init-BAD\n");
+        return 0;
+    }
+
+    /* **戻ってこない。** EL0 へ降り、exit したらゾンビになって schedule へ */
+    task_main();
+    return 1;
 }
 
 /* ---- まだ無いもの --------------------------------------------------------
