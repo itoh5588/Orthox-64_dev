@@ -158,13 +158,11 @@ aarch64_task_enter_initial_user_context:
     ldr     x0,  [x0, #8 * 0]
     eret
 
-/* fork した子が最初に走り出す場所 (M3c-2b)。
- * **まだ経路が繋がっていない** (task_fork.c を取り込んでいない)。
- * 呼ばれたら分かるように止める。黙って先へ進めると、子が親の続きを
- * カーネル権限で走らせることになる */
-.globl aarch64_task_fork_child_return
-aarch64_task_fork_child_return:
-    b       .
+/* fork した子が最初に走り出す場所は kernel/aarch64/task.c に C で置いた。
+ * get_current_task() から ctx を取って上の
+ * aarch64_task_enter_initial_user_context へ渡すだけなので、
+ * ctx のオフセットを .S に持たせるより C のほうが壊れにくい
+ * (riscv64 も kernel/riscv64/task.c に C で置いている) */
 
 /* EL0 を終えたときの着地点。
  *

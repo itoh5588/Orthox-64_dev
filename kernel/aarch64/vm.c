@@ -601,13 +601,81 @@ arch_address_space_t arch_vm_create_user_address_space(void) {
     return root_pa;
 }
 
-/* fork 用。まだ中身を写していない。**呼ばれたら分かるように 0 を返す。**
- * 黙って空の空間を返すと、子プロセスが何も張られていない空間で走り出して
- * 原因不明のアボートになる */
-arch_address_space_t arch_vm_clone_address_space(arch_address_space_t address_space) {
-    (void)address_space;
-    aarch64_uart_puts("  vm: arch_vm_clone_address_space は未実装 (M3c-2b)\n");
+/* ページの中身を 1 枚写す。
+ *
+ * **物理アドレスのまま触らない。** 恒等マッピングを外した後は上位 VA を
+ * 通さないと翻訳できない (P2 で kernel/linux_syscall.c が同じ形で落ちた:
+ * ESR=0x96000045 / FAR に物理アドレスがそのまま出る)。
+ * aarch64_vm_table_ptr が MMU の状態に応じて変換してくれる */
+static void aarch64_vm_copy_page(uint64_t dst_pa, uint64_t src_pa) {
+    uint64_t* d = aarch64_vm_table_ptr(dst_pa);
+    const uint64_t* s = aarch64_vm_table_ptr(src_pa);
+    for (uint64_t i = 0; i < AARCH64_PAGE_SIZE / sizeof(uint64_t); i++) d[i] = s[i];
+}
+
+/* fork 用にテーブルを 1 段ぶん写す。level は aarch64_vm_index と同じ 1..3。
+ *
+ * **カーネル領域を避ける処理は要らない。** riscv64 / x86 は 1 本のテーブルに
+ * カーネルとユーザーが同居するので「カーネルと同じエントリなら共有する」
+ * 判定が要る (kernel/riscv64/vm.c の riscv64_vm_clone_table)。AArch64 は
+ * カーネルが TTBR1 に居るので、TTBR0 の中身はすべてユーザーのもの。
+ *
+ * ページは**その場で写す (eager copy)。** CoW はまだ無いので、fork した
+ * 瞬間に親と同じだけの物理ページを食う。 */
+static int aarch64_vm_clone_table(uint64_t dst_pa, uint64_t src_pa, int level) {
+    uint64_t* dst = aarch64_vm_table_ptr(dst_pa);
+    const uint64_t* src = aarch64_vm_table_ptr(src_pa);
+
+    for (uint64_t i = 0; i < AARCH64_PTES; i++) {
+        uint64_t entry = src[i];
+        dst[i] = 0;
+        if ((entry & AARCH64_PTE_VALID) == 0) continue;
+
+        if (level < 3) {
+            uint64_t child;
+            /* L1/L2 で TABLE ビットが落ちていればブロック写像。ユーザー空間に
+             * ブロックは張っていないので、**黙って共有せず失敗させる** —
+             * 共有すると親子で同じ物理ページを書き合う */
+            if ((entry & AARCH64_PTE_TABLE) == 0) {
+                aarch64_uart_puts("  vm: clone: 想定外のブロック写像\n");
+                return -1;
+            }
+            child = aarch64_vm_alloc_table();
+            if (!child) return -1;
+            dst[i] = (child & AARCH64_PTE_ADDR_MASK) | AARCH64_PTE_VALID | AARCH64_PTE_TABLE;
+            if (aarch64_vm_clone_table(child, entry & AARCH64_PTE_ADDR_MASK, level + 1) < 0) {
+                return -1;
+            }
+            continue;
+        }
+
+        /* L3 = ページ本体。**属性はそのまま、物理アドレスだけ差し替える** */
+        {
+            uint64_t new_pa = aarch64_pmm_alloc(1);
+            if (!new_pa) return -1;
+            aarch64_vm_copy_page(new_pa, entry & AARCH64_PTE_ADDR_MASK);
+            dst[i] = (new_pa & AARCH64_PTE_ADDR_MASK) | (entry & ~AARCH64_PTE_ADDR_MASK);
+        }
+    }
     return 0;
+}
+
+/* fork 用。親のアドレス空間を丸ごと写した新しい空間を返す。失敗なら 0。
+ * **失敗したら途中まで作ったものを捨てる** — 半端な空間を返すと、子が
+ * 穴の空いた空間で走り出して原因不明のアボートになる */
+arch_address_space_t arch_vm_clone_address_space(arch_address_space_t address_space) {
+    uint64_t root_pa;
+
+    if (!address_space) return 0;
+    root_pa = (uint64_t)arch_vm_create_user_address_space();
+    if (!root_pa) return 0;
+
+    /* ルートは L1 (VA 39bit / 4KB granule なので L1 が最上位) */
+    if (aarch64_vm_clone_table(root_pa, (uint64_t)address_space, 1) < 0) {
+        arch_vm_destroy_user_address_space(root_pa);
+        return 0;
+    }
+    return (arch_address_space_t)root_pa;
 }
 
 /* テーブルの解放。**まだページそのものは返していない。**

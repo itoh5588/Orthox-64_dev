@@ -214,6 +214,26 @@ void aarch64_task_use_shared_scheduler(void) {
 
 int aarch64_task_shared_scheduler_on(void) { return g_shared_sched; }
 
+/* fork した子が最初に走り出す場所 (P3)。
+ *
+ * arch_task_prepare_fork_child_context が、子の ctx の「復帰先」をここに
+ * 仕込んである。子が初めてスケジュールされると arch_context_switch が
+ * ここへ ret してくるので、**子のフレームを載せて EL0 へ降ろす。**
+ * 子のフレームは x0 = 0 (fork の戻り値) に細工済み。
+ *
+ * riscv64 の riscv64_task_fork_child_return と同じ形。ctx のオフセットを
+ * .S に持たせないよう C で書く。**戻らない。** */
+void aarch64_task_fork_child_return(void) {
+    struct task* current = get_current_task();
+    if (!current) {
+        /* **黙って先へ進めない。** 進めると、子が親の続きをカーネル権限で
+         * 走らせることになる */
+        aarch64_uart_puts("  task: fork の子に current がいない\n");
+        aarch64_wait_forever();
+    }
+    aarch64_task_enter_initial_user_context(&current->ctx);
+}
+
 /* svc を共有システムコール層へ流すかどうか (P1)。
  * **M3a の自前検査が終わってから切り替える。** あちらは独自の
  * write/exit を前提にしていて、共有層の exit は戻ってこない */

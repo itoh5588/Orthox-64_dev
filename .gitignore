@@ -136,3 +136,7 @@ out/aarch64-test-fs/
 
 # P2 の musl スモークが作るもの (tests/aarch64_musl_smoke.sh)
 out/aarch64-musl-fs/
+
+# P3 のスモークが作るもの (fork / コンソール入力)
+out/aarch64-fork-fs/
+out/aarch64-console-fs/
