@@ -140,3 +140,6 @@ out/aarch64-musl-fs/
 # P3 のスモークが作るもの (fork / コンソール入力)
 out/aarch64-fork-fs/
 out/aarch64-console-fs/
+
+# P3-3 の FP スモークが作るもの
+out/aarch64-fp-fs/

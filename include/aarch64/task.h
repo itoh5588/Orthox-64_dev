@@ -27,12 +27,18 @@
 #define AARCH64_CTX_X29  80
 #define AARCH64_CTX_SP   96
 #define AARCH64_CTX_DAIF 104
-#define AARCH64_CTX_SIZE 112
+/* FP/SIMD (P3-3)。**v0-v31 は 128bit なので 16 バイト単位で置く。**
+ * fpcr/fpsr を先に並べて、v の開始を 16 バイト境界に揃えてある
+ * (揃っていないと stp q が使えない) */
+#define AARCH64_CTX_FPCR 112
+#define AARCH64_CTX_FPSR 120
+#define AARCH64_CTX_V0   128
+#define AARCH64_CTX_SIZE 640
 
 /* struct arch_task_context の中で user_frame がどこから始まるか (M3c-2b)。
  * .S から使うので __ASSEMBLER__ の外に置く。**C 側で _Static_assert して
  * いるので、struct を変えたらビルドが落ちる** */
-#define AARCH64_TASKCTX_USER_FRAME 128
+#define AARCH64_TASKCTX_USER_FRAME 656
 
 #ifndef __ASSEMBLER__
 
@@ -50,6 +56,21 @@ typedef struct aarch64_context {
      * (M4-3 のマウントで実際に踏んだ。daif=0x3c0 を実測)。
      * 16 バイト境界のために元から余っていた枠を使っている */
     uint64_t daif;
+    /* ---- FP/SIMD (P3-3) --------------------------------------------------
+     *
+     * **v0-v31 と FPCR/FPSR もタスクの状態。** カーネル自身は
+     * -mgeneral-regs-only なので FP を使わないが、**ユーザーは使う** —
+     * musl は memcpy などで NEON を踏む。保存しないと、FP を使うタスクが
+     * 2 本並んだ瞬間に互いのレジスタを踏み合う。
+     *
+     * **これは「落ちる」のではなく計算結果が静かに壊れる**種類の欠落なので、
+     * 症状が出てから追うと高くつく。fork が入った時点で入れておく。
+     *
+     * v は 8 バイト x 2 で 1 本ぶん。**構造体の先頭から 128 バイト目**に
+     * 来るよう fpcr/fpsr を先に置いてある (AARCH64_CTX_V0 と対) */
+    uint64_t fpcr;
+    uint64_t fpsr;
+    uint64_t v[64];
 } aarch64_context_t;
 
 #define AARCH64_TASK_FREE    0
@@ -128,6 +149,20 @@ struct arch_task_context {
 
 _Static_assert(__builtin_offsetof(struct arch_task_context, regs) == 0,
                "switch.S は regs が offset 0 にあることを前提にしている");
+/* **switch.S が触る offset は全部ここで縛る。** ずれると、退避先が
+ * 隣のフィールドになって「静かに壊れる」形になる (FP は特にそう) */
+_Static_assert(__builtin_offsetof(aarch64_context_t, daif) == AARCH64_CTX_DAIF,
+               "AARCH64_CTX_DAIF が struct とずれている");
+_Static_assert(__builtin_offsetof(aarch64_context_t, fpcr) == AARCH64_CTX_FPCR,
+               "AARCH64_CTX_FPCR が struct とずれている");
+_Static_assert(__builtin_offsetof(aarch64_context_t, fpsr) == AARCH64_CTX_FPSR,
+               "AARCH64_CTX_FPSR が struct とずれている");
+_Static_assert(__builtin_offsetof(aarch64_context_t, v) == AARCH64_CTX_V0,
+               "AARCH64_CTX_V0 が struct とずれている");
+_Static_assert(__builtin_offsetof(aarch64_context_t, v) % 16 == 0,
+               "v0-v31 は 16 バイト境界に置くこと (stp q が使えない)");
+_Static_assert(sizeof(aarch64_context_t) == AARCH64_CTX_SIZE,
+               "AARCH64_CTX_SIZE が struct とずれている");
 _Static_assert(__builtin_offsetof(struct arch_task_context, user_frame) ==
                    AARCH64_TASKCTX_USER_FRAME,
                "entry.S の AARCH64_TASKCTX_USER_FRAME とずれている");
@@ -210,22 +245,30 @@ static inline uint64_t arch_task_read_current_stack_pointer(void) {
 
 /* 浮動小数点。**-mgeneral-regs-only なのでカーネルは FP を使わない。**
  * EL0 で使い始めたら d8-d15 を積む必要がある (日報2026-08-09 追4-1) */
-/* **これは「まだ無い」ほう。「何もしなくてよい」ではない。**
+/* 新しいタスクの FP を 0 から始める (P3-3)。
  *
- * FPEN は start.S で開けてあるので EL0 は FP / NEON を使えるが、
- * **v0-v31 と FPCR / FPSR を切り替えで保存していない。** いま壊れないのは
- * FP を使うタスクが同時に 1 本しか走らないからで、P3 で musl のプロセスが
- * 2 本になった瞬間にレジスタを踏み合う。
+ * **前のタスクの v0-v31 を引き継がせない。** switch.S は復元側も必ず通るので、
+ * ここで 0 にしておけば新タスクは 0 から始まる。埋めずに置くと、
+ * **他プロセスのレジスタの中身がそのまま見える** (誤動作だけでなく漏洩)。
  *
- * riscv64 も同じ形 (あちらは sstatus.FS)。P3 に入る前に両方へ入れること */
+ * FPCR も 0 にする = 既定の丸めモード (RN) / 例外マスクなし。
+ * musl が期待する初期状態と同じ */
 static inline void arch_task_context_init_fp_state(struct arch_task_context* ctx) {
-    (void)ctx;
+    if (!ctx) return;
+    ctx->regs.fpcr = 0;
+    ctx->regs.fpsr = 0;
+    for (int i = 0; i < 64; i++) ctx->regs.v[i] = 0;
 }
 
+/* fork の子は親の FP をそのまま引き継ぐ (P3-3)。
+ * **fork は「その瞬間の続きから 2 本になる」ので、丸めモードも
+ * レジスタの中身も親と同じでなければならない** */
 static inline void arch_task_context_copy_fp_state(struct arch_task_context* dst,
                                                    const struct arch_task_context* src) {
-    (void)dst;
-    (void)src;
+    if (!dst || !src) return;
+    dst->regs.fpcr = src->regs.fpcr;
+    dst->regs.fpsr = src->regs.fpsr;
+    for (int i = 0; i < 64; i++) dst->regs.v[i] = src->regs.v[i];
 }
 
 /* **x30 (lr) に入口を仕込むと、最初の切り替えで「そこへ戻る」形で走り出す。**
