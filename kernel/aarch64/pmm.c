@@ -216,3 +216,19 @@ void* pmm_get_isa_dma_page(void) { return 0; }
 uint64_t pmm_get_allocated_pages(void) { return g_used; }
 uint64_t pmm_get_free_pages(void)      { return g_pages - g_used; }
 uint64_t pmm_get_total_pages(void)     { return g_pages; }
+
+/* 空きページ数を 1 行で出す (P3-4)。
+ *
+ * **アドレス空間の解放が効いているかは、数えないと分からない。**
+ * 漏れていても即座には落ちず、fork を繰り返した後で ENOMEM になるだけ
+ * なので、実測値を出しておく */
+void aarch64_uart_puts(const char* s);
+void aarch64_uart_puthex64(uint64_t v);
+
+void aarch64_pmm_report_free(const char* label) {
+    aarch64_uart_puts(label);
+    aarch64_uart_puthex64(g_pages - g_used);
+    aarch64_uart_puts(" / ");
+    aarch64_uart_puthex64(g_pages);
+    aarch64_uart_puts("\n");
+}

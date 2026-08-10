@@ -167,6 +167,7 @@ vec_el1_sync:
 vec_el1_irq:
     SAVE_ALL
     bl      aarch64_irq_handler
+    mov     x0, sp              /* フレームを渡す。SPSR で「どこを割り込んだか」を見る (P3-4) */
     bl      aarch64_task_resched_if_needed
     RESTORE_ALL
     eret
@@ -191,6 +192,7 @@ vec_el0_sync:
 vec_el0_irq:
     SAVE_ALL
     bl      aarch64_irq_handler
+    mov     x0, sp              /* 同上 (P3-4) */
     bl      aarch64_task_resched_if_needed
     RESTORE_ALL
     eret

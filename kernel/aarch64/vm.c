@@ -23,9 +23,15 @@
  * VA == PA ならその心配が無い。
  */
 #include <stdint.h>
+#include <stddef.h>
 #include "aarch64/boot.h"
 #include "aarch64/vm.h"
 #include "aarch64/usermode.h"
+/* **ユーザーページは参照カウント付きの pmm_alloc / pmm_free で扱う。**
+ * aarch64_pmm_alloc (生) で取ると refcount が 0 のままになり、pmm_free は
+ * 「カウントが 0 より大きいときだけ減らす」作りなので**永久に解放されない**。
+ * elf.c / task_exec.c / linux_syscall.c も pmm_alloc を使っている */
+#include "pmm.h"
 
 extern char __kernel_start[];
 extern char __kernel_end[];
@@ -649,9 +655,15 @@ static int aarch64_vm_clone_table(uint64_t dst_pa, uint64_t src_pa, int level) {
             continue;
         }
 
-        /* L3 = ページ本体。**属性はそのまま、物理アドレスだけ差し替える** */
+        /* L3 = ページ本体。**属性はそのまま、物理アドレスだけ差し替える。**
+         *
+         * **pmm_alloc を使う (生の aarch64_pmm_alloc ではない)。**
+         * ユーザーページは参照カウントで管理されていて、解放側の pmm_free は
+         * カウントが 0 より大きいときしか減らさない。生で取ると refcount が
+         * 0 のままになり、arch_vm_destroy_user_address_space が呼ばれても
+         * **そのページだけ永久に返らない** */
         {
-            uint64_t new_pa = aarch64_pmm_alloc(1);
+            uint64_t new_pa = (uint64_t)(uintptr_t)pmm_alloc(1);
             if (!new_pa) return -1;
             aarch64_vm_copy_page(new_pa, entry & AARCH64_PTE_ADDR_MASK);
             dst[i] = (new_pa & AARCH64_PTE_ADDR_MASK) | (entry & ~AARCH64_PTE_ADDR_MASK);
@@ -678,11 +690,44 @@ arch_address_space_t arch_vm_clone_address_space(arch_address_space_t address_sp
     return (arch_address_space_t)root_pa;
 }
 
-/* テーブルの解放。**まだページそのものは返していない。**
- * (日報2026-08-09 の未実施表「タスク・テーブルの後始末」) */
+/* アドレス空間を丸ごと返す (P3-4)。level は aarch64_vm_index と同じ 1..3。
+ *
+ * **確保したときと同じ流儀で返すこと。**
+ *
+ *   L3 のページ本体  pmm_alloc で取った -> pmm_free (参照カウントを 1 つ減らす)
+ *   L1/L2 のテーブル  aarch64_pmm_alloc で取った -> aarch64_pmm_free (生)
+ *
+ * 取り違えると、**片方は永久に返らず、もう片方はまだ使われているページを
+ * 配り直す。** どちらも「その場では動く」ので気づきにくい。
+ *
+ * カーネル領域を避ける処理は要らない (TTBR0 の中身はすべてユーザーのもの)。 */
+static void aarch64_vm_destroy_table(uint64_t table_pa, int level) {
+    uint64_t* table = aarch64_vm_table_ptr(table_pa);
+
+    for (uint64_t i = 0; i < AARCH64_PTES; i++) {
+        uint64_t entry = table[i];
+        if ((entry & AARCH64_PTE_VALID) == 0) continue;
+
+        if (level < 3) {
+            /* ブロック写像は張っていない。**黙って素通りせず**、
+             * 万一あったら気づけるようにする (あれば漏れる) */
+            if (entry & AARCH64_PTE_TABLE) {
+                aarch64_vm_destroy_table(entry & AARCH64_PTE_ADDR_MASK, level + 1);
+            } else {
+                aarch64_uart_puts("  vm: destroy: 想定外のブロック写像\n");
+            }
+        } else {
+            pmm_free((void*)(uintptr_t)(entry & AARCH64_PTE_ADDR_MASK), 1);
+        }
+        table[i] = 0;
+    }
+    aarch64_pmm_free(table_pa, 1);
+}
+
 void arch_vm_destroy_user_address_space(arch_address_space_t address_space) {
     if (!address_space) return;
-    aarch64_pmm_free(address_space, 1);
+    /* ルートは L1 (VA 39bit / 4KB granule) */
+    aarch64_vm_destroy_table((uint64_t)address_space, 1);
 }
 
 void arch_vm_map_page(arch_address_space_t address_space, uint64_t vaddr,

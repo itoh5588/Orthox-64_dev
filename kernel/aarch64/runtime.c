@@ -248,8 +248,8 @@ int aarch64_shared_layer_selftest(void) {
     }
 
     /* 4. 後始末。**確保したぶんが戻ること。**
-     * テーブルは arch_vm_map_page が作るので、そのぶんは残る
-     * (テーブルの解放は M3c-2b。日報の未実施表にある) */
+     * 上の arch_vm_destroy_user_address_space が、arch_vm_map_page の作った
+     * 中間テーブルまで返すようになった (P3-4)。残るものは無い */
     pmm_free(page, 1);
     report("  free x2   :", pmm_get_ref(page) == 0, &ok);
 
@@ -260,11 +260,18 @@ done:
     puthex(pages_before);
     puts(" -> ");
     puthex(pages_after);
-    /* 張るのに使った L2 / L3 のテーブル 2 枚が残る。**「0 に戻る」と
-     * 書かずに、残る枚数を明示しておく。** ここが変わったら気づける */
-    puts(pages_after == pages_before + 2 ? "  ok (テーブル 2 枚が未解放)\n"
-                                         : "  BAD (見込みと違う)\n");
-    if (pages_after != pages_before + 2) ok = 0;
+    /* **P3-4 で「完全に戻る」に変わった。**
+     *
+     * それまでは arch_vm_destroy_user_address_space が root 1 枚しか返さず、
+     * 張るのに使った L2 / L3 の 2 枚が残るので +2 を期待値にしていた。
+     * いまは中間テーブルもページ本体も返すので **前後で一致する。**
+     *
+     * 前の判定は「ここが変わったら気づける」と書いてあり、実際に
+     * aarch64-shared-BAD で気づけた。**期待値は実態に合わせて更新すること** —
+     * 「まだ出来ていない」を前提にした数字を残すと、直したときに落ちる */
+    puts(pages_after == pages_before ? "  ok (確保したぶんが全部戻った)\n"
+                                     : "  BAD (見込みと違う)\n");
+    if (pages_after != pages_before) ok = 0;
     puts(ok ? "aarch64-shared-ok\n" : "aarch64-shared-BAD\n");
     aarch64_console_end();
     return ok;

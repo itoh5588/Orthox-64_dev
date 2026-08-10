@@ -59,7 +59,16 @@ void arch_task_store_user_frame_hook(struct arch_task_context* ctx,
     aarch64_task_store_user_frame(ctx, frame);
 }
 
+void aarch64_pmm_report_free(const char* label);
+
 void arch_halt_forever(void) {
+    /* **最初のユーザープロセスが exit した所。** ここで物理ページの残りを
+     * 出す (P3-4)。fork した子の空間を返せていないと、fork/exec を繰り返す
+     * ほど減っていく — **落ちないので、数えないと気づけない。**
+     *
+     * 共有の linux_syscall.c ではなくここに置くのは、riscv64 の出力を
+     * 変えないため */
+    aarch64_pmm_report_free("  pmm 残り  : ");
     aarch64_wait_forever();
     for (;;) { }
 }

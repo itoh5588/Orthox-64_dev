@@ -451,6 +451,20 @@ aarch64-fp-smoke: $(AARCH64_FP_PROBE_ELF)
 	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/fp-probe
 	bash ./tests/aarch64_fp_smoke.sh
 
+# P3-4: fork した子のアドレス空間が返っているか
+AARCH64_VMLEAK_PROBE_ELF = out/aarch64-vmleak-probe.elf
+$(AARCH64_VMLEAK_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_vmleak_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_vmleak_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-vmleak-probe: $(AARCH64_VMLEAK_PROBE_ELF)
+
+aarch64-vmleak-smoke: $(AARCH64_VMLEAK_PROBE_ELF)
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/vmleak-probe
+	bash ./tests/aarch64_vmleak_smoke.sh
+
 # 最初のユーザープロセスとして musl の probe を exec する。
 # **fork はまだ無いので 1 プロセスしか走らない** (P3 で入れる)
 aarch64-musl-smoke: $(AARCH64_MUSL_PROBE_ELF)

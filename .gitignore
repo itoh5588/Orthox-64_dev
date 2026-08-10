@@ -143,3 +143,6 @@ out/aarch64-console-fs/
 
 # P3-3 の FP スモークが作るもの
 out/aarch64-fp-fs/
+
+# P3-4 のスモークが作るもの
+out/aarch64-vmleak-fs/

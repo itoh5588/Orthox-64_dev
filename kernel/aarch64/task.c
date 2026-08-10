@@ -224,7 +224,13 @@ int aarch64_task_shared_scheduler_on(void) { return g_shared_sched; }
  * riscv64 の riscv64_task_fork_child_return と同じ形。ctx のオフセットを
  * .S に持たせないよう C で書く。**戻らない。** */
 void aarch64_task_fork_child_return(void) {
-    struct task* current = get_current_task();
+    struct task* current;
+    /* **入場列の先頭で I を閉じる (P3-4)。** enter の中だけ閉じても、
+     * ここから enter までの数命令に IRQ が入ると、excursion 中に ctx が
+     * 書き替えられてから eret に至る余地が残る。eret が SPSR から EL0 の
+     * PSTATE を復元するので、ここで閉じてもユーザーには開いて降りる */
+    __asm__ volatile("msr daifset, #2" ::: "memory");
+    current = get_current_task();
     if (!current) {
         /* **黙って先へ進めない。** 進めると、子が親の続きをカーネル権限で
          * 走らせることになる */
@@ -254,6 +260,7 @@ void arch_context_switch(struct arch_task_context* next, struct arch_task_contex
         aarch64_vm_activate_address_space(next->root_pa);
     }
     aarch64_context_switch(&next->regs, &prev->regs);
+    /* ここへ戻る = このタスクが再開された直後 */
 }
 
 /* ---- 共有層が要求するフレームの組み立て (M3c-2b) ------------------------ */
@@ -317,8 +324,25 @@ void aarch64_task_on_tick(void) {
 
 /* IRQ の出口で呼ぶ。**割り込みハンドラのフレームを積み終えた後**なので、
  * ここで切り替えれば、戻ってきたときに続きから再開できる */
-void aarch64_task_resched_if_needed(void) {
+void aarch64_task_resched_if_needed(uint64_t* frame) {
     int next_id;
+
+    /* **EL0 を割り込んだときだけ切り替える (P3-4)。**
+     *
+     * frame[32] は SPSR。M[3:0] != 0 なら EL1 (カーネル) を割り込んでいる。
+     * カーネルの真っ最中 — **とくに aarch64_context_switch の途中** — で
+     * schedule() を再入させると、切り替え途中の半端な状態の上でもう一度
+     * 切り替えて ctx を壊す。QEMU の -d int トレースで実測した:
+     *
+     *   Taking IRQ from EL1, ELR=aarch64_context_switch の第 1 命令
+     *   Exception return to AArch32 EL0 PC 0x40377000   <- 壊れた eret
+     *
+     * riscv64 は同じ判定を最初から持っている (kernel/riscv64/trap.c:
+     * `(frame->sstatus & SPP) == 0 && !kernel_lock_held()`)。
+     * 印 (resched) は消さずに残す — 次に EL0 へ降りた後の tick で切り替わる。
+     * カーネル側で長く待つ処理は kernel_yield が自分で schedule を呼ぶので、
+     * EL1 のプリエンプションが無くても詰まらない (riscv64 と同じ設計) */
+    if (frame && (frame[32] & 0xfULL) != 0) return;
 
     /* 共有層に乗り換えた後は、こちらが切り替える。
      * **区間の中では保留する**のは M3c-1 と同じ。印は task_request_resched

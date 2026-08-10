@@ -62,6 +62,10 @@ aarch64_wait_forever:
  * 差し替えて eret してくる。そこで下の epilogue に着地し、呼び出し元へ戻る。 */
 .globl aarch64_enter_el0
 aarch64_enter_el0:
+    /* 上と同じ理由で IRQ を閉じる (P3-4)。ここも msr ELR/SPSR と eret の
+     * 間に IRQ が入ると同じ壊れ方をする。M3a の自己検査は I が開いた
+     * カーネル文脈から呼ぶ */
+    msr     daifset, #2
     /* 呼び出し元へ戻れるように callee-saved を積む。**EL0 から帰ってくる
      * のは eret 経由の別経路**なので、着地点でも同じ形で降ろせるよう
      * sp の使い方を揃えておく */
@@ -128,6 +132,23 @@ aarch64_enter_el0:
  * x0 が ctx。user_frame の先頭へ進めてから読む。 */
 .globl aarch64_task_enter_initial_user_context
 aarch64_task_enter_initial_user_context:
+    /* **例外復帰列は IRQ に対して原子でなければならない (P3-4)。**
+     *
+     * ここは fork の子など「新しいタスクの文脈」で呼ばれ、DAIF の I は
+     * 開いている。msr ELR_EL1 と eret の間に IRQ が入ると、ハードウェアが
+     * ELR_EL1 / SPSR_EL1 を上書きし、**書いたユーザー値はどこにも保存され
+     * ないまま消える**。復帰後 msr は再実行されないので、eret は
+     * 「割り込まれた地点 / EL1h」へ飛ぶ — EL1 のまま自分の続きを
+     * 壊れたレジスタで再実行して死ぬ。
+     *
+     * 実測: DBGIRQ が 0x...221078 (msr 3 連の直後の ldr) への IRQ を捕捉し、
+     * 直後に同じ PC で FAR=0x8 (x0 = fork の子の戻り値 0) のアボート。
+     * ELR に root PA や AArch32 ビットが入る変種も全部この機構だった。
+     *
+     * riscv64 は trap 出口が SIE マスクのまま sret するので同じ穴が無い。
+     * eret は SPSR からユーザーの PSTATE を復元するため、ここでマスクしても
+     * EL0 には割り込みが開いた状態で降りる */
+    msr     daifset, #2
     add     x0, x0, #AARCH64_TASKCTX_USER_FRAME
 
     ldr     x1, [x0, #AARCH64_FRAME_ELR]

@@ -539,6 +539,10 @@ int aarch64_sync_exception(uint64_t esr, uint64_t elr, uint64_t far) {
 /* 想定していない例外。**黙って戻らない。** 取りこぼすと原因不明のハングに
  * なるので、どの入口で何が起きたかを出してから止める */
 void aarch64_unexpected_exception(uint64_t which, uint64_t esr, uint64_t elr) {
+    uint64_t spsr, far, sp0;
+    __asm__ volatile("mrs %0, spsr_el1" : "=r"(spsr));
+    __asm__ volatile("mrs %0, far_el1" : "=r"(far));
+    __asm__ volatile("mrs %0, sp_el0" : "=r"(sp0));
     aarch64_uart_puts("\n*** aarch64 unexpected exception ***\n");
     aarch64_uart_puts("  vector : ");
     put_hex64(which);
@@ -546,5 +550,21 @@ void aarch64_unexpected_exception(uint64_t which, uint64_t esr, uint64_t elr) {
     put_hex64(esr);
     aarch64_uart_puts("\n  ELR    : ");
     put_hex64(elr);
+    /* **ESR / ELR だけでは足りない (P3-4 で学んだ)。**
+     *
+     *   SPSR   : どこへ戻ろうとしていたか。M[4] が立っていれば AArch32 で、
+     *            これが「壊れた ctx から eret した」決定的な証拠になる
+     *   FAR    : アボートなら触ろうとしたアドレス
+     *   SP_EL0 : どのタスクが死んだか (kstack の位置で当たりが付く)
+     *
+     * P3-4 の真因 (EL1 を割り込んだ preempt) は、vector 0xc と SPSR の
+     * M[4] から辿った。この 3 つが無ければ「どこかで壊れる」までしか
+     * 分からず、また仮説で当てにいくことになる */
+    aarch64_uart_puts("\n  SPSR   : ");
+    put_hex64(spsr);
+    aarch64_uart_puts("\n  FAR    : ");
+    put_hex64(far);
+    aarch64_uart_puts("\n  SP_EL0 : ");
+    put_hex64(sp0);
     aarch64_uart_puts("\naarch64-exception-BAD\n");
 }
