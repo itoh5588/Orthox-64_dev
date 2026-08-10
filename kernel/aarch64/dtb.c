@@ -256,6 +256,15 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                 reg_entry(n->reg_data, n->reg_len, ac, sc, 0, &base, &size) && base != 0) {
                 info->uart_base = base;
                 info->flags |= AARCH64_BOOT_FLAG_UART_FROM_DTB;
+                /* 受信割り込みの INTID (P3)。virtio と同じ形式で
+                 * interrupts = <type num flags>、type 0 = SPI なので +32。
+                 * **reg と別に立てる** — アドレスだけ DTB から取れて
+                 * 割り込みは既定値、という半端な状態を見分けるため */
+                if (n->intr_data && n->intr_len >= 12U &&
+                    aarch64_dtb_read_be32(n->intr_data) == 0U) {
+                    info->uart_intid = aarch64_dtb_read_be32(n->intr_data + 4) + 32U;
+                    info->flags |= AARCH64_BOOT_FLAG_UART_IRQ_FROM_DTB;
+                }
             }
 
             /* GIC は **2 組そろって初めて使える**。1 組目 = Distributor、

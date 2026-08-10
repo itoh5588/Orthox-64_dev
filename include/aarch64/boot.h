@@ -23,6 +23,11 @@
 #define AARCH64_TIMER_PPI_DEFAULT       14
 #define AARCH64_PPI_INTID_BASE          16
 
+/* PL011 の受信割り込み。QEMU virt の DTB は interrupts = <0 1 4> なので
+ * SPI 1、INTID は +32 で 33 (PPI が +16 なのと同じ理屈) */
+#define AARCH64_UART_SPI_DEFAULT        1
+#define AARCH64_SPI_INTID_BASE          32
+
 typedef struct aarch64_boot_info {
     uint64_t dtb_pa;
     uint64_t memory_base;
@@ -37,6 +42,9 @@ typedef struct aarch64_boot_info {
     uint32_t dtb_size;
     uint32_t virtio_mmio_count;
     uint32_t timer_intid;   /* 非セキュア物理タイマ。QEMU virt では 30 */
+    /* PL011 の受信割り込み (P3)。DTB の interrupts = <0 1 4> なので
+     * SPI 1 -> INTID 33。**これが無いと対話シェルの入力が届かない** */
+    uint32_t uart_intid;
     /* virtio-mmio スロットの割り込み。**スロット i の INTID = base + i**。
      * この関係が成り立つことを DTB で確かめてからでないと使えないので、
      * flags の VIRTIO_IRQ_OK が立っているときだけ有効 */
@@ -54,6 +62,7 @@ typedef struct aarch64_boot_info {
 #define AARCH64_BOOT_FLAG_VIRTIO_FROM_DTB (1U << 6)
 #define AARCH64_BOOT_FLAG_TIMER_FROM_DTB  (1U << 7)
 #define AARCH64_BOOT_FLAG_VIRTIO_IRQ_OK   (1U << 8)  /* base + i が成り立つ */
+#define AARCH64_BOOT_FLAG_UART_IRQ_FROM_DTB (1U << 9)
 
 /* 直書きの既定値で埋めてから DTB で上書きする。
  * DTB が無くても QEMU virt では動き続ける */

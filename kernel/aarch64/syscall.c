@@ -51,14 +51,8 @@ void arch_syscall_flush_tlb(void) {
     __asm__ volatile("isb");
 }
 
-/* ---- コンソール入力 ------------------------------------------------------
- *
- * **PL011 の受信割り込みをまだ入れていない。** 「入力が無い」ではなく
- * 「入力の口が無い」ので、待ち手を登録できないと答える。
- * 登録できたと嘘をつくと、誰にも起こされないまま寝続ける */
-int  arch_console_has_input(void)              { return 0; }
-int  arch_console_set_waiter(struct task* t)   { (void)t; return 0; }
-void arch_console_clear_waiter(struct task* t) { (void)t; }
+/* コンソール入力は kernel/aarch64/console.c に移した (P3)。
+ * PL011 の受信割り込みが入ったので、ここのダミーは不要になった */
 
 void arch_task_store_user_frame_hook(struct arch_task_context* ctx,
                                      const arch_syscall_frame_t* frame) {

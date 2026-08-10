@@ -29,6 +29,14 @@ static uint64_t g_uart_base = AARCH64_QEMU_VIRT_UART0_BASE;
 #define PL011_DR_OFF    0x00
 #define PL011_FR_OFF    0x18
 #define PL011_FR_TXFF   (1U << 5)   /* 送信 FIFO が満杯 */
+#define PL011_FR_RXFE   (1U << 4)   /* 受信 FIFO が空 */
+/* 受信割り込み (P3)。IMSC で有効化し、ICR で確認応答する。
+ * **RT (受信タイムアウト) も要る。** RX だけだと FIFO の閾値に達しない
+ * 半端な入力が割り込みにならず、対話シェルで 1 文字打っても届かない */
+#define PL011_IMSC_OFF  0x38
+#define PL011_ICR_OFF   0x44
+#define PL011_INT_RX    (1U << 4)
+#define PL011_INT_RT    (1U << 6)
 
 static inline void mmio_write32(uint64_t addr, uint32_t v) {
     *(volatile uint32_t*)addr = v;
@@ -54,6 +62,24 @@ void aarch64_uart_putchar(char c) {
         /* 送信 FIFO が空くまで待つ */
     }
     mmio_write32(g_uart_base + PL011_DR_OFF, (uint32_t)(unsigned char)c);
+}
+
+/* 1 文字だけ取る。無ければ -1 (P3)。**待たない** —
+ * 待つかどうかを決めるのは呼び出し側 (kernel/aarch64/console.c) */
+int aarch64_uart_getchar_nonblock(void) {
+    if (mmio_read32(g_uart_base + PL011_FR_OFF) & PL011_FR_RXFE) return -1;
+    return (int)(mmio_read32(g_uart_base + PL011_DR_OFF) & 0xFFU);
+}
+
+/* 受信割り込みを開ける (P3)。GIC 側の有効化とは別で、**両方要る** */
+void aarch64_uart_enable_rx_irq(void) {
+    mmio_write32(g_uart_base + PL011_ICR_OFF, PL011_INT_RX | PL011_INT_RT);
+    mmio_write32(g_uart_base + PL011_IMSC_OFF, PL011_INT_RX | PL011_INT_RT);
+}
+
+/* 受信割り込みの確認応答。**これを忘れると同じ割り込みが上がり続ける** */
+void aarch64_uart_clear_rx_irq(void) {
+    mmio_write32(g_uart_base + PL011_ICR_OFF, PL011_INT_RX | PL011_INT_RT);
 }
 
 /* **文字列 1 本は割れない。** マルチバイト文字の途中で切り替わると
@@ -133,6 +159,9 @@ int aarch64_fs_selftest(void);
 int aarch64_first_user_task(void);
 uint32_t aarch64_virtio_blk_intid(void);
 void aarch64_virtio_blk_irq(void);
+uint32_t aarch64_uart_intid(void);
+void aarch64_console_rx_irq(void);
+void aarch64_console_input_init(void);
 
 /* MMU の探針 (vm.c)。「未マップの VA を読んだら fault が上がるはず」の
  * やりとりに使う。上がった fault はここで拾って呼び出し元に返す */
@@ -245,6 +274,12 @@ static void aarch64_boot_info_dump(void) {
     aarch64_uart_puts("  timer irq : ");
     put_hex64(b->timer_intid);
     put_src(AARCH64_BOOT_FLAG_TIMER_FROM_DTB);
+
+    /* PL011 の受信割り込み (P3)。**QEMU virt では既定値と同じ 33 になるので、
+     * 値だけ見ても DTB を読めた証拠にならない。** どこから来たかを出す */
+    aarch64_uart_puts("  uart irq  : ");
+    put_hex64(aarch64_uart_intid());
+    put_src(AARCH64_BOOT_FLAG_UART_IRQ_FROM_DTB);
 
     /* **スロット i の INTID = base + i が成り立つと確かめられたときだけ
      * 有効。** 確かめずに決め打ちすると、別のデバイスの割り込みを待つ */
@@ -447,6 +482,11 @@ void aarch64_boot_continue(void) {
      * 居ないと成立しない */
     aarch64_fs_selftest();
 
+    /* ---- P3: コンソール入力の口を開ける -------------------------------
+     * **ユーザープロセスを起こす前に開ける。** exec してからでは、
+     * 対話プログラムが最初の read で誰にも起こされないまま寝る */
+    aarch64_console_input_init();
+
     /* ---- P1: ディスクの ELF を EL0 で走らせる -------------------------- */
     aarch64_first_user_task();
 
@@ -462,6 +502,9 @@ void aarch64_irq_handler(void) {
         aarch64_timer_on_tick();
     } else if (intid && intid == aarch64_virtio_blk_intid()) {
         aarch64_virtio_blk_irq();
+    } else if (intid && intid == aarch64_uart_intid()) {
+        /* コンソール入力 (P3)。リングへ移して待ち手を起こす */
+        aarch64_console_rx_irq();
     }
     /* 1023 は「上がっていなかった」を意味する偽物。EOI してはいけない */
     if (intid < 1020U) {

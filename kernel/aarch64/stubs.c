@@ -20,24 +20,10 @@
 
 /* ---- コンソール入力 (キーボード) ----------------------------------------
  *
- * **PL011 の受信割り込みをまだ入れていない。** riscv64 は
- * kernel/riscv64/runtime.c に riscv64_console_* 一式を持っている。
- *
- * kernel/fs.c の fs_console_read_blocking は
- *
- *     while (read_bytes == 0) { kb_read(); 寝る; 譲る; }
- *
- * という形なので、**0 を返すと誰も起こさないまま永久に寝る。**
- * 負を返してループを抜けさせ、read が失敗として返るようにする。
- * 「入力が無い」ではなく「入力の口が無い」ので、これが正しい */
-int kb_read(char* buf, int count) {
-    (void)buf;
-    (void)count;
-    return -1;
-}
-
-void kb_set_waiter(struct task* t)   { (void)t; }
-void kb_clear_waiter(struct task* t) { (void)t; }
+ * **kernel/aarch64/console.c に本物が入った (P3)。**
+ * M3c-2b までは、PL011 の受信割り込みが無いので kb_read が負を返していた
+ * (「入力が無い」ではなく「入力の口が無い」= read を失敗させるのが正しい)。
+ * いまは口があるので、来ていなければ 0 を返して待ち手に登録される */
 
 /* ---- 時刻 ----------------------------------------------------------------
  *

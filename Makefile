@@ -297,7 +297,7 @@ AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer
 	kernel/aarch64/dtb.c \
 	kernel/aarch64/vm.c kernel/aarch64/usermode.c kernel/aarch64/pmm.c \
 	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/runtime.c \
-	kernel/aarch64/stubs.c kernel/aarch64/syscall.c
+	kernel/aarch64/stubs.c kernel/aarch64/syscall.c kernel/aarch64/console.c
 # 共有層のうち、**いま繋がるものだけ**を取り込む (M3c-2a)。
 # どれが入るかは推測せず、llvm-nm -u で未解決シンボルを実測して決めた。
 #
@@ -422,6 +422,20 @@ aarch64-fork-probe: $(AARCH64_FORK_PROBE_ELF)
 aarch64-fork-smoke: $(AARCH64_FORK_PROBE_ELF)
 	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/fork-probe
 	bash ./tests/aarch64_fork_smoke.sh
+
+# P3-2: コンソール入力 (PL011 の受信割り込み)
+AARCH64_CONSOLE_PROBE_ELF = out/aarch64-console-probe.elf
+$(AARCH64_CONSOLE_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_console_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_console_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-console-probe: $(AARCH64_CONSOLE_PROBE_ELF)
+
+aarch64-console-smoke: $(AARCH64_CONSOLE_PROBE_ELF)
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/console-probe
+	bash ./tests/aarch64_console_smoke.sh
 
 # 最初のユーザープロセスとして musl の probe を exec する。
 # **fork はまだ無いので 1 プロセスしか走らない** (P3 で入れる)
