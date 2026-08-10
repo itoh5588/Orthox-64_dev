@@ -112,6 +112,7 @@ ports/cmake/
 ports/make-4.4.1/
 ports/musl-build-riscv64-linux-musl/
 ports/musl-install-riscv64/
+ports/musl-install-aarch64/
 ports/ninja/
 ports/python-install/
 ports/rust/
@@ -132,3 +133,6 @@ rootfs.img.*
 
 # aarch64 スモークが作る xv6fs イメージの種 (tests/aarch64_smoke.sh)
 out/aarch64-test-fs/
+
+# P2 の musl スモークが作るもの (tests/aarch64_musl_smoke.sh)
+out/aarch64-musl-fs/

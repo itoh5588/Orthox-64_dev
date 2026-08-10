@@ -214,7 +214,32 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
          * M3a の自前 aarch64_svc は、共有層が来るまでの足場だった。
          * いまは kernel/linux_syscall.c が受ける (riscv64 と同じ実装) */
         if (aarch64_use_shared_syscalls()) {
+            /* **syscall 処理の間だけ IRQ を開ける。**
+             *
+             * svc で例外に入った時点で、ハードウェアが PSTATE.{D,A,I,F} を
+             * 全部 1 にする。閉じたまま処理すると、**カーネル内で「割り込みで
+             * しか進まないもの」を待つ処理が永久に返らない。**
+             *
+             * P2 (musl) で踏んだ。open(O_CREAT) がディスク書き込みを伴い、
+             * gdbstub で実測したところ:
+             *
+             *   PC     = vblk_rw+288   (wfi を挟む完了待ちループの中)
+             *   PSTATE = 0x800003c5    -> bit7 (I) = 1 でマスク
+             *   3 回サンプリングして PC / SP が 1 ビットも動かない
+             *
+             * あのループを抜ける道は「完了フラグが立つ」か「タイマの ticks が
+             * タイムアウトを超える」の 2 つだけで、**どちらも
+             * aarch64_irq_handler からしか進まない**。だから完了も
+             * タイムアウトも来ない。open(O_RDONLY) が通っていたのは、
+             * ディスク書き込みを伴わなかったため。
+             *
+             * riscv64 は kernel/riscv64/trap.c の riscv64_handle_ecall で
+             * sstatus.SIE に対して同じことをしている。**元の値へ必ず戻す** */
+            uint64_t daif;
+            __asm__ volatile("mrs %0, daif" : "=r"(daif));
+            __asm__ volatile("msr daifclr, #2" ::: "memory");   /* I だけ開ける */
             linux_syscall_dispatch((arch_syscall_frame_t*)frame);
+            __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
             return;
         }
         aarch64_svc(frame);

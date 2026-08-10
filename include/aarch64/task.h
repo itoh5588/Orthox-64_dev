@@ -210,6 +210,14 @@ static inline uint64_t arch_task_read_current_stack_pointer(void) {
 
 /* 浮動小数点。**-mgeneral-regs-only なのでカーネルは FP を使わない。**
  * EL0 で使い始めたら d8-d15 を積む必要がある (日報2026-08-09 追4-1) */
+/* **これは「まだ無い」ほう。「何もしなくてよい」ではない。**
+ *
+ * FPEN は start.S で開けてあるので EL0 は FP / NEON を使えるが、
+ * **v0-v31 と FPCR / FPSR を切り替えで保存していない。** いま壊れないのは
+ * FP を使うタスクが同時に 1 本しか走らないからで、P3 で musl のプロセスが
+ * 2 本になった瞬間にレジスタを踏み合う。
+ *
+ * riscv64 も同じ形 (あちらは sstatus.FS)。P3 に入る前に両方へ入れること */
 static inline void arch_task_context_init_fp_state(struct arch_task_context* ctx) {
     (void)ctx;
 }

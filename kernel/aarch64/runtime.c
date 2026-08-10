@@ -565,7 +565,11 @@ int task_execve(arch_task_exec_frame_t* frame, const char* path,
                 char* const argv[], char* const envp[]);
 void task_main(void);
 
+/* 既定は P1 の最小プログラム。P2 のスモークは Makefile から
+ * -DAARCH64_INIT_PATH=/bin/musl-probe を渡して差し替える */
+#ifndef AARCH64_INIT_PATH
 #define AARCH64_INIT_PATH "/bin/hello"
+#endif
 
 int aarch64_first_user_task(void) {
     static char* argv[] = { (char*)AARCH64_INIT_PATH, 0 };

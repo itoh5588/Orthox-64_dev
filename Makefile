@@ -319,6 +319,12 @@ AARCH64_ASM_SRCS = kernel/aarch64/start.S kernel/aarch64/vectors.S \
 AARCH64_CFLAGS = --target=aarch64-none-elf -mgeneral-regs-only \
 	-ffreestanding -fno-stack-protector -fno-stack-check -fno-lto -fno-PIE \
 	-mcmodel=small -O2 -Wall -Wextra -Iinclude -MMD -MP
+# 最初に exec するプログラム。既定は P1 の /bin/hello。
+# P2 のスモークはここを /bin/musl-probe に差し替えて起動する
+AARCH64_INIT_PATH_VALUE ?=
+ifneq ($(AARCH64_INIT_PATH_VALUE),)
+AARCH64_CFLAGS += '-DAARCH64_INIT_PATH="$(AARCH64_INIT_PATH_VALUE)"'
+endif
 AARCH64_LDFLAGS = -nostdlib -static -m aarch64elf -T scripts/kernel-aarch64.ld
 AARCH64_OBJS = $(patsubst kernel/aarch64/%.c, $(BUILD_DIR)/aarch64/kernel/%.o, $(AARCH64_C_SRCS)) \
 	$(patsubst kernel/%.c, $(BUILD_DIR)/aarch64/shared/%.o, $(AARCH64_SHARED_C_SRCS)) \
@@ -355,6 +361,59 @@ $(AARCH64_USER_HELLO): user/aarch64_hello.S scripts/user-aarch64.ld
 	$(LD) -nostdlib -static -m aarch64elf -T scripts/user-aarch64.ld $(BUILD_DIR)/aarch64/user/hello.o -o $@
 
 aarch64-user-bin: $(AARCH64_USER_HELLO)
+
+# ---- P2: musl 静的プログラム ---------------------------------------------
+# build_musl.sh は TARGET が引数なので、riscv64 のレシピをそのまま使える。
+# **sysroot は riscv64 と別に持つ** (同じ場所に入れると上書きし合う)。
+#
+# riscv64 と違って -march / -mabi は要らない (aarch64 は 1 つしか無い)。
+AARCH64_MUSL_SYSROOT = ports/musl-install-aarch64
+AARCH64_MUSL_CFLAGS = --target=aarch64-linux-musl -ffreestanding \
+	-fno-PIE -O2 -I$(AARCH64_MUSL_SYSROOT)/include -MMD -MP
+# **リンカスクリプトは使わない。** user-aarch64.ld は hello 専用で
+# .init_array 等を落とす。musl は ld の既定配置で通る (riscv64 と同じ)
+AARCH64_MUSL_LDFLAGS = -nostdlib -static -m aarch64elf --entry=_start -Ttext 0x400000
+AARCH64_MUSL_PROBE_ELF = out/aarch64-musl-probe.elf
+
+$(AARCH64_MUSL_SYSROOT)/lib/libc.a:
+	MUSL_CC="$(AARCH64_CC)" MUSL_AR="$(RISCV64_LLVM_AR)" MUSL_RANLIB="$(RISCV64_LLVM_RANLIB)" \
+	MUSL_CONFIGURE_EXTRA="--disable-shared" \
+	./ports/build_musl.sh $(abspath ports/musl) $(abspath $(AARCH64_MUSL_SYSROOT)) aarch64-linux-musl $(abspath $(BUILD_DIR)/musl-aarch64-build)
+
+aarch64-musl-sysroot: $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+
+# init のパスが変わったら runtime.o を作り直す (stale 防止スタンプ)。
+# **CFLAGS の変更を make は追跡しない。** これが無いと musl-probe 版で
+# 焼いた runtime.o がそのまま残り、次の aarch64-smoke が /bin/musl-probe を
+# 探しに行って落ちる (riscv64 の bootstrap_args.stamp と同じ理由)
+$(BUILD_DIR)/aarch64/init_path.stamp: FORCE
+	@mkdir -p $(@D)
+	@echo "$(AARCH64_INIT_PATH_VALUE)" > $@.tmp; \
+	if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+$(BUILD_DIR)/aarch64/kernel/runtime.o: $(BUILD_DIR)/aarch64/init_path.stamp
+
+$(BUILD_DIR)/aarch64-musl/user/crt0.o: user/crt0_musl_aarch64.S $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_MUSL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/aarch64-musl/user/%.o: user/%.c $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_MUSL_CFLAGS) -c $< -o $@
+
+$(AARCH64_MUSL_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_musl_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_musl_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-musl-probe: $(AARCH64_MUSL_PROBE_ELF)
+
+# 最初のユーザープロセスとして musl の probe を exec する。
+# **fork はまだ無いので 1 プロセスしか走らない** (P3 で入れる)
+aarch64-musl-smoke: $(AARCH64_MUSL_PROBE_ELF)
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/musl-probe
+	bash ./tests/aarch64_musl_smoke.sh
 
 aarch64-smoke: $(AARCH64_KERNEL_ELF) $(AARCH64_USER_HELLO)
 	bash ./tests/aarch64_smoke.sh

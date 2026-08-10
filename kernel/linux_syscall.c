@@ -2,6 +2,7 @@
 #include "fs.h"
 #include "stdio.h"
 #include "pmm.h"
+#include "vmm.h"
 #include "linux_errno.h"
 #include "spinlock.h"
 #include "linux_syscalls.h"
@@ -427,6 +428,29 @@ static int64_t linux_bootstrap_sys_readv(int fd, const struct linux_iovec* iov, 
     return total;
 }
 
+/* ユーザーに配るページを 1 枚取って 0 で埋め、**物理アドレス**を返す。
+ * 取れなければ 0。
+ *
+ * **pmm_alloc が返すのは物理アドレスなので、そのまま触ってはいけない。**
+ * ここは元々 kernel/riscv64/syscall.c に居たコードで、riscv64 は
+ * g_hhdm_offset が 0 (恒等) なため直書きでも動いていた。aarch64 は
+ * 恒等マッピングを外して上位 VA だけで走るので、載せた瞬間に落ちる:
+ *
+ *   ESR=0x96000045  EC=0x25 (EL1 のデータアボート)
+ *                   DFSC=0x05 translation fault level 1, WnR=1
+ *   FAR=0x000000004036c000  (= 物理アドレスそのもの)
+ *
+ * **オフセット 0 を暗黙に前提にした共有コードだった。** brk と mmap が
+ * 同じ書き方をしていたので 1 か所にまとめる */
+static uint64_t linux_alloc_zeroed_user_page(void) {
+    uint64_t phys = (uint64_t)(uintptr_t)pmm_alloc(1);
+    uint8_t* mapped;
+    if (!phys) return 0;
+    mapped = (uint8_t*)PHYS_TO_VIRT(phys);
+    for (uint64_t i = 0; i < PAGE_SIZE; i++) mapped[i] = 0;
+    return phys;
+}
+
 static uint64_t linux_bootstrap_sys_brk(uint64_t addr) {
     struct task* current = get_current_task();
     uint64_t current_page;
@@ -441,11 +465,8 @@ static uint64_t linux_bootstrap_sys_brk(uint64_t addr) {
     address_space = arch_task_context_get_address_space(&current->ctx);
 
     while (current_page < target_page) {
-        uint64_t phys = (uint64_t)(uintptr_t)pmm_alloc(1);
+        uint64_t phys = linux_alloc_zeroed_user_page();
         if (!phys) return current->heap_break;
-        for (uint64_t i = 0; i < PAGE_SIZE; i++) {
-            ((uint8_t*)(uintptr_t)phys)[i] = 0;
-        }
         arch_vm_map_page(address_space, current_page, phys, arch_vm_user_page_flags(1, 0));
         current_page += PAGE_SIZE;
     }
@@ -906,11 +927,8 @@ static void* linux_bootstrap_sys_mmap(void* addr, size_t length, int prot, int f
 
     map_flags = arch_vm_user_page_flags((prot & PROT_WRITE) != 0, 0);
     for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        uint64_t phys = (uint64_t)(uintptr_t)pmm_alloc(1);
+        uint64_t phys = linux_alloc_zeroed_user_page();
         if (!phys) return linux_mmap_err(LINUX_ENOMEM);
-        for (uint64_t i = 0; i < PAGE_SIZE; i++) {
-            ((uint8_t*)(uintptr_t)phys)[i] = 0;
-        }
         arch_vm_map_page(address_space, base + off, phys, map_flags);
     }
     current->mmap_end = base + size;

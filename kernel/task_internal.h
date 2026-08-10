@@ -7,8 +7,16 @@
 
 #define TASK_TIMESLICE_TICKS 5
 
-// Sv39 (riscv64) は 39bit VA のためユーザースタックを 2^38 未満に置く
-#if defined(__riscv)
+// Sv39 (riscv64) / 4KB granule + T0SZ=25 (aarch64) は **どちらも 39bit VA**
+// なので、ユーザースタックを 2^38 未満に置く。
+//
+// **aarch64 をここに入れ忘れると、x86 と同じ 2^47 を要求して落ちる。**
+// P2 (musl) で実際に踏んだ:
+//   ESR=0x92000004 (下位 EL のデータアボート, translation fault level 0)
+//   FAR=0x00007fffffffef00   ELR=crt0 の `ldr x1, [x9]`
+// P1 の hello が通っていたのは、あれが sp を一度も触らなかったため。
+// **「ユーザープロセスが動いた」はスタックが張れている証拠にならない。**
+#if defined(__riscv) || defined(__aarch64__)
 #define USER_STACK_TOP_VADDR   0x0000003FFFFFF000ULL
 #define USER_MMAP_BASE_VADDR   0x0000002000000000ULL
 #else
