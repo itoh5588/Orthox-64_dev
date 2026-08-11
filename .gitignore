@@ -159,3 +159,11 @@ out/aarch64-vmleak-fs/
 ports/orthox-native-aarch64/
 ports/gcc-prereq-aarch64/
 ports/.prereq-aarch64/
+
+# aarch64 セルフホストの中間生成物。
+#   aarch64-selfhost-fs   イメージのステージング (60MB、750 ファイル)
+#   make-4.4.1-aarch64    Orthox 上で動く make のビルドツリー
+# 作り方は scripts/build_rootfs_aarch64_selfhost.sh と
+# ports/build_make_orthox_aarch64.sh にある
+out/aarch64-selfhost-fs/
+ports/make-4.4.1-aarch64/
