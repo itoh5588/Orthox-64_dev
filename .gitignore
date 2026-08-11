@@ -152,3 +152,10 @@ out/aarch64-fp-fs/
 
 # P3-4 のスモークが作るもの
 out/aarch64-vmleak-fs/
+
+# aarch64 セルフホストのビルド成果物 (計 100MB 超)。
+# 作り方は ports/build_binutils_orthox_aarch64.sh と
+# ports/build_gcc474_orthox_aarch64.sh にある
+ports/orthox-native-aarch64/
+ports/gcc-prereq-aarch64/
+ports/.prereq-aarch64/

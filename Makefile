@@ -325,6 +325,14 @@ AARCH64_INIT_PATH_VALUE ?=
 ifneq ($(AARCH64_INIT_PATH_VALUE),)
 AARCH64_CFLAGS += '-DAARCH64_INIT_PATH="$(AARCH64_INIT_PATH_VALUE)"'
 endif
+# 逆確認用の差し込み口。**検査が本当に火を噴くことを確かめる**のに使う
+# (例: make aarch64-kernel AARCH64_CFLAGS_EXTRA=-DORTHOX_NO_TLS_SWITCH)。
+# **CFLAGS の変更を make は追跡しない**ので、切り替えるときは
+# build/aarch64 を消してから作り直すこと (AARCH64_INIT_PATH_VALUE が
+# init_path.stamp を持っているのと同じ理由)
+AARCH64_CFLAGS_EXTRA ?=
+AARCH64_CFLAGS += $(AARCH64_CFLAGS_EXTRA)
+
 AARCH64_LDFLAGS = -nostdlib -static -m aarch64elf -T scripts/kernel-aarch64.ld
 AARCH64_OBJS = $(patsubst kernel/aarch64/%.c, $(BUILD_DIR)/aarch64/kernel/%.o, $(AARCH64_C_SRCS)) \
 	$(patsubst kernel/%.c, $(BUILD_DIR)/aarch64/shared/%.o, $(AARCH64_SHARED_C_SRCS)) \

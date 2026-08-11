@@ -33,12 +33,17 @@
 #define AARCH64_CTX_FPCR 112
 #define AARCH64_CTX_FPSR 120
 #define AARCH64_CTX_V0   128
-#define AARCH64_CTX_SIZE 640
+/* TLS ベース (TPIDR_EL0)。**ユーザーが所有しカーネルが退避すべきレジスタ。**
+ * AArch64 の TPIDR_EL0 は EL0 から読み書きできるので、musl は起動時に
+ * 自分で msr tpidr_el0 して設定する。退避しないと **最後に走ったタスクの値が
+ * 残り**、別の像を走らせた瞬間に他人の TLS を指す */
+#define AARCH64_CTX_TPIDR 640
+#define AARCH64_CTX_SIZE  648
 
 /* struct arch_task_context の中で user_frame がどこから始まるか (M3c-2b)。
  * .S から使うので __ASSEMBLER__ の外に置く。**C 側で _Static_assert して
  * いるので、struct を変えたらビルドが落ちる** */
-#define AARCH64_TASKCTX_USER_FRAME 656
+#define AARCH64_TASKCTX_USER_FRAME 664
 
 #ifndef __ASSEMBLER__
 
@@ -71,6 +76,23 @@ typedef struct aarch64_context {
     uint64_t fpcr;
     uint64_t fpsr;
     uint64_t v[64];
+    /* ---- TLS ベース (TPIDR_EL0) ------------------------------------------
+     *
+     * **FP/SIMD とまったく同じ性格の欠落だった。** ユーザーが所有していて
+     * カーネルが退避しなければならないのに、していなかった。
+     *
+     * musl は起動時に自分で msr tpidr_el0 する (AArch64 では EL0 から
+     * 書ける)。退避しないと最後に走ったタスクの値が残るので、
+     * **同じ像同士なら値も同じで症状が出ない。** fork した子が exec して
+     * 別の像になった瞬間に、親が他人の TLS を指して落ちる。
+     *
+     * 実測した壊れ方 (どちらも musl の exit の中):
+     *   ldur w8, [tpidr_el0, #-168]   pthread_self()->tid を読む
+     *     -> 他人の像を指していれば未マップで data abort
+     *     -> たまたま読めて 0 なら a_crash() (strb wzr, [xzr]) で自爆
+     *
+     * fork+exit では露出しない。**親子が同じ像なので TLS ベースも同じ。**  */
+    uint64_t tpidr;
 } aarch64_context_t;
 
 #define AARCH64_TASK_FREE    0
@@ -161,6 +183,8 @@ _Static_assert(__builtin_offsetof(aarch64_context_t, v) == AARCH64_CTX_V0,
                "AARCH64_CTX_V0 が struct とずれている");
 _Static_assert(__builtin_offsetof(aarch64_context_t, v) % 16 == 0,
                "v0-v31 は 16 バイト境界に置くこと (stp q が使えない)");
+_Static_assert(__builtin_offsetof(aarch64_context_t, tpidr) == AARCH64_CTX_TPIDR,
+               "AARCH64_CTX_TPIDR が struct とずれている");
 _Static_assert(sizeof(aarch64_context_t) == AARCH64_CTX_SIZE,
                "AARCH64_CTX_SIZE が struct とずれている");
 _Static_assert(__builtin_offsetof(struct arch_task_context, user_frame) ==
@@ -199,9 +223,13 @@ static inline void arch_task_context_activate_address_space(const struct arch_ta
 }
 
 /* TLS。**AArch64 は TPIDR_EL0 が素直に使える** (x86 の fs_base 相当)。
- * まだ使っていないので受け取るだけにしてある */
+ *
+ * いま走っているレジスタに書く。**次の切り替えで switch.S が退避する**ので、
+ * これだけでタスクごとの値になる。
+ * (clone(CLONE_SETTLS) 経由でカーネルが TLS を決める場合に効く。musl の
+ *  静的リンクの起動路は自分で msr tpidr_el0 するので、そちらは素通りする) */
 static inline void arch_task_apply_user_tls(uint64_t tls_base) {
-    (void)tls_base;
+    __asm__ volatile("msr tpidr_el0, %0" :: "r"(tls_base));
 }
 
 static inline struct cpu_local* arch_task_get_cpu_local(void) {
@@ -258,6 +286,11 @@ static inline void arch_task_context_init_fp_state(struct arch_task_context* ctx
     ctx->regs.fpcr = 0;
     ctx->regs.fpsr = 0;
     for (int i = 0; i < 64; i++) ctx->regs.v[i] = 0;
+    /* **TLS も一緒に落とす。** exec は使い回しの ctx に対して呼ばれるので、
+     * ここで消さないと **前の像の TLS ベースが残る**。musl は起動路で
+     * 自分で設定し直すが、それより前に何かが読むと他人の像を指す。
+     * (名前は fp のままだが「ユーザーが持っていた状態を捨てる」場所) */
+    ctx->regs.tpidr = 0;
 }
 
 /* fork の子は親の FP をそのまま引き継ぐ (P3-3)。
@@ -269,6 +302,9 @@ static inline void arch_task_context_copy_fp_state(struct arch_task_context* dst
     dst->regs.fpcr = src->regs.fpcr;
     dst->regs.fpsr = src->regs.fpsr;
     for (int i = 0; i < 64; i++) dst->regs.v[i] = src->regs.v[i];
+    /* **TLS はここで写さない。** src->regs.tpidr は「親が最後に切り替わった
+     * ときの値」で、走行中の親に対しては **古い**。生のレジスタから取る必要が
+     * あるので、呼び出し元 (arch_task_commit_fork_child) でやる */
 }
 
 /* **x30 (lr) に入口を仕込むと、最初の切り替えで「そこへ戻る」形で走り出す。**
@@ -354,6 +390,21 @@ static inline void arch_task_commit_fork_child(struct arch_task_context* child_c
     if (child_ctx) child_ctx->kernel_sp = child_kstack_top;
     arch_task_prepare_fork_child_context(child_ctx, child_frame, parent_frame);
     arch_task_context_copy_fp_state(child_ctx, parent_ctx);
+    /* **TLS は生のレジスタから取る。** ここは fork の syscall の中で、
+     * **親がいま走っている**ので TPIDR_EL0 に親の値が入っている。
+     *
+     * parent_ctx->regs.tpidr を使うと壊れる。あれは「親が最後に切り替わった
+     * ときの値」で、musl が起動路で msr tpidr_el0 した後まだ一度も切り替わって
+     * いなければ **0 のまま**。実測では子が 0 を継いで、最初に
+     * pthread_self() を読んだ瞬間に落ちた (fork+exit だけで 126,213 回)。
+     *
+     * 子は親の続きなので、親と同じ TLS ベースで走り出すのが正しい。
+     * 子のアドレス空間は親を写したものなので、同じ番地に同じ中身がある */
+    if (child_ctx) {
+        uint64_t tls;
+        __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tls));
+        child_ctx->regs.tpidr = tls;
+    }
 }
 
 static inline void arch_task_prepare_initial_user_context(struct arch_task_context* ctx,

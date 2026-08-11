@@ -74,6 +74,23 @@ aarch64_context_switch:
     mrs     x9, fpsr
     str     x9, [x1, #AARCH64_CTX_FPSR]
 
+    /* **TLS ベースも退避する。**
+     *
+     * TPIDR_EL0 は **EL0 から読み書きできる**ので musl が自分で設定する。
+     * ユーザーが所有しカーネルが持ち越すべきレジスタで、FP/SIMD と同じ性格。
+     *
+     * 退避しないと最後に走ったタスクの値が残る。**fork した親子は同じ像なので
+     * 値も同じで症状が出ない** — 子が exec して別の像になった瞬間に、親が
+     * 他人の TLS を指して musl の exit の中で落ちる (ldur w8, [tpidr_el0, #-168]
+     * で pthread_self()->tid を読むため)。
+     *
+     * ここを ORTHOX_NO_TLS_SWITCH で潰せるようにしてあるのは **逆確認のため**。
+     * 検査が本当に火を噴くことを確かめずに信じない (日報2026-08-10 追§5) */
+#ifndef ORTHOX_NO_TLS_SWITCH
+    mrs     x9, tpidr_el0
+    str     x9, [x1, #AARCH64_CTX_TPIDR]
+#endif
+
     /* 次のものを x0 が指す枠から復元 */
     ldp     x19, x20, [x0, #AARCH64_CTX_X19]
     ldp     x21, x22, [x0, #AARCH64_CTX_X21]
@@ -109,6 +126,12 @@ aarch64_context_switch:
     ldp     q26, q27, [x9, #16 * 26]
     ldp     q28, q29, [x9, #16 * 28]
     ldp     q30, q31, [x9, #16 * 30]
+
+    /* TLS ベースの復元。退避と対称に置く */
+#ifndef ORTHOX_NO_TLS_SWITCH
+    ldr     x9, [x0, #AARCH64_CTX_TPIDR]
+    msr     tpidr_el0, x9
+#endif
 
     /* x30 に入っている場所へ「戻る」。新しいタスクなら入口へ飛ぶ */
     ret

@@ -64,6 +64,30 @@ fi
 
 cp -a "$SRCTREE" "$FSDIR/src/kernel-build"
 
+# ---- busybox ash ----------------------------------------------------------
+# **make が /bin/sh を呼ぶので必須。** applet は本体へのハードリンクにする
+# (xv6fs に symlink 型が無い。riscv64 の RISCV64_ROOTFS_APPLETS と同じ形)。
+# applet を増やしてもイメージは busybox 1 本分しか太らない。
+BUSYBOX="${BUSYBOX:-$ROOT/out/busybox-aarch64-musl.elf}"
+APPLETS="ash sh cat chmod cp echo env false head ln ls mkdir mv printf pwd rm \
+         rmdir sleep stat tail test touch true wc which"
+if [ -f "$BUSYBOX" ]; then
+  echo "--- busybox ash を入れる"
+  cp "$BUSYBOX" "$FSDIR/bin/busybox"
+  for a in $APPLETS; do
+    ln -f "$FSDIR/bin/busybox" "$FSDIR/bin/$a"
+  done
+  echo "  applet $(echo $APPLETS | wc -w) 本 (ハードリンク)"
+else
+  echo "warning: $BUSYBOX が無い。**/bin/sh が無いと make は動かない**" >&2
+fi
+
+# OS の中でコンパイルさせる種火。**中身まで照合できるように出力を固定する**
+cat > "$FSDIR/selfhost-check.c" <<'EOF'
+#include <stdio.h>
+int main(void) { printf("SELF-HOSTED-ON-ORTHOX-AARCH64\n"); return 0; }
+EOF
+
 # ---- ツールチェーンを重ねる ----------------------------------------------
 # riscv64 の deploy と同じ形 (日報2026-08-01 追記 5):
 #   make riscv64-rootfs RISCV64_ROOTFS_EXTRA=ports/orthox-native
