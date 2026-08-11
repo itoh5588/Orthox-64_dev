@@ -144,6 +144,34 @@ static int node_name_is(const char* node, const char* name) {
  *
  * kernel/riscv64/boot.c の riscv64_dtb_scan は 1 組しか持っていないが、
  * あちらが拾う uart / virtio / memory は子ノードを持たないので露見しない。 */
+/* ---- ranges (バスアドレス -> 親のアドレス) の変換 ------------------------
+ *
+ * **QEMU virt では要らないが、Raspberry Pi では必須。**
+ *
+ * QEMU virt は周辺をルート直下に置くので、reg にそのまま物理が入っている。
+ * Pi は /soc というバスノードの下に置き、reg には**バスアドレス**を書く:
+ *
+ *   soc {
+ *       #address-cells = <1>; #size-cells = <1>;
+ *       ranges = <0x7e000000  0x0 0xfe000000  0x1800000>;
+ *                 ^子のアドレス ^親のアドレス  ^長さ
+ *       serial@7e201000 { reg = <0x7e201000 0x200>; };   -> 物理 0xfe201000
+ *   };
+ *
+ * **変換しないと 0x7e201000 を叩きに行って沈黙する。** どこにも繋がって
+ * いないアドレスなので、エラーも出ない。
+ *
+ * ranges が空 (長さ 0) なら「そのまま通す」の意味。プロパティが無い場合は
+ * 本来「変換できない」だが、ここでは素通しにする — QEMU virt のように
+ * バスノードを持たない木で余計な失敗をしないため。 */
+typedef struct dtb_range {
+    uint64_t child;
+    uint64_t parent;
+    uint64_t size;
+} dtb_range_t;
+
+#define MAX_RANGES_PER_NODE 4
+
 typedef struct dtb_node_state {
     int is_uart;
     int is_gic;
@@ -151,19 +179,64 @@ typedef struct dtb_node_state {
     int is_memory;
     int is_timer;
     int is_cpu;
+    /* **status = "disabled" のノードを採用しないための印。**
+     * Pi 4 の DTB には arm,pl011 を名乗るノードが 5 つあり、有効なのは
+     * serial@7e201000 だけ。残り 4 つは disabled。見ないと最後に見つけた
+     * 無効なポート (0xfe201a00) を掴んで**実機で沈黙する**。
+     * **プロパティが無ければ有効** (DT の既定) */
+    int is_disabled;
     const uint8_t* reg_data;
     uint32_t reg_len;
     const uint8_t* intr_data;
     uint32_t intr_len;
+    /* このノードが**バスとして**持つ ranges。子の reg に適用する */
+    dtb_range_t ranges[MAX_RANGES_PER_NODE];
+    uint32_t range_count;
+    int has_ranges;      /* プロパティが在ったか (空の ranges と区別する) */
 } dtb_node_state_t;
 
 static void node_state_clear(dtb_node_state_t* n) {
     n->is_uart = n->is_gic = n->is_virtio = 0;
     n->is_memory = n->is_timer = n->is_cpu = 0;
+    n->is_disabled = 0;
     n->reg_data = 0;
     n->reg_len = 0;
     n->intr_data = 0;
     n->intr_len = 0;
+    n->range_count = 0;
+    n->has_ranges = 0;
+}
+
+/* 深さ depth のノードの reg を、ルートから見た物理アドレスに直す。
+ * **親から順に適用する** (子のバス -> 親のバス -> ... -> 物理)。
+ * 変換に当たらなければそのまま返す (素通しの木で壊さないため)。 */
+static uint64_t dtb_translate(const dtb_node_state_t* nodes, int depth, uint64_t addr) {
+    for (int d = depth - 1; d >= 0; d--) {
+        const dtb_node_state_t* bus = &nodes[d];
+        if (!bus->has_ranges || bus->range_count == 0) continue;
+        for (uint32_t i = 0; i < bus->range_count; i++) {
+            const dtb_range_t* r = &bus->ranges[i];
+            if (addr >= r->child && addr - r->child < r->size) {
+                addr = r->parent + (addr - r->child);
+                break;
+            }
+        }
+    }
+    return addr;
+}
+
+/* reg を読んで **その場で物理へ直す**。
+ *
+ * **reg_entry を直接呼ばないこと。** 呼び出しが 6 箇所あり、片方だけ変換を
+ * 忘れると「UART は当たるが GIC は当たらない」のような形で静かに壊れる。
+ * ここを通す限り、増やしても直し忘れが起きない。 */
+static int reg_entry_phys(const dtb_node_state_t* nodes, int depth,
+                          const uint8_t* data, uint32_t len,
+                          uint32_t addr_cells, uint32_t size_cells,
+                          uint32_t index, uint64_t* out_base, uint64_t* out_size) {
+    if (!reg_entry(data, len, addr_cells, size_cells, index, out_base, out_size)) return 0;
+    *out_base = dtb_translate(nodes, depth, *out_base);
+    return 1;
 }
 
 void aarch64_dtb_scan(uint64_t dtb_pa) {
@@ -244,16 +317,16 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
             }
             n = &nodes[depth];
 
-            if (n->is_memory && n->reg_data &&
-                reg_entry(n->reg_data, n->reg_len, ac, sc, 0, &base, &size) &&
+            if (n->is_memory && !n->is_disabled && n->reg_data &&
+                reg_entry_phys(nodes, depth, n->reg_data, n->reg_len, ac, sc, 0, &base, &size) &&
                 base != 0 && size != 0 && info->memory_size == 0) {
                 info->memory_base = base;
                 info->memory_size = size;
                 info->flags |= AARCH64_BOOT_FLAG_MEMORY_FROM_DTB;
             }
 
-            if (n->is_uart && n->reg_data &&
-                reg_entry(n->reg_data, n->reg_len, ac, sc, 0, &base, &size) && base != 0) {
+            if (n->is_uart && !n->is_disabled && n->reg_data &&
+                reg_entry_phys(nodes, depth, n->reg_data, n->reg_len, ac, sc, 0, &base, &size) && base != 0) {
                 info->uart_base = base;
                 info->flags |= AARCH64_BOOT_FLAG_UART_FROM_DTB;
                 /* 受信割り込みの INTID (P3)。virtio と同じ形式で
@@ -269,12 +342,12 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
 
             /* GIC は **2 組そろって初めて使える**。1 組目 = Distributor、
              * 2 組目 = CPU Interface。日報2026-08-09 §1 で落とした所 */
-            if (n->is_gic && n->reg_data) {
+            if (n->is_gic && !n->is_disabled && n->reg_data) {
                 uint64_t db = 0, ds = 0, cb = 0, cs = 0;
-                if (reg_entry(n->reg_data, n->reg_len, ac, sc, 0, &db, &ds) && db != 0) {
+                if (reg_entry_phys(nodes, depth, n->reg_data, n->reg_len, ac, sc, 0, &db, &ds) && db != 0) {
                     info->gicd_base = db;
                     if (ds) info->gicd_size = ds;
-                    if (reg_entry(n->reg_data, n->reg_len, ac, sc, 1, &cb, &cs) && cb != 0) {
+                    if (reg_entry_phys(nodes, depth, n->reg_data, n->reg_len, ac, sc, 1, &cb, &cs) && cb != 0) {
                         info->gicc_base = cb;
                         if (cs) info->gicc_size = cs;
                         info->flags |= AARCH64_BOOT_FLAG_GIC_FROM_DTB;
@@ -287,8 +360,8 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
             /* **DTB に並ぶ順は昇順とは限らない** (QEMU virt は上のアドレスから
              * 並べる)。順に依存しないよう最小と最大だけ覚えておき、刻み幅は
              * ループの後で (max - min) / (本数 - 1) から出す */
-            if (n->is_virtio && n->reg_data &&
-                reg_entry(n->reg_data, n->reg_len, ac, sc, 0, &base, &size) && base != 0) {
+            if (n->is_virtio && !n->is_disabled && n->reg_data &&
+                reg_entry_phys(nodes, depth, n->reg_data, n->reg_len, ac, sc, 0, &base, &size) && base != 0) {
                 /* interrupts = <type num flags>。type 0 = SPI で、
                  * SPI の INTID は番号 + 32 (PPI が +16 なのと同じ理屈) */
                 uint32_t intid = 0;
@@ -367,6 +440,44 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
             } else if (str_eq(prop_name, "reg")) {
                 nodes[depth].reg_data = data;
                 nodes[depth].reg_len = len;
+            } else if (str_eq(prop_name, "status")) {
+                /* "okay" と "ok" だけが有効。他 (disabled / fail / reserved)
+                 * は採用しない。**文字列は NUL 終端で入っている** */
+                const char* v = (const char*)data;
+                if (len > 0 && !str_eq(v, "okay") && !str_eq(v, "ok")) {
+                    nodes[depth].is_disabled = 1;
+                }
+            } else if (str_eq(prop_name, "ranges")) {
+                /* **1 組は「子のアドレス + 親のアドレス + 長さ」。**
+                 * セル数は 子=このノードの #address-cells /
+                 * 親=親の #address-cells / 長さ=このノードの #size-cells。
+                 * **子と親でセル数が違う木がある** (Pi は 1 と 2) ので、
+                 * 別々に読むこと。ここを揃えて読むと組の境界がずれる。
+                 *
+                 * len == 0 の ranges は「そのまま通す」。has_ranges だけ
+                 * 立てて組を 0 にしておけば、dtb_translate が素通しにする */
+                uint32_t cac = addr_cells[depth];
+                uint32_t pac = (depth > 0) ? addr_cells[depth - 1] : addr_cells[0];
+                uint32_t csc = size_cells[depth];
+                uint32_t stride = (cac + pac + csc) * 4U;
+                nodes[depth].has_ranges = 1;
+                nodes[depth].range_count = 0;
+                if (stride > 0 && cac <= 2 && pac <= 2 && csc <= 2) {
+                    for (uint32_t o = 0;
+                         o + stride <= len && nodes[depth].range_count < MAX_RANGES_PER_NODE;
+                         o += stride) {
+                        const uint8_t* p = data + o;
+                        dtb_range_t* r = &nodes[depth].ranges[nodes[depth].range_count++];
+                        r->child = (cac == 2) ? aarch64_dtb_read_be64(p)
+                                              : (uint64_t)aarch64_dtb_read_be32(p);
+                        p += cac * 4U;
+                        r->parent = (pac == 2) ? aarch64_dtb_read_be64(p)
+                                               : (uint64_t)aarch64_dtb_read_be32(p);
+                        p += pac * 4U;
+                        r->size = (csc == 2) ? aarch64_dtb_read_be64(p)
+                                             : (uint64_t)aarch64_dtb_read_be32(p);
+                    }
+                }
             } else if (str_eq(prop_name, "interrupts")) {
                 nodes[depth].intr_data = data;
                 nodes[depth].intr_len = len;

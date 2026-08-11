@@ -214,8 +214,16 @@ void aarch64_boot_capture(uint64_t dtb_hint) {
         g_boot_info.virtio_mmio_stride = AARCH64_QEMU_VIRT_VIRTIO_STRIDE;
     }
 
-    /* UART が別の場所だと分かったらここで乗り換える */
+    /* UART が別の場所だと分かったらここで乗り換える。
+     *
+     * **他機の DTB を読ませて検証するときは乗り換えると何も見えなくなる。**
+     * 例: QEMU virt に Pi 4 の DTB を -dtb で食わせると、ここで
+     * 0xfe201000 へ移ってしまい、以降の表示が届かない。
+     * ORTHOX_DTB_KEEP_UART を渡すと乗り換えを止めて、
+     * **解釈結果だけを手元の UART で読める。** */
+#ifndef ORTHOX_DTB_KEEP_UART
     aarch64_uart_set_base(g_boot_info.uart_base);
+#endif
 }
 
 /* 1 行 1 項目で出す。**どこから来た値かを添える。** 「DTB を読んだ」と
