@@ -243,7 +243,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: aarch64-kernel8 riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: aarch64-kernel8 aarch64-pi4-boot riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -384,6 +384,22 @@ $(AARCH64_KERNEL8_IMG): $(AARCH64_KERNEL_ELF)
 	@echo "kernel8.img: $$(stat -c %s $@) バイト (ロード先 $(AARCH64_LOAD_PA))"
 
 aarch64-kernel8: $(AARCH64_KERNEL8_IMG)
+
+# ---- Raspberry Pi 4 で起動する一式 ----------------------------------------
+# **QEMU の raspi4b でも実機でも同じものを使う。** 中身と使い方は
+# scripts/pi4/README.md に書いた。
+#
+#   ロード先    0x80000     ファームウェアがここに置いて飛んでくる
+#   早期 UART   0xFE201000  DTB を読む前の出力先 (Pi 4 の PL011)
+aarch64-pi4-boot:
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
+	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000
+	@mkdir -p out/pi4-boot
+	cp out/kernel8.img out/pi4-boot/
+	cp scripts/pi4/config.txt out/pi4-boot/
+	@echo "=== out/pi4-boot/ ==="
+	@ls -la out/pi4-boot/
+	@echo "SD カードの boot パーティション直下に置く (scripts/pi4/README.md)"
 
 aarch64-run: $(AARCH64_KERNEL_ELF)
 	qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 512M -smp 1 \

@@ -167,3 +167,4 @@ ports/.prereq-aarch64/
 # ports/build_make_orthox_aarch64.sh にある
 out/aarch64-selfhost-fs/
 ports/make-4.4.1-aarch64/
+out/pi4-boot/
