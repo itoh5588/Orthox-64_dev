@@ -64,6 +64,30 @@ fi
 
 cp -a "$SRCTREE" "$FSDIR/src/kernel-build"
 
+# ---- ツールチェーンを重ねる ----------------------------------------------
+# riscv64 の deploy と同じ形 (日報2026-08-01 追記 5):
+#   make riscv64-rootfs RISCV64_ROOTFS_EXTRA=ports/orthox-native
+# こちらは Makefile を経由せず、この台本の中で重ねる。
+#
+# EXTRA は **DESTDIR install したツリー**をそのまま重ねる想定
+# (ports/orthox-native-aarch64 は prefix=/usr で install してあるので
+#  usr/bin/as などが入っている)。
+EXTRA="${EXTRA:-$ROOT/ports/orthox-native-aarch64}"
+if [ -d "$EXTRA" ]; then
+  echo "--- ツールチェーンを重ねる: $EXTRA"
+  cp -a "$EXTRA"/. "$FSDIR/"
+  # musl のヘッダと libc.a も要る。**Orthox 上の gcc は /include と /lib を見る**
+  # (--with-sysroot=/ --with-native-system-header-dir=/include。日報2026-08-01)
+  if [ -d "$ROOT/ports/musl-install-aarch64" ]; then
+    mkdir -p "$FSDIR/include" "$FSDIR/lib"
+    cp -a "$ROOT/ports/musl-install-aarch64/include"/. "$FSDIR/include/"
+    cp -a "$ROOT/ports/musl-install-aarch64/lib"/.     "$FSDIR/lib/"
+  fi
+  du -sh "$FSDIR" | sed 's/^/  重ねた後: /'
+else
+  echo "--- ツールチェーンは無い ($EXTRA)。ソースだけのイメージになる"
+fi
+
 # ---- イメージを焼く -------------------------------------------------------
 echo "--- イメージを焼く (FSSIZE=$FSSIZE blocks / NINODES=$NINODES)"
 rm -f "$IMG"
