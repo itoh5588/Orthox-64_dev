@@ -51,7 +51,24 @@ typedef struct fs_file {
 #define O_CREAT     0x0040
 #define O_TRUNC     0x0200
 #define O_APPEND    0x0400
-#define O_DIRECTORY 0x10000
+/* **O_DIRECTORY だけはアーキで値が違う。**
+ *
+ *   asm-generic (x86_64 / riscv64)   0200000 = 0x10000
+ *   aarch64 / arm                    0040000 = 0x04000
+ *
+ * Linux の arch/arm64/include/uapi/asm/fcntl.h が asm-generic の既定を
+ * 上書きしているため。musl もそれに合わせている (bits/fcntl.h を実測)。
+ *
+ * **システムコール番号と struct のレイアウトが同じでも、O_* フラグは
+ * 別物**という例外。合っていないと musl の opendir() が O_DIRECTORY 無しの
+ * open に見え、ディレクトリを開こうとして EISDIR で弾かれる。
+ * 症状はディレクトリが読めないことで、**GNU make は readdir の結果で
+ * ファイルの有無を判断する**ので「Makefile が無い」と言って止まる。
+ *
+ * 両方受けても害は無い (どちらの値も他のフラグと衝突しない) ので、
+ * arch ごとに切らずに両方を見る */
+#define O_DIRECTORY      0x10000    /* asm-generic (x86_64 / riscv64) */
+#define O_DIRECTORY_ARM  0x04000    /* aarch64 / arm */
 #define FD_CLOEXEC  1
 
 #define PIPE_BUF_SIZE 4000

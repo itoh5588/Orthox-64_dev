@@ -489,7 +489,25 @@ static int linux_bootstrap_sys_munmap(void* addr, size_t length) {
 
     address_space = arch_task_context_get_address_space(&current->ctx);
     for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
+        /* **外す前に物理ページを取って返すこと。**
+         *
+         * arch_vm_unmap_page は名前のとおり「写像を外す」だけで、物理ページの
+         * 持ち主を変えない。外しただけだと **そのページは誰の物でもなくなり、
+         * 参照カウントが 1 のまま二度と配られない**。
+         *
+         * musl の malloc は大きい塊を mmap / munmap で扱うので、cc1 のように
+         * 確保と解放を繰り返すプログラムで積み上がる。実測では OS の中で
+         * カーネルを 1 本コンパイルするたびに約 18MB 漏れ、512MB を
+         * 15 本で使い切っていた。
+         *
+         * pmm_free は参照カウントを見るので、共有されているページを
+         * ここで返しても取り上げてしまうことはない。
+         *
+         * get_phys はページ内オフセットを OR して返すアーキがあるので、
+         * **下位ビットを落としてから渡す** */
+        uint64_t phys = arch_vm_get_phys(address_space, base + off);
         arch_vm_unmap_page(address_space, base + off);
+        if (phys) pmm_free((void*)(uintptr_t)(phys & ~(PAGE_SIZE - 1ULL)), 1);
     }
     arch_syscall_flush_tlb();
     return 0;

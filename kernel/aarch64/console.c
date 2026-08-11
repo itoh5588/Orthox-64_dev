@@ -70,23 +70,36 @@ void aarch64_console_rx_irq(void) {
     struct task* waiter;
     int pushed = 0;
     uint64_t flags = console_lock();
-    int ch = aarch64_uart_getchar_nonblock();
 
-    while (ch >= 0) {
-        uint32_t next = (g_console_head + 1U) % CONSOLE_BUF_SIZE;
-        /* 端末は改行を CR で送る。**ここで LF に直す** —
-         * ash は '\n' で行を区切るので、CR のままだと入力が確定しない */
-        if (ch == '\r') ch = '\n';
-        if (next != g_console_tail) {
-            g_console_buf[g_console_head] = (uint8_t)ch;
-            g_console_head = next;
-            pushed = 1;
-        }
-        /* リングが満杯なら捨てる。**待つ側は割り込み文脈なので詰まらせない** */
+    /* **確認応答は読む前。読み終わってからでは入力が永久に止まる。**
+     *
+     * 以前は「空になるまで読む -> ICR でクリア」の順だった。FIFO が空だと
+     * 判定した後・ICR を書く前に 1 文字届くと、**その文字が上げた割り込みを
+     * 自分で消す**。文字は FIFO に残り、QEMU 側は FIFO が埋まっているので
+     * 次を送らない。以後どちらも動かず、入力が行の途中で切れたまま戻らない。
+     *
+     * 正しい順序は「クリア -> 空になるまで読む -> もう一度確かめる」。
+     * クリアの後に届いた文字は新しい割り込みを上げるので取りこぼさない。 */
+    for (;;) {
+        int ch;
+        aarch64_uart_clear_rx_irq();
         ch = aarch64_uart_getchar_nonblock();
+        if (ch < 0) break;                  /* クリア後に空 = ここで終わってよい */
+        while (ch >= 0) {
+            uint32_t next = (g_console_head + 1U) % CONSOLE_BUF_SIZE;
+            /* 端末は改行を CR で送る。**ここで LF に直す** —
+             * ash は '\n' で行を区切るので、CR のままだと入力が確定しない */
+            if (ch == '\r') ch = '\n';
+            if (next != g_console_tail) {
+                g_console_buf[g_console_head] = (uint8_t)ch;
+                g_console_head = next;
+                pushed = 1;
+            }
+            /* リングが満杯なら捨てる。**待つ側は割り込み文脈なので詰まらせない** */
+            ch = aarch64_uart_getchar_nonblock();
+        }
     }
     waiter = g_console_waiter;
-    aarch64_uart_clear_rx_irq();
     console_unlock(flags);
 
     /* task_wake はロックの外で呼ぶ (ロック順序を作らない) */

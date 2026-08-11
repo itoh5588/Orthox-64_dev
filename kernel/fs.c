@@ -1725,7 +1725,11 @@ static void exec_cache_invalidate(const char* raw_path) {
 
 int fs_open(const char* path, int flags, int mode) {
     struct task* current = get_current_task();
-    int want_dir = (flags & (O_DIRECTORY | ORTH_LEGACY_O_DIRECTORY)) != 0;
+    /* **O_DIRECTORY_ARM を必ず含めること。** aarch64 の musl は 0x4000 を
+     * 渡す (include/fs.h の注記)。抜けるとディレクトリが開けず、
+     * GNU make が「Makefile が無い」と言って止まる */
+    int want_dir = (flags & (O_DIRECTORY | O_DIRECTORY_ARM |
+                             ORTH_LEGACY_O_DIRECTORY)) != 0;
     int want_creat = (flags & O_CREAT) != 0;
     int want_trunc = (flags & O_TRUNC) != 0;
     const char* mount_subpath = 0;
