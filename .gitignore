@@ -128,6 +128,12 @@ ports/make-4.4.1-riscv64/
 ports/orthox-native/
 ports/*.tar.xz
 
+# aarch64 GCC セルフホストのビルド成果物 (計 239MB)。
+# 作り方は ports/build_binutils_aarch64.sh と ports/port_aarch64_to_gcc47.sh にある。
+# ports/gcc-4.7.4-aarch64/ は上の ports/gcc-*/ で既に外れている
+ports/cross-aarch64/
+ports/.gcc494-aarch64-parts/
+
 # rootfs.img の退避 (rootfs.img.20260705 など)。*.img には当たらない
 rootfs.img.*
 
