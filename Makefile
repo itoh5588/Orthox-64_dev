@@ -243,7 +243,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: aarch64-kernel8 riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -333,7 +333,19 @@ endif
 AARCH64_CFLAGS_EXTRA ?=
 AARCH64_CFLAGS += $(AARCH64_CFLAGS_EXTRA)
 
-AARCH64_LDFLAGS = -nostdlib -static -m aarch64elf -T scripts/kernel-aarch64.ld
+# 物理のロードアドレス。**機械ごとに違う** (scripts/kernel-aarch64.ld の注記)。
+#   QEMU virt          0x40200000  (既定)
+#   Raspberry Pi 3/4   0x00080000  ファームウェアがここへ置いて飛んでくる
+# 例: make aarch64-kernel8 AARCH64_LOAD_PA=0x80000
+AARCH64_LOAD_PA ?= 0x40200000
+# DTB を読む前の出力先。機械ごとに違う (include/aarch64/boot.h の注記)
+#   QEMU virt  0x09000000 (既定) / Pi 3  0x3F201000 / Pi 4  0xFE201000
+AARCH64_EARLY_UART ?=
+ifneq ($(AARCH64_EARLY_UART),)
+AARCH64_CFLAGS += -DAARCH64_EARLY_UART=$(AARCH64_EARLY_UART)ULL
+endif
+AARCH64_LDFLAGS = -nostdlib -static -m aarch64elf -T scripts/kernel-aarch64.ld \
+	--defsym=AARCH64_LOAD_PA=$(AARCH64_LOAD_PA)
 AARCH64_OBJS = $(patsubst kernel/aarch64/%.c, $(BUILD_DIR)/aarch64/kernel/%.o, $(AARCH64_C_SRCS)) \
 	$(patsubst kernel/%.c, $(BUILD_DIR)/aarch64/shared/%.o, $(AARCH64_SHARED_C_SRCS)) \
 	$(patsubst kernel/aarch64/%.S, $(BUILD_DIR)/aarch64/kernel/%_asm.o, $(AARCH64_ASM_SRCS))
@@ -355,6 +367,23 @@ $(AARCH64_KERNEL_ELF): $(AARCH64_OBJS)
 	$(LD) $(AARCH64_LDFLAGS) $(AARCH64_OBJS) -o $@
 
 aarch64-kernel: $(AARCH64_KERNEL_ELF)
+
+# ---- Raspberry Pi 向けの生バイナリ (kernel8.img) --------------------------
+# **Pi のファームウェアは ELF を読まない。** kernel8.img を 0x80000 に置いて
+# そこへ飛ぶだけなので、ELF の区画情報を落とした生イメージが要る。
+#
+# **-O binary は LMA (物理) の順に並べる。** このカーネルは上位 VA でリンクし
+# AT(...) で物理を指定してあるので、VMA で並べると 2^40 の穴が空いて
+# 巨大なファイルになる。objcopy が LMA を見ることに依存している。
+#
+# .bss は含まれない (NOBITS)。start.S が自分で 0 埋めする。
+AARCH64_KERNEL8_IMG = out/kernel8.img
+$(AARCH64_KERNEL8_IMG): $(AARCH64_KERNEL_ELF)
+	@mkdir -p $(@D)
+	llvm-objcopy -O binary $< $@
+	@echo "kernel8.img: $$(stat -c %s $@) バイト (ロード先 $(AARCH64_LOAD_PA))"
+
+aarch64-kernel8: $(AARCH64_KERNEL8_IMG)
 
 aarch64-run: $(AARCH64_KERNEL_ELF)
 	qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 512M -smp 1 \

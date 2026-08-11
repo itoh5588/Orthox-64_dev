@@ -24,7 +24,7 @@
  * 既定値で出し始め、DTB が別の場所を指していたら差し替える。
  * Pi 4 の PL011 は 0xFE201000 なので、**実機では差し替え前の出力が
  * 捨てられる**。段取り 3 で既定値の決め方が要る。 */
-static uint64_t g_uart_base = AARCH64_QEMU_VIRT_UART0_BASE;
+static uint64_t g_uart_base = AARCH64_EARLY_UART;
 
 #define PL011_DR_OFF    0x00
 #define PL011_FR_OFF    0x18

@@ -32,9 +32,22 @@ ENTRY(_start)
  * **include/aarch64/vm.h の AARCH64_KERNEL_VA_OFFSET と同じ値にすること** */
 KERNEL_VA_OFFSET = 0xffffff8000000000;
 
+/* ---- 物理のロードアドレス -------------------------------------------------
+ *
+ * **機械ごとに違うので固定しない。** リンカの --defsym で外から与える
+ * (Makefile の AARCH64_LOAD_PA)。与えられなければ QEMU virt の値にする。
+ *
+ *   QEMU virt          0x40200000  RAM が 0x40000000 から。DTB の実測値
+ *   Raspberry Pi 3/4   0x00080000  **ファームウェアが kernel8.img を
+ *                                  ここに置いて飛んでくる。動かせない**
+ *
+ * ここを変えても上位 VA 側は影響を受けない。カーネルの VA は
+ * 「物理 + KERNEL_VA_OFFSET」で、__boot_end からの相対で決まるため。 */
+KERNEL_LOAD_PA = DEFINED(AARCH64_LOAD_PA) ? AARCH64_LOAD_PA : 0x40200000;
+
 SECTIONS
 {
-    . = 0x40200000;
+    . = KERNEL_LOAD_PA;
     __boot_start = .;
 
     /* QEMU が飛んでくる入口。ここだけ VA = PA */

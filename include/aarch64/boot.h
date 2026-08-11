@@ -18,6 +18,25 @@
 #define AARCH64_QEMU_VIRT_VIRTIO_BASE   0x0a000000ULL
 #define AARCH64_QEMU_VIRT_VIRTIO_STRIDE 0x00000200ULL
 
+/* ---- 早期 UART の既定値 --------------------------------------------------
+ *
+ * **DTB を読む前の出力はここで決まる。** 起動直後 (dtb.c が走る前) に
+ * 1 文字でも出せないと、実機では何も分からないまま沈黙する。
+ * 機械ごとに違うのでビルド時に差せるようにしてある:
+ *
+ *   make aarch64-kernel8 AARCH64_LOAD_PA=0x80000 \
+ *        AARCH64_EARLY_UART=0x3F201000     Raspberry Pi 3 (BCM2837)
+ *   make ... AARCH64_EARLY_UART=0xFE201000 Raspberry Pi 4 (BCM2711)
+ *
+ * **Pi の値は実機の DTB か公式資料で確認すること** (上の注記と同じ)。
+ * ここに書いてあるのは「そう聞いている値」であって、実測ではない。
+ *
+ * DTB が読めればそちらで上書きされる (boot.c)。**表示が (dtb) か (既定値) か
+ * を見れば、どちらで動いているか分かる。** */
+#ifndef AARCH64_EARLY_UART
+#define AARCH64_EARLY_UART              AARCH64_QEMU_VIRT_UART0_BASE
+#endif
+
 /* 非セキュア物理タイマの PPI 番号。DTB の timer interrupts が
  * <1 14 0x104> = PPI 14 で、PPI の INTID は +16 なので 30 */
 #define AARCH64_TIMER_PPI_DEFAULT       14
