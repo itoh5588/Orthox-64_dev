@@ -891,6 +891,43 @@ for f in ('config/aarch64/aarch64.c', 'config/aarch64/aarch64-common.c',
         print("    %s: 4.9 で分割されたヘッダの取り込みを %d 行削除"
               % (os.path.basename(f), len(ls) - len(keep)))
 
+# ---- 逆に 4.7.4 にしか無いヘッダを足す ----
+# 上は「4.9 で分割されたものを落とす」だったが、**逆向きもある。**
+# 4.8/4.9 で integrate.h が廃止され、中身が function.h に取り込まれた:
+#
+#   get_hard_reg_initial_val の宣言   4.7.4 integrate.h:21 / 4.9 function.h
+#
+# aarch64.c は function.h しか include しないので 4.7.4 では**暗黙宣言**になる。
+# **-w が効いているので警告は出ない。** C89 の暗黙宣言は int を返す扱いなので
+# **rtx ポインタが 32bit に切り詰められてゴミになる**。
+#
+# 出方は cc1 の segfault で、**libgcc を組む段になって初めて出る**:
+#   void *f(void) { return __builtin_return_address(0); }
+#     -> internal compiler error: Segmentation fault (expand_builtin の中)
+#   libgcc/unwind-dw2.c:1490 の uw_init_context_1 で踏む
+#
+# 洗い出し方 (この表を増やすとき):
+#   ビルドログから aarch64.c のコンパイル行を取り、**-w を
+#   -Wimplicit-function-declaration に置き換えて**再実行する。
+#   実測では aarch64.c 1 件 / aarch64-common.c 0 件 /
+#   aarch-common.c 0 件 / aarch64-builtins.c 0 件 だった
+NEED_INCLUDE = (('get_hard_reg_initial_val', 'integrate.h'),)
+
+p = os.path.join(A, 'aarch64.c')
+s = read(p)
+added = []
+for fn_, hdr in NEED_INCLUDE:
+    inc = '#include "%s"' % hdr
+    if fn_ in s and inc not in s:
+        anchor = '#include "function.h"\n'
+        s = s.replace(anchor, anchor + inc + '\n', 1)
+        added.append(hdr)
+if added:
+    write(p, s)
+    print("    aarch64.c: 4.7.4 にしか無いヘッダを追加 (%s)" % ', '.join(added))
+else:
+    print("    aarch64.c: 4.7.4 側のヘッダは適用済み。skip")
+
 # ---- crtl->is_leaf: 4.8 で新設。4.7.4 は output.h の大域変数 ----
 p = os.path.join(A, 'aarch64.c')
 s = read(p)
@@ -1020,6 +1057,16 @@ for f in sorted(os.listdir(A)):
 if left:
     raise SystemExit("★ 4.7.4 に無い識別子が残っている: %s" % ', '.join(left))
 print("    4.7.4 に無い識別子 (%s) が残っていないことを確認" % ', '.join(GONE_47))
+
+# **配線証明: 4.7.4 で別ヘッダにある宣言の取り込み** ------------------------
+# これが抜けると **-w で警告も出ずに** 暗黙宣言になり、戻り値のポインタが
+# int に切り詰められて cc1 が segfault する。**libgcc を組むまで出ない**
+s = read(os.path.join(A, 'aarch64.c'))
+left = ['%s には %s が要る' % (fn_, hdr) for fn_, hdr in NEED_INCLUDE
+        if fn_ in s and '#include "%s"' % hdr not in s]
+if left:
+    raise SystemExit("★ ヘッダの取り込みが足りない: %s" % ', '.join(left))
+print("    4.7.4 側のヘッダ %d 件が取り込まれていることを確認" % len(NEED_INCLUDE))
 PY
 
 echo
