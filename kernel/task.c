@@ -605,6 +605,9 @@ static struct task* alloc_task_struct(void) {
     if (!phys) return NULL;
     struct task* t = (struct task*)PHYS_TO_VIRT(phys);
     kernel_memset(t, 0, sizeof(struct task));
+    /* **0 埋めのままにしない。** umask=0 は「作ったファイルが誰でも書ける」。
+     * fork の子は親から引き継ぐので (task_fork.c)、ここが効くのは根だけ */
+    t->umask = 022;
     return t;
 }
 

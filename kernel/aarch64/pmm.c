@@ -27,8 +27,19 @@
 #define AARCH64_BOOT_CPUS   8
 #define AARCH64_BOOT_STACK  65536ULL
 
-/* 管理できるページ数の上限。4KB x 131072 = 512MB */
-#define AARCH64_PMM_MAX_PAGES 131072U
+/* 管理できるページ数の上限。4KB x 524288 = 2GB。
+ *
+ * **512MB だった。** DTB が 2GB と言っても pmm は 512MB で頭打ちにしていて、
+ * QEMU に -m を積んでも効かなかった (1G と 2G で同じ所で停止することを実測)。
+ *
+ * 上げる代償は .bss:
+ *    512MB  bitmap 16KB + refcount 256KB  =  272KB
+ *   2048MB  bitmap 64KB + refcount 1024KB = 1088KB
+ *
+ * **Raspberry Pi 4 の 4GB / 8GB はこの形では賄えない** (4GB で 2176KB)。
+ * 実機に行くときは、ビットマップと refcount を静的配列でなく
+ * **管理対象の RAM から切り出す**必要がある。そこまでやると上限が消える。 */
+#define AARCH64_PMM_MAX_PAGES 524288U
 
 extern char __kernel_end[];
 

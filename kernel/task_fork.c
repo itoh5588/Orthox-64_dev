@@ -52,6 +52,7 @@ int task_fork(arch_syscall_frame_t* frame) {
     }
     child->heap_break = parent->heap_break;
     child->mmap_end = parent->mmap_end;
+    child->umask = parent->umask;    /* umask は fork で引き継ぐ */
     child->user_entry = parent->user_entry;
     child->user_stack = parent->user_stack;
     child->user_stack_top = parent->user_stack_top;

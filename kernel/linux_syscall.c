@@ -299,6 +299,109 @@ static int linux_sys_uname(struct linux_utsname* out) {
     return 0;
 }
 
+/* ---- 資源の上限 (getrlimit / setrlimit / prlimit64) ----------------------
+ *
+ * **実測で ENOSYS が出たので埋めた (2026-08-11)。** Orthox の中で gcc / ld を
+ * 動かすと呼ばれる。Orthox には資源制限の仕組みが無いので、**答えるだけで
+ * 記憶しない**。設定側 (setrlimit / prlimit64 の new) は黙って受ける —
+ * ここで EPERM を返すと、上限を下げようとする側が異常終了することがある。
+ *
+ * **無限で答えてよいものと、実際の値を答えるべきものがある。**
+ *   NOFILE  MAX_FDS を答える。無限にすると、呼び手が上限まで
+ *           close() を回して大量に空振りする
+ *   STACK   実際に張っている大きさ。無限だと alloca を使う側が踏み外す */
+static void linux_rlimit_for(int resource, struct linux_rlimit64* out) {
+    struct task* current = get_current_task();
+    out->rlim_cur = LINUX_RLIM_INFINITY;
+    out->rlim_max = LINUX_RLIM_INFINITY;
+    switch (resource) {
+        case LINUX_RLIMIT_NOFILE:
+            out->rlim_cur = MAX_FDS;
+            out->rlim_max = MAX_FDS;
+            break;
+        case LINUX_RLIMIT_STACK:
+            /* **実際に張ってある大きさを答える。** USER_STACK_PAGES は
+             * kernel/task_internal.h にあり共有層からは見えないので、
+             * タスクが持っている上端と下端の差から出す */
+            if (current && current->user_stack_top > current->user_stack_bottom) {
+                out->rlim_cur = current->user_stack_top - current->user_stack_bottom;
+            } else {
+                out->rlim_cur = 64ULL * PAGE_SIZE;   /* 張る前に聞かれたとき */
+            }
+            out->rlim_max = out->rlim_cur;
+            break;
+        case LINUX_RLIMIT_CORE:
+            /* コアダンプは出さない */
+            out->rlim_cur = 0;
+            out->rlim_max = 0;
+            break;
+        default:
+            break;
+    }
+}
+
+static int linux_sys_getrlimit(int resource, struct linux_rlimit64* rlim) {
+    if (resource < 0 || resource >= LINUX_RLIMIT_NLIMITS) return -LINUX_EINVAL;
+    if (!rlim) return -LINUX_EFAULT;
+    linux_rlimit_for(resource, rlim);
+    return 0;
+}
+
+/* 上限は記憶しないが、**成功を返す**。失敗にすると呼び手が落ちる */
+static int linux_sys_setrlimit(int resource, const struct linux_rlimit64* rlim) {
+    if (resource < 0 || resource >= LINUX_RLIMIT_NLIMITS) return -LINUX_EINVAL;
+    if (!rlim) return -LINUX_EFAULT;
+    return 0;
+}
+
+static int linux_sys_prlimit64(int pid, int resource,
+                               const struct linux_rlimit64* new_limit,
+                               struct linux_rlimit64* old_limit) {
+    struct task* current = get_current_task();
+    if (resource < 0 || resource >= LINUX_RLIMIT_NLIMITS) return -LINUX_EINVAL;
+    /* pid 0 は自分。他プロセスは見ない */
+    if (pid != 0 && current && pid != current->pid) return -LINUX_EPERM;
+    if (old_limit) linux_rlimit_for(resource, old_limit);
+    (void)new_limit;   /* 記憶しない (上のコメント) */
+    return 0;
+}
+
+/* **中身は 0 でよい。** 呼び手は「取れたかどうか」しか見ない。
+ * 0 を返さずに ENOSYS にすると、gcc が時間計測を諦めずに落ちることがある */
+static int linux_sys_getrusage(int who, struct linux_rusage* usage) {
+    uint8_t* p;
+    if (who != LINUX_RUSAGE_SELF && who != LINUX_RUSAGE_CHILDREN) return -LINUX_EINVAL;
+    if (!usage) return -LINUX_EFAULT;
+    p = (uint8_t*)usage;
+    for (uint64_t i = 0; i < sizeof(*usage); i++) p[i] = 0;
+    return 0;
+}
+
+/* umask はプロセスごとの状態で fork で引き継ぐ (include/task.h)。
+ * **古い値を返すのが仕様。** 返さないと、保存して戻す側が壊れる */
+static int linux_sys_umask(int mask) {
+    struct task* current = get_current_task();
+    int old;
+    if (!current) return -LINUX_ESRCH;
+    old = (int)current->umask;
+    current->umask = (uint32_t)mask & 0777U;
+    return old;
+}
+
+static int linux_sys_sysinfo(struct linux_sysinfo* info) {
+    uint8_t* p;
+    if (!info) return -LINUX_EFAULT;
+    p = (uint8_t*)info;
+    for (uint64_t i = 0; i < sizeof(*info); i++) p[i] = 0;
+    /* **mem_unit を 0 にしないこと。** 呼び手が totalram に掛けるので
+     * 0 だと「メモリ 0」に見え、確保をあきらめる側がいる */
+    info->mem_unit = PAGE_SIZE;
+    info->totalram = pmm_get_allocated_pages() + pmm_get_free_pages();
+    info->freeram  = pmm_get_free_pages();
+    info->procs    = 1;
+    return 0;
+}
+
 /* xv6fs に symlink が無いので、存在するパスは「symlink ではない」= EINVAL、
  * 存在しないパスは ENOENT を返す。musl の realpath() はこの EINVAL を見て
  * 「このパス要素は symlink ではない」と判断して先へ進む。 */
@@ -1297,6 +1400,42 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)linux_sys_uname(
                                         (struct linux_utsname*)(uintptr_t)arch_syscall_arg0(frame)));
+            return;
+        case LINUX_SYS_GETRLIMIT:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)linux_sys_getrlimit(
+                                        (int)arch_syscall_arg0(frame),
+                                        (struct linux_rlimit64*)(uintptr_t)arch_syscall_arg1(frame)));
+            return;
+        case LINUX_SYS_SETRLIMIT:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)linux_sys_setrlimit(
+                                        (int)arch_syscall_arg0(frame),
+                                        (const struct linux_rlimit64*)(uintptr_t)arch_syscall_arg1(frame)));
+            return;
+        case LINUX_SYS_PRLIMIT64:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)linux_sys_prlimit64(
+                                        (int)arch_syscall_arg0(frame),
+                                        (int)arch_syscall_arg1(frame),
+                                        (const struct linux_rlimit64*)(uintptr_t)arch_syscall_arg2(frame),
+                                        (struct linux_rlimit64*)(uintptr_t)arch_syscall_arg3(frame)));
+            return;
+        case LINUX_SYS_GETRUSAGE:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)linux_sys_getrusage(
+                                        (int)arch_syscall_arg0(frame),
+                                        (struct linux_rusage*)(uintptr_t)arch_syscall_arg1(frame)));
+            return;
+        case LINUX_SYS_UMASK:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)linux_sys_umask(
+                                        (int)arch_syscall_arg0(frame)));
+            return;
+        case LINUX_SYS_SYSINFO:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)linux_sys_sysinfo(
+                                        (struct linux_sysinfo*)(uintptr_t)arch_syscall_arg0(frame)));
             return;
         case LINUX_SYS_TRUNCATE:
             arch_syscall_set_return(frame,

@@ -164,3 +164,30 @@ uint16_t pmm_get_ref(void* addr) {
 void* pmm_get_isa_dma_page(void) {
     return g_riscv64_isa_dma_page;
 }
+
+/* ---- 使用量の問い合わせ (共有層が使う) ----------------------------------
+ *
+ * kernel/linux_syscall.c の sysinfo(2) が呼ぶ。x86 は kernel/pmm.c、
+ * aarch64 は kernel/aarch64/pmm.c が同じものを出しており、riscv64 だけ
+ * 無かったのでリンクで落ちた。
+ *
+ * **ビットマップを数える。** 別に使用数のカウンタを持つと、pmm_alloc /
+ * pmm_free の全経路で更新し続けなければならず、片方を足し忘れたときに
+ * 「静かにずれる」形になる。ここは問い合わせの頻度が低いので数えてよい */
+uint64_t pmm_get_allocated_pages(void) {
+    uint64_t used = 0;
+    uint64_t flags = spin_lock_irqsave(&g_riscv64_pmm_lock);
+    for (uint64_t i = 0; i < g_riscv64_pmm_pages; i++) {
+        if (riscv64_pmm_test(i)) used++;
+    }
+    spin_unlock_irqrestore(&g_riscv64_pmm_lock, flags);
+    return used;
+}
+
+uint64_t pmm_get_total_pages(void) {
+    return g_riscv64_pmm_pages;
+}
+
+uint64_t pmm_get_free_pages(void) {
+    return pmm_get_total_pages() - pmm_get_allocated_pages();
+}

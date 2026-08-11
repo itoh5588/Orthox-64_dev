@@ -63,6 +63,10 @@ struct task {
     int cpu_affinity;
     uint64_t heap_break;
     uint64_t mmap_end;
+    /* **umask はプロセスごとの状態で fork で引き継ぐ。** 既定は 022。
+     * 0 で初期化されると「作ったファイルが誰でも書ける」になるので、
+     * task を作る所で必ず 022 を入れること (task_set_default_umask) */
+    uint32_t umask;
     uint64_t user_entry;
     uint64_t user_stack;
     uint64_t user_stack_top;
