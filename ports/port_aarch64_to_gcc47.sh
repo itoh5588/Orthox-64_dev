@@ -344,6 +344,74 @@ def write_text(p, s):
     with io.open(p, 'w', encoding='utf-8', errors='surrogateescape') as f:
         f.write(s)
 
+
+def md_blocks(text, want='('):
+    """.md のトップレベルの括弧を (開始, 終了) の一覧で返す。
+    want='(' で定義、want='[' でベクタ。
+
+    **素朴な括弧数えでは壊れる。** 文字列やコメントの中の括弧まで数えて
+    しまい、aarch64-simd.md を実際に壊した。
+    ; コメント / " 文字列 / { } 波括弧文字列 を読み飛ばすこと。
+
+    検証: 4.9.4 の 4 ファイルで「全ブロックが (define か (include で
+    始まり、ブロックの外は空白とコメントだけ」を確認済み"""
+    close = {'(': ')', '[': ']'}[want]
+    out, i, n, depth, start = [], 0, len(text), 0, None
+    while i < n:
+        c = text[i]
+        if c == ';':                                   # コメント
+            j = text.find('\n', i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':                                   # 文字列
+            i += 1
+            while i < n:
+                if text[i] == '\\':
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == '{':                                   # 波括弧文字列 (入れ子)
+            b, i = 1, i + 1
+            while i < n and b:
+                if text[i] == '\\':
+                    i += 2
+                    continue
+                if text[i] == '{':
+                    b += 1
+                elif text[i] == '}':
+                    b -= 1
+                i += 1
+            continue
+        if c == want:
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == close:
+            depth -= 1
+            if depth == 0 and start is not None:
+                out.append((start, i + 1))
+                start = None
+        i += 1
+    return out
+
+# int iterator を使う define_insn と一緒に消える "_internal" のうち、
+# **呼ぶ側の expander が生き残ってしまう** もの。4.9.4 の定義は
+#   (define_insn "aarch64_sq<r>dmulh_lane<mode>_internal")
+# と int_attr <r> を含む名前で、呼ぶ側は
+#   gen_aarch64_sqdmulh_lane<mode>_internal
+# と展開後の名前で書く。**テンプレート同士の文字列照合では対応が付かない**
+# (mode iterator 由来の aarch64_saddl<mode>_hi_internal 等は生きているので、
+#  「定義が無い名前」で機械的に拾うと巻き込む)。よってリンカの実測で決めた。
+#
+# 取り直し方:
+#   make all-gcc 2>&1 | grep -oE "undefined reference to .gen_[A-Za-z0-9_]+"
+ORPHAN_EXPANDERS = ('aarch64_sqdmulh_lane<mode>', 'aarch64_sqrdmulh_lane<mode>',
+                    'aarch64_sqdmulh_laneq<mode>', 'aarch64_sqrdmulh_laneq<mode>')
+
 # ---- int iterator を使う定義だけを落とす ----
 # **aarch64-simd.md を丸ごと消したら aarch64.c が 82 箇所で壊れた。**
 # SIMD のパターンは mode iterator から生成されるので、aarch64.c が呼ぶ
@@ -368,64 +436,12 @@ if iters:
     pat_i = re.compile(r'(?<![A-Za-z0-9_<])(%s)(?![A-Za-z0-9_>])' % '|'.join(iters))
     pat_a = re.compile(r'<(%s)>' % '|'.join(attrs))
 
-    def top_blocks(text):
-        """.md のトップレベル定義を (開始, 終了) で返す。
-
-        **素朴な括弧数えでは壊れる。** 文字列やコメントの中の括弧まで数えて
-        しまい、aarch64-simd.md を実際に壊した (genpreds が
-        「expected character `)', found `['」で停止)。
-        ; コメント / " 文字列 / { } 波括弧文字列 を読み飛ばすこと。
-
-        検証: 4.9.4 の 4 ファイルで「全ブロックが (define か (include で
-        始まり、ブロックの外は空白とコメントだけ」を確認済み"""
-        out, i, n, depth, start = [], 0, len(text), 0, None
-        while i < n:
-            c = text[i]
-            if c == ';':                                   # コメント
-                j = text.find('\n', i)
-                i = n if j < 0 else j + 1
-                continue
-            if c == '"':                                   # 文字列
-                i += 1
-                while i < n:
-                    if text[i] == '\\':
-                        i += 2
-                        continue
-                    if text[i] == '"':
-                        i += 1
-                        break
-                    i += 1
-                continue
-            if c == '{':                                   # 波括弧文字列 (入れ子)
-                b, i = 1, i + 1
-                while i < n and b:
-                    if text[i] == '\\':
-                        i += 2
-                        continue
-                    if text[i] == '{':
-                        b += 1
-                    elif text[i] == '}':
-                        b -= 1
-                    i += 1
-                continue
-            if c == '(':
-                if depth == 0:
-                    start = i
-                depth += 1
-            elif c == ')':
-                depth -= 1
-                if depth == 0 and start is not None:
-                    out.append((start, i + 1))
-                    start = None
-            i += 1
-        return out
-
     for fn in ('aarch64.md', 'aarch64-simd.md'):
         p = os.path.join(A, fn)
         if not os.path.exists(p):
             continue
         s = read_text(p)
-        drop = [(a, b) for a, b in top_blocks(s)
+        drop = [(a, b) for a, b in md_blocks(s)
                 if pat_i.search(s[a:b]) or pat_a.search(s[a:b])]
         for a, b in reversed(drop):          # 後ろから消すと位置がずれない
             s = s[:a] + s[b:]
@@ -492,6 +508,57 @@ if iters:
         print("    aarch64-simd.md: zip/uzp/trn を %d 個に手展開" % len(PERM))
     else:
         print("    aarch64-simd.md: 手展開は適用済み。skip")
+
+    # ---- 孤児になった expander を落とす (ORPHAN_EXPANDERS 参照) ----
+    # 呼び先の _internal が int iterator と一緒に消えたので、残すと
+    #   insn-emit.c: undefined reference to `gen_aarch64_sqdmulh_lanev4hi_internal'
+    # で cc1 のリンクが落ちる。**コンパイルは通るのでリンクまで出ない**
+    p = os.path.join(A, 'aarch64-simd.md')
+    s = read_text(p)
+    pat_o = re.compile(r'\(define_expand\s+"(%s)"'
+                       % '|'.join(re.escape(o) for o in ORPHAN_EXPANDERS))
+    drop = [(a, b) for a, b in md_blocks(s) if pat_o.match(s[a:b])]
+    for a, b in reversed(drop):
+        s = s[:a] + s[b:]
+    if drop:
+        write_text(p, s)
+        print("    aarch64-simd.md: 孤児になった expander を %d 個削除" % len(drop))
+    else:
+        print("    aarch64-simd.md: 孤児の expander は無い。skip")
+
+# ---- define_expand の属性ベクタを落とす ----
+# **4.8 で define_expand に属性ベクタが増えた。** rtl.def の書式文字列:
+#   4.7.4  DEF_RTL_EXPR(DEFINE_EXPAND, "define_expand", "sEss",  RTX_EXTRA)
+#   4.9.4  DEF_RTL_EXPR(DEFINE_EXPAND, "define_expand", "sEssV", RTX_EXTRA)
+# 4.7.4 の読み手は名前 / パターン / 条件 / 準備文の 4 つを読んだら `)' を
+# 期待するので、後ろに [(set_attr ...)] があると
+#   aarch64-simd.md:2438: expected character `)', found `['
+# で genpreds が止まる。**define_insn (sEsTV) と define_insn_and_split
+# (sEsTsESV) は 4.7.4 でも V を持つので無事。** define_expand だけ。
+#
+# 実測: aarch64-simd.md の 96 個中 1 個 (aarch64_simd_combine<mode>) のみ。
+# 属性は展開後の insn には残らないので落として構わない
+print("--- define_expand の属性ベクタを落とす (4.7.4 は sEss)")
+for fn in sorted(f for f in os.listdir(A) if f.endswith('.md')):
+    p = os.path.join(A, fn)
+    s = read_text(p)
+    edits = []
+    for a, b in md_blocks(s):
+        if not s[a:b].startswith('(define_expand'):
+            continue
+        inner = s[a + 1:b - 1]
+        # 1 個目の [ ] はパターンベクタ。**2 個目以降が 4.8 で増えた属性**
+        for x, y in md_blocks(inner, '[')[1:]:
+            edits.append((a + 1 + x, a + 1 + y))
+    for x, y in reversed(edits):               # 後ろから消すと位置がずれない
+        while x > 0 and s[x - 1] in ' \t':     # 直前の空白も
+            x -= 1
+        if y < len(s) and s[y] == '\n':        # 行ごと落とす
+            y += 1
+        s = s[:x] + s[y:]
+    if edits:
+        write_text(p, s)
+        print("    %s: define_expand の属性ベクタを %d 個削除" % (fn, len(edits)))
 
 # ---- iterators.md: 末尾の Int Iterators 節を切り落とす ----
 # 実測で 26 個の define_int_iterator と 18 個の define_int_attr が
@@ -615,6 +682,36 @@ for f in sorted(os.listdir(A)):
 if dups:
     raise SystemExit("★ define_c_enum のメンバが重複: %s" % '; '.join(dups))
 print("    define_c_enum のメンバに重複が無いことを確認 (%d 個)" % len(seen))
+
+# **配線証明: define_expand に属性ベクタが残っていないこと** ----------------
+# 残っていると genpreds が「expected character `)', found `['」で止まる
+left, total = [], 0
+for f in sorted(os.listdir(A)):
+    if not f.endswith('.md'):
+        continue
+    t = read_text(os.path.join(A, f))
+    for a, b in md_blocks(t):
+        if not t[a:b].startswith('(define_expand'):
+            continue
+        total += 1
+        if len(md_blocks(t[a + 1:b - 1], '[')) > 1:
+            left.append('%s:%d' % (f, t.count('\n', 0, a) + 1))
+if left:
+    raise SystemExit("★ define_expand に属性ベクタが残っている: %s" % ', '.join(left))
+print("    define_expand に属性ベクタが無いことを確認 (%d 個)" % total)
+
+# **配線証明: 孤児になった expander が残っていないこと** --------------------
+left = []
+for f in sorted(os.listdir(A)):
+    if not f.endswith('.md'):
+        continue
+    t = read_text(os.path.join(A, f))
+    for o in ORPHAN_EXPANDERS:
+        if '"%s"' % o in t:
+            left.append('%s: %s' % (f, o))
+if left:
+    raise SystemExit("★ 孤児 expander が残っている: %s" % ', '.join(left))
+print("    孤児 expander %d 系統が残っていないことを確認" % len(ORPHAN_EXPANDERS))
 PY
 
 # --- 4.8 で変わった API の呼び出しを直す ----------------------------------
@@ -683,6 +780,85 @@ for f in ('aarch64.c', 'aarch64.md'):
         total += n
     print("    %s: plus_constant の mode 引数を %d 箇所削除" % (f, n))
 
+# ---- GET_MODE_UNIT_BITSIZE: 4.8 で machmode.h に入ったマクロ ----
+# **4.7.4 には無い。** aarch64.h は tm.h なので、CLZ_DEFINED_VALUE_AT_ZERO を
+# 展開する core 側 (builtins.c / dwarf2out.c / optabs.c / rtlanal.c /
+# simplify-rtx.c) で暗黙の関数呼び出しになり、cc1 のリンクで
+#   libbackend.a(builtins.o): undefined reference to `GET_MODE_UNIT_BITSIZE'
+# になる。**-w が効いているのでコンパイルは黙って通る。リンクまで出ない。**
+# バックエンドのマクロが tm.h 経由で core を汚す形なので、直すのは aarch64.h 側。
+# 4.9.4 の定義をその場に展開する (4.7.4 の GET_MODE_BITSIZE と同じ書き方)
+p = os.path.join(A, 'aarch64.h')
+s = read(p)
+OLD_UB = 'GET_MODE_UNIT_BITSIZE (MODE)'
+NEW_UB = '((unsigned short) (GET_MODE_UNIT_SIZE (MODE) * BITS_PER_UNIT))'
+n = s.count(OLD_UB)
+if n:
+    write(p, s.replace(OLD_UB, NEW_UB))
+    print("    aarch64.h: GET_MODE_UNIT_BITSIZE を 4.7.4 の式に展開 (%d 箇所)" % n)
+else:
+    print("    aarch64.h: GET_MODE_UNIT_BITSIZE は既に無い")
+
+# ---- 4.9 で入った tree / rtl のアクセサ ----
+#   4.9 の呼び方               4.7.4 の呼び方
+#   tree_fits_uhwi_p (T)       host_integerp (T, 1)
+#   tree_to_uhwi (T)           tree_low_cst (T, 1)
+#   tree_to_shwi (T)           tree_low_cst (T, 0)
+#   add_int_reg_note (I,K,V)   add_reg_note (I, K, GEN_INT (V))
+# **どれも引数の数か形が変わるので綴りの置換では済まない。**
+# 宣言が無いだけなのでコンパイルは通り (-w)、リンクで初めて出る
+
+
+def rewrite_call(src, fname, newname, transform):
+    """fname (...) を探し、深さ 1 のコンマで引数に割って transform に渡す。
+    **複数行にまたがる呼び出しがある**ので正規表現では切れない"""
+    pat = re.compile(r'\b%s\s*\(' % re.escape(fname))
+    out, i, n = [], 0, 0
+    while True:
+        m = pat.search(src, i)
+        if not m:
+            out.append(src[i:])
+            break
+        depth, k, args, start = 1, m.end(), [], m.end()
+        while k < len(src) and depth:
+            c = src[k]
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    args.append(src[start:k])
+                    break
+            elif c == ',' and depth == 1:
+                args.append(src[start:k])
+                start = k + 1
+            k += 1
+        out.append(src[i:m.start()])
+        out.append('%s (%s)'
+                   % (newname, ', '.join(transform([a.strip() for a in args]))))
+        i = k + 1
+        n += 1
+    return ''.join(out), n
+
+
+SUBS = (('tree_fits_uhwi_p', 'host_integerp', lambda a: a + ['1']),
+        ('tree_to_uhwi',     'tree_low_cst',  lambda a: a + ['1']),
+        ('tree_to_shwi',     'tree_low_cst',  lambda a: a + ['0']),
+        ('add_int_reg_note', 'add_reg_note',
+         lambda a: a[:2] + ['GEN_INT (%s)' % a[2]]))
+p = os.path.join(A, 'aarch64.c')
+s = read(p)
+done = []
+for old, new, tr in SUBS:
+    s, n = rewrite_call(s, old, new, tr)
+    if n:
+        done.append('%s -> %s %d' % (old, new, n))
+if done:
+    write(p, s)
+    print("    aarch64.c: 4.9 のアクセサを 4.7.4 の形に (%s)" % ' / '.join(done))
+else:
+    print("    aarch64.c: 4.9 のアクセサは既に無い")
+
 # ---- aarch64-protos.h: 落としたフックの宣言を消す ----
 # TARGET_GIMPLE_FOLD_BUILTIN は 4.7.4 に無いので登録を外してある。
 # 宣言だけ残ると gimple_stmt_iterator が未定義で gencondmd が通らない
@@ -750,6 +926,39 @@ if i is not None:
 else:
     print("    aarch64.c: aarch64_add_stmt_cost は既に無い")
 
+# ---- vec_construct: 4.8 で enum vect_cost_for_stmt に増えた列挙子 ----
+# 4.7.4 の enum は target.h:134 にあり 13 個。**vec_construct だけが無い**:
+#   4.7.4  scalar_stmt … vec_perm, vec_promote_demote        13 個
+#   4.9.4  + vec_construct                                   14 個
+# aarch64_builtin_vectorization_cost が case で受けているので
+#   aarch64.c:4938: error: 'vec_construct' undeclared
+# で止まる。**4.7.4 のベクトル化器はこの原価を問い合わせない**ので arm ごと
+# 落として良い。core の target.h に足す手もあるが、バックエンドの外に
+# 触らない方針を保つ。唯一の使い手が消えるので宣言 (unsigned elements;) も落とす
+p = os.path.join(A, 'aarch64.c')
+ls = read(p).split('\n')
+i = next((k for k, l in enumerate(ls) if l.strip() == 'case vec_construct:'), None)
+if i is None:
+    print("    aarch64.c: vec_construct の case は既に無い")
+else:
+    e = next(k for k in range(i + 1, len(ls)) if ls[k].strip().startswith('return '))
+    if e + 1 < len(ls) and ls[e + 1].strip() == '':
+        e += 1                                    # 続く空行も
+    del ls[i:e + 1]
+    # **宣言を消すのは、その関数の中に他の使い手が無いときだけ**
+    b = next(k for k, l in enumerate(ls)
+             if l.startswith('aarch64_builtin_vectorization_cost '))
+    z = next(k for k in range(b, len(ls)) if ls[k] == '}')
+    rest = [l for l in ls[b:z + 1] if l.strip() != 'unsigned elements;']
+    if any(re.search(r'\belements\b', l) for l in rest):
+        print("    aarch64.c: vec_construct の case を削除 (宣言は使用中なので残す)")
+    else:
+        d = next(k for k in range(b, z) if ls[k].strip() == 'unsigned elements;')
+        n = 2 if ls[d + 1].strip() == '' else 1
+        del ls[d:d + n]
+        print("    aarch64.c: vec_construct の case と unsigned elements; を削除")
+    write(p, '\n'.join(ls))
+
 # ---- simd_immediate_info の前方宣言 ----
 # **C と C++ の差。** 4.9 は C++ でビルドされるので、引数リストの中で
 # struct を初出させても名前空間スコープに入る。**C では引数リスト限りの
@@ -787,6 +996,30 @@ for f in ('aarch64.c', 'aarch64.md'):
 if left:
     raise SystemExit("★ plus_constant が 3 引数のまま: %s" % '; '.join(left[:5]))
 print("    plus_constant の残り (3 引数形) が無いことを確認")
+
+# **配線証明: 4.7.4 に無い列挙子・識別子が残っていないこと** ----------------
+# 綴りだけで消えたつもりになるのを防ぐ。増えたらここに足す
+# **リンクまで出ない類がここに効く。** 綴りが残っていてもコンパイルは
+# -w で黙って通り、cc1 のリンクで undefined reference になる
+GONE_47 = ('vec_construct',           # 4.8 で enum vect_cost_for_stmt に追加
+           'crtl->is_leaf',           # 4.8 で新設。4.7.4 は current_function_is_leaf
+           'aarch64_add_stmt_cost',
+           'GET_MODE_UNIT_BITSIZE',   # 4.8 で machmode.h に追加
+           'tree_fits_uhwi_p',        # 4.9。4.7.4 は host_integerp (T, 1)
+           'tree_to_uhwi',            # 4.9。4.7.4 は tree_low_cst (T, 1)
+           'tree_to_shwi',            # 4.9。4.7.4 は tree_low_cst (T, 0)
+           'add_int_reg_note')        # 4.9。4.7.4 は add_reg_note + GEN_INT
+left = []
+for f in sorted(os.listdir(A)):
+    if not (f.endswith('.c') or f.endswith('.h')):
+        continue
+    s = read(os.path.join(A, f))
+    for g_ in GONE_47:
+        if g_ in s:
+            left.append('%s: %s' % (f, g_))
+if left:
+    raise SystemExit("★ 4.7.4 に無い識別子が残っている: %s" % ', '.join(left))
+print("    4.7.4 に無い識別子 (%s) が残っていないことを確認" % ', '.join(GONE_47))
 PY
 
 echo
