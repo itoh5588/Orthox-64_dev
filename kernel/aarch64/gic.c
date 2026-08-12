@@ -28,6 +28,7 @@
 #define GICD_CTLR_OFF        0x000
 #define GICD_ISENABLER_OFF   0x100   /* 32 本ずつ 1 レジスタ */
 #define GICD_IPRIORITYR_OFF  0x400   /* 4 本ずつ 1 レジスタ */
+#define GICD_ITARGETSR_OFF   0x800   /* 1 本 1 バイト。宛先 CPU のビットマスク */
 
 #define GICC_CTLR_OFF   0x000
 #define GICC_PMR_OFF    0x004        /* 優先度マスク */
@@ -40,6 +41,7 @@ static uint64_t g_gicc_base = AARCH64_QEMU_VIRT_GICC_BASE;
 #define GICD_CTLR        (g_gicd_base + GICD_CTLR_OFF)
 #define GICD_ISENABLER   (g_gicd_base + GICD_ISENABLER_OFF)
 #define GICD_IPRIORITYR  (g_gicd_base + GICD_IPRIORITYR_OFF)
+#define GICD_ITARGETSR   (g_gicd_base + GICD_ITARGETSR_OFF)
 #define GICC_CTLR        (g_gicc_base + GICC_CTLR_OFF)
 #define GICC_PMR         (g_gicc_base + GICC_PMR_OFF)
 #define GICC_IAR         (g_gicc_base + GICC_IAR_OFF)
@@ -74,6 +76,24 @@ void aarch64_gic_enable_irq(unsigned intid) {
     /* 優先度を最高 (0) にしておく。PMR(0xF0) より小さくないと通らない */
     volatile uint8_t* prio = (volatile uint8_t*)(GICD_IPRIORITYR + intid);
     *prio = 0;
+
+    /* **SPI は宛先 CPU を書かないとどこにも届かない。**
+     *
+     * GICD_ITARGETSR は 1 本 1 バイトで、宛先 CPU のビットマスクを持つ。
+     * **実機の GIC-400 はリセット値が 0** なので、有効化だけしても
+     * 「どの CPU にも配らない」設定のまま黙って落ちる。
+     *
+     * QEMU は CPU が 1 個のとき宛先を見ないので、**virt のスモークでは
+     * 素通りしていた**。実機の Pi 4 は 4 コアなので効いてくる
+     * (rpi4-osdev の enable_interrupt_controller も target[irq] = 1 を書く)。
+     *
+     * **0-31 (SGI / PPI) は書かない。** 読み取り専用で、CPU ごとに
+     * 個別に配線されている。タイマ (INTID 30) が実機で動いていたのは
+     * PPI だからで、SPI が届く証拠にはならなかった */
+    if (intid >= 32) {
+        volatile uint8_t* target = (volatile uint8_t*)(GICD_ITARGETSR + intid);
+        *target = 1;   /* CPU 0 へ */
+    }
 
     w32(GICD_ISENABLER + (intid / 32) * 4, 1U << (intid % 32));
 }
