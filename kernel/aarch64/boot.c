@@ -183,6 +183,10 @@ static aarch64_boot_info_t g_boot_info;
 /* リンカスクリプトが置く印。**MMU の前に読むと物理アドレスが返る** */
 extern char __kernel_start[];
 
+/* start.S が「降ろす前の CurrentEL」を入れる。**C から読む CurrentEL は
+ * 降格後の値なので、どの EL で飛んできたかはこちらでしか分からない** */
+uint64_t aarch64_entry_el;
+
 aarch64_boot_info_t* aarch64_boot_info_mut(void) { return &g_boot_info; }
 const aarch64_boot_info_t* aarch64_boot_info(void) { return &g_boot_info; }
 
@@ -333,9 +337,17 @@ void aarch64_wait_forever(void);
 void aarch64_early_main(uint64_t dtb_phys) {
     aarch64_uart_puts("\n--- Orthox-64 aarch64 boot ---\n");
 
+    /* **入口の EL と、いまの EL の両方を出す。**
+     * start.S が EL3 -> EL2 -> EL1 と降ろすので、ここで読める CurrentEL は
+     * 常に EL1 になる。それだけを見て「この機械は EL1 で来る」と読むと
+     * 間違える (raspi4b を EL3 起動と読み違えた)。
+     * 入口の EL は start.S が降ろす前に控えたもの */
     aarch64_uart_puts("  CurrentEL : EL");
     aarch64_uart_putchar((char)('0' + (int)(read_current_el() & 3U)));
-    aarch64_uart_puts("\n");
+    aarch64_uart_puts("  (入口 EL");
+    aarch64_uart_putchar((char)('0' + (int)(aarch64_entry_el & 3U)));
+    aarch64_uart_puts(")\n");
+
 
     aarch64_uart_puts("  MPIDR_EL1 : ");
     put_hex64(read_mpidr());

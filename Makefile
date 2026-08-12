@@ -356,6 +356,34 @@ AARCH64_EARLY_UART ?=
 ifneq ($(AARCH64_EARLY_UART),)
 AARCH64_CFLAGS += -DAARCH64_EARLY_UART=$(AARCH64_EARLY_UART)ULL
 endif
+# **CNTFRQ_EL0 は EL3 でしか書けない** (start.S)。EL3 で飛んでくる構成
+# (実機の kernel_old=1 など) でここが 0 のままだと、タイマの計算が全部壊れる。
+# 空なら何もしない。**既に入っている値は上書きしない**ので、armstub や QEMU が
+# 入れてくれる構成では効かない。
+#   Raspberry Pi 4 (BCM2711)  54000000  ← armstub8.S の OSC_FREQ
+AARCH64_CNTFRQ_HZ ?=
+ifneq ($(AARCH64_CNTFRQ_HZ),)
+AARCH64_CFLAGS += -DAARCH64_CNTFRQ_HZ=$(AARCH64_CNTFRQ_HZ)
+endif
+# **EL3 で飛んできたときだけ使う GIC の番地** (start.S)。
+# GICv2 のセキュリティ拡張では GICD_IGROUPR と**セキュア側の GICC** が
+# セキュア側からしか触れず、ここを通らないと非セキュア EL1 は割り込みを
+# 1 本も受け取れない。**両方要る** (実測: GICD だけでは動かなかった)。
+# DTB を読む前なので直書きするしかない。分からなければ空のまま。
+#   QEMU virt          0x08000000 / 0x08010000
+#   Raspberry Pi 4     0xFF841000 / 0xFF842000  (実物の DTB で確認済み)
+#
+# **EL1 / EL2 で来たときは 1 命令も実行されない** (CurrentEL == 3 の中だけ)
+# ので、既定を入れておいても既存の経路には影響しない。
+# AARCH64_LOAD_PA と同じく virt の値を既定にしてある
+AARCH64_EARLY_GICD ?= 0x08000000
+AARCH64_EARLY_GICC ?= 0x08010000
+ifneq ($(AARCH64_EARLY_GICD),)
+AARCH64_CFLAGS += -DAARCH64_EARLY_GICD=$(AARCH64_EARLY_GICD)
+endif
+ifneq ($(AARCH64_EARLY_GICC),)
+AARCH64_CFLAGS += -DAARCH64_EARLY_GICC=$(AARCH64_EARLY_GICC)
+endif
 AARCH64_LDFLAGS = -nostdlib -static -m aarch64elf -T scripts/kernel-aarch64.ld \
 	--defsym=AARCH64_LOAD_PA=$(AARCH64_LOAD_PA)
 AARCH64_OBJS = $(patsubst kernel/aarch64/%.c, $(BUILD_DIR)/aarch64/kernel/%.o, $(AARCH64_C_SRCS)) \
@@ -403,9 +431,13 @@ aarch64-kernel8: $(AARCH64_KERNEL8_IMG)
 #
 #   ロード先    0x80000     ファームウェアがここに置いて飛んでくる
 #   早期 UART   0xFE201000  DTB を読む前の出力先 (Pi 4 の PL011)
+#   CNTFRQ      54000000    EL3 で飛んできたときだけ使う (BCM2711 の OSC_FREQ)
+#   GICD/GICC   0xFF841000 / 0xFF842000  同上。armstub を経由すれば不要
 aarch64-pi4-boot:
 	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
-	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000
+	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \
+	    AARCH64_CNTFRQ_HZ=54000000 \
+	    AARCH64_EARLY_GICD=0xFF841000 AARCH64_EARLY_GICC=0xFF842000
 	@mkdir -p out/pi4-boot
 	cp out/kernel8.img out/pi4-boot/
 	cp scripts/pi4/config.txt out/pi4-boot/

@@ -35,10 +35,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 3 通りで回す。
+# 5 通りで回す。
 #   virt                    既定。EL1 から始まる
 #   virt,virtualization=on  **EL2 から始まる**。Raspberry Pi 4 の
 #                           ファームウェアと同じ条件を QEMU で再現できる
+#   virt,secure=on,...      **EL3 から始まる**。実機で armstub を経由しない
+#                           構成 (kernel_old=1) と、セキュア側 GIC の設定
 #   virt (-m 1G)            **DTB を本当に読んでいるかの確認。**
 #                           直書きの 512MB では追随できない
 #
@@ -343,6 +345,25 @@ check_one "EL1 起動" LOGs/aarch64-serial.log 0x0000000020000000 0x000000005fff
 run_one "virt,virtualization=on" LOGs/aarch64-serial-el2.log 512M
 check_one "EL2 起動 -> 降格" LOGs/aarch64-serial-el2.log 0x0000000020000000 0x000000005fffffff
 
+# **EL3 から始まる回。** secure=on を足すと QEMU が EL3 で起動し、GIC に
+# セキュリティ拡張が入る。実機で config.txt に kernel_old=1 を書くと
+# armstub を経由せず EL3 で飛んでくるので、その経路の代わりになる。
+#
+# ここは「降格できるか」だけでは足りない。**セキュア側の GIC を設定しないと
+# 非セキュア EL1 は割り込みを 1 本も受け取れず、タイマ待ちで止まる**
+# (実測: 例外が 1 つも上がらない)。下の check_one が ticks を見るので、
+# GICD_IGROUPR と GICC の設定が落ちたらここで落ちる
+run_one "virt,secure=on,virtualization=on" LOGs/aarch64-serial-el3.log 512M
+check_one "EL3 起動 -> 降格" LOGs/aarch64-serial-el3.log 0x0000000020000000 0x000000005fffffff
+
+# **どの EL で入ったかを、回ごとに突き合わせる。**
+# これが無いと、EL2 の回が実は EL1 で始まっていても気づけない
+# (降格後の CurrentEL はどの回も EL1 になるため)。
+# 入口 EL は start.S が降ろす前に控えて aarch64_entry_el に入れている
+grep -aq "(入口 EL1)" LOGs/aarch64-serial.log
+grep -aq "(入口 EL2)" LOGs/aarch64-serial-el2.log
+grep -aq "(入口 EL3)" LOGs/aarch64-serial-el3.log
+
 # **DTB を本当に読んでいるかの確認。** RAM を 1GB にすると DTB の memory も
 # 1GB になる。直書きの 512MB のままなら追随できないので、ここで落ちる。
 # ram end-1 = 0x7fffffff まで張れていることまで見る (マップも追随している証拠)
@@ -396,7 +417,7 @@ must_not "xv6bio: disk" LOGs/aarch64-serial-disk.log
 # (「無い」と「壊れた」を混ぜない)
 grep -aq "aarch64-fs-none" LOGs/aarch64-serial.log
 
-echo "aarch64 smoke test: PASS (M0-M4, EL1 / EL2 降格 / RAM 1GB / virtio-blk の 4 通り)"
+echo "aarch64 smoke test: PASS (M0-M4, EL1 / EL2 / EL3 降格 / RAM 1GB / virtio-blk の 5 通り)"
 }
 
 # ==========================================================================
