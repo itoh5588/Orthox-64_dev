@@ -327,7 +327,7 @@ AARCH64_ASM_SRCS = kernel/aarch64/start.S kernel/aarch64/vectors.S \
 #
 # **QEMU 8.2.2 は Device メモリの整列を強制しないので素通りしていた。**
 # 11.0.3 と実機では落ちる。版が古いほうが甘いので、緩いほうで通ったことを
-# 根拠にしないこと (日報2026-08-12)。
+# 根拠にしないこと (日報2026-08-13)。
 AARCH64_CFLAGS = --target=aarch64-none-elf -mgeneral-regs-only -mstrict-align \
 	-ffreestanding -fno-stack-protector -fno-stack-check -fno-lto -fno-PIE \
 	-mcmodel=small -O2 -Wall -Wextra -Iinclude -MMD -MP
