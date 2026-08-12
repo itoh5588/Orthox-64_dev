@@ -316,7 +316,19 @@ AARCH64_SHARED_C_SRCS = kernel/cstring.c kernel/cstdio.c kernel/vfs.c kernel/sto
 	kernel/linux_syscall.c kernel/sys_fs.c
 AARCH64_ASM_SRCS = kernel/aarch64/start.S kernel/aarch64/vectors.S \
 	kernel/aarch64/entry.S kernel/aarch64/user_blob.S kernel/aarch64/switch.S
-AARCH64_CFLAGS = --target=aarch64-none-elf -mgeneral-regs-only \
+# -mstrict-align は必須。**MMU を入れる前の C は Device メモリの上で走る。**
+# AArch64 は MMU off のとき全アクセスが Device-nGnRnE 扱いになり、
+# **非整列アクセスは SCTLR_EL1.A に関係なく必ず Alignment fault になる**。
+# これを付けないと clang が局所配列の 0 埋めなどで平気で 4 バイト境界への
+# 8 バイト書き込み (stur xzr, [x13, #0x14]) を出す。
+#
+#   実測: aarch64_dtb_scan で ESR 0x96000061 (DFSC 0x21 = Alignment fault)。
+#   VBAR_EL1 を入れる前なので PC 0x200 で無限ループし **1 文字も出ない**。
+#
+# **QEMU 8.2.2 は Device メモリの整列を強制しないので素通りしていた。**
+# 11.0.3 と実機では落ちる。版が古いほうが甘いので、緩いほうで通ったことを
+# 根拠にしないこと (日報2026-08-12)。
+AARCH64_CFLAGS = --target=aarch64-none-elf -mgeneral-regs-only -mstrict-align \
 	-ffreestanding -fno-stack-protector -fno-stack-check -fno-lto -fno-PIE \
 	-mcmodel=small -O2 -Wall -Wextra -Iinclude -MMD -MP
 # 最初に exec するプログラム。既定は P1 の /bin/hello。
