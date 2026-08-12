@@ -404,10 +404,21 @@ static void aarch64_vm_build_kernel(void) {
     aarch64_vm_map_range(aarch64_phys_to_virt(b->uart_base), b->uart_base,
                          AARCH64_UART_SIZE, VM_DEVICE_RW);
 
-    virtio_size = (uint64_t)b->virtio_mmio_count * b->virtio_mmio_stride;
-    if (virtio_size < AARCH64_PAGE_SIZE) virtio_size = AARCH64_PAGE_SIZE;
-    aarch64_vm_map_range(aarch64_phys_to_virt(b->first_virtio_mmio_base),
-                         b->first_virtio_mmio_base, virtio_size, VM_DEVICE_RW);
+    /* **virtio が無い機械では張らない。** 番地 0 は「この機械には無い」の印
+     * (boot.c)。無い番地を Device で張ると、RAM のブロックと重なった瞬間に
+     * block/table conflict でテーブル構築ごと失敗する。
+     * 実測: Pi 4 で virt の 0x0a000000 を張ろうとして
+     *       "block/table conflict at 0xffffff800a000000"。
+     *
+     * **枠数は virtio_blk_mmio.c と同じ式で数える。** 片方だけ 32 枠を
+     * 見に行くと、張っていない枠を読んで落ちる */
+    if (b->first_virtio_mmio_base) {
+        uint32_t slots = b->virtio_mmio_count ? b->virtio_mmio_count : 32;
+        virtio_size = (uint64_t)slots * b->virtio_mmio_stride;
+        if (virtio_size < AARCH64_PAGE_SIZE) virtio_size = AARCH64_PAGE_SIZE;
+        aarch64_vm_map_range(aarch64_phys_to_virt(b->first_virtio_mmio_base),
+                             b->first_virtio_mmio_base, virtio_size, VM_DEVICE_RW);
+    }
 }
 
 /* ---- TTBR0: 移行のあいだだけの恒等マッピング ----------------------------

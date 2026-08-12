@@ -254,6 +254,10 @@ int aarch64_virtio_blk_init(void) {
     g_base = 0;
     g_base_pa = 0;
 
+    /* **番地 0 は「この機械には virtio が無い」の印** (boot.c)。
+     * 張っていない VA を読みに行かせない。Pi 4 がこちら */
+    if (b->first_virtio_mmio_base == 0) return -1;
+
     for (uint32_t i = 0; i < count; i++) {
         uint64_t pa = b->first_virtio_mmio_base + (uint64_t)i * b->virtio_mmio_stride;
         volatile uint8_t* base = (volatile uint8_t*)(uintptr_t)aarch64_phys_to_virt(pa);

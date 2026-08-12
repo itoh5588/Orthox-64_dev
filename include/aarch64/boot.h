@@ -9,6 +9,8 @@
  *   Pi 4 の PL011 は 0xFE201000、GIC-400 は 0xFF841000 付近。
  *   **記憶で書かず、実機の DTB か公式資料で確認すること** (日報2026-08-09 E)
  */
+/* RAM は**もう既定値に退かない** (下の FALLBACK を見ること)。
+ * 実測値として残してあるだけで、コードからは参照していない */
 #define AARCH64_QEMU_VIRT_RAM_BASE      0x40000000ULL
 #define AARCH64_QEMU_VIRT_RAM_SIZE      0x20000000ULL   /* 512MB */
 #define AARCH64_QEMU_VIRT_UART0_BASE    0x09000000ULL
@@ -17,6 +19,26 @@
 #define AARCH64_QEMU_VIRT_GIC_SIZE      0x00010000ULL
 #define AARCH64_QEMU_VIRT_VIRTIO_BASE   0x0a000000ULL
 #define AARCH64_QEMU_VIRT_VIRTIO_STRIDE 0x00000200ULL
+
+/* ---- RAM が DTB から取れなかったときの退き先 -----------------------------
+ *
+ * **機械名を直書きせず、カーネル自身のロード先から導く。**
+ * ファームウェアはカーネルを RAM の中に置くので、ロード先を含む切りのいい
+ * 境界まで下ろせば RAM の基点に当たる:
+ *
+ *   QEMU virt          0x40200000 -> 0x40000000   (従来の直書きと同じ値)
+ *   Raspberry Pi 3/4   0x00080000 -> 0x00000000
+ *
+ * **Pi 4 で virt の 0x40000000 に退くと、存在しない RAM を張ったうえに
+ * virt の virtio (0x0a000000) と重なってテーブル構築が失敗する** (実測:
+ * block/table conflict at 0xffffff800a000000)。
+ *
+ * 大きさは**確実に存在するぶんだけ**にする。Pi 4 は最小構成でも 1GB、
+ * QEMU virt のスモークは 512MB で回しているので 512MB なら両方で安全。
+ * 実機では DTB をファームウェアが書き換えるので、ここへ退くのは
+ * **配布 DTB をそのまま食わせた QEMU の場合**が主。 */
+#define AARCH64_FALLBACK_RAM_ALIGN      0x40000000ULL   /* 1GB */
+#define AARCH64_FALLBACK_RAM_SIZE       0x20000000ULL   /* 512MB */
 
 /* ---- 早期 UART の既定値 --------------------------------------------------
  *

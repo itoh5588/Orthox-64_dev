@@ -180,6 +180,9 @@ static void aarch64_vectors_init(void) {
  * 「DTB を読んだつもりで既定値のままだった」を見分けられる。 */
 static aarch64_boot_info_t g_boot_info;
 
+/* リンカスクリプトが置く印。**MMU の前に読むと物理アドレスが返る** */
+extern char __kernel_start[];
+
 aarch64_boot_info_t* aarch64_boot_info_mut(void) { return &g_boot_info; }
 const aarch64_boot_info_t* aarch64_boot_info(void) { return &g_boot_info; }
 
@@ -193,7 +196,9 @@ void aarch64_boot_capture(uint64_t dtb_hint) {
     g_boot_info.gicd_size   = AARCH64_QEMU_VIRT_GIC_SIZE;
     g_boot_info.gicc_base   = AARCH64_QEMU_VIRT_GICC_BASE;
     g_boot_info.gicc_size   = AARCH64_QEMU_VIRT_GIC_SIZE;
-    g_boot_info.first_virtio_mmio_base = AARCH64_QEMU_VIRT_VIRTIO_BASE;
+    /* virtio の番地は既定値で埋めない。**「DTB に無い」と「まだ読んでいない」
+     * を 0 で見分ける**ため。読めなかったときの退き先は走査の後で入れる */
+    g_boot_info.first_virtio_mmio_base = 0;
     g_boot_info.timer_intid = AARCH64_TIMER_PPI_DEFAULT + AARCH64_PPI_INTID_BASE;
 
     dtb = aarch64_dtb_find(dtb_hint);
@@ -206,12 +211,27 @@ void aarch64_boot_capture(uint64_t dtb_hint) {
         aarch64_dtb_scan(dtb);
     }
 
+    /* **RAM が分からないときは、自分がどこに載っているかから導く。**
+     * 機械ごとの直書きに退くと、別の機械では存在しない番地を張ってしまう
+     * (include/aarch64/boot.h の注記)。
+     *
+     * ここはまだ MMU の前なので、リンカシンボルを C から取ると
+     * **物理アドレスが返る** (adrp が PC 相対で、PC が物理のため。
+     * vm.c の aarch64_vm_ptr_pa が同じ前提に立っている) */
     if (g_boot_info.memory_size == 0) {
-        g_boot_info.memory_base = AARCH64_QEMU_VIRT_RAM_BASE;
-        g_boot_info.memory_size = AARCH64_QEMU_VIRT_RAM_SIZE;
+        uint64_t kernel_pa = (uint64_t)(uintptr_t)__kernel_start;
+        g_boot_info.memory_base = kernel_pa & ~(AARCH64_FALLBACK_RAM_ALIGN - 1);
+        g_boot_info.memory_size = AARCH64_FALLBACK_RAM_SIZE;
     }
     if (g_boot_info.virtio_mmio_stride == 0) {
         g_boot_info.virtio_mmio_stride = AARCH64_QEMU_VIRT_VIRTIO_STRIDE;
+    }
+    /* **DTB が読めたのに virtio が 1 つも無いなら、その機械には無い。**
+     * virt の既定値を残すと Pi 4 で 0x0a000000 を Device で張ろうとし、
+     * RAM のブロックと衝突してテーブル構築ごと失敗する。
+     * DTB そのものが読めなかったときだけ、従来どおり virt の値に退く */
+    if (!(g_boot_info.flags & AARCH64_BOOT_FLAG_DTB_VALID)) {
+        g_boot_info.first_virtio_mmio_base = AARCH64_QEMU_VIRT_VIRTIO_BASE;
     }
 
     /* UART が別の場所だと分かったらここで乗り換える。
