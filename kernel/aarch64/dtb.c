@@ -176,6 +176,12 @@ typedef struct dtb_node_state {
     int is_uart;
     int is_gic;
     int is_virtio;
+    /* Raspberry Pi 4 の SD カードコントローラ (EMMC2)。**Pi の SD は
+     * 世代で別物**で、Pi 4 の実物 DTB では旧 mmc@7e300000 が disabled、
+     * 有効なのは /emmc2bus/mmc@7e340000 のほう。
+     * emmc2bus は soc とは**別のバスノード**で子のセル数も違う
+     * (emmc2bus は子 2 / soc は子 1) ので、ranges 変換をここでも通す */
+    int is_emmc2;
     int is_memory;
     int is_timer;
     int is_cpu;
@@ -197,6 +203,7 @@ typedef struct dtb_node_state {
 
 static void node_state_clear(dtb_node_state_t* n) {
     n->is_uart = n->is_gic = n->is_virtio = 0;
+    n->is_emmc2 = 0;
     n->is_memory = n->is_timer = n->is_cpu = 0;
     n->is_disabled = 0;
     n->reg_data = 0;
@@ -382,6 +389,24 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                 virtio_count++;
             }
 
+            /* EMMC2 (Pi 4 の SD カード)。**アドレスは /emmc2bus の ranges を
+             * 通して初めて物理になる** (0x7e340000 -> 0xfe340000)。
+             * 変換しないとどこにも繋がらない番地を叩いて沈黙する */
+            if (n->is_emmc2 && !n->is_disabled && n->reg_data &&
+                reg_entry_phys(nodes, depth, n->reg_data, n->reg_len, ac, sc, 0, &base, &size) &&
+                base != 0 && info->emmc2_base == 0) {
+                info->emmc2_base = base;
+                info->emmc2_size = size ? size : 0x100U;
+                info->flags |= AARCH64_BOOT_FLAG_EMMC2_FROM_DTB;
+                /* interrupts = <type num flags>。type 0 = SPI なので +32。
+                 * **いまの実装はポーリングなので使っていない**が、
+                 * 取れているかどうかを表示で見分けられるようにしておく */
+                if (n->intr_data && n->intr_len >= 12U &&
+                    aarch64_dtb_read_be32(n->intr_data) == 0U) {
+                    info->emmc2_intid = aarch64_dtb_read_be32(n->intr_data + 4) + 32U;
+                }
+            }
+
             /* timer の interrupts は <type num flags> の 3 セル x 4 本
              * (secure / non-secure physical / virtual / hyp)。
              * 2 本目 (index 1) が非セキュア物理タイマ。
@@ -435,6 +460,10 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                 if (compatible_has(c, len, "arm,cortex-a15-gic") ||
                     compatible_has(c, len, "arm,gic-400") ||
                     compatible_has(c, len, "arm,arm11mp-gic")) n->is_gic = 1;
+                /* **旧 arasan (brcm,bcm2835-sdhci) は拾わない。**
+                 * Pi 4 では mmc@7e300000 が disabled で、生きている
+                 * mmcnr@7e300000 は WiFi の SDIO。SD カードは EMMC2 */
+                if (compatible_has(c, len, "brcm,bcm2711-emmc2")) n->is_emmc2 = 1;
             } else if (str_eq(prop_name, "device_type")) {
                 if (len >= 7U && str_eq((const char*)data, "memory")) nodes[depth].is_memory = 1;
             } else if (str_eq(prop_name, "reg")) {

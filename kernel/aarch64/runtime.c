@@ -30,6 +30,12 @@ int aarch64_virtio_blk_present(void);
 uint64_t aarch64_virtio_blk_capacity(void);
 int aarch64_virtio_blk_storage_read(void* ctx, uint64_t lba, void* buf, size_t count);
 int aarch64_virtio_blk_storage_write(void* ctx, uint64_t lba, const void* buf, size_t count);
+/* Raspberry Pi 4 の SD カード (EMMC2)。**QEMU virt には無い**ので
+ * aarch64_emmc2_init が -1 を返す */
+int aarch64_emmc2_init(void);
+uint64_t aarch64_emmc2_blocks(void);
+int aarch64_emmc2_storage_read(void* ctx, uint64_t lba, void* buf, size_t count);
+int aarch64_emmc2_storage_write(void* ctx, uint64_t lba, const void* buf, size_t count);
 
 /* ---- 時刻 ----------------------------------------------------------------
  *
@@ -453,16 +459,37 @@ static char g_fs_buf[128];
 int aarch64_fs_selftest(void) {
     int ok = 1;
     int n;
+    const char* disk_name;
 
     aarch64_console_begin();
-    puts("--- M4-3: xv6fs (virtio-blk の上) ---\n");
+    puts("--- M4-3: xv6fs (virtio-blk / EMMC2 の上) ---\n");
     aarch64_console_end();
 
     /* **fs_init が storage_init も呼ぶ。** ramfs / fifo / VFS の
      * マウントテーブルもここで初期化される (C-1a) */
     fs_init();
 
-    if (!aarch64_virtio_blk_present()) {
+    /* **どのストレージで動くかは機械で変わる。**
+     * QEMU virt は virtio-blk、Raspberry Pi 4 は EMMC2 (SD カード)。
+     * 上の層 (xv6bio / xv6fs / VFS) は storage の名前しか見ないので、
+     * ここで登録するものを差し替えるだけで済む */
+    if (aarch64_virtio_blk_present()) {
+        if (storage_register_device("vblk0", 512, aarch64_virtio_blk_capacity(),
+                                    aarch64_virtio_blk_storage_read,
+                                    aarch64_virtio_blk_storage_write, 0, 0) < 0) {
+            report("  register  :", 0, &ok);
+            goto done;
+        }
+        disk_name = "vblk0";
+    } else if (aarch64_emmc2_init() == 0) {
+        if (storage_register_device("sd0", 512, aarch64_emmc2_blocks(),
+                                    aarch64_emmc2_storage_read,
+                                    aarch64_emmc2_storage_write, 0, 0) < 0) {
+            report("  register  :", 0, &ok);
+            goto done;
+        }
+        disk_name = "sd0";
+    } else {
         /* ディスクを付けずに起動した回。**「無い」と「壊れた」を混ぜない** */
         aarch64_console_begin();
         puts("  device    : 見つからない (-drive を付けずに起動した)\n");
@@ -470,16 +497,9 @@ int aarch64_fs_selftest(void) {
         aarch64_console_end();
         return 1;
     }
-
-    if (storage_register_device("vblk0", 512, aarch64_virtio_blk_capacity(),
-                                aarch64_virtio_blk_storage_read,
-                                aarch64_virtio_blk_storage_write, 0, 0) < 0) {
-        report("  register  :", 0, &ok);
-        goto done;
-    }
     report("  register  :", 1, &ok);
 
-    report("  mount     :", xv6fs_mount_storage("vblk0") == 0, &ok);
+    report("  mount     :", xv6fs_mount_storage(disk_name) == 0, &ok);
     if (!xv6fs_is_mounted()) goto done;
 
     /* **root を xv6fs に切り替える。** これを忘れると fs.c は

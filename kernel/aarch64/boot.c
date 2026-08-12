@@ -238,6 +238,23 @@ void aarch64_boot_capture(uint64_t dtb_hint) {
         g_boot_info.first_virtio_mmio_base = AARCH64_QEMU_VIRT_VIRTIO_BASE;
     }
 
+#ifdef AARCH64_EMMC2_BASE_OVERRIDE
+    /* **検証専用の差し込み口。既定では定義しない。**
+     *
+     * QEMU の raspi4b は SD カードを **旧 sdhci (0xFE300000) に繋いでいて、
+     * EMMC2 (0xFE340000) は空のまま**にしている
+     * (hw/arm/bcm2838_peripherals.c が GPIO の sdbus-sdhci を
+     *  s_base->sdhci に結んでいる)。**実機の Pi 4 とは配線が違う。**
+     *
+     * 両方とも QEMU では同じ generic-sdhci なので、番地だけ差し替えれば
+     * ドライバの中身 (初期化手順 / PIO 転送 / LBA の単位) は確かめられる。
+     * **実機向けのビルドでは定義しないこと** — 実機の 0xFE300000 は
+     * WiFi の SDIO で、SD カードではない */
+    g_boot_info.emmc2_base = AARCH64_EMMC2_BASE_OVERRIDE;
+    g_boot_info.emmc2_size = 0x100;
+    g_boot_info.flags &= ~AARCH64_BOOT_FLAG_EMMC2_FROM_DTB;
+#endif
+
     /* UART が別の場所だと分かったらここで乗り換える。
      *
      * **他機の DTB を読ませて検証するときは乗り換えると何も見えなくなる。**
@@ -302,6 +319,22 @@ static void aarch64_boot_info_dump(void) {
     aarch64_uart_puts(" stride ");
     put_hex64(b->virtio_mmio_stride);
     put_src(AARCH64_BOOT_FLAG_VIRTIO_FROM_DTB);
+
+    /* **Pi 4 の SD カード。** QEMU virt には無い。
+     * **「この機械には無い」と「取り損ねた」を混ぜない。** 無いときに
+     * (既定値) と出すと、退いた値を使っているように見える (実際には
+     * 退き先が無い) し、スモークの「全部 DTB 由来か」の判定にも当たる */
+    aarch64_uart_puts("  emmc2     : ");
+    if (b->emmc2_base == 0) {
+        aarch64_uart_puts("この機械には無い\n");
+    } else {
+        put_hex64(b->emmc2_base);
+        aarch64_uart_puts(" size ");
+        put_hex64(b->emmc2_size);
+        aarch64_uart_puts(" irq ");
+        put_hex64(b->emmc2_intid);
+        put_src(AARCH64_BOOT_FLAG_EMMC2_FROM_DTB);
+    }
 
     aarch64_uart_puts("  timer irq : ");
     put_hex64(b->timer_intid);

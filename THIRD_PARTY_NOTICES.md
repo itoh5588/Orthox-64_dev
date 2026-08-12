@@ -46,6 +46,47 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
+### rpi-boot の `emmc.c` （Raspberry Pi 4 の SD カードドライバ）
+
+`kernel/aarch64/emmc2.c` は、**jncronin/rpi-boot** の `emmc.c` を土台に、
+Raspberry Pi 4 の EMMC2 (BCM2711) 向けに書き直したものです。SDHCI の
+レジスタ配置・コマンド定義・カード初期化の順序をそちらから取っています。
+
+**リポジトリのルートには `LICENCE.GPL` があり、GitHub の判定も GPL-2.0 に
+なりますが、`emmc.c` 自体はファイル冒頭で MIT を宣言しています。**
+根拠にすべきは当該ファイルの宣言のほうなので、MIT として扱っています。
+**`emmc.c` 以外は一切持ち込んでいません。**
+
+主な相違点（`kernel/aarch64/emmc2.c` の冒頭にも記載）:
+
+- 対象が **EMMC2 (`brcm,bcm2711-emmc2`)**。原典は旧 arasan (`bcm2835-sdhci`) 向け
+- VideoCore のメールボックスを使わず、ベースクロックを `CAPABILITIES_0` から読む
+- 番地は直書きせず DTB から取る（`/emmc2bus` の `ranges` 変換を通す）
+- 転送は PIO のみ。DMA / ADMA は使わない
+- Orthox-64 の `storage.h` に合わせた受け口に置き換え
+
+```
+Copyright (C) 2013 by John Cronin <jncronin@tysos.org>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
 ---
 
 ## 2. 同梱・ビルド時に利用している第三者コンポーネント（`ports/`, `Limine/` ほか）

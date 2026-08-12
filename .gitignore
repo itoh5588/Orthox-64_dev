@@ -153,6 +153,10 @@ out/aarch64-fp-fs/
 # P3-4 のスモークが作るもの
 out/aarch64-vmleak-fs/
 
+# Pi 4 の SD (EMMC2) スモークが作るもの (tests/aarch64_pi4_sd_smoke.sh)
+out/aarch64-pi4-sdfs/
+out/aarch64-pi4-sd.img
+
 # aarch64 セルフホストのビルド成果物 (計 100MB 超)。
 # 作り方は ports/build_binutils_orthox_aarch64.sh と
 # ports/build_gcc474_orthox_aarch64.sh にある

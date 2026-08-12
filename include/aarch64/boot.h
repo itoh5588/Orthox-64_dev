@@ -91,6 +91,11 @@ typedef struct aarch64_boot_info {
      * flags の VIRTIO_IRQ_OK が立っているときだけ有効 */
     uint32_t virtio_mmio_irq_base;
     uint32_t cpu_count;
+    /* Raspberry Pi 4 の SD カードコントローラ (EMMC2)。**QEMU virt には
+     * 無い**ので 0 のまま。番地 0 が「この機械には無い」の印 (virtio と同じ) */
+    uint64_t emmc2_base;
+    uint64_t emmc2_size;
+    uint32_t emmc2_intid;
     uint32_t flags;
 } aarch64_boot_info_t;
 
@@ -104,6 +109,7 @@ typedef struct aarch64_boot_info {
 #define AARCH64_BOOT_FLAG_TIMER_FROM_DTB  (1U << 7)
 #define AARCH64_BOOT_FLAG_VIRTIO_IRQ_OK   (1U << 8)  /* base + i が成り立つ */
 #define AARCH64_BOOT_FLAG_UART_IRQ_FROM_DTB (1U << 9)
+#define AARCH64_BOOT_FLAG_EMMC2_FROM_DTB  (1U << 10)
 
 /* 直書きの既定値で埋めてから DTB で上書きする。
  * DTB が無くても QEMU virt では動き続ける */

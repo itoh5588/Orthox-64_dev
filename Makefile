@@ -243,7 +243,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-smoke aarch64-pi4-sd-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -296,7 +296,7 @@ AARCH64_KERNEL_ELF = out/kernel-aarch64.elf
 AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer.c \
 	kernel/aarch64/dtb.c \
 	kernel/aarch64/vm.c kernel/aarch64/usermode.c kernel/aarch64/pmm.c \
-	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/runtime.c \
+	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/emmc2.c kernel/aarch64/runtime.c \
 	kernel/aarch64/stubs.c kernel/aarch64/syscall.c kernel/aarch64/console.c
 # 共有層のうち、**いま繋がるものだけ**を取り込む (M3c-2a)。
 # どれが入るかは推測せず、llvm-nm -u で未解決シンボルを実測して決めた。
@@ -378,6 +378,14 @@ endif
 # AARCH64_LOAD_PA と同じく virt の値を既定にしてある
 AARCH64_EARLY_GICD ?= 0x08000000
 AARCH64_EARLY_GICC ?= 0x08010000
+# **EMMC2 の番地を差し替える検証専用の口。既定では空。**
+# QEMU の raspi4b は SD カードを旧 sdhci (0xFE300000) に繋いでいて EMMC2 は
+# 空なので、ドライバの中身を確かめるときだけここに 0xFE300000 を渡す。
+# **実機向けには渡さない** (実機の 0xFE300000 は WiFi の SDIO)
+AARCH64_EMMC2_BASE ?=
+ifneq ($(AARCH64_EMMC2_BASE),)
+AARCH64_CFLAGS += -DAARCH64_EMMC2_BASE_OVERRIDE=$(AARCH64_EMMC2_BASE)ULL
+endif
 ifneq ($(AARCH64_EARLY_GICD),)
 AARCH64_CFLAGS += -DAARCH64_EARLY_GICD=$(AARCH64_EARLY_GICD)
 endif
@@ -451,6 +459,17 @@ aarch64-pi4-boot:
 aarch64-pi4-smoke: aarch64-pi4-boot
 	bash ./tests/aarch64_pi4_smoke.sh
 
+# SD カードドライバ (EMMC2) の確認。**QEMU は SD を旧 sdhci に繋いでいる**ので、
+# 検証用に番地を差し替えて組む (tests/aarch64_pi4_sd_smoke.sh の注記)。
+# **実機向けの out/pi4-boot/ には入れない**
+aarch64-pi4-sd-smoke: $(AARCH64_USER_HELLO)
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
+	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \
+	    AARCH64_CNTFRQ_HZ=54000000 \
+	    AARCH64_EARLY_GICD=0xFF841000 AARCH64_EARLY_GICC=0xFF842000 \
+	    AARCH64_EMMC2_BASE=0xFE300000
+	bash ./tests/aarch64_pi4_sd_smoke.sh
+
 aarch64-run: $(AARCH64_KERNEL_ELF)
 	qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 512M -smp 1 \
 		-nographic -kernel $(AARCH64_KERNEL_ELF)
@@ -506,7 +525,7 @@ $(BUILD_DIR)/aarch64/kernel/runtime.o: $(BUILD_DIR)/aarch64/init_path.stamp
 # これで「切り替えるときは build/aarch64 を消す」手作業が要らなくなった
 $(BUILD_DIR)/aarch64/machine.stamp: FORCE
 	@mkdir -p $(@D)
-	@echo "$(AARCH64_LOAD_PA)|$(AARCH64_EARLY_UART)|$(AARCH64_CNTFRQ_HZ)|$(AARCH64_EARLY_GICD)|$(AARCH64_EARLY_GICC)|$(AARCH64_CFLAGS_EXTRA)" > $@.tmp; \
+	@echo "$(AARCH64_LOAD_PA)|$(AARCH64_EARLY_UART)|$(AARCH64_CNTFRQ_HZ)|$(AARCH64_EARLY_GICD)|$(AARCH64_EARLY_GICC)|$(AARCH64_EMMC2_BASE)|$(AARCH64_CFLAGS_EXTRA)" > $@.tmp; \
 	if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
 
 $(AARCH64_OBJS): $(BUILD_DIR)/aarch64/machine.stamp
