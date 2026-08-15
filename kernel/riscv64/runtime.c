@@ -290,8 +290,22 @@ void kernel_panic(const char* file, int line, const char* func, const char* expr
 }
 
 int64_t sys_write_serial(const char* buf, size_t count) {
+    extern int arch_console_onlcr_enabled(void);   /* kernel/linux_syscall.c */
+    int onlcr;
     if (!buf) return -1;
+    /* **termios の ONLCR を開く。** 実機のシリアル端末は LF だけでは行頭に
+     * 戻らず、次の行が前の行の終端位置から始まる (Pi 4 実機の ash で
+     * `ls` の段組みが階段状に崩れて発覚。aarch64 と同じ修正)。
+     * QEMU の -serial stdio ではホスト端末が吸収するので見えない。
+     *
+     * **既に CR が置かれている所には足さない。** kernel/riscv64/fs.c の
+     * コンソールエコーは "\r\n" を出すが、そちらは riscv64_uart_puts を
+     * 直接呼ぶのでここは通らない。それでも将来の呼び手に備えて見ておく */
+    onlcr = arch_console_onlcr_enabled();
     for (size_t i = 0; i < count; i++) {
+        if (onlcr && buf[i] == '\n' && (i == 0 || buf[i - 1] != '\r')) {
+            riscv64_uart_putchar('\r');
+        }
         riscv64_uart_putchar(buf[i]);
     }
     return (int64_t)count;

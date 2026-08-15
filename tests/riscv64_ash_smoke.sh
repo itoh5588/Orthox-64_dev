@@ -191,6 +191,15 @@ echo "--- RISC-V ash Serial Output ---"
 cat "$SERIAL_LOG"
 echo "--------------------------------"
 
+# **判定は CR を除いたコピーに当てる。**
+#
+# カーネルは termios の ONLCR に従って LF を CRLF で出す (実機のシリアル端末は
+# LF だけでは行頭に戻らないため)。そのままだと行の中身が "riscv64\r" になり、
+# `^riscv64$` のような行末アンカーが当たらない。
+# **表示は元のログ、判定はこちら**。
+tr -d '\r' < "$SERIAL_LOG" > "$SERIAL_LOG.nocr"
+SERIAL_LOG="$SERIAL_LOG.nocr"
+
 grep -aq "built-in shell (ash)" "$SERIAL_LOG"
 grep -aq "riscv64 supervisor timer interrupt" "$SERIAL_LOG"
 grep -aq "interactive-ok" "$SERIAL_LOG"

@@ -650,8 +650,21 @@ int64_t sys_write(int fd, const void* buf, size_t count) {
     }
     if (current->fds[fd].type != FT_CONSOLE) return -LINUX_EBADF;
 
-    for (size_t i = 0; i < count; i++) {
-        riscv64_uart_putchar((char)src[i]);
+    {
+        /* **termios の ONLCR を開く。** 実機のシリアル端末は LF だけでは
+         * 行頭に戻らず、次の行が前の行の終端位置から始まる (Pi 4 実機の
+         * ash で `ls` の段組みが階段状に崩れて発覚。aarch64 と同じ修正)。
+         * QEMU の -serial stdio ではホスト端末が吸収するので見えない。
+         *
+         * **既に CR が置かれている所には足さない。** */
+        extern int arch_console_onlcr_enabled(void);   /* kernel/linux_syscall.c */
+        int onlcr = arch_console_onlcr_enabled();
+        for (size_t i = 0; i < count; i++) {
+            if (onlcr && src[i] == '\n' && (i == 0 || src[i - 1] != '\r')) {
+                riscv64_uart_putchar('\r');
+            }
+            riscv64_uart_putchar((char)src[i]);
+        }
     }
     return (int64_t)count;
 }
