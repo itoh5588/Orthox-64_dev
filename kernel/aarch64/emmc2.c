@@ -140,7 +140,11 @@ static uint32_t g_last_resp[4];
 
 void aarch64_uart_puts(const char* s);
 void aarch64_uart_puthex64(uint64_t v);
+void aarch64_uart_putchar(char c);
 uint64_t aarch64_timer_freq(void);
+
+int aarch64_emmc2_read(uint64_t lba, void* buf, uint32_t sectors);
+static void find_xv6fs(void);
 
 static inline void w32(uint64_t off, uint32_t v) {
     *(volatile uint32_t*)(uintptr_t)(g_base + off) = v;
@@ -420,6 +424,32 @@ static uint64_t csd_to_blocks(void) {
 static void put(const char* s) { aarch64_uart_puts(s); }
 static void puthex(uint64_t v) { aarch64_uart_puthex64(v); }
 
+/* **桁を揃えると読めなくなる値がある。** パーティション番号やセクタ数を
+ * puthex64 で出すと `part 0x0000000000000003` になり、目が滑る。
+ * レジスタのダンプ (ビットの位置を数えるもの) は 16 桁のままでよいが、
+ * ただの数はこちらで出す */
+static void putdec(uint64_t v) {
+    char buf[21];
+    int i = 0;
+    if (v == 0) { put("0"); return; }
+    while (v) { buf[i++] = (char)('0' + (uint32_t)(v % 10U)); v /= 10U; }
+    while (i--) aarch64_uart_putchar(buf[i]);
+}
+
+/* 先頭の 0 を落とした 16 進。番地やサイズは 16 進のほうが見当をつけやすい */
+static void puthex_short(uint64_t v) {
+    char buf[17];
+    int i = 0;
+    put("0x");
+    if (v == 0) { put("0"); return; }
+    while (v) {
+        uint32_t d = (uint32_t)(v & 0xFU);
+        buf[i++] = (char)(d < 10U ? '0' + d : 'a' + (d - 10U));
+        v >>= 4;
+    }
+    while (i--) aarch64_uart_putchar(buf[i]);
+}
+
 /* 落ちたときのレジスタを全部出す。**実機は往復が高くつく** (SD の抜き差しが
  * 要る) ので、1 回で原因が絞れるだけ出す。
  *
@@ -604,16 +634,145 @@ int aarch64_emmc2_init(void) {
     }
 
     put("  emmc2     : 初期化 ok  base=");
-    puthex(g_base_pa);
-    put(" blocks=");
-    puthex(g_blocks);
+    puthex_short(g_base_pa);
+    put("  ");
+    putdec(g_blocks);
+    put(" ブロック (");
+    putdec(g_blocks / 2097152ULL);    /* 512B ブロック -> GiB */
+    put(" GiB)");
     put(g_sdhc ? "  (SDHC/SDXC)\n" : "  (標準容量)\n");
+
+    /* **カードが読めるようになってから MBR を見る。** ここまで来て初めて
+     * aarch64_emmc2_read が使える */
+    find_xv6fs();
     return 0;
+}
+
+/* ---- パーティション ------------------------------------------------------
+ *
+ * **Pi 4 の SD スロットは 1 つしかない。** QEMU のように「起動用と rootfs 用を
+ * 別デバイスにする」ことができず、カードの先頭には Orthox 自身を起動するための
+ * boot パーティション (FAT32) が要る。そこを xv6fs で潰すと自分が起動できない。
+ *
+ * そこで **MBR を読んで xv6fs の居場所を自分で見つける。**
+ *
+ * 判定は**パーティションタイプではなく magic** で行う。xv6fs に割り当てられた
+ * タイプ番号は無いので、型で決め打ちすると「Linux (0x83) の 1 番目」のような
+ * 当てにならない規則になる。**中身を見れば確実で、カードを作り直しても
+ * 番号を調べ直さなくてよい。**
+ *
+ * storage 層のブロック = 512 バイトセクタ。xv6fs は BSIZE=1024 なので
+ * **superblock (xv6 のブロック 1) は 512 バイトセクタの 2 番目**に載る。 */
+#define MBR_SIG_OFF       0x1FEU
+#define MBR_PART_OFF      0x1BEU
+#define MBR_PART_SIZE     16U
+#define MBR_PART_COUNT    4U
+#define MBR_PART_TYPE     4U      /* エントリ内オフセット */
+#define MBR_PART_LBA      8U
+#define MBR_PART_SECTORS  12U
+
+#define XV6FS_MAGIC       0x10203040U
+#define XV6FS_SB_SECTOR   2U      /* BSIZE=1024 のブロック 1 = 512B の 2 番目 */
+
+static uint64_t g_part_lba;       /* xv6fs の先頭 LBA。0 = カードの先頭から */
+static uint64_t g_part_blocks;    /* そこから使えるブロック数。0 = カード全体 */
+
+/* **バッファは uint32_t で持つ。** -mstrict-align で組んでいるので、
+ * 512 バイトを uint8_t の配列に置いて 32 ビットで読むと整列違反になりうる */
+static uint32_t g_sector[SD_BLOCK_SIZE / 4U];
+
+static uint32_t le32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* その LBA から始まる領域が xv6fs か。**生の LBA で読む** (この時点では
+ * まだオフセットが決まっていない) */
+static int looks_like_xv6fs(uint64_t lba) {
+    if (aarch64_emmc2_read(lba + XV6FS_SB_SECTOR, g_sector, 1) != 0) return 0;
+    return le32((const uint8_t*)g_sector) == XV6FS_MAGIC;
+}
+
+static void find_xv6fs(void) {
+    const uint8_t* mbr = (const uint8_t*)g_sector;
+    uint32_t i;
+
+    g_part_lba = 0;
+    g_part_blocks = 0;
+
+    /* **カードの先頭がいきなり xv6fs の場合を先に見る。** QEMU に渡している
+     * ような「まるごと 1 個の fs」のイメージを、そのまま焼いたカード */
+    if (looks_like_xv6fs(0)) {
+        put("  xv6fs     : カードの先頭から (パーティションなし)\n");
+        return;
+    }
+
+    if (aarch64_emmc2_read(0, g_sector, 1) != 0) {
+        put("  xv6fs     : MBR が読めない\n");
+        return;
+    }
+    if (mbr[MBR_SIG_OFF] != 0x55U || mbr[MBR_SIG_OFF + 1U] != 0xAAU) {
+        put("  xv6fs     : MBR の印が無い\n");
+        return;
+    }
+
+    for (i = 0; i < MBR_PART_COUNT; i++) {
+        const uint8_t* e = mbr + MBR_PART_OFF + i * MBR_PART_SIZE;
+        uint32_t type = e[MBR_PART_TYPE];
+        uint32_t lba = le32(e + MBR_PART_LBA);
+        uint32_t sectors = le32(e + MBR_PART_SECTORS);
+        uint32_t saved[SD_BLOCK_SIZE / 4U];
+        uint32_t k;
+
+        if (type == 0U || sectors == 0U) continue;   /* 空きエントリ */
+
+        /* **見つからなかったときのために、あるものを全部出す。**
+         * 「無い」とだけ言われても、パーティションが幾つあってどこから
+         * 始まっているのかが分からないと次の手が打てない */
+        put("  part ");
+        putdec(i + 1U);
+        put("    : type=");
+        puthex_short(type);
+        put(" lba=");
+        puthex_short(lba);
+        put(" sectors=");
+        puthex_short(sectors);
+        put("\n");
+
+        /* **MBR を退避してから中身を見に行く。** looks_like_xv6fs が
+         * g_sector を踏むので、残りのエントリを読めなくなる */
+        for (k = 0; k < SD_BLOCK_SIZE / 4U; k++) saved[k] = g_sector[k];
+
+        if (looks_like_xv6fs(lba)) {
+            g_part_lba = lba;
+            g_part_blocks = sectors;
+            put("  xv6fs     : パーティション ");
+            putdec(i + 1U);
+            put("  lba=");
+            puthex_short(g_part_lba);
+            put(" blocks=");
+            putdec(g_part_blocks);
+            put("\n");
+            return;
+        }
+
+        for (k = 0; k < SD_BLOCK_SIZE / 4U; k++) g_sector[k] = saved[k];
+    }
+
+    put("  xv6fs     : MBR に xv6fs が無い\n");
 }
 
 int aarch64_emmc2_present(void) { return g_base != 0; }
 uint64_t aarch64_emmc2_base_pa(void) { return g_base_pa; }
-uint64_t aarch64_emmc2_blocks(void) { return g_blocks; }
+
+/* **storage に見せるのはパーティションの大きさ。** カード全体を見せると、
+ * 上の層が末尾を越えて読みに行ける形になる */
+uint64_t aarch64_emmc2_blocks(void) {
+    return g_part_blocks ? g_part_blocks : g_blocks;
+}
+
+uint64_t aarch64_emmc2_card_blocks(void) { return g_blocks; }
+uint64_t aarch64_emmc2_part_lba(void) { return g_part_lba; }
 
 /* **アドレスの単位がカードで違う。** SDHC/SDXC はブロック番号、
  * 標準容量はバイト単位。ここを取り違えると 512 倍ずれた場所を読む */
@@ -650,12 +809,15 @@ int aarch64_emmc2_write(uint64_t lba, const void* buf, uint32_t sectors) {
  *
  * **戻り値は「成功なら 0」。** ブロック数ではない (virtio 側と同じ約束。
  * count を返すと xv6bio が毎回エラーとして記録する) */
+/* **オフセットを足すのはここだけ。** aarch64_emmc2_read/write は生の LBA を
+ * 扱う (MBR 自体を読むのに要る)。上の層はパーティションの先頭を 0 として
+ * 数えるので、その差をこの 2 つで吸収する */
 int aarch64_emmc2_storage_read(void* ctx, uint64_t lba, void* buf, size_t count) {
     (void)ctx;
-    return aarch64_emmc2_read(lba, buf, (uint32_t)count);
+    return aarch64_emmc2_read(g_part_lba + lba, buf, (uint32_t)count);
 }
 
 int aarch64_emmc2_storage_write(void* ctx, uint64_t lba, const void* buf, size_t count) {
     (void)ctx;
-    return aarch64_emmc2_write(lba, buf, (uint32_t)count);
+    return aarch64_emmc2_write(g_part_lba + lba, buf, (uint32_t)count);
 }
