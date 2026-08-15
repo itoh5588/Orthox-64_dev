@@ -2301,6 +2301,16 @@ int fs_truncate(const char* path, uint64_t length) {
     return -ENOENT;
 }
 
+/* **termios の ECHO を見るための既定実装 (弱いシンボル)。**
+ *
+ * 本物は kernel/linux_syscall.c にあるが、**x86 はそれをリンクしない**
+ * (RISCV64_SHARED_C_SRCS / AARCH64_SHARED_C_SRCS にはあるが SRCS には無い)。
+ * 弱く置いておけば、持っている構成では強い定義が勝ち、持たない構成でも
+ * リンクが通って従来どおり「常にエコーする」になる。
+ *
+ * riscv64 は kernel/riscv64/fs.c の実装を使うのでここは通らない。 */
+__attribute__((weak)) int arch_console_echo_enabled(void) { return 1; }
+
 /* Blocking console read shared by /dev/tty and /dev/console (no echo). */
 static int fs_console_read_blocking(struct task* current, char* buf, size_t count) {
     extern int kb_read(char* buf, int count);
@@ -2328,6 +2338,10 @@ int64_t fs_read(int fd, void* buf, size_t count) {
         extern void kb_set_waiter(struct task* t);
         extern void kb_clear_waiter(struct task* t);
         extern int64_t sys_write_serial(const char* buf, size_t count);
+        /* **termios の ECHO を見る。** busybox の行編集は raw モードにして
+         * 自前でエコーするので、ここが立っていないのに書くと 1 文字が 2 回出る。
+         * riscv64 は kernel/riscv64/fs.c が同じ判定を持っているが、共有側は
+         * 無条件に書いていた (aarch64 の ash で `ppwwdd` と出て発覚) */
         int read_bytes = 0;
         while (read_bytes == 0) {
             read_bytes = kb_read((char*)buf, count);
@@ -2338,7 +2352,7 @@ int64_t fs_read(int fd, void* buf, size_t count) {
                 kb_clear_waiter(current);
             }
         }
-        if (fd == 0 && read_bytes > 0) {
+        if (fd == 0 && read_bytes > 0 && arch_console_echo_enabled()) {
             const char* src = (const char*)buf;
             for (int i = 0; i < read_bytes; i++) {
                 if (src[i] == '\r' || src[i] == '\n') {

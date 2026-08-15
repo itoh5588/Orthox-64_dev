@@ -437,6 +437,18 @@ int arch_console_echo_enabled(void) {
     return (g_linux_console_termios.c_lflag & 0x00000008u) != 0;
 }
 
+/* termios の ONLCR (c_oflag bit0)。**LF だけでは実機の端末は行頭に戻らない。**
+ *
+ * QEMU の -serial stdio ではホスト端末が LF を改行として扱うので見えないが、
+ * 実機のシリアル端末 (Tera Term) では次の行が前の行の終端位置から始まる。
+ * Pi 4 実機の ash で `ls` の段組みが階段状に崩れて発覚した。
+ *
+ * カーネルの起動ログ (aarch64_uart_puts) は自前で CR を出していたので、
+ * **ユーザープロセスの write だけが崩れていた**。 */
+int arch_console_onlcr_enabled(void) {
+    return (g_linux_console_termios.c_oflag & 0x00000001u) != 0;
+}
+
 static uint64_t linux_align_up_page(uint64_t value) {
     return (value + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
 }

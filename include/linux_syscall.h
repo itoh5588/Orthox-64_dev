@@ -38,6 +38,7 @@ void arch_syscall_set_current_context(struct arch_task_context* ctx);
 
 /* コンソールのエコー設定 (termios) をアーキ側のドライバに聞く */
 int arch_console_echo_enabled(void);
+int arch_console_onlcr_enabled(void);
 
 /* fd が持つ size の写しを inode から取り直す。fs の実装がアーキで違うため */
 void arch_fs_refresh_size(file_descriptor_t* f);

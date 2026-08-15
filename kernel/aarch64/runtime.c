@@ -157,9 +157,23 @@ void puthex(uint64_t value) {
 }
 
 int64_t sys_write_serial(const char* buf, size_t count) {
+    extern int arch_console_onlcr_enabled(void);   /* kernel/linux_syscall.c */
+    int onlcr;
     if (!buf) return -1;
+    /* **termios の ONLCR を開く。** 実機のシリアル端末は LF だけでは行頭に
+     * 戻らない (Pi 4 の ash で `ls` の段組みが階段状に崩れて発覚)。
+     * QEMU の -serial stdio ではホスト端末が吸収するので見えない。
+     *
+     * **既に CR が置かれている所には足さない。** 共有層のコンソールエコーは
+     * "\r\n" を渡してくるので、無条件に足すと CR が 2 つ出る */
+    onlcr = arch_console_onlcr_enabled();
     aarch64_console_begin();
-    for (size_t i = 0; i < count; i++) aarch64_uart_putchar(buf[i]);
+    for (size_t i = 0; i < count; i++) {
+        if (onlcr && buf[i] == '\n' && (i == 0 || buf[i - 1] != '\r')) {
+            aarch64_uart_putchar('\r');
+        }
+        aarch64_uart_putchar(buf[i]);
+    }
     aarch64_console_end();
     return (int64_t)count;
 }
