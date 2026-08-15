@@ -243,7 +243,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-smoke aarch64-pi4-sd-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-smoke aarch64-pi4-sd-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -616,6 +616,38 @@ aarch64-smoke: $(AARCH64_KERNEL_ELF) $(AARCH64_USER_HELLO)
 # (日報2026-08-09 追9-6: `! grep` は set -e の対象外で 15 か所が空振りしていた)
 aarch64-smoke-selftest: $(AARCH64_KERNEL_ELF) $(AARCH64_USER_HELLO)
 	bash ./tests/aarch64_smoke.sh --self-test
+
+# ---- P4: busybox ash (aarch64 + musl) --------------------------------------
+#
+# riscv64-busybox-musl の aarch64 版だが、**CC の方針が違う。**
+#   riscv64  clang + sysroot を手で並べる
+#   aarch64  ports/cross-aarch64 の GCC が --with-sysroot で解決するので、
+#            ドライバ (ports/orthos-aarch64-musl-gcc.sh) は
+#            「じゃまな指定を落とす」だけ
+#
+# **AR/RANLIB/STRIP もクロス側を渡す。** 既定はホストの ar に落ちるので、
+# 渡さないと applets/built-in.o の部分リンクで x86 のアーカイブができる。
+AARCH64_MUSL_CC_DRIVER ?= ports/orthos-aarch64-musl-gcc.sh
+AARCH64_CROSS_BIN ?= $(abspath ports/cross-aarch64/bin)
+AARCH64_CROSS_TOOL_PREFIX ?= $(AARCH64_CROSS_BIN)/aarch64-linux-musl-
+AARCH64_BUSYBOX_ASH_MUSL_ELF = out/busybox-aarch64-musl.elf
+
+aarch64-busybox-musl: $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p out
+	ORTHOS_CC=$(abspath $(AARCH64_MUSL_CC_DRIVER)) \
+	ORTHOS_SYSROOT=$(abspath $(AARCH64_MUSL_SYSROOT)) \
+	ORTHOS_INCLUDEDIR=$(abspath $(AARCH64_MUSL_SYSROOT))/include \
+	ORTHOS_EXTRA_CFLAGS="-DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_LINEEDIT_PTR_HACK=1 -DORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS=1" \
+	ORTHOS_AR="$(AARCH64_CROSS_TOOL_PREFIX)ar" \
+	ORTHOS_RANLIB="$(AARCH64_CROSS_TOOL_PREFIX)ranlib" \
+	ORTHOS_STRIP="$(AARCH64_CROSS_TOOL_PREFIX)strip" \
+	./ports/build_busybox_ash.sh $(abspath ports/busybox) $(abspath $(AARCH64_BUSYBOX_ASH_MUSL_ELF))
+
+# 最初のユーザープロセスとして ash を exec する。
+# **fork / waitpid / pipe が要る** (P3-1 が通っていること)
+aarch64-ash-smoke: aarch64-busybox-musl
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/ash
+	bash ./tests/aarch64_ash_smoke.sh
 
 $(RISCV64_KERNEL_ELF): $(RISCV64_OBJS)
 	@mkdir -p $(@D)
