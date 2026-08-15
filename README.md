@@ -43,6 +43,23 @@ make run
 - **ファイルシステム:** VFS + Read-Write な xv6fs（xv6-riscv から移植、triple-indirect ブロックで最大 ~16 GB/ファイル）。
 - **移植済み:** musl 1.2.5 / BusyBox 1.27 / Binutils 2.26 / GCC 4.7.4 / Python 3.12.3 / NumPy 1.26.4 / doomgeneric。
 
+## Raspberry Pi 4 (aarch64) への移植
+
+x86-64 で作ったカーネルを **aarch64 に移植中**です。**2026 年 8 月 15 日、Raspberry Pi 4 の実機で初めて起動しました。**
+
+![Raspberry Pi 4 実機での初ブート](assets/pi4-first-boot.png)
+
+QEMU で積み上げた MMU とユーザーモードが、**実機で無修正のまま動きました。**
+
+- **起動:** armstub8 経由で EL2 から入り、EL1 に降りて起動（`0x80000` に生バイナリでロード）
+- **DTB:** ファームウェアが渡す `bcm2711-rpi-4-b.dtb` を解釈し、UART / GIC-400 / EMMC2 の番地と IRQ を実機の値で取得
+- **MMU:** 4KB granule / VA 39bit、TTBR1 にカーネル、恒等マップを外して高位 VA で走行
+- **EL0:** 2 つのアドレス空間でユーザープロセスを実行、permission fault からの復帰、コンテキストスイッチ、タイマー起床までのスケジューラ
+
+**未対応:** SD カード（EMMC2）の初期化、実機 RAM 容量の取得。
+
+手順と実機の値は [`scripts/pi4/README.md`](scripts/pi4/README.md) にあります。
+
 ## ライセンス
 
 Orthox-64 本体は MIT ライセンス（[LICENSE](LICENSE)）。カーネルには xv6-riscv（MIT）由来のコードを含み、`ports/` に musl・lwIP・BearSSL・Limine・CPython・zlib・BusyBox・GNU Make/Binutils/GCC などを同梱しています。ライセンスと配布上の注意は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照。
