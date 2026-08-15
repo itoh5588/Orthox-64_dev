@@ -27,19 +27,22 @@
 #define AARCH64_BOOT_CPUS   8
 #define AARCH64_BOOT_STACK  65536ULL
 
-/* 管理できるページ数の上限。4KB x 524288 = 2GB。
+/* 管理できるページ数の上限。4KB x 1048576 = 4GB。
  *
- * **512MB だった。** DTB が 2GB と言っても pmm は 512MB で頭打ちにしていて、
- * QEMU に -m を積んでも効かなかった (1G と 2G で同じ所で停止することを実測)。
+ * **512MB -> 2GB -> 4GB と上げてきた。** DTB が 2GB と言っても pmm が
+ * 512MB で頭打ちにしていて、QEMU に -m を積んでも効かなかった
+ * (1G と 2G で同じ所で停止することを実測)。
  *
  * 上げる代償は .bss:
- *    512MB  bitmap 16KB + refcount 256KB  =  272KB
- *   2048MB  bitmap 64KB + refcount 1024KB = 1088KB
+ *    512MB  bitmap  16KB + refcount  256KB =  272KB
+ *   2048MB  bitmap  64KB + refcount 1024KB = 1088KB
+ *   4096MB  bitmap 128KB + refcount 2048KB = 2176KB   <- いまここ
  *
- * **Raspberry Pi 4 の 4GB / 8GB はこの形では賄えない** (4GB で 2176KB)。
- * 実機に行くときは、ビットマップと refcount を静的配列でなく
- * **管理対象の RAM から切り出す**必要がある。そこまでやると上限が消える。 */
-#define AARCH64_PMM_MAX_PAGES 524288U
+ * **Raspberry Pi 4 (4GB) の実機に合わせた。**2176KB は 4GB に対して 0.05% で、
+ * 静的配列のまま賄える。**8GB モデルはこの形では足りない** (4352KB)。
+ * そこまで行くなら、ビットマップと refcount を静的配列でなく
+ * **管理対象の RAM から切り出す**設計にする。そうすれば上限が消える。 */
+#define AARCH64_PMM_MAX_PAGES 1048576U
 
 extern char __kernel_end[];
 
@@ -88,7 +91,35 @@ void aarch64_pmm_init(void) {
     g_pages = (mem_end - free_base) / AARCH64_PAGE_SIZE;
     if (g_pages > AARCH64_PMM_MAX_PAGES) g_pages = AARCH64_PMM_MAX_PAGES;
 
-    for (uint64_t page = 0; page < g_pages; page++) pmm_clear(page);
+    /* **穴は使用済みのまま残す。**
+     *
+     * Raspberry Pi 4 (4GB) は RAM が 2 つに割れていて、間に
+     * ファームウェア/GPU の予約領域がある。memory_base/size は穴を含む
+     * 全体を指す (HHDM がそれを使う) が、**配ってよいのは実在するレンジだけ**。
+     *
+     * ビットマップは 0xff (全部使用済み) で初期化してあるので、
+     * レンジの中だけを空きにすれば穴は自動的に残る。
+     *
+     * mem_range_count == 0 は DTB から取れず既定値に退いた場合。
+     * そのときは従来どおり全体を空きとして扱う */
+    if (b->mem_range_count == 0) {
+        for (uint64_t page = 0; page < g_pages; page++) pmm_clear(page);
+    } else {
+        uint64_t usable = 0;
+        for (uint32_t r = 0; r < b->mem_range_count; r++) {
+            uint64_t rs = b->mem_range_base[r];
+            uint64_t re = rs + b->mem_range_size[r];
+            if (rs < free_base) rs = free_base;
+            if (re > mem_end) re = mem_end;
+            for (uint64_t pa = rs; pa < re; pa += AARCH64_PAGE_SIZE) {
+                uint64_t page = (pa - g_base_pa) / AARCH64_PAGE_SIZE;
+                if (page < g_pages && pmm_test(page)) { pmm_clear(page); usable++; }
+            }
+        }
+        /* **穴のぶんを最初から「使用済み」として数える。** そうしないと
+         * 「pmm : 全体 (使用 0)」と出て、実際より多く使えるように見える */
+        g_used = g_pages - usable;
+    }
 
     /* DTB が管理領域の中にあるなら予約する。QEMU virt では RAM の先頭
      * (カーネルより手前) なので普通は当たらないが、実機では分からない */

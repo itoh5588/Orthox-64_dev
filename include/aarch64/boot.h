@@ -69,10 +69,27 @@
 #define AARCH64_UART_SPI_DEFAULT        1
 #define AARCH64_SPI_INTID_BASE          32
 
+/* memory ノードの reg エントリの上限。
+ *
+ * **Raspberry Pi 4 (4GB) は RAM が 2 つに割れている。**低位 942MB の後ろに
+ * ファームウェア/GPU の予約領域があり、そこを飛ばして 0x40000000 から続く。
+ * 最初のエントリだけ読むと 942MB しか見えない (2026-08-15 実機で確認)。
+ *
+ * QEMU virt は 1 つ。4 あれば当面足りる */
+#define AARCH64_MAX_MEM_RANGES 4
+
 typedef struct aarch64_boot_info {
     uint64_t dtb_pa;
+    /* **memory_base / memory_size は「穴を含む全体」を指す。**
+     * base = 最小の base、size = 最後のエントリの終端まで。
+     * HHDM のマッピング範囲 (vm.c) はこれを使う。
+     * **実際に配ってよいページは mem_range_* のほう** — 穴は RAM では
+     * あってもファームウェアの持ち物なので、pmm は配らない */
     uint64_t memory_base;
     uint64_t memory_size;
+    uint64_t mem_range_base[AARCH64_MAX_MEM_RANGES];
+    uint64_t mem_range_size[AARCH64_MAX_MEM_RANGES];
+    uint32_t mem_range_count;
     uint64_t uart_base;
     uint64_t gicd_base;     /* Distributor。DTB の intc reg[0] */
     uint64_t gicd_size;

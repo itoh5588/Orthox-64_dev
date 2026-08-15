@@ -295,6 +295,19 @@ static void aarch64_boot_info_dump(void) {
     put_hex64(b->memory_size);
     put_src(AARCH64_BOOT_FLAG_MEMORY_FROM_DTB);
 
+    /* **レンジが 2 つ以上なら中身を出す。**
+     * Raspberry Pi 4 (4GB) は RAM が割れていて、上の size は穴を含む全体。
+     * **配れるのはここに出るぶんだけ**なので、食い違いが見えるようにする */
+    if (b->mem_range_count > 1) {
+        for (uint32_t i = 0; i < b->mem_range_count; i++) {
+            aarch64_uart_puts("  mem range : ");
+            put_hex64(b->mem_range_base[i]);
+            aarch64_uart_puts(" + ");
+            put_hex64(b->mem_range_size[i]);
+            aarch64_uart_puts("\n");
+        }
+    }
+
     aarch64_uart_puts("  uart      : ");
     put_hex64(b->uart_base);
     put_src(AARCH64_BOOT_FLAG_UART_FROM_DTB);

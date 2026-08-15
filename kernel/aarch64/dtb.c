@@ -327,17 +327,34 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
             /* **base == 0 を弾かないこと。** RAM が物理 0 から始まる機械では
              * それが正しい値で、Raspberry Pi 4 がまさにそれ (/memory@0)。
              * QEMU の virt は RAM が 0x40000000 からなので base が非 0 になり、
-             * この条件でも通っていた。**実機でだけ既定値に退いていた。**
+             * 以前の `base != 0` 条件でも通っていた。**実機でだけ既定値に
+             * 退いていた。**
              *
              * 弾く根拠があるのは size == 0 だけ (配布 DTB の /memory@0 は
              * reg = <0 0 0> で、ファームウェアが起動時に書き換える。
-             * 書き換えられていなければ size が 0 のまま) */
+             * 書き換えられていなければ size が 0 のまま)。
+             *
+             * **エントリは全部読む。** Pi 4 (4GB) は RAM が 2 つに割れていて、
+             * 最初だけ読むと 942MB しか見えない */
             if (n->is_memory && !n->is_disabled && n->reg_data &&
-                reg_entry_phys(nodes, depth, n->reg_data, n->reg_len, ac, sc, 0, &base, &size) &&
-                size != 0 && info->memory_size == 0) {
-                info->memory_base = base;
-                info->memory_size = size;
-                info->flags |= AARCH64_BOOT_FLAG_MEMORY_FROM_DTB;
+                info->mem_range_count == 0) {
+                uint64_t lo = 0, hi = 0;
+                for (uint32_t idx = 0; idx < AARCH64_MAX_MEM_RANGES; idx++) {
+                    if (!reg_entry_phys(nodes, depth, n->reg_data, n->reg_len,
+                                        ac, sc, idx, &base, &size)) break;
+                    if (size == 0) continue;
+                    info->mem_range_base[info->mem_range_count] = base;
+                    info->mem_range_size[info->mem_range_count] = size;
+                    info->mem_range_count++;
+                    if (hi == 0 || base < lo) lo = base;
+                    if (base + size > hi) hi = base + size;
+                }
+                if (info->mem_range_count != 0) {
+                    /* **穴を含む全体。**配ってよい範囲は mem_range_* のほう */
+                    info->memory_base = lo;
+                    info->memory_size = hi - lo;
+                    info->flags |= AARCH64_BOOT_FLAG_MEMORY_FROM_DTB;
+                }
             }
 
             if (n->is_uart && !n->is_disabled && n->reg_data &&
