@@ -97,6 +97,21 @@
 #define SD_STATUS_DAT_INHIBIT   (1U << 1)
 #define SD_STATUS_CARD_INSERTED (1U << 16)
 
+/* CONTROL0 のビット。
+ *
+ * **標準 SDHCI では 0x28 の上位バイトが Power Control。**
+ * bit8 = SD Bus Power / bits9-11 = SD Bus Voltage Select (0b111 = 3.3V)。
+ *
+ * 土台にした rpi-boot の emmc.c は BCM2708 の ARASAN 向けで、
+ * **あちらは電源を VideoCore のメールボックスで入れる**ため
+ * Power Control を書かない。EMMC2 は標準 SDHCI なので、
+ * **メールボックスを捨てた代わりにここを書く必要がある。**
+ *
+ * しかも CONTROL1 の全体リセット (bit24 = Reset All) は
+ * **Power Control もクリアする**ので、ファームウェアが入れた設定は残らない。 */
+#define SD_CTRL0_BUS_POWER      (1U << 8)
+#define SD_CTRL0_VOLT_3V3       (7U << 9)
+
 /* 使うコマンドだけ。**表を丸ごと持たない** — 使わないものを持つと、
  * 合っているかどうかを確かめる手立てが無いまま増える */
 #define CMD_GO_IDLE         (SD_CMD_INDEX(0))
@@ -232,15 +247,37 @@ static int set_clock(uint32_t base_clock, uint32_t target) {
  * 最後の INTERRUPT を残す (CMD8 は古いカードで時間切れになるのが正常) */
 static uint32_t g_last_interrupt;
 
+/* **どこで落ちたかを残す。** 「応答しない」の一言では、コマンドを出す前に
+ * 詰まったのか、出したが返らないのか、エラーが返ったのかを区別できない。
+ * 実機は往復が高くつく (SD の抜き差しが要る) ので、1 回で絞れるようにする */
+#define EMMC_FAIL_NONE          0
+#define EMMC_FAIL_CMD_INHIBIT   1   /* 前のコマンドが終わらない = 出す前 */
+#define EMMC_FAIL_DAT_INHIBIT   2   /* 前の転送が終わらない = 出す前 */
+#define EMMC_FAIL_CMD_TIMEOUT   3   /* 出したが CMD_DONE も ERR も来ない */
+#define EMMC_FAIL_CMD_ERROR     4   /* エラービットが立って返った */
+#define EMMC_FAIL_XFER_TIMEOUT  5   /* データの ready が来ない */
+#define EMMC_FAIL_XFER_ERROR    6
+#define EMMC_FAIL_DATA_TIMEOUT  7   /* 転送完了が来ない */
+#define EMMC_FAIL_DATA_ERROR    8
+static uint32_t g_last_fail;
+
 static int issue_cmd(uint32_t cmd, uint32_t arg, uint32_t blocks,
                      void* buf, uint32_t timeout_us) {
     uint32_t irpts;
 
+    g_last_fail = EMMC_FAIL_NONE;
+
     /* 前のコマンドが終わっているか。**DAT の待ちは abort コマンドでは見ない** */
-    if (!WAIT_UNTIL((r32(EMMC_STATUS) & SD_STATUS_CMD_INHIBIT) == 0, timeout_us)) return -1;
+    if (!WAIT_UNTIL((r32(EMMC_STATUS) & SD_STATUS_CMD_INHIBIT) == 0, timeout_us)) {
+        g_last_fail = EMMC_FAIL_CMD_INHIBIT;
+        return -1;
+    }
     if ((cmd & SD_CMD_TYPE_ABORT) == 0 &&
         ((cmd & SD_CMD_RSPNS_MASK) == SD_CMD_RSPNS_48B || (cmd & SD_CMD_ISDATA))) {
-        if (!WAIT_UNTIL((r32(EMMC_STATUS) & SD_STATUS_DAT_INHIBIT) == 0, timeout_us)) return -1;
+        if (!WAIT_UNTIL((r32(EMMC_STATUS) & SD_STATUS_DAT_INHIBIT) == 0, timeout_us)) {
+            g_last_fail = EMMC_FAIL_DAT_INHIBIT;
+            return -1;
+        }
     }
 
     if (cmd & SD_CMD_ISDATA) {
@@ -251,11 +288,20 @@ static int issue_cmd(uint32_t cmd, uint32_t arg, uint32_t blocks,
     w32(EMMC_ARG1, arg);
     w32(EMMC_CMDTM, cmd);
 
-    if (!WAIT_UNTIL(r32(EMMC_INTERRUPT) & (SD_INT_CMD_DONE | SD_INT_ERR), timeout_us)) return -1;
+    if (!WAIT_UNTIL(r32(EMMC_INTERRUPT) & (SD_INT_CMD_DONE | SD_INT_ERR), timeout_us)) {
+        /* **時間切れでも INTERRUPT を控える。** 何も立っていないこと自体が
+         * 「コマンドが線に出ていない」という手がかりになる */
+        g_last_interrupt = r32(EMMC_INTERRUPT);
+        g_last_fail = EMMC_FAIL_CMD_TIMEOUT;
+        return -1;
+    }
     irpts = r32(EMMC_INTERRUPT);
     g_last_interrupt = irpts;
     w32(EMMC_INTERRUPT, SD_INT_ERR_MASK | SD_INT_CMD_DONE);
-    if ((irpts & (SD_INT_ERR_MASK | SD_INT_CMD_DONE)) != SD_INT_CMD_DONE) return -1;
+    if ((irpts & (SD_INT_ERR_MASK | SD_INT_CMD_DONE)) != SD_INT_CMD_DONE) {
+        g_last_fail = EMMC_FAIL_CMD_ERROR;
+        return -1;
+    }
 
     switch (cmd & SD_CMD_RSPNS_MASK) {
     case SD_CMD_RSPNS_48:
@@ -281,10 +327,18 @@ static int issue_cmd(uint32_t cmd, uint32_t arg, uint32_t blocks,
 
         for (b = 0; b < blocks; b++) {
             uint32_t i;
-            if (!WAIT_UNTIL(r32(EMMC_INTERRUPT) & (ready | SD_INT_ERR), timeout_us)) return -1;
+            if (!WAIT_UNTIL(r32(EMMC_INTERRUPT) & (ready | SD_INT_ERR), timeout_us)) {
+                g_last_interrupt = r32(EMMC_INTERRUPT);
+                g_last_fail = EMMC_FAIL_XFER_TIMEOUT;
+                return -1;
+            }
             irpts = r32(EMMC_INTERRUPT);
+            g_last_interrupt = irpts;
             w32(EMMC_INTERRUPT, SD_INT_ERR_MASK | ready);
-            if ((irpts & (SD_INT_ERR_MASK | ready)) != ready) return -1;
+            if ((irpts & (SD_INT_ERR_MASK | ready)) != ready) {
+                g_last_fail = EMMC_FAIL_XFER_ERROR;
+                return -1;
+            }
 
             /* **DATA レジスタは 4 バイト単位。** buf の整列は呼び手の責任だが、
              * -mstrict-align で組んでいるので uint32_t* 経由で読み書きする */
@@ -301,10 +355,18 @@ static int issue_cmd(uint32_t cmd, uint32_t arg, uint32_t blocks,
             w32(EMMC_INTERRUPT, SD_INT_ERR_MASK | SD_INT_DATA_DONE);
         } else {
             if (!WAIT_UNTIL(r32(EMMC_INTERRUPT) & (SD_INT_DATA_DONE | SD_INT_ERR),
-                            timeout_us)) return -1;
+                            timeout_us)) {
+                g_last_interrupt = r32(EMMC_INTERRUPT);
+                g_last_fail = EMMC_FAIL_DATA_TIMEOUT;
+                return -1;
+            }
             irpts = r32(EMMC_INTERRUPT);
+            g_last_interrupt = irpts;
             w32(EMMC_INTERRUPT, SD_INT_ERR_MASK | SD_INT_DATA_DONE);
-            if ((irpts & (SD_INT_ERR_MASK | SD_INT_DATA_DONE)) != SD_INT_DATA_DONE) return -1;
+            if ((irpts & (SD_INT_ERR_MASK | SD_INT_DATA_DONE)) != SD_INT_DATA_DONE) {
+                g_last_fail = EMMC_FAIL_DATA_ERROR;
+                return -1;
+            }
         }
     }
     return 0;
@@ -358,6 +420,29 @@ static uint64_t csd_to_blocks(void) {
 static void put(const char* s) { aarch64_uart_puts(s); }
 static void puthex(uint64_t v) { aarch64_uart_puthex64(v); }
 
+/* 落ちたときのレジスタを全部出す。**実機は往復が高くつく** (SD の抜き差しが
+ * 要る) ので、1 回で原因が絞れるだけ出す。
+ *
+ * 見方:
+ *   fail=3 (CMD_TIMEOUT) で int=0     -> コマンドが線に出ていない。電源かクロック
+ *   fail=3 で int に何か立っている    -> 出たが CMD_DONE を取り逃した
+ *   fail=4 (CMD_ERROR)                -> int の上位 16 ビットが理由 (bit16=CTO
+ *                                        タイムアウト / bit17=CCRC / bit19=CMD index)
+ *   fail=1 (CMD_INHIBIT)              -> 前のコマンドが終わっていない。出す前に詰まった
+ *   ctrl0 の bit8 が 0                -> **バス電源が入っていない** */
+static void dump_regs(uint32_t base_clock) {
+    put("              fail  = ");   puthex(g_last_fail);
+    put("  int = ");                 puthex(g_last_interrupt);
+    put("\n              status= ");  puthex(r32(EMMC_STATUS));
+    put("  ctrl0 = ");               puthex(r32(EMMC_CONTROL0));
+    put("\n              ctrl1 = ");  puthex(r32(EMMC_CONTROL1));
+    put("  ctrl2 = ");               puthex(r32(EMMC_CONTROL2));
+    put("\n              caps0 = ");  puthex(r32(EMMC_CAPABILITIES_0));
+    put("  base clk = ");            puthex(base_clock);
+    put("\n              ver   = ");  puthex(r32(EMMC_SLOTISR_VER));
+    put("\n");
+}
+
 int aarch64_emmc2_init(void) {
     const aarch64_boot_info_t* b = aarch64_boot_info();
     uint32_t ver, c1, base_clock, i;
@@ -401,6 +486,17 @@ int aarch64_emmc2_init(void) {
 
     w32(EMMC_CONTROL2, 0);
 
+    /* **バス電源を入れる。** ここを書かないとカードに電気が行かず、
+     * コマンドが線に出ないまま CMD0 が時間切れになる (2026-08-15 の実機)。
+     *
+     * 仕様どおり**電圧を選んでから電源を入れる** (同時に書くと、電圧が
+     * 決まる前に投入する実装がある)。3.3V 以外は使わない —
+     * Pi 4 の SD スロットは 3.3V 固定で、1.8V へ落とすのは UHS-I の話。 */
+    w32(EMMC_CONTROL0, SD_CTRL0_VOLT_3V3);
+    udelay(2000);
+    w32(EMMC_CONTROL0, SD_CTRL0_VOLT_3V3 | SD_CTRL0_BUS_POWER);
+    udelay(2000);
+
     /* **ベースクロックは CAPABILITIES_0 から読む。** メールボックスは要らない。
      * 0 が返ったら EMMC2 の実測値 (100MHz) に退く */
     base_clock = ((r32(EMMC_CAPABILITIES_0) >> 8) & 0xffU) * 1000000U;
@@ -421,6 +517,7 @@ int aarch64_emmc2_init(void) {
     /* CMD0: アイドルへ */
     if (issue_cmd(CMD_GO_IDLE, 0, 0, 0, 500000) != 0) {
         put("  emmc2     : CMD0 に応答しない\n");
+        dump_regs(base_clock);
         return -1;
     }
 
@@ -444,7 +541,10 @@ int aarch64_emmc2_init(void) {
         for (i = 0; i < 1000U; i++) {
             uint32_t arg = 0x00ff8000U | (v2 ? (1U << 30) : 0U);
             if (issue_acmd(ACMD_SD_SEND_OP_COND, arg, 500000) != 0) {
-                put("  emmc2     : ACMD41 が通らない\n");
+                put("  emmc2     : ACMD41 が通らない (i=");
+                puthex(i);
+                put(")\n");
+                dump_regs(base_clock);
                 return -1;
             }
             if (g_last_resp[0] & (1U << 31)) {
@@ -462,6 +562,7 @@ int aarch64_emmc2_init(void) {
     /* CMD2 -> CMD3: CID を読み、相対アドレスをもらう */
     if (issue_cmd(CMD_ALL_SEND_CID, 0, 0, 0, 500000) != 0) {
         put("  emmc2     : CMD2 が通らない\n");
+        dump_regs(base_clock);
         return -1;
     }
     if (issue_cmd(CMD_SEND_REL_ADDR, 0, 0, 0, 500000) != 0) {
