@@ -66,6 +66,25 @@ static inline uint64_t aarch64_virt_to_phys(uint64_t va) {
 /* MAIR_EL1 の枠。0 番 = Device-nGnRnE / 1 番 = Normal WB */
 #define MAIR_IDX_DEVICE 0
 #define MAIR_IDX_NORMAL 1
+/* Normal Non-Cacheable。**フレームバッファ用。**
+ *
+ * Device にすると 1 語ずつの厳密な順序になり、画面の書き換えが極端に遅い。
+ * かといって Normal WB (キャッシュ有効) にすると、書いた絵がキャッシュに
+ * 留まって **VideoCore からは古いまま見える**。間を取って NC にする。
+ * 属性値 0x44 = outer NC / inner NC */
+#define MAIR_IDX_NORMAL_NC 2
+
+/* フレームバッファを張る上位 VA。
+ *
+ * **HHDM に重ねない。** 理由が 2 つある:
+ *   - フレームバッファは **RAM の外に置かれることがある** (QEMU の raspi4b は
+ *     RAM 末尾 0x3c000000 の上、0x3c100000 に返す)。HHDM は RAM しか張らない
+ *   - RAM の中に返ってきた場合、HHDM は同じ番地を Normal WB で張っており、
+ *     属性が食い違う。**同じ物理を別の属性で 2 通り張るのは禁じ手**
+ *
+ * TTBR1 の窓 (39bit VA = 512GB) の中で、HHDM から 256GB 離した所に置く。
+ * MMU の探針が未マップの VA を探す範囲 (RAM 末尾から 64GB) とも被らない */
+#define AARCH64_FB_VA_BASE 0xffffffc000000000ULL
 
 /* EL0 から使えるページの属性。共有層の arch_vm_user_page_flags がこれを返す。
  *

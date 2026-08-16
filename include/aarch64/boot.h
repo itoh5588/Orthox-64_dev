@@ -113,6 +113,10 @@ typedef struct aarch64_boot_info {
     uint64_t emmc2_base;
     uint64_t emmc2_size;
     uint32_t emmc2_intid;
+    /* VideoCore の mailbox (Raspberry Pi)。**画面はこれ経由でしか取れない。**
+     * DTB には HDMI の framebuffer が載っていないので、解像度もアドレスも
+     * ファームウェアに聞くしかない。**QEMU virt には無い**ので 0 のまま */
+    uint64_t mbox_base;
     uint32_t flags;
 } aarch64_boot_info_t;
 
@@ -127,6 +131,7 @@ typedef struct aarch64_boot_info {
 #define AARCH64_BOOT_FLAG_VIRTIO_IRQ_OK   (1U << 8)  /* base + i が成り立つ */
 #define AARCH64_BOOT_FLAG_UART_IRQ_FROM_DTB (1U << 9)
 #define AARCH64_BOOT_FLAG_EMMC2_FROM_DTB  (1U << 10)
+#define AARCH64_BOOT_FLAG_MBOX_FROM_DTB   (1U << 11)
 
 /* 直書きの既定値で埋めてから DTB で上書きする。
  * DTB が無くても QEMU virt では動き続ける */

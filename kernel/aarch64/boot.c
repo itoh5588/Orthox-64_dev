@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include "aarch64/boot.h"
 #include "aarch64/dtb.h"
+#include "aarch64/fb.h"
 #include "aarch64/task.h"
 #include "aarch64/vm.h"
 #include "pmm.h"
@@ -113,6 +114,16 @@ static void put_hex64(uint64_t v) {
     aarch64_uart_puthex64(v);
 }
 
+/* 10 進。**解像度やピッチは 16 桁の 16 進で出しても読めない**ので、
+ * 人が見る数はこちらで出す (emmc2.c が同じ理由で putdec を持っている) */
+static void put_dec(uint64_t v) {
+    char buf[24];
+    int i = 0;
+    if (v == 0) { aarch64_uart_putchar('0'); return; }
+    while (v > 0 && i < (int)sizeof(buf)) { buf[i++] = (char)('0' + (int)(v % 10U)); v /= 10U; }
+    while (i > 0) aarch64_uart_putchar(buf[--i]);
+}
+
 static uint64_t read_current_el(void) {
     uint64_t v;
     __asm__ volatile("mrs %0, CurrentEL" : "=r"(v));
@@ -142,6 +153,7 @@ uint64_t aarch64_pmm_total(void);
 uint64_t aarch64_pmm_used(void);
 uint64_t aarch64_pmm_meta_pages(void);
 int aarch64_pmm_meta_fault(void);
+uint64_t aarch64_vm_translate(uint64_t va);
 void aarch64_vm_fault_probe(void);
 void aarch64_vm_drop_identity(void);
 uint64_t aarch64_read_sctlr(void);
@@ -450,6 +462,40 @@ void aarch64_early_main(uint64_t dtb_phys) {
     }
     aarch64_uart_puts("\n");
 
+    /* ---- 画面 (Raspberry Pi のみ) ---------------------------------------
+     *
+     * **MMU より前。** mailbox のバッファにキャッシュ管理が要らないのと、
+     * 返ってくる番地が GPU の予約領域 (pmm の管理外) なので、
+     * ページを確保せずに済むため。詳しくは kernel/aarch64/fb.c の冒頭 */
+    {
+        const aarch64_fb_info_t* fb;
+        aarch64_fb_init(0, 0);
+        fb = aarch64_fb_info();
+        aarch64_uart_puts("  fb        : ");
+        if (fb->base != 0) {
+            put_hex64(fb->base);
+            aarch64_uart_puts(" ");
+            put_dec(fb->width);
+            aarch64_uart_puts("x");
+            put_dec(fb->height);
+            aarch64_uart_puts("x");
+            put_dec(fb->depth);
+            aarch64_uart_puts(" pitch ");
+            put_dec(fb->pitch);
+            aarch64_uart_puts("  ok\n");
+            /* **画面に出す前にログへ出す。** 絵が出ないとき、番地を取れて
+             * いないのか描けていないのかを切り分けられるようにする */
+            aarch64_fb_test_pattern();
+            aarch64_uart_puts("  fb pattern: 描いた (HDMI を見ること)\n");
+        } else if (fb->fail == AARCH64_FB_FAIL_NO_MBOX) {
+            aarch64_uart_puts("無し (mailbox が無い機械)\n");
+        } else {
+            aarch64_uart_puts("BAD (fail=");
+            put_dec(fb->fail);
+            aarch64_uart_puts(" 1=mbox無 2=時間切れ 3=VC拒否 4=返事が変)\n");
+        }
+    }
+
     /* **0 のまま進んでいないことを出させる。** 値が正しいことと、
      * 設定されたことは別 (日報2026-08-09 追-7)。共有層はここを使って
      * 物理 → VA を作るので、0 のままだと恒等を外した瞬間に落ちる */
@@ -563,6 +609,29 @@ void aarch64_boot_continue(void) {
             aarch64_uart_puts("aarch64-mmu-ok\n");
         } else {
             aarch64_uart_puts("aarch64-mmu-BAD (MMU on で tick が止まった)\n");
+        }
+    }
+
+    /* ---- 画面が MMU の後も届くか ----------------------------------------
+     *
+     * **ここが本番。**テストパターンは MMU の前 (物理番地) で描いており、
+     * それだけでは「上位 VA から書ける」ことの証拠にならない。
+     * コンソールも DOOM も MMU の後から書くので、ここで確かめておく。
+     *
+     * **触る前にテーブルを見る。**いきなり書いて data abort になると、
+     * 「写像が無い」のか「番地が違う」のかが分からないまま落ちる */
+    {
+        const aarch64_fb_info_t* fb = aarch64_fb_info();
+        if (fb->base != 0) {
+            aarch64_uart_puts("  fb va     : ");
+            put_hex64(AARCH64_FB_VA_BASE);
+            if (aarch64_vm_translate(AARCH64_FB_VA_BASE) == fb->base) {
+                aarch64_uart_puts("  ok (物理と一致)\n");
+                aarch64_fb_mark_top(0x00ff00U);
+                aarch64_uart_puts("  fb post   : 上位 VA から描いた (画面の上端が緑)\n");
+            } else {
+                aarch64_uart_puts("  BAD (張れていない)\n");
+            }
         }
     }
 

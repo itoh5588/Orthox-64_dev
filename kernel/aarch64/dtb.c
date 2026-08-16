@@ -182,6 +182,9 @@ typedef struct dtb_node_state {
      * emmc2bus は soc とは**別のバスノード**で子のセル数も違う
      * (emmc2bus は子 2 / soc は子 1) ので、ranges 変換をここでも通す */
     int is_emmc2;
+    /* VideoCore の mailbox。**画面を取るのに要る唯一の口。**
+     * /soc/mailbox@7e00b880 で、soc の ranges を通して 0xfe00b880 になる */
+    int is_mbox;
     int is_memory;
     int is_timer;
     int is_cpu;
@@ -204,6 +207,7 @@ typedef struct dtb_node_state {
 static void node_state_clear(dtb_node_state_t* n) {
     n->is_uart = n->is_gic = n->is_virtio = 0;
     n->is_emmc2 = 0;
+    n->is_mbox = 0;
     n->is_memory = n->is_timer = n->is_cpu = 0;
     n->is_disabled = 0;
     n->reg_data = 0;
@@ -432,6 +436,17 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                 }
             }
 
+            /* mailbox (VideoCore との窓口)。**EMMC2 と同じく ranges 変換が要る**
+             * (0x7e00b880 -> 0xfe00b880)。割り込みは使わない — property の
+             * やり取りは STATUS を見るポーリングで足りる */
+            if (n->is_mbox && !n->is_disabled && n->reg_data &&
+                reg_entry_phys(nodes, depth, n->reg_data, n->reg_len, ac, sc, 0, &base, &size) &&
+                base != 0 && info->mbox_base == 0) {
+                (void)size;
+                info->mbox_base = base;
+                info->flags |= AARCH64_BOOT_FLAG_MBOX_FROM_DTB;
+            }
+
             /* timer の interrupts は <type num flags> の 3 セル x 4 本
              * (secure / non-secure physical / virtual / hyp)。
              * 2 本目 (index 1) が非セキュア物理タイマ。
@@ -489,6 +504,8 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                  * Pi 4 では mmc@7e300000 が disabled で、生きている
                  * mmcnr@7e300000 は WiFi の SDIO。SD カードは EMMC2 */
                 if (compatible_has(c, len, "brcm,bcm2711-emmc2")) n->is_emmc2 = 1;
+                /* **Pi 4 でも名乗りは bcm2835-mbox のまま。**世代で変わらない */
+                if (compatible_has(c, len, "brcm,bcm2835-mbox")) n->is_mbox = 1;
             } else if (str_eq(prop_name, "device_type")) {
                 if (len >= 7U && str_eq((const char*)data, "memory")) nodes[depth].is_memory = 1;
             } else if (str_eq(prop_name, "reg")) {

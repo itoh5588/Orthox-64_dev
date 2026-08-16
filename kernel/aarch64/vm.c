@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "aarch64/boot.h"
+#include "aarch64/fb.h"
 #include "aarch64/vm.h"
 #include "aarch64/usermode.h"
 /* **ユーザーページは参照カウント付きの pmm_alloc / pmm_free で扱う。**
@@ -67,9 +68,11 @@ extern char aarch64_user_entry[];
  * 読み込みが古い値を返す、といった形で壊れる。QEMU では見逃せても実機で出る。 */
 #define MAIR_ATTR_DEVICE_nGnRnE 0x00ULL
 #define MAIR_ATTR_NORMAL_WB     0xffULL
+#define MAIR_ATTR_NORMAL_NC     0x44ULL   /* outer NC / inner NC。画面用 */
 /* MAIR_IDX_DEVICE / MAIR_IDX_NORMAL は include/aarch64/vm.h */
 #define MAIR_EL1_VALUE  ((MAIR_ATTR_DEVICE_nGnRnE << (8 * MAIR_IDX_DEVICE)) | \
-                         (MAIR_ATTR_NORMAL_WB     << (8 * MAIR_IDX_NORMAL)))
+                         (MAIR_ATTR_NORMAL_WB     << (8 * MAIR_IDX_NORMAL))  | \
+                         (MAIR_ATTR_NORMAL_NC     << (8 * MAIR_IDX_NORMAL_NC)))
 
 /* ---- TCR_EL1 -------------------------------------------------------------
  *
@@ -125,6 +128,9 @@ extern char aarch64_user_entry[];
 #define VM_KERNEL_RO    (VM_ATTR_NORMAL | AARCH64_PTE_AP_RO_EL1 | AARCH64_PTE_UXN | AARCH64_PTE_PXN)
 #define VM_KERNEL_RW    (VM_ATTR_NORMAL | AARCH64_PTE_AP_RW_EL1 | AARCH64_PTE_UXN | AARCH64_PTE_PXN)
 #define VM_DEVICE_RW    (VM_ATTR_DEVICE | AARCH64_PTE_AP_RW_EL1 | AARCH64_PTE_UXN | AARCH64_PTE_PXN)
+/* フレームバッファ。**Normal NC** — 速さと可視性の折り合い (vm.h の MAIR_IDX_NORMAL_NC) */
+#define VM_ATTR_NORMAL_NC (AARCH64_PTE_ATTRINDX(MAIR_IDX_NORMAL_NC) | AARCH64_PTE_AF)
+#define VM_FB_RW        (VM_ATTR_NORMAL_NC | AARCH64_PTE_AP_RW_EL1 | AARCH64_PTE_UXN | AARCH64_PTE_PXN)
 
 /* ---- EL0 から使えるページ (M3a) -----------------------------------------
  *
@@ -427,6 +433,29 @@ static void aarch64_vm_build_kernel(void) {
         if (virtio_size < AARCH64_PAGE_SIZE) virtio_size = AARCH64_PAGE_SIZE;
         aarch64_vm_map_range(aarch64_phys_to_virt(b->first_virtio_mmio_base),
                              b->first_virtio_mmio_base, virtio_size, VM_DEVICE_RW);
+    }
+
+    /* ---- フレームバッファ ------------------------------------------------
+     *
+     * **専用の VA に張る。HHDM には重ねない** (理由は vm.h の
+     * AARCH64_FB_VA_BASE の注記)。要点は 2 つ:
+     *
+     *   - **RAM の外に返ってくることがある。** QEMU の raspi4b は RAM 末尾
+     *     0x3c000000 の上、0x3c100000 に返す。HHDM は RAM しか張らないので
+     *     そのままでは届かない (実測で判明)
+     *   - RAM の中に返ってきた場合、HHDM が同じ物理を Normal WB で張って
+     *     いる。**同じ物理を別の属性で 2 通り張ってはいけない**ので、
+     *     どちらにせよ別の VA が要る
+     *
+     * 属性は Normal NC。Device では遅すぎ、Normal WB では書いた絵が
+     * キャッシュに留まって VideoCore から見えない */
+    {
+        const aarch64_fb_info_t* fb = aarch64_fb_info();
+        if (fb->base != 0 && fb->size != 0) {
+            uint64_t sz = ((uint64_t)fb->size + AARCH64_PAGE_SIZE - 1) &
+                          ~(AARCH64_PAGE_SIZE - 1);
+            aarch64_vm_map_range(AARCH64_FB_VA_BASE, fb->base, sz, VM_FB_RW);
+        }
     }
 }
 
