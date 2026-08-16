@@ -47,6 +47,23 @@ static uint8_t g_usb_msc_if_subclass = 0;
 static uint8_t g_usb_msc_if_proto = 0;
 static uint8_t g_usb_cfg_value = 0;
 static uint8_t g_usb_msc_if_number = 0;
+/* ---- HID (キーボード) -----------------------------------------------------
+ *
+ * **既存の経路は大容量記憶装置しか探していなかった。**キーボードは
+ * インターフェースのクラスが 0x03 (HID) で、**割り込み IN エンドポイント**を
+ * 1 本持つ。bulk と並べて拾えるようにする。
+ *
+ * boot protocol を使うので、レポートの中身は 8 バイト固定:
+ *   [0] 修飾キー  [1] 予約  [2..7] 同時に押されているキーのコード
+ * **HID レポートデスクリプタを解釈しなくてよい**のが boot protocol の利点 */
+static int      g_usb_hid_if_ready = 0;
+static uint8_t  g_usb_hid_if_number = 0;
+static uint8_t  g_usb_hid_if_proto = 0;   /* 1 = キーボード、2 = マウス */
+static uint8_t  g_usb_int_in_ep = 0;
+static uint16_t g_usb_int_in_mps = 0;
+static uint8_t  g_usb_int_in_interval = 0;
+static uint8_t  g_usb_int_in_dci = 0;
+
 static uint8_t g_usb_bulk_out_ep = 0;
 static uint8_t g_usb_bulk_in_ep = 0;
 static uint16_t g_usb_ep0_mps = 64;
@@ -693,6 +710,11 @@ static int xhci_ep0_get_config_descriptor(uint8_t slot_id) {
     g_usb_bulk_in_mps = 0;
     uint8_t current_if_num = 0xFF;
     int current_if_is_msc = 0;
+    int current_if_is_hid = 0;
+    g_usb_hid_if_ready = 0;
+    g_usb_int_in_ep = 0;
+    g_usb_int_in_mps = 0;
+    g_usb_int_in_interval = 0;
 
     uint16_t off = 0;
     while (off + 2 <= total_len) {
@@ -706,6 +728,16 @@ static int xhci_ep0_get_config_descriptor(uint8_t slot_id) {
             uint8_t s = cfg[off + 6];
             uint8_t p = cfg[off + 7];
             current_if_is_msc = 0;
+            current_if_is_hid = 0;
+            /* **HID。** サブクラスが 1 なら boot protocol に対応している。
+             * プロトコル 1 = キーボード。**サブクラスが 0 のものは
+             * レポートデスクリプタを読まないと使えない**ので採らない */
+            if (c == 0x03 && s == 0x01 && p == 0x01 && !g_usb_hid_if_ready) {
+                g_usb_hid_if_ready = 1;
+                g_usb_hid_if_number = current_if_num;
+                g_usb_hid_if_proto = p;
+                current_if_is_hid = 1;
+            }
             if (c == 0x08 && s == 0x06 && p == 0x50) {
                 g_usb_msc_if_ready = 1;
                 g_usb_msc_if_class = c;
@@ -713,6 +745,16 @@ static int xhci_ep0_get_config_descriptor(uint8_t slot_id) {
                 g_usb_msc_if_proto = p;
                 g_usb_msc_if_number = current_if_num;
                 current_if_is_msc = 1;
+            }
+        } else if (typ == 5 && len >= 7 && current_if_is_hid) {
+            uint8_t ep_addr = cfg[off + 2];
+            uint8_t attr = cfg[off + 3] & 0x03U;
+            /* **割り込み (3) の IN (bit7) だけ。** キーボードは OUT を
+             * 持つこともある (LED 用) が、いまは使わない */
+            if (attr == 3 && (ep_addr & 0x80U) && g_usb_int_in_ep == 0) {
+                g_usb_int_in_ep = ep_addr;
+                g_usb_int_in_mps = (uint16_t)cfg[off + 4] | ((uint16_t)cfg[off + 5] << 8);
+                g_usb_int_in_interval = cfg[off + 6];
             }
         } else if (typ == 5 && len >= 7 && current_if_is_msc) {
             uint8_t ep_addr = cfg[off + 2];
@@ -730,11 +772,19 @@ static int xhci_ep0_get_config_descriptor(uint8_t slot_id) {
         }
         off += len;
     }
-    if (!g_usb_msc_if_ready) return -8;
-    if (g_usb_bulk_out_ep == 0 || g_usb_bulk_in_ep == 0) return -9;
-
-    g_usb_bulk_out_dci = xhci_dci_from_epaddr(g_usb_bulk_out_ep);
-    g_usb_bulk_in_dci = xhci_dci_from_epaddr(g_usb_bulk_in_ep);
+    /* **どちらか見つかれば成功。** 以前は大容量記憶装置が無いだけで -8 を
+     * 返していたので、キーボードを挿すと「Config デスクリプタが読めない」
+     * ように見えていた。**読めている。探し物が無かっただけ** */
+    if (!g_usb_msc_if_ready && !g_usb_hid_if_ready) return -8;
+    if (g_usb_hid_if_ready) {
+        if (g_usb_int_in_ep == 0) return -10;
+        g_usb_int_in_dci = xhci_dci_from_epaddr(g_usb_int_in_ep);
+    }
+    if (g_usb_msc_if_ready) {
+        if (g_usb_bulk_out_ep == 0 || g_usb_bulk_in_ep == 0) return -9;
+        g_usb_bulk_out_dci = xhci_dci_from_epaddr(g_usb_bulk_out_ep);
+        g_usb_bulk_in_dci = xhci_dci_from_epaddr(g_usb_bulk_in_ep);
+    }
     return 0;
 }
 
@@ -1376,6 +1426,19 @@ void usb_init(void) {
                     }
 
                     int gc = xhci_ep0_get_config_descriptor(g_xhci_slot_id);
+                    if (gc == 0 && g_usb_hid_if_ready) {
+                        puts("[usb] HID keyboard if=0x");
+                        puthex(g_usb_hid_if_number);
+                        puts(" ep=0x");
+                        puthex(g_usb_int_in_ep);
+                        puts(" mps=0x");
+                        puthex(g_usb_int_in_mps);
+                        puts(" interval=0x");
+                        puthex(g_usb_int_in_interval);
+                        puts(" dci=0x");
+                        puthex(g_usb_int_in_dci);
+                        puts("\r\n");
+                    }
                     if (gc == 0) {
                         puts("[usb] GET_DESCRIPTOR(Config) MSC if class=0x");
                         puthex(g_usb_msc_if_class);
