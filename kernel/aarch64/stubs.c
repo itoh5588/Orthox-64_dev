@@ -71,14 +71,9 @@ int64_t sys_getrandom(void* buf, size_t len, unsigned flags) {
 
 /* ---- USB -----------------------------------------------------------------
  *
- * aarch64 に USB スタックは無い。**「準備できていない」と答えるのが正しい。**
- * ready が 0 を返すので read が呼ばれることは無いが、念のため失敗を返す */
-int usb_block_device_ready(void) { return 0; }
-
-int usb_read_block(uint32_t lba, void* buf, uint32_t count) {
-    (void)lba; (void)buf; (void)count;
-    return -1;
-}
+ * **kernel/usb.c を共有層として取り込んだので、ここのスタブは外した**
+ * (USB キーボードのため。日報2026-08-16)。本物が
+ * usb_block_device_ready / usb_read_block を出す */
 
 /* ---- virtio コンソール出力 ----------------------------------------------
  *

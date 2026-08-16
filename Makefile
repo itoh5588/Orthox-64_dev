@@ -298,7 +298,8 @@ AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer
 	kernel/aarch64/vm.c kernel/aarch64/usermode.c kernel/aarch64/pmm.c \
 	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/emmc2.c kernel/aarch64/runtime.c \
 	kernel/aarch64/stubs.c kernel/aarch64/syscall.c kernel/aarch64/console.c \
-	kernel/aarch64/mailbox.c kernel/aarch64/fb.c kernel/aarch64/fbcon.c kernel/aarch64/font8x8.c
+	kernel/aarch64/mailbox.c kernel/aarch64/fb.c kernel/aarch64/fbcon.c kernel/aarch64/font8x8.c \
+	kernel/aarch64/pci.c
 # 共有層のうち、**いま繋がるものだけ**を取り込む (M3c-2a)。
 # どれが入るかは推測せず、llvm-nm -u で未解決シンボルを実測して決めた。
 #
@@ -310,7 +311,10 @@ AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer
 #                            kernel_panic は runtime.c に置いた。
 #                            -fsyntax-only では通り -c で落ちるので、
 #                            構文チェックだけで「入る」と判断しないこと
-AARCH64_SHARED_C_SRCS = kernel/cstring.c kernel/cstdio.c kernel/vfs.c kernel/storage.c \
+# **usb.c は共有層に入る。** xHCI の中身 (リング / スロット / TRB) は
+# アーキに依らない。唯一の依存だった 1ms 待ちは USB_NOW_MS() に切り出した
+AARCH64_SHARED_C_SRCS = kernel/usb.c \
+	kernel/cstring.c kernel/cstdio.c kernel/vfs.c kernel/storage.c \
 	kernel/task.c kernel/sched.c kernel/wait.c \
 	kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c \
 	kernel/fs.c kernel/elf.c kernel/task_exec.c kernel/task_fork.c \

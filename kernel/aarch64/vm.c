@@ -438,6 +438,27 @@ static void aarch64_vm_build_kernel(void) {
                              b->first_virtio_mmio_base, virtio_size, VM_DEVICE_RW);
     }
 
+    /* ---- PCIe (ECAM と BAR の窓) ------------------------------------------
+     *
+     * **番地 0 は「この機械には無い」の印** (virtio / emmc2 と同じ)。
+     * QEMU virt にはあるが raspi4b には無い。
+     *
+     * **ECAM 全体は張らない。** 256MB あるが、いま見るのはバス 0 だけ
+     * (256 デバイス x 8 関数 x 4KB = 1MB)。
+     * **MMIO 窓も全部は張らない** — 750MB あるが BAR を配るのは先頭だけ */
+    if (b->pcie_ecam_base) {
+        uint64_t ecam_sz = b->pcie_ecam_size;
+        if (ecam_sz > AARCH64_PCIE_ECAM_MAP_SIZE) ecam_sz = AARCH64_PCIE_ECAM_MAP_SIZE;
+        aarch64_vm_map_range(aarch64_phys_to_virt(b->pcie_ecam_base),
+                             b->pcie_ecam_base, ecam_sz, VM_DEVICE_RW);
+    }
+    if (b->pcie_mmio_base) {
+        uint64_t win = b->pcie_mmio_size;
+        if (win > AARCH64_PCIE_MMIO_MAP_SIZE) win = AARCH64_PCIE_MMIO_MAP_SIZE;
+        aarch64_vm_map_range(aarch64_phys_to_virt(b->pcie_mmio_base),
+                             b->pcie_mmio_base, win, VM_DEVICE_RW);
+    }
+
     /* ---- フレームバッファ ------------------------------------------------
      *
      * **専用の VA に張る。HHDM には重ねない** (理由は vm.h の

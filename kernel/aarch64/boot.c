@@ -181,6 +181,11 @@ void aarch64_virtio_blk_irq(void);
 uint32_t aarch64_uart_intid(void);
 void aarch64_console_rx_irq(void);
 void aarch64_console_input_init(void);
+void pci_init(void);
+void aarch64_pci_dump(void);
+int aarch64_pci_ready(void);
+void usb_init(void);
+int usb_is_ready(void);
 
 /* MMU の探針 (vm.c)。「未マップの VA を読んだら fault が上がるはず」の
  * やりとりに使う。上がった fault はここで拾って呼び出し元に返す */
@@ -489,6 +494,10 @@ void aarch64_early_main(uint64_t dtb_phys) {
         }
     }
 
+    /* **PCI の走査は MMU の後にしたい**が、BAR を配るのは早いほうがよい。
+     * ECAM は恒等マッピングにも HHDM にも無いので、**MMU を入れてから**
+     * (aarch64_vm_init の後で) 呼ぶ。ここではまだ呼ばない */
+
     /* ---- 画面 (Raspberry Pi のみ) ---------------------------------------
      *
      * **MMU より前。** mailbox のバッファにキャッシュ管理が要らないのと、
@@ -651,6 +660,22 @@ void aarch64_boot_continue(void) {
         } else {
             aarch64_uart_puts("aarch64-mmu-BAD (MMU on で tick が止まった)\n");
         }
+    }
+
+    /* ---- PCI (MMU の後) ---------------------------------------------------
+     *
+     * **ECAM は恒等マッピングに無い。** MMU を入れて TTBR1 が効いてから
+     * でないと設定空間を読めない */
+    pci_init();
+    aarch64_pci_dump();
+
+    /* xHCI。**共有層の kernel/usb.c をそのまま使う** — リングもスロットも
+     * TRB もアーキに依らない。**QEMU virt でしか動かない**  (raspi4b は
+     * PCIe を持っていない)。ここが通れば USB キーボードへの道が開く */
+    if (aarch64_pci_ready()) {
+        usb_init();
+        aarch64_uart_puts("  usb       : ");
+        aarch64_uart_puts(usb_is_ready() ? "ok\n" : "見つからない / 初期化できない\n");
     }
 
     /* ---- 画面が MMU の後も届くか ----------------------------------------

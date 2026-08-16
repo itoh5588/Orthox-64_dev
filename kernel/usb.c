@@ -3,7 +3,21 @@
 #include "pci.h"
 #include "vmm.h"
 #include "pmm.h"
+
+/* **1ms 待ちの時刻源。ここが唯一のアーキ依存だった。**
+ * x86 は LAPIC のタイマ、aarch64 は generic timer から取る。
+ * 中身 (xHCI のリングやスロット操作) は両方で同じものが動く */
+#if defined(__x86_64__)
 #include "lapic.h"
+#define USB_NOW_MS() lapic_get_ticks_ms()
+#define USB_CPU_RELAX() __asm__ volatile("pause")
+#else
+uint64_t arch_time_now_ms(void);
+#define USB_NOW_MS() arch_time_now_ms()
+/* aarch64 に pause は無い。**同じ役目は yield** — 待ちループで
+ * 他のハードウェアスレッドに譲るヒント */
+#define USB_CPU_RELAX() __asm__ volatile("yield")
+#endif
 
 void puts(const char* s);
 void puthex(uint64_t v);
@@ -952,9 +966,9 @@ static int usb_msc_bot_command(const uint8_t* cdb, uint8_t cdb_len, void* data, 
         }
 
         // Delay to prevent polling starvation / overwhelming the controller
-        uint64_t start_tick = lapic_get_ticks_ms();
-        while (lapic_get_ticks_ms() - start_tick < 1) {
-            __asm__ volatile("pause");
+        uint64_t start_tick = USB_NOW_MS();
+        while (USB_NOW_MS() - start_tick < 1) {
+            USB_CPU_RELAX();
         }
 
         return 0;

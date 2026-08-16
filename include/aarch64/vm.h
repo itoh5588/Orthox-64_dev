@@ -86,6 +86,14 @@ static inline uint64_t aarch64_virt_to_phys(uint64_t va) {
  * MMU の探針が未マップの VA を探す範囲 (RAM 末尾から 64GB) とも被らない */
 #define AARCH64_FB_VA_BASE 0xffffffc000000000ULL
 
+/* PCIe を張る範囲。**全部は張らない。**
+ *   ECAM  256MB あるが、いま見るのはバス 0 だけ = 1MB
+ *   MMIO  750MB あるが、BAR を配るのは先頭だけ
+ * 足りなくなったら増やす。**張っていない所を触ると translation fault で
+ * 落ちる**ので、黙って壊れることはない */
+#define AARCH64_PCIE_ECAM_MAP_SIZE 0x00100000ULL   /* 1MB = バス 0 */
+#define AARCH64_PCIE_MMIO_MAP_SIZE 0x01000000ULL   /* 16MB */
+
 /* EL0 から使えるページの属性。共有層の arch_vm_user_page_flags がこれを返す。
  *
  * **PXN は常に立てる。** EL1 がユーザーのコードを実行できてしまうと、
