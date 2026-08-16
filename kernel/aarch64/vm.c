@@ -850,18 +850,55 @@ uint64_t aarch64_read_sctlr(void) {
  * 確かめる。上がれば「翻訳が実際に行われている」ことになる。
  * 例外ハンドラ側 (boot.c の aarch64_sync_exception) がこのフラグを見て、
  * 命令 1 つぶん進めて戻してくれる。 */
-#define AARCH64_VM_PROBE_VA 0x20000000ULL   /* RAM の手前・デバイスの奥。未マップ */
-
 volatile int g_aarch64_vm_expect_fault;
 volatile uint64_t g_aarch64_vm_fault_esr;
 
+/* 探針に使う VA を実行時に選ぶ。
+ *
+ * **固定値 (0x20000000 = 「RAM の手前・デバイスの奥」) にしていたが、
+ * RAM が物理 0 から始まる機械では破綻した。** Pi 4 がまさにそれ。
+ * 2 つの理由が重なっている:
+ *
+ *   - HHDM が RAM 全体を張るので、その番地は**実際に張られている**
+ *   - **低位 VA を aarch64_vm_translate に渡してはいけない。** あれは
+ *     TTBR1 のテーブルを歩き、索引は VA の上位ビットを落とす。
+ *     0x20000000 は **HHDM の先頭 1GB** を索いてしまう
+ *
+ * 実機で `SKIP (探針アドレスが張られている)` になり、検査の網が 1 つ
+ * 落ちていた (日報2026-08-16 §7)。QEMU virt は RAM が 0x40000000 から
+ * なので、たまたま当たっていただけ。
+ *
+ * **HHDM の外側 (RAM の終わりより後ろ) の上位 VA から探す。** そこは
+ * 上位 VA なので translate の索引も一致し、判定と実アクセスが同じ所を見る。
+ * 見つからなければ 0 を返す */
+static uint64_t aarch64_vm_pick_probe_va(void) {
+    const aarch64_boot_info_t* b = aarch64_boot_info();
+    uint64_t past_ram = b ? (b->memory_base + b->memory_size) : 0;
+
+    /* RAM の終わりから 1GB 空ける。端の切り上げで踏まないため */
+    past_ram = aarch64_align_up(past_ram + (1ULL << 30), 1ULL << 30);
+
+    for (int i = 0; i < 64; i++) {
+        uint64_t va = AARCH64_KERNEL_VA_OFFSET + past_ram + (uint64_t)i * (1ULL << 30);
+        if (aarch64_vm_translate(va) == 0) return va;
+    }
+    return 0;
+}
+
 void aarch64_vm_fault_probe(void) {
-    volatile uint32_t* p = (volatile uint32_t*)(uintptr_t)AARCH64_VM_PROBE_VA;
+    uint64_t probe_va = aarch64_vm_pick_probe_va();
+    volatile uint32_t* p;
     uint64_t esr, ec, dfsc;
+
+    if (probe_va == 0) {
+        aarch64_uart_puts("  mmu probe : SKIP (未マップの VA が見つからない)\n");
+        return;
+    }
+    p = (volatile uint32_t*)(uintptr_t)probe_va;
 
     /* 先に「張られていない」ことをテーブル側で確かめる。ここが 0 でなければ
      * 探針の前提が崩れているので、fault が上がらなくても当然になる */
-    if (aarch64_vm_translate(AARCH64_VM_PROBE_VA) != 0) {
+    if (aarch64_vm_translate(probe_va) != 0) {
         aarch64_uart_puts("  mmu probe : SKIP (探針アドレスが張られている)\n");
         return;
     }

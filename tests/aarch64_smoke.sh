@@ -233,7 +233,13 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     grep -aq "vbar/uart : 0xffffff80.* / 0xffffff8009000000" "$2"
     # **恒等を外した後の行。** ここが出れば TTBR1 だけで走っている
     grep -aq "恒等を外した。カーネルは TTBR1 だけで走っている" "$2"
-    grep -aq "mmu probe : ESR=0x0000000096000006 (translation fault, level 2) ok" "$2"
+    # **段 (level) と ESR の値は固定しない。** 探針の VA は実行時に
+    # 「HHDM の外側で未マップの所」を探して決めるので、どの段で翻訳が
+    # 途切れるかは RAM の広さで変わる (実測: QEMU virt で level 1)。
+    # **見たいのは「translation fault が上がって ok と判定されたこと」**で、
+    # 段はその副産物。べた書きすると番地を変えるたびに落ちる
+    grep -aqE "mmu probe : ESR=0x[0-9a-f]{16} \(translation fault, level [0-3]\) ok" "$2"
+    must_not "mmu probe : SKIP" "$2" "探針が素通りしている (未マップの VA を選べていない)"
     grep -aq "aarch64-mmu-ok" "$2"
     must_not "aarch64-mmu-BAD" "$2"
 
