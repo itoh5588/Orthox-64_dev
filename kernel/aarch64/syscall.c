@@ -82,7 +82,6 @@ void arch_halt_forever(void) {
  * (共有スケジューラの task_poll_sleep_wakeups が拾う)。
  * riscv64 も 07-31 にスピン待ちを廃止している (`c3ec630`) */
 uint64_t arch_time_now_ms(void);
-int aarch64_kbd_get_event(struct key_event* ev);
 void kernel_yield(void);
 
 int64_t sys_sleep_ms(uint64_t ms) {
@@ -133,6 +132,11 @@ int sys_tcsetpgrp(int fd, int pgrp) {
  */
 #include "aarch64/fb.h"
 #include "syscall.h"
+
+/* **struct key_event の定義 (syscall.h) より後ろに置くこと。**
+ * 前に置くとファイル内だけの不完全型になり、型が食い違ったまま通る
+ * (警告は出るがエラーにならない) */
+int aarch64_kbd_get_event(struct key_event* ev);
 #include "vmm.h"
 
 uint64_t aarch64_vm_map_fb_user(arch_address_space_t as, uint64_t uva);

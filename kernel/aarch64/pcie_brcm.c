@@ -43,6 +43,7 @@ static void puthex_n(uint64_t v, int digits) {
 
 static uint64_t g_base;
 
+__attribute__((unused))
 static uint32_t rd32(uint32_t off) {
     uint64_t pa = g_base + off;
     if (aarch64_vm_mmu_enabled()) return *(volatile uint32_t*)(uintptr_t)aarch64_phys_to_virt(pa);
@@ -60,6 +61,30 @@ int aarch64_pcie_brcm_probe(void) {
     const aarch64_boot_info_t* b = aarch64_boot_info();
     if (!b || b->pcie_brcm_base == 0) return -1;
     g_base = b->pcie_brcm_base;
+
+#ifndef AARCH64_PCIE_BRCM_PROBE
+    /* **既定では触らない。実機が起動しなくなる。**
+     *
+     * 2026-08-16 の実測 (Raspberry Pi 4 本体):
+     *
+     *   pcie probe: レジスタを読む (ここで止まったら窓が死んでいる)
+     *   pcie raw  : 0x00000000 0x00000000 0x00000000     <- ここで停止
+     *
+     * **最初の 3 語は例外なく読めて全部 0、4 語目 (+0x0C) で固まった。**
+     * ブロックにクロックか電源が来ていない。
+     *
+     * **「ファームウェアが既にリンクを上げているかもしれない」という
+     * 見立ては外れた。**start4.elf は PCIe を立ち上げていない (少なくとも
+     * ARM から見える形では)。第 2 段は本当にゼロから初期化が要る。
+     *
+     * 調べ直すときは
+     *   make ... AARCH64_PCIE_BRCM_PROBE=1
+     * で有効にする。**巻き戻せる状態で試すこと** */
+    aarch64_uart_puts("  pcie brcm : ");
+    puthex_n(b->pcie_brcm_base, 8);
+    aarch64_uart_puts("  (dtb。触らない — 4 語目で固まる実測あり)\n");
+    return -4;
+#else
 
     aarch64_uart_puts("  pcie brcm : ");
     puthex_n(b->pcie_brcm_base, 8);
@@ -116,4 +141,143 @@ int aarch64_pcie_brcm_probe(void) {
                                          : "  ? (応答はあるが Broadcom ではない)\n");
     }
     return 0;
+#endif
+}
+
+/* ==========================================================================
+ * ルートコンプレックスの立ち上げ (第 2 段)
+ *
+ * **QEMU では一切検証できない。** raspi4b は PCIe を持っていないので、
+ * ここは実機でしか通らない。既定で無効:
+ *
+ *     make ... AARCH64_PCIE_BRCM_INIT=1
+ *
+ * ---- 読まずに書く --------------------------------------------------------
+ *
+ * **ブロックが眠っている間の読み出しが危険。** 実測で、リセット状態の
+ * まま読むと 3 語目までは 0 が返り 4 語目で固まった。読み書きを混ぜた
+ * 「read-modify-write」は使わない。
+ *
+ * 代わりに**実測した「上がった状態の値」をそのまま書く。**
+ * Raspberry Pi OS が立ち上げた後の値を採ってあるので、目標が分かっている
+ * (Docs/pi4-pcie-notes.md §5c)。読むのは**リンク判定の 1 か所だけ**。
+ *
+ * ---- ビットの出所 --------------------------------------------------------
+ *
+ * Linux の pcie-brcmstb.c から**値だけ**を確認した (コードは持ち込んで
+ * いない)。実測値と辻褄が合うことも確かめてある:
+ *
+ *   PCIE_STATUS の PORT|DL_ACTIVE|PHYLINKUP = 0x80|0x20|0x10 = 0xB0
+ *   実測した「上がった状態」の +0x4068 = 0x000000B0   <- 一致
+ * ========================================================================== */
+
+#define RGR1_SW_INIT_1        0x9210
+#define RGR1_PERST_MASK       0x00000001U
+#define RGR1_INIT_GENERIC     0x00000002U
+
+#define MISC_MISC_CTRL        0x4008
+#define MISC_MEM_WIN0_LO      0x400c
+#define MISC_PCIE_STATUS      0x4068
+#define MISC_MEM_WIN0_LIMIT   0x4070
+#define MISC_HARD_DEBUG       0x4204
+
+/* PCIE_STATUS。**3 つ揃って初めてリンクが上がったと言える** */
+#define STATUS_PORT           0x00000080U
+#define STATUS_DL_ACTIVE      0x00000020U
+#define STATUS_PHYLINKUP      0x00000010U
+#define STATUS_LINK_UP        (STATUS_PORT | STATUS_DL_ACTIVE | STATUS_PHYLINKUP)
+
+/* **実測値をそのまま書く。**個々のビットを組み立てるより、
+ * 「動いている状態」を再現するほうが確実で、突き合わせもできる */
+#define MISC_CTRL_UP_VALUE    0x88003480U   /* SCB_ACCESS_EN | CFG_READ_UR_MODE 等 */
+#define HARD_DEBUG_UP_VALUE   0x00200000U   /* SerDes IDDQ (0x08000000) が落ちている */
+#define MEM_WIN0_LO_VALUE     0xC0000000U   /* 外向き窓 = PCI 0xc0000000 */
+#define MEM_WIN0_LIMIT_VALUE  0x3FF00000U
+
+/* **既定ビルドでは使われない。**探針も立ち上げも opt-in なので */
+__attribute__((unused))
+static void wr32(uint32_t off, uint32_t v) {
+    uint64_t pa = g_base + off;
+    volatile uint32_t* p = aarch64_vm_mmu_enabled()
+        ? (volatile uint32_t*)(uintptr_t)aarch64_phys_to_virt(pa)
+        : (volatile uint32_t*)(uintptr_t)pa;
+    *p = v;
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+/* **時間待ちはタイマで測る。**空回しの回数で待つと、CPU の速さで
+ * 変わってしまう */
+uint64_t aarch64_timer_ticks(void);
+uint64_t aarch64_timer_freq(void);
+
+__attribute__((unused))
+static void pcie_delay_us(uint32_t us) {
+    uint64_t f = aarch64_timer_freq();
+    uint64_t want = (f / 1000000ULL) * us;
+    uint64_t t0 = aarch64_timer_ticks();
+    if (f == 0) { for (volatile uint32_t i = 0; i < us * 100U; i++) { } return; }
+    while (aarch64_timer_ticks() - t0 < want) { __asm__ volatile("yield"); }
+}
+
+int aarch64_pcie_brcm_init(void) {
+    const aarch64_boot_info_t* b = aarch64_boot_info();
+    if (!b || b->pcie_brcm_base == 0) return -1;
+    g_base = b->pcie_brcm_base;
+
+#ifndef AARCH64_PCIE_BRCM_INIT
+    (void)0;
+    return -9;   /* 既定では何もしない */
+#else
+    /* **段ごとに印を出す。**実機で固まったとき、どこまで進んだかが
+     * 1 行で分かる。QEMU で試せない以上、これが唯一の手がかりになる */
+    aarch64_uart_puts("  pcie init : 1 リセットを立てる\n");
+    wr32(RGR1_SW_INIT_1, RGR1_PERST_MASK | RGR1_INIT_GENERIC);
+    pcie_delay_us(200);
+
+    aarch64_uart_puts("  pcie init : 2 ブリッジのリセットを落とす (PERST は立てたまま)\n");
+    wr32(RGR1_SW_INIT_1, RGR1_PERST_MASK);
+    pcie_delay_us(200);
+
+    aarch64_uart_puts("  pcie init : 3 SerDes の IDDQ を落とす\n");
+    wr32(MISC_HARD_DEBUG, HARD_DEBUG_UP_VALUE);
+    pcie_delay_us(200);
+
+    aarch64_uart_puts("  pcie init : 4 MISC_CTRL と外向き窓\n");
+    wr32(MISC_MISC_CTRL, MISC_CTRL_UP_VALUE);
+    wr32(MISC_MEM_WIN0_LO, MEM_WIN0_LO_VALUE);
+    wr32(MISC_MEM_WIN0_LIMIT, MEM_WIN0_LIMIT_VALUE);
+
+    aarch64_uart_puts("  pcie init : 5 PERST を落とす\n");
+    wr32(RGR1_SW_INIT_1, 0);
+    pcie_delay_us(100000);   /* 100ms。リンク訓練に時間がかかる */
+
+    /* **ここで初めて読む。**待ちには必ず上限を付ける */
+    aarch64_uart_puts("  pcie init : 6 リンクを待つ\n");
+    {
+        uint32_t st = 0;
+        for (int i = 0; i < 100; i++) {
+            st = rd32(MISC_PCIE_STATUS);
+            if ((st & STATUS_LINK_UP) == STATUS_LINK_UP) break;
+            pcie_delay_us(10000);
+        }
+        aarch64_uart_puts("  pcie link : status ");
+        puthex_n(st, 8);
+        if ((st & STATUS_LINK_UP) == STATUS_LINK_UP) {
+            aarch64_uart_puts("  ok (リンクが上がった)\n");
+        } else {
+            aarch64_uart_puts("  BAD (上がらない。期待は 0xb0 のビット)\n");
+            return -2;
+        }
+    }
+
+    /* ルートポートが名乗るか。**実測の 0x271114E4 と突き合わせる** */
+    {
+        uint32_t vid_did = rd32(RC_CFG_VENDOR);
+        aarch64_uart_puts("  pcie rc   : ");
+        puthex_n(vid_did, 8);
+        aarch64_uart_puts(vid_did == 0x271114E4U ? "  ok (実測値と一致)\n"
+                                                 : "  ? (実測は 0x271114e4)\n");
+    }
+    return 0;
+#endif
 }

@@ -893,6 +893,7 @@ static int xhci_setup_bulk_endpoints(uint8_t slot_id) {
 
 static int xhci_bulk_transfer_ex(uint8_t slot_id, uint8_t dci, uint64_t ring_phys, uint64_t data_phys,
                                  uint32_t len, int in_dir, int log_errors) {
+    (void)log_errors;   /* いまは常に出す。呼び分けは未使用 */
     if (slot_id == 0 || dci == 0 || ring_phys == 0 || data_phys == 0) return -1;
 
     volatile uint32_t* ring = (volatile uint32_t*)PHYS_TO_VIRT((void*)ring_phys);

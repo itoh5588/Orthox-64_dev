@@ -389,6 +389,21 @@ AARCH64_EARLY_GICC ?= 0x08010000
 # **実機向けには渡さない** (実機の 0xFE300000 は WiFi の SDIO)
 # **USB キーボードの探針。** スモークでだけ立てる。通常の起動では
 # 12 秒もキーを待たれると困る
+# **BCM2711 の PCIe を触る探針。既定では無効。**
+# 実測で 4 語目を読むと固まる (2026-08-16、実機)。有効にするときは
+# 巻き戻せる状態で
+# **BCM2711 の PCIe を立ち上げる。既定では無効。**
+# QEMU で一切検証できないので、実機で 1 段ずつ確かめる用
+AARCH64_PCIE_BRCM_INIT ?=
+ifneq ($(AARCH64_PCIE_BRCM_INIT),)
+AARCH64_CFLAGS += -DAARCH64_PCIE_BRCM_INIT=1
+endif
+
+AARCH64_PCIE_BRCM_PROBE ?=
+ifneq ($(AARCH64_PCIE_BRCM_PROBE),)
+AARCH64_CFLAGS += -DAARCH64_PCIE_BRCM_PROBE=1
+endif
+
 AARCH64_USB_KBD_PROBE ?=
 ifneq ($(AARCH64_USB_KBD_PROBE),)
 AARCH64_CFLAGS += -DAARCH64_USB_KBD_PROBE=1
