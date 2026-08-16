@@ -186,6 +186,9 @@ void aarch64_pci_dump(void);
 int aarch64_pci_ready(void);
 void usb_init(void);
 int usb_is_ready(void);
+int usb_hid_keyboard_init(void);
+int usb_hid_keyboard_poll(uint8_t report[8]);
+uint64_t arch_time_now_ms(void);
 
 /* MMU の探針 (vm.c)。「未マップの VA を読んだら fault が上がるはず」の
  * やりとりに使う。上がった fault はここで拾って呼び出し元に返す */
@@ -676,6 +679,56 @@ void aarch64_boot_continue(void) {
         usb_init();
         aarch64_uart_puts("  usb       : ");
         aarch64_uart_puts(usb_is_ready() ? "ok\n" : "見つからない / 初期化できない\n");
+        if (usb_is_ready()) {
+            int hk = usb_hid_keyboard_init();
+            aarch64_uart_puts("  usb kbd   : ");
+            if (hk == 0) {
+                aarch64_uart_puts("ok (boot protocol)\n");
+                /* **押されていないことを 1 回読んで確かめる。**
+                 * 「初期化できた」と「レポートが取れる」は別 */
+                {
+                    uint8_t rep[8];
+                    int r = usb_hid_keyboard_poll(rep);
+                    aarch64_uart_puts("  usb kbd rd: ");
+                    if (r == 0) {
+                        aarch64_uart_puts("レポートが取れた mod=");
+                        put_dec(rep[0]);
+                        aarch64_uart_puts(" key=");
+                        put_dec(rep[2]);
+                        aarch64_uart_puts("\n");
+                    } else if (r == 1) {
+                        aarch64_uart_puts("まだ何も来ていない (押されていない)\n");
+                    } else {
+                        aarch64_uart_puts("BAD\n");
+                    }
+                }
+                /* **押したキーが読めるかを実測する。** 初期化が通ることと
+                 * レポートが届くことは別。QEMU なら monitor の sendkey で
+                 * 送れる。10 秒ほど回して、来たものを出す */
+                {
+                    uint8_t rep[8];
+                    uint64_t t0 = arch_time_now_ms();
+                    int seen = 0;
+                    aarch64_uart_puts("  usb kbd   : 10 秒キーを待つ (sendkey で送れる)\n");
+                    while (arch_time_now_ms() - t0 < 10000 && seen < 12) {
+                        if (usb_hid_keyboard_poll(rep) == 0) {
+                            if (rep[0] == 0 && rep[2] == 0) continue;   /* 離した通知 */
+                            aarch64_uart_puts("  [key] mod=");
+                            put_dec(rep[0]);
+                            aarch64_uart_puts(" code=");
+                            put_dec(rep[2]);
+                            aarch64_uart_puts("\n");
+                            seen++;
+                        }
+                    }
+                    aarch64_uart_puts("  usb kbd   : 待ち終わり 受け取り=");
+                    put_dec((uint64_t)seen);
+                    aarch64_uart_puts("\n");
+                }
+            } else {
+                aarch64_uart_puts("無し / 初期化できない\n");
+            }
+        }
     }
 
     /* ---- 画面が MMU の後も届くか ----------------------------------------

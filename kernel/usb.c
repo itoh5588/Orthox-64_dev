@@ -64,6 +64,12 @@ static uint16_t g_usb_int_in_mps = 0;
 static uint8_t  g_usb_int_in_interval = 0;
 static uint8_t  g_usb_int_in_dci = 0;
 
+static uint64_t g_int_ring_phys = 0;
+static uint64_t g_int_buf_phys = 0;
+static uint32_t g_int_enqueue_idx = 0;
+static uint32_t g_int_cycle = 1;
+static int      g_usb_kbd_ready = 0;
+
 static uint8_t g_usb_bulk_out_ep = 0;
 static uint8_t g_usb_bulk_in_ep = 0;
 static uint16_t g_usb_ep0_mps = 64;
@@ -919,6 +925,168 @@ static int xhci_bulk_transfer_ex(uint8_t slot_id, uint8_t dci, uint64_t ring_phy
         puts("\r\n");
     }
     return (cc == 1) ? 0 : -3;
+}
+
+/* ---- HID キーボード -------------------------------------------------------
+ *
+ * **bulk と同じ道具立てで済む。** 違うのは 2 つだけ:
+ *   - エンドポイントの種別が 7 (Interrupt In)。bulk IN は 6
+ *   - Interval (ポーリング間隔) を EP コンテキストに入れる
+ *
+ * TRB の積み方 (Normal TRB + IOC) もイベントの待ち方も bulk と同一。 */
+static int xhci_setup_interrupt_endpoint(uint8_t slot_id) {
+    if (slot_id == 0 || g_input_ctx_phys == 0 || g_output_ctx_phys == 0) return -1;
+    if (g_usb_int_in_dci == 0) return -2;
+
+    if (!g_int_ring_phys) {
+        void* p = pmm_alloc(1);
+        if (!p) return -3;
+        g_int_ring_phys = (uint64_t)p;
+    }
+    if (!g_int_buf_phys) {
+        void* p = pmm_alloc(1);
+        if (!p) return -4;
+        g_int_buf_phys = (uint64_t)p;
+    }
+    xhci_ring_reset(g_int_ring_phys);
+    g_int_enqueue_idx = 0;
+    g_int_cycle = 1;
+    memzero(PHYS_TO_VIRT((void*)g_int_buf_phys), PAGE_SIZE);
+
+    volatile uint32_t* ic = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_input_ctx_phys);
+    memzero((void*)ic, PAGE_SIZE);
+    {
+        uint32_t stride_dw = g_xhci_ctx_size / 4U;
+        volatile uint32_t* oc = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_output_ctx_phys);
+        for (uint32_t dci = 0; dci <= 31; dci++) {
+            uint32_t in_off = stride_dw * (1U + dci);
+            uint32_t out_off = stride_dw * dci;
+            for (uint32_t j = 0; j < stride_dw; j++) ic[in_off + j] = oc[out_off + j];
+        }
+    }
+    ic[0] = 0;
+    ic[1] = (1U << 0) | (1U << g_usb_int_in_dci);
+
+    uint32_t slot_off = xhci_ctx_offset_dw(0);
+    ic[slot_off + 0] = (ic[slot_off + 0] & ~(0x1FU << 27)) |
+                       ((uint32_t)g_usb_int_in_dci << 27);
+
+    {
+        uint32_t off = xhci_ctx_offset_dw(1);
+        ic[off + 0] = 0;
+        ic[off + 1] = (4U << 3) | ((uint32_t)g_usb_ep0_mps << 16);
+        ic[off + 2] = (uint32_t)((g_ep0_ring_phys & ~0xFULL) | 1U);
+        ic[off + 3] = (uint32_t)(g_ep0_ring_phys >> 32);
+        ic[off + 4] = 8;
+    }
+
+    {
+        uint32_t off = xhci_ctx_offset_dw(g_usb_int_in_dci);
+        /* **Interval は DW0 の [23:16]。** 125us を 1 として 2 のべき乗で
+         * 数える。デスクリプタの bInterval (ミリ秒) をそのまま入れては
+         * いけないが、**遅いぶんには取りこぼすだけで壊れない**ので、
+         * 安全側の 7 (= 2^7 x 125us = 16ms) に寄せる */
+        uint32_t interval = 7;
+        ic[off + 0] = (interval << 16);
+        ic[off + 1] = (7U << 3) | (3U << 1) | ((uint32_t)g_usb_int_in_mps << 16);
+        ic[off + 2] = (uint32_t)((g_int_ring_phys & ~0xFULL) | 1U);
+        ic[off + 3] = (uint32_t)(g_int_ring_phys >> 32);
+        ic[off + 4] = g_usb_int_in_mps;
+    }
+
+    uint64_t cmd_ptr = xhci_cmd_submit(
+        (uint32_t)(g_input_ctx_phys & 0xFFFFFFFFU),
+        (uint32_t)(g_input_ctx_phys >> 32),
+        0,
+        (12U << 10) | ((uint32_t)slot_id << 24));
+    if (!cmd_ptr) return -5;
+    uint8_t cc = 0xFF, slot = 0;
+    if (xhci_wait_cmd_completion(cmd_ptr, slot_id, &cc, &slot) < 0) return -6;
+    (void)slot;
+    if (cc != 1) {
+        puts("[usb] Configure Endpoint(INT) cc=0x");
+        puthex(cc);
+        puts("\r\n");
+        return -7;
+    }
+    return 0;
+}
+
+/* SET_CONFIGURATION -> SET_PROTOCOL(boot) -> SET_IDLE。
+ *
+ * **boot protocol にするのが要点。** そうしないとレポートの形が
+ * HID レポートデスクリプタ次第になり、解釈器が要る。
+ * SET_IDLE(0) は「変化があったときだけ報告しろ」— 押しっぱなしで
+ * 同じレポートが繰り返し来るのを止める */
+int usb_hid_keyboard_init(void) {
+    if (g_xhci_slot_id == 0 || !g_usb_hid_if_ready) return -1;
+
+    if (xhci_ep0_control_no_data(g_xhci_slot_id,
+            usb_setup_packet(0x00, 9, g_usb_cfg_value, 0, 0)) < 0) return -2;
+
+    if (xhci_setup_interrupt_endpoint(g_xhci_slot_id) < 0) return -3;
+
+    /* **失敗しても続ける。** 対応していないキーボードがある。
+     * boot protocol が既定のものも多い */
+    (void)xhci_ep0_control_no_data(g_xhci_slot_id,
+            usb_setup_packet(0x21, 0x0B, 0, g_usb_hid_if_number, 0));   /* SET_PROTOCOL(boot) */
+    (void)xhci_ep0_control_no_data(g_xhci_slot_id,
+            usb_setup_packet(0x21, 0x0A, 0, g_usb_hid_if_number, 0));   /* SET_IDLE(0) */
+
+    g_usb_kbd_ready = 1;
+    return 0;
+}
+
+int usb_hid_keyboard_ready(void) { return g_usb_kbd_ready; }
+
+/* 8 バイトのレポートを 1 つ取る。**待たない。**
+ * 0 = 取れた / 1 = まだ来ていない / 負 = 故障
+ *
+ * ---- 積みっぱなしにする ----------------------------------------------------
+ *
+ * **呼ばれるたびに TRB を積んではいけない。** 割り込みエンドポイントは
+ * 「キーが押されるまで完了しない」ので、押されない間に積み続けると
+ * リングが埋まり、いざ押されたとき完了するのは**最初に積んだ TRB**。
+ * こちらが「今積んだ TRB」の完了を探していると永久に一致しない
+ * (実測: sendkey を 6 回送って受け取り 0)。
+ *
+ * **1 つ積んだら、完了するまで積み直さない。**照合も TRB の番地では行わず、
+ * スロットとエンドポイントだけで見る */
+static int g_int_outstanding = 0;
+
+int usb_hid_keyboard_poll(uint8_t report[8]) {
+    uint8_t cc = 0xFF;
+    uint32_t residual = 0;
+    if (!g_usb_kbd_ready || !report) return -1;
+
+    if (!g_int_outstanding) {
+        volatile uint32_t* ring = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_int_ring_phys);
+        uint32_t trb = g_int_enqueue_idx;
+        uint32_t pcs = g_int_cycle & 1U;
+        memzero(PHYS_TO_VIRT((void*)g_int_buf_phys), 8);
+        ring[trb * 4 + 0] = (uint32_t)(g_int_buf_phys & 0xFFFFFFFFU);
+        ring[trb * 4 + 1] = (uint32_t)(g_int_buf_phys >> 32);
+        ring[trb * 4 + 2] = 8;
+        ring[trb * 4 + 3] = (1U << 10) | (1U << 5) | pcs;   /* Normal TRB + IOC */
+        mmio_write32(g_db_regs, (uint32_t)g_xhci_slot_id * 4U, g_usb_int_in_dci);
+        xhci_ring_enqueue_advance(&g_int_enqueue_idx, &g_int_cycle, 1);
+        g_int_outstanding = 1;
+    }
+
+    /* **待ちは短く。** キーが来ていないのが普通の状態で、ここで長く回すと
+     * 呼び出し側 (DOOM の描画) が止まる */
+    if (xhci_poll_transfer_event(g_xhci_slot_id, g_usb_int_in_dci, 0,
+                                 2000, &cc, &residual) < 0) {
+        return 1;   /* まだ来ていない。TRB は積んだまま */
+    }
+    g_int_outstanding = 0;
+    if (cc != 1 && cc != 13) return -2;   /* 13 = Short Packet。8 未満でも可 */
+
+    {
+        const volatile uint8_t* b = (const volatile uint8_t*)PHYS_TO_VIRT((void*)g_int_buf_phys);
+        for (int i = 0; i < 8; i++) report[i] = b[i];
+    }
+    return 0;
 }
 
 static int usb_msc_reset_recovery(void) {
