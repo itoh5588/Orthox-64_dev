@@ -360,8 +360,37 @@ int aarch64_pcie_brcm_scan(void) {
     cpu_base = b->pcie_brcm_cpu_base;
     g_xhci_cpu_bar = 0;
 
-    /* **ルートポートのバス番号を入れる。** 入れないと下流に届かない */
+    /* ---- ルートポートはブリッジである ------------------------------------
+     *
+     * **設定空間の読み書きが通ることと、メモリのアクセスが下流へ届くことは
+     * 別。** 設定空間は EXT_CFG_INDEX/DATA 経由なのでブリッジの窓を通らない
+     * が、**BAR へのメモリアクセスはブリッジが転送してくれないと届かない。**
+     *
+     * 実測 (2026-08-16): バス番号だけ入れて BAR を配ったところ、
+     * **xHCI のレジスタを読んだ瞬間に止まった。**下の 2 つが抜けていた。
+     *
+     *   1. メモリ窓 (0x20)。**1MB 単位で、番地の [31:20] だけが効く**
+     *   2. MEM デコードと bus master (0x04)
+     */
     brcm_cfg_w32(0, 0, 0, 0x18, 0x00010100U);   /* primary 0 / secondary 1 / subordinate 1 */
+
+    /* メモリ窓。PCI 側の番地 (0xc0000000) から 1MB を覆う */
+    {
+        uint32_t base16  = (uint32_t)((pci_base >> 16) & 0xfff0U);
+        uint32_t limit16 = (uint32_t)(((pci_base + 0x000fffffULL) >> 16) & 0xfff0U);
+        brcm_cfg_w32(0, 0, 0, 0x20, base16 | (limit16 << 16));
+        /* **I/O とプリフェッチは base > limit で無効にする。**
+         * 中途半端に有効だと、そこへの読み書きが黙って吸われる */
+        brcm_cfg_w32(0, 0, 0, 0x1c, 0x000000f0U);
+        brcm_cfg_w32(0, 0, 0, 0x24, 0x0000fff0U);
+    }
+
+    /* **ルートポート自身の MEM デコードと bus master。**
+     * 立ち上げでリセットしたので落ちている */
+    {
+        uint32_t cmd = brcm_cfg_r32(0, 0, 0, 0x04);
+        brcm_cfg_w32(0, 0, 0, 0x04, cmd | 0x6U);
+    }
 
     for (uint32_t d = 0; d < 32 && !found; d++) {
         for (uint32_t f = 0; f < 8; f++) {

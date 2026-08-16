@@ -187,6 +187,7 @@ void aarch64_pci_dump(void);
 int aarch64_pcie_brcm_probe(void);
 int aarch64_pcie_brcm_init(void);
 int aarch64_pcie_brcm_scan(void);
+uint64_t usb_arch_xhci_mmio(void);
 int aarch64_fb_init_pci(uint32_t w, uint32_t h);
 int aarch64_pci_ready(void);
 void usb_init(void);
@@ -712,7 +713,13 @@ void aarch64_boot_continue(void) {
     /* xHCI。**共有層の kernel/usb.c をそのまま使う** — リングもスロットも
      * TRB もアーキに依らない。**QEMU virt でしか動かない**  (raspi4b は
      * PCIe を持っていない)。ここが通れば USB キーボードへの道が開く */
-    if (aarch64_pci_ready()) {
+    /* **ECAM が使えるかだけで決めてはいけない。**
+     *
+     * Raspberry Pi 4 には ECAM が無く、xHCI は BCM2711 の PCIe を
+     * 立ち上げた先で見つかる。**そちらで見つけていたら呼ぶ** —
+     * 実機で「PCIe は上がったのに usb_init が一度も呼ばれない」に
+     * なっていた (2026-08-16 実測) */
+    if (aarch64_pci_ready() || usb_arch_xhci_mmio() != 0) {
         usb_init();
         aarch64_uart_puts("  usb       : ");
         aarch64_uart_puts(usb_is_ready() ? "ok\n" : "見つからない / 初期化できない\n");
