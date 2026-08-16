@@ -430,3 +430,8 @@ int aarch64_pcie_brcm_scan(void) {
     }
     return 0;
 }
+
+/* **共有の kernel/usb.c から呼ばれる。**弱いシンボルを上書きして、
+ * PCIe の先で見つけた xHCI の **CPU から見た** MMIO 番地を返す。
+ * 見つけていなければ 0 で、あちらは従来どおり PCI (ECAM) から探す */
+uint64_t usb_arch_xhci_mmio(void) { return g_xhci_cpu_bar; }

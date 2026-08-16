@@ -22,6 +22,12 @@ uint64_t arch_time_now_ms(void);
 void puts(const char* s);
 void puthex(uint64_t v);
 
+/* **アーキ固有の経路で見つけた xHCI の MMIO 番地。**
+ * 0 = 持っていない (PCI から探す)。既定は弱いシンボルで 0 を返す
+ * (kernel/fs.c の arch_console_echo_enabled と同じ形) */
+__attribute__((weak))
+uint64_t usb_arch_xhci_mmio(void) { return 0; }
+
 static int g_usb_ready = 0;
 static int g_usb_mass_ready = 0;
 static int g_xhci_rings_ready = 0;
@@ -1449,25 +1455,36 @@ void usb_init(void) {
     g_xhci_port_id = 0;
     g_xhci_mmio = 0;
 
-    struct pci_device_info xhci;
-    if (pci_find_xhci(&xhci) < 0) {
-        puts("[usb] no xHCI controller\r\n");
-        return;
-    }
-    pci_enable_mmio_busmaster(&xhci);
-
-    uint64_t mmio_phys = pci_get_bar0_mmio(&xhci);
+    /* **アーキ側が別の経路で見つけていたら、そちらを使う。**
+     *
+     * Raspberry Pi 4 の xHCI (VL805) は PCIe の先にいて、設定空間が
+     * ECAM ではない (索引とデータの 2 段)。そちらは
+     * kernel/aarch64/pcie_brcm.c が面倒を見るので、ここへは**結果の
+     * MMIO 番地だけ**が渡ってくる。0 なら従来どおり PCI から探す */
+    uint64_t mmio_phys = usb_arch_xhci_mmio();
     if (mmio_phys == 0) {
-        puts("[usb] xHCI BAR0 invalid\r\n");
-        return;
-    }
+        struct pci_device_info xhci;
+        if (pci_find_xhci(&xhci) < 0) {
+            puts("[usb] no xHCI controller\r\n");
+            return;
+        }
+        pci_enable_mmio_busmaster(&xhci);
 
-    // Current kernel maps HHDM only for low 4GiB during boot.
-    if (mmio_phys >= 0x100000000ULL) {
-        puts("[usb] xHCI BAR0 above 4GiB is not mapped yet\r\n");
-        puthex(mmio_phys);
-        puts("\r\n");
-        return;
+        mmio_phys = pci_get_bar0_mmio(&xhci);
+        if (mmio_phys == 0) {
+            puts("[usb] xHCI BAR0 invalid\r\n");
+            return;
+        }
+
+        /* **4GiB 以上は HHDM に無い。**PCI から見つけた場合は張られて
+         * いないので断る。**アーキ側が渡してきた場合は別** — あちらは
+         * 自分で張ったうえで渡してくる (Pi 4 の BAR は 0x6_00000000) */
+        if (mmio_phys >= 0x100000000ULL) {
+            puts("[usb] xHCI BAR0 above 4GiB is not mapped yet\r\n");
+            puthex(mmio_phys);
+            puts("\r\n");
+            return;
+        }
     }
 
     volatile uint8_t* cap = (volatile uint8_t*)PHYS_TO_VIRT(mmio_phys);
