@@ -188,6 +188,8 @@ typedef struct dtb_node_state {
     /* PCIe のホストブリッジ (ECAM)。**QEMU virt にはあるが raspi4b には無い。**
      * reg が ECAM の窓、ranges が BAR を置ける空間を指す */
     int is_pcie;
+    /* Raspberry Pi 4 の PCIe。**ECAM とは別扱い** — 設定空間の出し方が違う */
+    int is_pcie_brcm;
     int is_memory;
     int is_timer;
     int is_cpu;
@@ -216,6 +218,7 @@ static void node_state_clear(dtb_node_state_t* n) {
     n->is_emmc2 = 0;
     n->is_mbox = 0;
     n->is_pcie = 0;
+    n->is_pcie_brcm = 0;
     n->is_memory = n->is_timer = n->is_cpu = 0;
     n->is_disabled = 0;
     n->reg_data = 0;
@@ -485,6 +488,29 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                 }
             }
 
+            /* Raspberry Pi 4 の PCIe。**番地は /scb の ranges を通して初めて
+             * 物理になる** (EMMC2 と同じ理屈)。
+             *
+             * ranges は ECAM と同じ 7 セルの組。32bit MMIO の窓だけ拾う。
+             * **PCI 側と CPU 側の番地が違う**ので両方覚える */
+            if (n->is_pcie_brcm && !n->is_disabled && n->reg_data &&
+                reg_entry_phys(nodes, depth, n->reg_data, n->reg_len, ac, sc, 0, &base, &size) &&
+                base != 0 && info->pcie_brcm_base == 0) {
+                info->pcie_brcm_base = base;
+                info->pcie_brcm_size = size;
+                info->flags |= AARCH64_BOOT_FLAG_PCIE_BRCM_FROM_DTB;
+                if (n->ranges_data && n->ranges_len >= 28U) {
+                    for (uint32_t o = 0; o + 28U <= n->ranges_len; o += 28U) {
+                        const uint8_t* r = n->ranges_data + o;
+                        if ((aarch64_dtb_read_be32(r) & 0x03000000U) != 0x02000000U) continue;
+                        info->pcie_brcm_pci_base = aarch64_dtb_read_be64(r + 4);
+                        info->pcie_brcm_cpu_base = aarch64_dtb_read_be64(r + 12);
+                        info->pcie_brcm_win_size = aarch64_dtb_read_be64(r + 20);
+                        break;
+                    }
+                }
+            }
+
             /* timer の interrupts は <type num flags> の 3 セル x 4 本
              * (secure / non-secure physical / virtual / hyp)。
              * 2 本目 (index 1) が非セキュア物理タイマ。
@@ -548,6 +574,7 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                  * これ。実機の brcm,bcm2711-pcie は設定空間の出し方が違うので
                  * ここでは拾わない (拾うと ECAM として読んで沈黙する) */
                 if (compatible_has(c, len, "pci-host-ecam-generic")) n->is_pcie = 1;
+                if (compatible_has(c, len, "brcm,bcm2711-pcie")) n->is_pcie_brcm = 1;
             } else if (str_eq(prop_name, "device_type")) {
                 if (len >= 7U && str_eq((const char*)data, "memory")) nodes[depth].is_memory = 1;
             } else if (str_eq(prop_name, "reg")) {

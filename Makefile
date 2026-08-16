@@ -299,7 +299,7 @@ AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer
 	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/emmc2.c kernel/aarch64/runtime.c \
 	kernel/aarch64/stubs.c kernel/aarch64/syscall.c kernel/aarch64/console.c \
 	kernel/aarch64/mailbox.c kernel/aarch64/fb.c kernel/aarch64/fbcon.c kernel/aarch64/font8x8.c \
-	kernel/aarch64/pci.c kernel/aarch64/kbd.c
+	kernel/aarch64/pci.c kernel/aarch64/kbd.c kernel/aarch64/pcie_brcm.c
 # 共有層のうち、**いま繋がるものだけ**を取り込む (M3c-2a)。
 # どれが入るかは推測せず、llvm-nm -u で未解決シンボルを実測して決めた。
 #

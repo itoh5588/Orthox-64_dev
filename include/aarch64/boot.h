@@ -131,6 +131,19 @@ typedef struct aarch64_boot_info {
     /* **いまはバス 0 しか見ない。** QEMU virt は qemu-xhci をバス 0 に置く。
      * ブリッジの先まで辿るのは必要になってから */
     uint32_t pcie_bus_max;
+    /* Raspberry Pi 4 (BCM2711) の PCIe。**ECAM ではない。**
+     * 設定空間の出し方が違うので pcie_ecam_base とは別に持つ。
+     * この先に VL805 (xHCI) がぶら下がっていて、実機の USB はそこ。
+     *
+     * **QEMU の raspi4b は PCIe を持っていない** ので、実機でしか 0 以外に
+     * ならない */
+    uint64_t pcie_brcm_base;
+    uint64_t pcie_brcm_size;
+    /* 外向きの窓。**PCI から見た番地と CPU の物理が違う** —
+     * 実機の DTB では PCI 0xc0000000 が CPU 0x6_00000000 に出る */
+    uint64_t pcie_brcm_pci_base;    /* PCI 側 */
+    uint64_t pcie_brcm_cpu_base;    /* CPU 側 (物理) */
+    uint64_t pcie_brcm_win_size;
     uint32_t flags;
 } aarch64_boot_info_t;
 
@@ -147,6 +160,7 @@ typedef struct aarch64_boot_info {
 #define AARCH64_BOOT_FLAG_EMMC2_FROM_DTB  (1U << 10)
 #define AARCH64_BOOT_FLAG_MBOX_FROM_DTB   (1U << 11)
 #define AARCH64_BOOT_FLAG_PCIE_FROM_DTB   (1U << 12)
+#define AARCH64_BOOT_FLAG_PCIE_BRCM_FROM_DTB (1U << 13)
 
 /* 直書きの既定値で埋めてから DTB で上書きする。
  * DTB が無くても QEMU virt では動き続ける */

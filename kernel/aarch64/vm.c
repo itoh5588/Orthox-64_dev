@@ -459,6 +459,17 @@ static void aarch64_vm_build_kernel(void) {
                              b->pcie_mmio_base, win, VM_DEVICE_RW);
     }
 
+    /* Raspberry Pi 4 の PCIe のレジスタ窓。**ECAM とは別物。**
+     * **いまは読むだけ**なので窓だけ張る (kernel/aarch64/pcie_brcm.c)。
+     * 外向きの MMIO 窓 (CPU 0x6_00000000) はまだ張らない — BAR を配る
+     * 段になってから */
+    if (b->pcie_brcm_base) {
+        uint64_t sz = b->pcie_brcm_size ? b->pcie_brcm_size : AARCH64_PAGE_SIZE;
+        sz = (sz + AARCH64_PAGE_SIZE - 1) & ~(AARCH64_PAGE_SIZE - 1);
+        aarch64_vm_map_range(aarch64_phys_to_virt(b->pcie_brcm_base),
+                             b->pcie_brcm_base, sz, VM_DEVICE_RW);
+    }
+
     /* ---- フレームバッファ ------------------------------------------------
      *
      * **専用の VA に張る。HHDM には重ねない** (理由は vm.h の

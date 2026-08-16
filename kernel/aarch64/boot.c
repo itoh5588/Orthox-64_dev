@@ -184,6 +184,7 @@ void aarch64_console_rx_irq(void);
 void aarch64_console_input_init(void);
 void pci_init(void);
 void aarch64_pci_dump(void);
+int aarch64_pcie_brcm_probe(void);
 int aarch64_pci_ready(void);
 void usb_init(void);
 int usb_is_ready(void);
@@ -673,6 +674,10 @@ void aarch64_boot_continue(void) {
      * でないと設定空間を読めない */
     pci_init();
     aarch64_pci_dump();
+
+    /* Raspberry Pi 4 の PCIe。**読むだけの探針** — 実機で何が見えているかを
+     * 確かめる段階。QEMU の raspi4b は PCIe を持っていないので何も出ない */
+    aarch64_pcie_brcm_probe();
 
     /* xHCI。**共有層の kernel/usb.c をそのまま使う** — リングもスロットも
      * TRB もアーキに依らない。**QEMU virt でしか動かない**  (raspi4b は
