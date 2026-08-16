@@ -20,6 +20,20 @@ kernel8.img を置くだけでよい (ファームウェア一式は既にある
     (https://github.com/raspberrypi/firmware の boot/ から取れる。
      Pi 4 に bootcode.bin は要らない — SPI EEPROM から起動するため)
 
+### **kernel8.img だけでなく config.txt も毎回コピーする**
+
+**正はこのリポジトリ側 (`scripts/pi4/config.txt`)。** SD の
+`config.txt.orthox` は切り分けの途中で書き換わることがあり、実際に
+`uart_2ndstage` が `0` と `1` で食い違ったまま残っていた
+(日報2026-08-15 §11)。**どちらが動いた版か後から分からなくなる。**
+
+    cp out/pi4-boot/kernel8.img out/pi4-boot/config.txt <boot パーティション>/
+
+カーネルだけ差し替えると、SD 側の古い `config.txt` が効き続ける。
+**2 つで 1 組**として扱い、SD 上で直接編集しない。切り分けのために
+設定を変えたくなったら `scripts/pi4/config.txt` を直してから組み直す
+— そうすれば「実機で動いた設定」が git に残る。
+
 ## シリアルの見方
 
 **HDMI には何も出ない。** シリアルが唯一の出力。
