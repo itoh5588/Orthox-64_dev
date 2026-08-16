@@ -117,6 +117,19 @@ if grep -aq "ENOSYS: syscall" "$LOG"; then
     exit 1
 fi
 
+# **判定は CR を除いたコピーに当てる。**
+#
+# カーネルは termios の ONLCR に従って LF を CRLF で出す (実機のシリアル端末は
+# LF だけでは行頭に戻らないため。日報2026-08-15 §12)。そのままだと
+# ユーザープロセスの出力が "FP-START\r" になり、`^FP-START$` のような
+# 行末アンカーが当たらない。**表示は元のログ、判定はこちら**。
+#
+# **対話シェルで grep を試して確かめないこと。** 環境によっては grep が
+# 別実装 (ugrep など) に置き換わっていて CR を無視して一致し、
+# 「手で試すと通るのにテストは落ちる」になる
+tr -d '\r' < "$LOG" > "$LOG.nocr"
+LOG="$LOG.nocr"
+
 echo "--- P3-3 の判定 (FP/SIMD の退避) ---"
 must_not "aarch64-fs-BAD" "$LOG"
 must_not "aarch64-user-BAD" "$LOG"
