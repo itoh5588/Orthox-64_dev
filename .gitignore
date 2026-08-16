@@ -7,6 +7,9 @@ user/*.so
 *.dmg
 iso_root/
 build/
+# ビルド生成物の置き場。**rootfs の材料 (拡張子なしの ELF コピー) も入る**ので、
+# *.img / *.elf だけでは漏れる
+out/
 rootfs.tar
 rootfs/bin/
 rootfs/doom1.wad
