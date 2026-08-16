@@ -243,7 +243,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: aarch64-doom aarch64-doom-run aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-smoke aarch64-pi4-sd-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-smoke aarch64-pi4-sd-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -478,6 +478,11 @@ aarch64-pi4-sd-smoke: $(AARCH64_USER_HELLO)
 # 噛み合わない。ソースの一覧だけ SRC_DOOM から借りて、組むのは自前の
 # scripts/build_doom_aarch64.sh
 AARCH64_DOOM_ELF = out/doomgeneric-aarch64.elf
+# **raspi4b は QEMU 9.0 以降。** apt のものでは足りないので自前ビルドを見に行く
+QEMU_RASPI4B = $(shell for c in "$$HOME/qemu-build/build/qemu-system-aarch64" \
+	"$$HOME/qemu-local/bin/qemu-system-aarch64" \
+	"$$(command -v qemu-system-aarch64 2>/dev/null)"; do \
+	[ -x "$$c" ] && "$$c" -machine help 2>/dev/null | grep -q "^raspi4b " && { printf %s "$$c"; break; }; done)
 
 aarch64-doom: $(AARCH64_DOOM_ELF)
 
@@ -490,6 +495,26 @@ $(AARCH64_DOOM_ELF): ports/musl-install-aarch64/lib/libc.a
 # フレームバッファ + EMMC2 の xv6fs) を通る。
 # **番地は pi4-sd-smoke と同じ差し替えが要る** — raspi4b の SD は
 # 旧 sdhci (0xFE300000) に繋がっている
+# **画面を人が見る用。** VNC で出す。
+#
+# **-display sdl は WSLg では映らない** (窓は開くが真っ黒のまま。Wayland でも
+# SDL_VIDEODRIVER=x11 でも同じ。ゲスト側は正しく描けていることを monitor の
+# screendump で確認済み)。この qemu は gtk を持っていないので、**VNC が
+# 唯一まともに映る道**。Windows 側の VNC ビューアで localhost:5901 に繋ぐ。
+#
+# 判定は付いていない (人が見るためのもの)。自動で確かめるのは
+# aarch64-doom-run のほう
+aarch64-doom-vnc: $(AARCH64_DOOM_ELF)
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
+	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \
+	    AARCH64_CNTFRQ_HZ=54000000 \
+	    AARCH64_EARLY_GICD=0xFF841000 AARCH64_EARLY_GICC=0xFF842000 \
+	    AARCH64_EMMC2_BASE=0xFE300000 AARCH64_INIT_PATH_VALUE=/bin/doom
+	@echo "VNC: localhost:5901 に繋ぐこと (Ctrl-C で止める)"
+	$(QEMU_RASPI4B) -machine raspi4b -vnc :1 \
+	    -kernel out/kernel8.img -dtb tests/dtb/bcm2711-rpi-4-b.dtb \
+	    -drive file=out/aarch64-doom-disk.img,if=sd,format=raw
+
 aarch64-doom-run: $(AARCH64_DOOM_ELF)
 	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
 	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \
