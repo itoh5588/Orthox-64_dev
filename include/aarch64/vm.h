@@ -91,8 +91,20 @@ static inline uint64_t aarch64_virt_to_phys(uint64_t va) {
  *   MMIO  750MB あるが、BAR を配るのは先頭だけ
  * 足りなくなったら増やす。**張っていない所を触ると translation fault で
  * 落ちる**ので、黙って壊れることはない */
+/* フレームバッファの写像に使う属性。**MMU を入れた後から張る経路
+ * (fb_pci.c) でも同じものを使う**ので、vm.c の中だけに閉じない。
+ * Normal NC / EL1 の読み書き / 実行不可 */
+#define AARCH64_VM_FB_FLAGS (AARCH64_PTE_ATTRINDX(MAIR_IDX_NORMAL_NC) | \
+                             AARCH64_PTE_AF | AARCH64_PTE_AP_RW_EL1 | \
+                             AARCH64_PTE_UXN | AARCH64_PTE_PXN)
+
 #define AARCH64_PCIE_ECAM_MAP_SIZE 0x00100000ULL   /* 1MB = バス 0 */
-#define AARCH64_PCIE_MMIO_MAP_SIZE 0x01000000ULL   /* 16MB */
+/* **64MB。** 16MB では足りなかった — 表示装置のフレームバッファの BAR が
+ * 16MB あり、境界を揃えると次のデバイスが窓の外に出る
+ * (実測: bochs-display の bar0 が 0x11000000、xHCI が 0x12004000)。
+ * 張っていない所を触れば translation fault で落ちるので、足りなければ
+ * すぐ分かる */
+#define AARCH64_PCIE_MMIO_MAP_SIZE 0x04000000ULL   /* 64MB */
 
 /* EL0 から使えるページの属性。共有層の arch_vm_user_page_flags がこれを返す。
  *

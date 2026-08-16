@@ -185,6 +185,7 @@ void aarch64_console_input_init(void);
 void pci_init(void);
 void aarch64_pci_dump(void);
 int aarch64_pcie_brcm_probe(void);
+int aarch64_fb_init_pci(uint32_t w, uint32_t h);
 int aarch64_pci_ready(void);
 void usb_init(void);
 int usb_is_ready(void);
@@ -674,6 +675,24 @@ void aarch64_boot_continue(void) {
      * でないと設定空間を読めない */
     pci_init();
     aarch64_pci_dump();
+
+    /* **画面がまだ無ければ PCI の表示装置を探す。**
+     * QEMU virt には mailbox が無いので、こちらでしか画面が取れない。
+     * **キーボードと画面を同時に試せる唯一の機械** */
+    if (aarch64_fb_info()->base == 0 && aarch64_pci_ready()) {
+        if (aarch64_fb_init_pci(0, 0) == 0) {
+            aarch64_fbcon_init();
+            aarch64_uart_puts("  fb console: ");
+            if (aarch64_fbcon_ready()) {
+                put_dec(aarch64_fbcon_cols());
+                aarch64_uart_puts("桁 x ");
+                put_dec(aarch64_fbcon_rows());
+                aarch64_uart_puts("行  ok (PCI の画面)\n");
+            } else {
+                aarch64_uart_puts("BAD\n");
+            }
+        }
+    }
 
     /* Raspberry Pi 4 の PCIe。**読むだけの探針** — 実機で何が見えているかを
      * 確かめる段階。QEMU の raspi4b は PCIe を持っていないので何も出ない */

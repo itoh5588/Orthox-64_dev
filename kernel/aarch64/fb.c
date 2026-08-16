@@ -57,6 +57,21 @@ static aarch64_fb_info_t g_fb;
 
 const aarch64_fb_info_t* aarch64_fb_info(void) { return &g_fb; }
 
+/* **画面の出所が 2 つある。** Raspberry Pi は mailbox (このファイル)、
+ * QEMU virt は PCI の表示装置 (kernel/aarch64/fb_pci.c)。
+ * **どちらから来ても同じ struct を通す**ので、fbcon も DOOM も
+ * 経路を分けずに済む */
+void aarch64_fb_set_info(uint64_t base, uint32_t size, uint32_t pitch,
+                         uint32_t width, uint32_t height, uint32_t depth) {
+    g_fb.base = base;
+    g_fb.size = size;
+    g_fb.pitch = pitch;
+    g_fb.width = width;
+    g_fb.height = height;
+    g_fb.depth = depth;
+    g_fb.fail = AARCH64_FB_FAIL_NONE;
+}
+
 /* 要求する既定の画面。**実機が別の大きさを返してきたら、返ってきた値に従う。**
  * HDMI の相手 (モニタ) 次第でファームウェアが丸めることがある */
 #define FB_DEFAULT_WIDTH   1024U
