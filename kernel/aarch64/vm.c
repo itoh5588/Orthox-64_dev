@@ -470,6 +470,16 @@ static void aarch64_vm_build_kernel(void) {
                              b->pcie_brcm_base, sz, VM_DEVICE_RW);
     }
 
+    /* **外向き窓の先頭。** BAR を配る先で、CPU から見た番地は
+     * 0x6_00000000 付近 (PCI 側の 0xc0000000 とは違う)。
+     * **張っていないと、BAR は配れたのにレジスタが読めない**。
+     * 全部 (1GB) は張らず、先頭の 1MB だけ — xHCI の BAR は 4KB */
+    if (b->pcie_brcm_cpu_base) {
+        aarch64_vm_map_range(aarch64_phys_to_virt(b->pcie_brcm_cpu_base),
+                             b->pcie_brcm_cpu_base,
+                             AARCH64_PCIE_BRCM_WIN_MAP_SIZE, VM_DEVICE_RW);
+    }
+
     /* ---- フレームバッファ ------------------------------------------------
      *
      * **専用の VA に張る。HHDM には重ねない** (理由は vm.h の

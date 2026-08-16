@@ -297,3 +297,136 @@ int aarch64_pcie_brcm_init(void) {
     return 0;
 #endif
 }
+
+/* ==========================================================================
+ * 下流 (VL805) へ辿る
+ *
+ * **ECAM ではない。** 設定空間は索引とデータの 2 段:
+ *
+ *   EXT_CFG_INDEX (0x9000) に (bus << 20) | (devfn << 12) を書く
+ *   EXT_CFG_DATA  (0x8000) + (off & 0xfff) を読み書きする
+ *
+ * **バス 0 (ルートポート自身) は直接。** 窓の先頭 (0x0000) がその設定
+ * ヘッダで、索引を書く必要はない。実測で 0x271114E4 を確認済み。
+ *
+ * 出所は Linux の pcie-brcmstb.c の PCIE_ECAM_OFFSET (値だけ確認)。
+ * ========================================================================== */
+
+#define EXT_CFG_INDEX  0x9000
+#define EXT_CFG_DATA   0x8000
+
+static uint32_t brcm_cfg_r32(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t off) {
+    if (bus == 0) {
+        /* **ルートポートは直接。** devfn 0 以外は居ない */
+        if (dev != 0 || fn != 0) return 0xffffffffU;
+        return rd32(off & 0xfffU);
+    }
+    {
+        uint32_t devfn = ((uint32_t)dev << 3) | fn;
+        wr32(EXT_CFG_INDEX, ((uint32_t)bus << 20) | (devfn << 12));
+        return rd32(EXT_CFG_DATA + (off & 0xfffU));
+    }
+}
+
+static void brcm_cfg_w32(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t off, uint32_t v) {
+    if (bus == 0) {
+        if (dev != 0 || fn != 0) return;
+        wr32(off & 0xfffU, v);
+        return;
+    }
+    {
+        uint32_t devfn = ((uint32_t)dev << 3) | fn;
+        wr32(EXT_CFG_INDEX, ((uint32_t)bus << 20) | (devfn << 12));
+        wr32(EXT_CFG_DATA + (off & 0xfffU), v);
+    }
+}
+
+/* 見つけた xHCI。**CPU から見た BAR の番地**を覚える
+ * (PCI 側とは違う。ranges で CPU 0x6_00000000 <-> PCI 0xc0000000) */
+static uint64_t g_xhci_cpu_bar;
+uint64_t aarch64_pcie_brcm_xhci_bar(void) { return g_xhci_cpu_bar; }
+
+/* 下流を走査して xHCI を見つけ、BAR を配る。
+ *
+ * **BAR に書くのは PCI 側の番地、CPU が触るのは別の番地。**
+ * ここを取り違えると「BAR は配れたのにレジスタが読めない」になる */
+int aarch64_pcie_brcm_scan(void) {
+    const aarch64_boot_info_t* b = aarch64_boot_info();
+    uint64_t pci_base, cpu_base;
+    int found = 0;
+
+    if (!b || g_base == 0) return -1;
+    pci_base = b->pcie_brcm_pci_base;
+    cpu_base = b->pcie_brcm_cpu_base;
+    g_xhci_cpu_bar = 0;
+
+    /* **ルートポートのバス番号を入れる。** 入れないと下流に届かない */
+    brcm_cfg_w32(0, 0, 0, 0x18, 0x00010100U);   /* primary 0 / secondary 1 / subordinate 1 */
+
+    for (uint32_t d = 0; d < 32 && !found; d++) {
+        for (uint32_t f = 0; f < 8; f++) {
+            uint32_t vid_did = brcm_cfg_r32(1, (uint8_t)d, (uint8_t)f, 0x00);
+            uint32_t cls;
+            if ((vid_did & 0xffffU) == 0xffffU || (vid_did & 0xffffU) == 0) {
+                if (f == 0) break; else continue;
+            }
+            cls = brcm_cfg_r32(1, (uint8_t)d, (uint8_t)f, 0x08) >> 8;
+
+            aarch64_uart_puts("  pcie dev  : 01:");
+            puthex_n(d, 2);
+            aarch64_uart_puts(".");
+            puthex_n(f, 1);
+            aarch64_uart_puts("  vid ");
+            puthex_n(vid_did & 0xffffU, 4);
+            aarch64_uart_puts(" did ");
+            puthex_n(vid_did >> 16, 4);
+            aarch64_uart_puts(" class ");
+            puthex_n(cls, 6);
+            aarch64_uart_puts("\n");
+
+            /* xHCI (0x0c0330) を見つけたら BAR を配る */
+            if (cls == 0x0c0330U) {
+                uint32_t orig = brcm_cfg_r32(1, (uint8_t)d, (uint8_t)f, 0x10);
+                uint32_t size_mask, size;
+
+                brcm_cfg_w32(1, (uint8_t)d, (uint8_t)f, 0x10, 0xffffffffU);
+                size_mask = brcm_cfg_r32(1, (uint8_t)d, (uint8_t)f, 0x10) & 0xfffffff0U;
+                brcm_cfg_w32(1, (uint8_t)d, (uint8_t)f, 0x10, orig);
+                size = (~size_mask) + 1U;
+
+                /* **BAR には PCI 側の番地を書く** */
+                brcm_cfg_w32(1, (uint8_t)d, (uint8_t)f, 0x10,
+                             (uint32_t)pci_base | (orig & 0xfU));
+                if ((orig & 0x6U) == 0x4U) {   /* 64bit BAR なら上位も */
+                    brcm_cfg_w32(1, (uint8_t)d, (uint8_t)f, 0x14, 0);
+                }
+                /* MEM デコードと bus master を開ける */
+                {
+                    uint32_t cmd = brcm_cfg_r32(1, (uint8_t)d, (uint8_t)f, 0x04);
+                    brcm_cfg_w32(1, (uint8_t)d, (uint8_t)f, 0x04, cmd | 0x6U);
+                }
+                /* **CPU から見た番地はこちら** */
+                g_xhci_cpu_bar = cpu_base;
+
+                aarch64_uart_puts("  pcie xhci : PCI ");
+                puthex_n(pci_base, 8);
+                aarch64_uart_puts(" -> CPU ");
+                puthex_n(cpu_base, 10);
+                aarch64_uart_puts(" size ");
+                puthex_n(size, 8);
+                aarch64_uart_puts("  ok\n");
+                found = 1;
+                break;
+            }
+            if (f == 0) {
+                uint32_t hdr = brcm_cfg_r32(1, (uint8_t)d, 0, 0x0c);
+                if (((hdr >> 16) & 0x80U) == 0) break;
+            }
+        }
+    }
+    if (!found) {
+        aarch64_uart_puts("  pcie xhci : 見つからない\n");
+        return -2;
+    }
+    return 0;
+}

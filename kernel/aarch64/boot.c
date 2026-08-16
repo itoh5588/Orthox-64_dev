@@ -186,6 +186,7 @@ void pci_init(void);
 void aarch64_pci_dump(void);
 int aarch64_pcie_brcm_probe(void);
 int aarch64_pcie_brcm_init(void);
+int aarch64_pcie_brcm_scan(void);
 int aarch64_fb_init_pci(uint32_t w, uint32_t h);
 int aarch64_pci_ready(void);
 void usb_init(void);
@@ -704,8 +705,7 @@ void aarch64_boot_continue(void) {
      * **PCI の走査をやり直す**必要がある */
     if (aarch64_pcie_brcm_init() == 0) {
         aarch64_uart_puts("  pcie brcm : 立ち上がった。下流を探す\n");
-        /* TODO: EXT_CFG_INDEX/DATA 経由で下流を走査する。
-         * いまはリンクが上がるところまでを確かめる段階 */
+        aarch64_pcie_brcm_scan();
     }
     aarch64_pcie_brcm_probe();
 

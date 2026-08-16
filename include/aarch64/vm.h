@@ -111,6 +111,10 @@ static inline uint64_t aarch64_virt_to_phys(uint64_t va) {
  * すぐ分かる */
 #define AARCH64_PCIE_MMIO_MAP_SIZE 0x04000000ULL   /* 64MB */
 
+/* Raspberry Pi 4 の外向き窓のうち張る量。**全部 (1GB) は要らない** —
+ * xHCI の BAR は 4KB。1MB あれば足りる */
+#define AARCH64_PCIE_BRCM_WIN_MAP_SIZE 0x00100000ULL   /* 1MB */
+
 /* EL0 から使えるページの属性。共有層の arch_vm_user_page_flags がこれを返す。
  *
  * **PXN は常に立てる。** EL1 がユーザーのコードを実行できてしまうと、
