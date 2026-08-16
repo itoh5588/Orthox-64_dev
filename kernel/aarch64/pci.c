@@ -65,10 +65,30 @@ static void puthex_n(uint64_t v, int digits) {
 #define PCI_BAR_TYPE_64     (2U << 1)
 #define PCI_BAR_ADDR_MASK   0xfffffff0U
 
+/* ブリッジ (header type 0x01) のレジスタ */
+#define PCI_IO_BASE_LIMIT   0x1c
+#define PCI_BUS_NUMBERS     0x18   /* primary(7:0) / secondary(15:8) / subordinate(23:16) */
+#define PCI_MEM_BASE_LIMIT  0x20   /* base(15:0) / limit(31:16)。番地 >> 16 の上位 12 ビット */
+#define PCI_PREF_BASE_LIMIT 0x24
+
+#define PCI_HEADER_TYPE_BRIDGE 0x01
+
+/* ブリッジの窓は **1MB 単位**。番地の [31:20] だけが効く */
+#define PCI_BRIDGE_WIN_ALIGN 0x00100000ULL
+
 /* xHCI = クラス 0x0c (Serial Bus) / サブクラス 0x03 (USB) / prog-if 0x30 */
 #define PCI_CLASS_SERIAL_BUS  0x0c
 #define PCI_SUBCLASS_USB      0x03
 #define PCI_PROGIF_XHCI       0x30
+
+/* **見つけたデバイスを覚えておく。**
+ *
+ * 以前は探すたびにバスを走査し直していたが、**ブリッジの先まで辿るように
+ * なると走査が高くつく**うえ、辿り方を 2 か所に書くことになる。
+ * 走査は 1 回にして、結果を表に残す */
+#define PCI_MAX_DEVICES 32
+static struct pci_device_info g_devs[PCI_MAX_DEVICES];
+static uint32_t g_dev_count;
 
 static uint64_t g_ecam;          /* ECAM の先頭 (物理) */
 static uint64_t g_mmio_next;     /* BAR を配る位置 (物理) */
@@ -159,10 +179,99 @@ static void fill_info(struct pci_device_info* out, uint8_t b, uint8_t d, uint8_t
     out->irq_line   = cfg_r8(b, d, f, PCI_IRQ_LINE);
 }
 
+/* ---- ブリッジの奥まで辿る ---------------------------------------------
+ *
+ * **バス 0 だけでは足りない。** Raspberry Pi 4 の実機では USB (VL805) が
+ * ルートポートの先、**バス 01** にいる (2026-08-16 実機の lspci で確認)。
+ * QEMU virt でも -device pcie-root-port の先に置くと同じ形になる。
+ *
+ * ブリッジを見つけたら:
+ *   1. バス番号を割り当てる (primary / secondary / subordinate)
+ *   2. **subordinate をいったん 0xff にする。** 奥に何バスあるか分かる前に
+ *      設定空間を読む必要があるため。走査後に本当の値へ縮める
+ *   3. 奥を走査する (再帰)
+ *   4. **奥に配った BAR を覆う窓をブリッジに設定する。**
+ *      これを忘れるとブリッジが素通ししてくれず、番地が届かない
+ *
+ * 窓は 1MB 単位。番地の [31:20] だけが効く */
+static uint8_t g_bus_max;
+
+static void pci_scan_bus(uint8_t bus);
+
+static void pci_setup_bridge(uint8_t b, uint8_t d, uint8_t f) {
+    uint8_t secondary = (uint8_t)(g_bus_max + 1U);
+    uint64_t win_start, win_end;
+
+    g_bus_max = secondary;
+
+    /* **奥を読む前にバス番号を入れる。** 入れないと奥の設定空間に届かない */
+    cfg_w32(b, d, f, PCI_BUS_NUMBERS,
+            (uint32_t)b | ((uint32_t)secondary << 8) | (0xffU << 16));
+
+    /* **窓の起点は 1MB 境界に揃える。**ブリッジの窓はそれ未満を表せない */
+    g_mmio_next = (g_mmio_next + PCI_BRIDGE_WIN_ALIGN - 1) & ~(PCI_BRIDGE_WIN_ALIGN - 1);
+    win_start = g_mmio_next;
+
+    pci_scan_bus(secondary);
+
+    /* 奥に何も無くても窓は 1MB 確保しておく (base > limit にすると無効化に
+     * なり、後から足せなくなる) */
+    if (g_mmio_next <= win_start) g_mmio_next = win_start + PCI_BRIDGE_WIN_ALIGN;
+    win_end = ((g_mmio_next + PCI_BRIDGE_WIN_ALIGN - 1) &
+               ~(PCI_BRIDGE_WIN_ALIGN - 1)) - 1;
+    g_mmio_next = win_end + 1;
+
+    /* **実際に使ったバスまでに縮める。** 0xff のままだと、そのブリッジが
+     * 全部のバスを自分のものだと主張し続ける */
+    cfg_w32(b, d, f, PCI_BUS_NUMBERS,
+            (uint32_t)b | ((uint32_t)secondary << 8) | ((uint32_t)g_bus_max << 16));
+
+    /* メモリ窓。**上位 12 ビットだけが効く** (番地 >> 16 の上位) */
+    cfg_w32(b, d, f, PCI_MEM_BASE_LIMIT,
+            (uint32_t)(((win_start >> 16) & 0xfff0U) |
+                       (((win_end >> 16) & 0xfff0U) << 16)));
+
+    /* **I/O とプリフェッチは使わない。** base > limit で無効にする —
+     * 中途半端に有効だと、そこへの読み書きが黙って吸われる */
+    cfg_w32(b, d, f, PCI_IO_BASE_LIMIT, 0x000000f0U);
+    cfg_w32(b, d, f, PCI_PREF_BASE_LIMIT, 0x0000fff0U);
+
+    /* ブリッジ自身も MEM デコードと bus master を開ける */
+    {
+        uint16_t cmd = cfg_r16(b, d, f, PCI_COMMAND);
+        cfg_w16(b, d, f, PCI_COMMAND,
+                (uint16_t)(cmd | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER));
+    }
+}
+
+static void pci_scan_bus(uint8_t bus) {
+    for (uint32_t d = 0; d < 32; d++) {
+        for (uint32_t f = 0; f < 8; f++) {
+            uint16_t vid = cfg_r16(bus, (uint8_t)d, (uint8_t)f, PCI_VENDOR_ID);
+            uint8_t hdr;
+            if (vid == 0xffffU || vid == 0) { if (f == 0) break; else continue; }
+            hdr = cfg_r8(bus, (uint8_t)d, (uint8_t)f, PCI_HEADER_TYPE);
+
+            if ((hdr & 0x7fU) == PCI_HEADER_TYPE_BRIDGE) {
+                pci_setup_bridge(bus, (uint8_t)d, (uint8_t)f);
+            } else {
+                assign_bars(bus, (uint8_t)d, (uint8_t)f);
+                if (g_dev_count < PCI_MAX_DEVICES) {
+                    fill_info(&g_devs[g_dev_count++], bus, (uint8_t)d, (uint8_t)f);
+                }
+            }
+            /* multi-function でなければ関数 0 だけ見ればよい */
+            if (f == 0 && (hdr & 0x80U) == 0) break;
+        }
+    }
+}
+
 void pci_init(void) {
     const aarch64_boot_info_t* b = aarch64_boot_info();
     g_ready = 0;
     g_ecam = 0;
+    g_dev_count = 0;
+    g_bus_max = 0;
     if (!b || b->pcie_ecam_base == 0 || b->pcie_mmio_base == 0) return;
 
     g_ecam = b->pcie_ecam_base;
@@ -170,36 +279,24 @@ void pci_init(void) {
     g_mmio_end  = b->pcie_mmio_base + b->pcie_mmio_size;
     g_ready = 1;
 
-    /* **見つけた順に BAR を配る。** 走査と割り当てを分けない —
-     * 分けると「見つけたが配っていない」状態が生まれ、後で気づきにくい */
-    for (uint32_t d = 0; d < 32; d++) {
-        for (uint32_t f = 0; f < 8; f++) {
-            uint16_t vid = cfg_r16(0, (uint8_t)d, (uint8_t)f, PCI_VENDOR_ID);
-            if (vid == 0xffffU || vid == 0) { if (f == 0) break; else continue; }
-            assign_bars(0, (uint8_t)d, (uint8_t)f);
-            /* multi-function でなければ関数 0 だけ見ればよい */
-            if (f == 0 && (cfg_r8(0, (uint8_t)d, 0, PCI_HEADER_TYPE) & 0x80U) == 0) break;
-        }
-    }
+    /* **走査と BAR の割り当てを分けない。** 分けると「見つけたが配って
+     * いない」状態が生まれ、後で気づきにくい */
+    pci_scan_bus(0);
 }
 
 int pci_find_device(struct pci_device_info* out, int vendor_id, int device_id,
                     int class_code, int subclass, int prog_if) {
     if (!g_ready || !out) return -1;
-    for (uint32_t d = 0; d < 32; d++) {
-        for (uint32_t f = 0; f < 8; f++) {
-            uint16_t vid = cfg_r16(0, (uint8_t)d, (uint8_t)f, PCI_VENDOR_ID);
-            if (vid == 0xffffU || vid == 0) { if (f == 0) break; else continue; }
-            fill_info(out, 0, (uint8_t)d, (uint8_t)f);
-            if (vendor_id  >= 0 && out->vendor_id  != (uint16_t)vendor_id)  goto next;
-            if (device_id  >= 0 && out->device_id  != (uint16_t)device_id)  goto next;
-            if (class_code >= 0 && out->class_code != (uint8_t)class_code)  goto next;
-            if (subclass   >= 0 && out->subclass   != (uint8_t)subclass)    goto next;
-            if (prog_if    >= 0 && out->prog_if    != (uint8_t)prog_if)     goto next;
-            return 0;
-        next:
-            if (f == 0 && (out->header_type & 0x80U) == 0) break;
-        }
+    /* **走査時に作った表から引く。** ブリッジの先も入っている */
+    for (uint32_t i = 0; i < g_dev_count; i++) {
+        const struct pci_device_info* p = &g_devs[i];
+        if (vendor_id  >= 0 && p->vendor_id  != (uint16_t)vendor_id)  continue;
+        if (device_id  >= 0 && p->device_id  != (uint16_t)device_id)  continue;
+        if (class_code >= 0 && p->class_code != (uint8_t)class_code)  continue;
+        if (subclass   >= 0 && p->subclass   != (uint8_t)subclass)    continue;
+        if (prog_if    >= 0 && p->prog_if    != (uint8_t)prog_if)     continue;
+        *out = *p;
+        return 0;
     }
     return -1;
 }
@@ -244,29 +341,32 @@ void aarch64_pci_dump(void) {
         aarch64_uart_puts("  pci       : 無し (ECAM が取れていない)\n");
         return;
     }
-    for (uint32_t d = 0; d < 32; d++) {
-        for (uint32_t f = 0; f < 8; f++) {
-            struct pci_device_info info;
-            uint16_t vid = cfg_r16(0, (uint8_t)d, (uint8_t)f, PCI_VENDOR_ID);
-            if (vid == 0xffffU || vid == 0) { if (f == 0) break; else continue; }
-            fill_info(&info, 0, (uint8_t)d, (uint8_t)f);
-            aarch64_uart_puts("  pci 00:");
-            puthex_n(d, 2);
-            aarch64_uart_puts(".");
-            puthex_n(f, 1);
-            aarch64_uart_puts("  vid ");
-            puthex_n(info.vendor_id, 4);
-            aarch64_uart_puts(" did ");
-            puthex_n(info.device_id, 4);
-            aarch64_uart_puts(" class ");
-            puthex_n(((uint64_t)info.class_code << 16) |
-                     ((uint64_t)info.subclass << 8) | info.prog_if, 6);
-            aarch64_uart_puts(" bar0 ");
-            puthex_n(pci_get_bar0_mmio(&info), 8);
-            aarch64_uart_puts("\n");
-            if (f == 0 && (info.header_type & 0x80U) == 0) break;
-        }
+    for (uint32_t i = 0; i < g_dev_count; i++) {
+        const struct pci_device_info* p = &g_devs[i];
+        aarch64_uart_puts("  pci ");
+        puthex_n(p->bus, 2);
+        aarch64_uart_puts(":");
+        puthex_n(p->device, 2);
+        aarch64_uart_puts(".");
+        puthex_n(p->function, 1);
+        aarch64_uart_puts("  vid ");
+        puthex_n(p->vendor_id, 4);
+        aarch64_uart_puts(" did ");
+        puthex_n(p->device_id, 4);
+        aarch64_uart_puts(" class ");
+        puthex_n(((uint64_t)p->class_code << 16) |
+                 ((uint64_t)p->subclass << 8) | p->prog_if, 6);
+        aarch64_uart_puts(" bar0 ");
+        puthex_n(pci_get_bar0_mmio(p), 8);
+        aarch64_uart_puts("\n");
     }
+    /* **ブリッジは表に入れていない** (デバイスではないので)。
+     * 何段辿ったかはバス番号の最大で分かる */
+    aarch64_uart_puts("  pci       : ");
+    puthex_n(g_dev_count, 2);
+    aarch64_uart_puts(" 台 (バス 0..");
+    puthex_n(g_bus_max, 2);
+    aarch64_uart_puts(")\n");
 }
 
 int aarch64_pci_ready(void) { return g_ready; }

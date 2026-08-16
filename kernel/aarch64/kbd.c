@@ -186,32 +186,24 @@ static void kbd_apply_report(const uint8_t rep[8]) {
 
 /* ---- 外から呼ぶ口 ---------------------------------------------------------
  *
- * **ここで USB を叩く。** 割り込みは使っていないので、取りに来られた
- * ときにポーリングする。DOOM は毎フレーム呼ぶので間隔としては足りる。
+ * **ここでは USB を叩かない。待ち行列から取るだけ。**
+ *
+ * 叩くのは aarch64_kbd_tick (タイマ割り込み) だけにする。
+ * **叩く者が 2 人いると取りこぼす** — 割り込みエンドポイントの転送
+ * イベントは 1 つしか無いので、片方が待っているものをもう片方が
+ * 消費してしまう。
+ *
+ * 実測 (2026-08-16): タイマと get_event の両方が叩いていたとき、
+ * sendkey を 5 回送って**受け取りが 10 個のときと 3 個のときがあった。**
+ * 構成によって出たり出なかったりする、いちばん厄介な形の取りこぼし。
  *
  * 戻り値: 1 = 取れた / 0 = 何も無い */
 int aarch64_kbd_get_event(struct key_event* ev) {
-    uint8_t rep[8];
     if (!ev) return 0;
-
-    /* **溜まっているものを先に吐く。** 1 回のレポートで押下と解放が
-     * 同時に出ることがあるので、キューを空にしてから次を読む */
-    if (g_head != g_tail) {
-        *ev = g_queue[g_tail];
-        g_tail = (g_tail + 1U) % KBD_QUEUE_SIZE;
-        return 1;
-    }
-
-    if (!usb_hid_keyboard_ready()) return 0;
-    if (usb_hid_keyboard_poll(rep) != 0) return 0;
-    kbd_apply_report(rep);
-
-    if (g_head != g_tail) {
-        *ev = g_queue[g_tail];
-        g_tail = (g_tail + 1U) % KBD_QUEUE_SIZE;
-        return 1;
-    }
-    return 0;
+    if (g_head == g_tail) return 0;
+    *ev = g_queue[g_tail];
+    g_tail = (g_tail + 1U) % KBD_QUEUE_SIZE;
+    return 1;
 }
 
 

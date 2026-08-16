@@ -43,9 +43,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# **ブリッジの先に置く。** Raspberry Pi 4 の実機では USB (VL805) が
+# ルートポートの先、バス 01 にいる (2026-08-16 実機の lspci で確認)。
+# **バス 0 に直付けした構成だけ試していると、実機で届かないことに
+# 気づけない。**ORTHOX_USB_KBD_FLAT=1 で直付けにも切り替えられる
+if [ -n "${ORTHOX_USB_KBD_FLAT:-}" ]; then
+    USB_ARGS=(-device qemu-xhci -device usb-kbd)
+    echo "(バス 0 に直付け)"
+else
+    USB_ARGS=(-device pcie-root-port,id=rp0,chassis=1
+              -device qemu-xhci,bus=rp0 -device usb-kbd)
+    echo "(ルートポートの先 = 実機と同じ形)"
+fi
+
 "$QEMU_BIN" -machine virt -cpu cortex-a72 -m 512M -smp 1 -display none \
     -serial file:"$LOG" -monitor unix:"$MON",server,nowait \
-    -device qemu-xhci -device usb-kbd \
+    "${USB_ARGS[@]}" \
     -kernel "$KERNEL" &
 QEMU_PID=$!
 
@@ -98,7 +111,8 @@ echo "--- 判定 ---"
 
 # 1) PCI から xHCI を見つけて BAR を配れたこと。
 #    **BAR が 0 のままだと番地 0 を読みに行って沈黙する**
-grep -aqE "pci 00:0x[0-9a-f]+\.0x[0-9a-f]+  vid 0x[0-9a-f]+ did 0x[0-9a-f]+ class 0x0c0330 bar0 0x[0-9a-f]+" "$LOGN"
+# **バス番号は固定しない。** 直付けならバス 0、ブリッジの先ならバス 1
+grep -aqE "pci 0x[0-9a-f]+:0x[0-9a-f]+\.0x[0-9a-f]+  vid 0x[0-9a-f]+ did 0x[0-9a-f]+ class 0x0c0330 bar0 0x[0-9a-f]+" "$LOGN"
 must_not "class 0x0c0330 bar0 0x00000000" "$LOGN" "xHCI の BAR を配れていない"
 
 # 2) HID のインターフェースと割り込みエンドポイントが取れたこと

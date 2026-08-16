@@ -98,7 +98,12 @@ static inline uint64_t aarch64_virt_to_phys(uint64_t va) {
                              AARCH64_PTE_AF | AARCH64_PTE_AP_RW_EL1 | \
                              AARCH64_PTE_UXN | AARCH64_PTE_PXN)
 
-#define AARCH64_PCIE_ECAM_MAP_SIZE 0x00100000ULL   /* 1MB = バス 0 */
+/* **バス 1 台につき 1MB。** 16MB = バス 0..15。
+ *
+ * 1MB (バス 0 だけ) にしていたら、**ブリッジの先のバス 1 を読んだ瞬間に
+ * translation fault で落ちた** (実測)。Raspberry Pi 4 の実機では USB が
+ * バス 1 にいるので、ここが足りないと実機でも同じ所で落ちる */
+#define AARCH64_PCIE_ECAM_MAP_SIZE 0x01000000ULL   /* 16MB = バス 0..15 */
 /* **64MB。** 16MB では足りなかった — 表示装置のフレームバッファの BAR が
  * 16MB あり、境界を揃えると次のデバイスが窓の外に出る
  * (実測: bochs-display の bar0 が 0x11000000、xHCI が 0x12004000)。
