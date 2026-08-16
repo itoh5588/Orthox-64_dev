@@ -152,10 +152,10 @@ int aarch64_fb_init(uint32_t want_w, uint32_t want_h) {
  * **MMU の前後で番地の見え方が変わる。** 前は物理そのもの、後は上位 VA。
  * 触るたびに今の走り方で変換する (pmm の管理情報と同じ理屈) */
 static volatile uint32_t* fb_ptr(void) {
-    /* **上位 VA へ移った後は専用の写像を使う。** HHDM ではない —
-     * フレームバッファは RAM の外に置かれることがあり、RAM の中にあっても
-     * 属性が違う (vm.h の AARCH64_FB_VA_BASE) */
-    if (aarch64_vm_running_high()) return (volatile uint32_t*)(uintptr_t)AARCH64_FB_VA_BASE;
+    /* **MMU が入っていれば専用の写像を使う。** 上位 VA で走っているかでは
+     * ない — TTBR1 は MMU を入れた時点で効いており、恒等マッピングには
+     * フレームバッファが無い (vm.h の aarch64_vm_mmu_enabled) */
+    if (aarch64_vm_mmu_enabled()) return (volatile uint32_t*)(uintptr_t)AARCH64_FB_VA_BASE;
     return (volatile uint32_t*)(uintptr_t)g_fb.base;
 }
 

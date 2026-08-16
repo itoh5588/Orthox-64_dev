@@ -29,4 +29,12 @@ void aarch64_fb_fill(uint32_t argb);
 void aarch64_fb_test_pattern(void);
 void aarch64_fb_mark_top(uint32_t argb);
 
+/* 画面のテキストコンソール (kernel/aarch64/fbcon.c)。
+ * **画面が無い機械では putc が何もしない**ので、呼ぶ側に条件は要らない */
+void aarch64_fbcon_init(void);
+void aarch64_fbcon_putc(char c);
+int aarch64_fbcon_ready(void);
+uint32_t aarch64_fbcon_cols(void);
+uint32_t aarch64_fbcon_rows(void);
+
 #endif

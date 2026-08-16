@@ -127,6 +127,21 @@ void arch_vm_update_page_flags(arch_address_space_t address_space, uint64_t vadd
 void aarch64_vm_activate_address_space(uint64_t root_pa);
 uint64_t aarch64_vm_kernel_root_pa(void);
 
+/* MMU が有効か (SCTLR_EL1.M)。
+ *
+ * **「上位 VA で走っているか」とは別物。** TTBR1 は MMU を入れた時点で
+ * 効いているので、まだ恒等マッピングで走っていても上位 VA には届く。
+ *
+ * **TTBR1 にしか写像が無いもの (フレームバッファ) は、こちらで判断する。**
+ * running_high で判断すると、MMU を入れてから高位 VA へ移るまでの間に
+ * 物理番地を触ってしまい、恒等マッピングに無いので落ちる
+ * (実測: raspi4b で FAR=0x3c110000 の translation fault) */
+static inline int aarch64_vm_mmu_enabled(void) {
+    uint64_t v;
+    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(v));
+    return (int)(v & 1ULL);
+}
+
 /* いま上位 VA で走っているか。恒等マッピングを外してよいかの判断に使う */
 static inline int aarch64_vm_running_high(void) {
     uint64_t pc;

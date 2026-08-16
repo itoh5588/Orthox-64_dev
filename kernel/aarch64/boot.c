@@ -57,12 +57,17 @@ void aarch64_uart_set_base(uint64_t base) {
 void aarch64_console_begin(void) { aarch64_preempt_disable(); }
 void aarch64_console_end(void)   { aarch64_preempt_enable(); }
 
-/* 1 文字は MMIO の書き込み 1 回なので、これ自体は割れようがない */
+/* 1 文字は MMIO の書き込み 1 回なので、これ自体は割れようがない。
+ *
+ * **画面にも同じものを流す。** シリアルの代わりではなく増設 —
+ * 画面が無い機械 (QEMU virt) では aarch64_fbcon_putc が何もしないので、
+ * ここに条件は書かない */
 void aarch64_uart_putchar(char c) {
     while (mmio_read32(g_uart_base + PL011_FR_OFF) & PL011_FR_TXFF) {
         /* 送信 FIFO が空くまで待つ */
     }
     mmio_write32(g_uart_base + PL011_DR_OFF, (uint32_t)(unsigned char)c);
+    aarch64_fbcon_putc(c);
 }
 
 /* 1 文字だけ取る。無ければ -1 (P3)。**待たない** —
@@ -484,9 +489,23 @@ void aarch64_early_main(uint64_t dtb_phys) {
             put_dec(fb->pitch);
             aarch64_uart_puts("  ok\n");
             /* **画面に出す前にログへ出す。** 絵が出ないとき、番地を取れて
-             * いないのか描けていないのかを切り分けられるようにする */
+             * いないのか描けていないのかを切り分けられるようにする。
+             *
+             * テストパターンを一瞬出してからコンソールで塗り潰す。
+             * **絵が出るかどうかと、字が出るかどうかは別の話** — 文字が
+             * 化けているときに「そもそも描けているのか」を見分けられる */
             aarch64_fb_test_pattern();
-            aarch64_uart_puts("  fb pattern: 描いた (HDMI を見ること)\n");
+            aarch64_uart_puts("  fb pattern: 描いた\n");
+            aarch64_fbcon_init();
+            aarch64_uart_puts("  fb console: ");
+            if (aarch64_fbcon_ready()) {
+                put_dec(aarch64_fbcon_cols());
+                aarch64_uart_puts("桁 x ");
+                put_dec(aarch64_fbcon_rows());
+                aarch64_uart_puts("行  ok (ここから先は HDMI にも出る)\n");
+            } else {
+                aarch64_uart_puts("BAD (立ち上げられない)\n");
+            }
         } else if (fb->fail == AARCH64_FB_FAIL_NO_MBOX) {
             aarch64_uart_puts("無し (mailbox が無い機械)\n");
         } else {
