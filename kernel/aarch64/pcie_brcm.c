@@ -205,18 +205,34 @@ static void wr32(uint32_t off, uint32_t v) {
     __asm__ volatile("dsb sy" ::: "memory");
 }
 
-/* **時間待ちはタイマで測る。**空回しの回数で待つと、CPU の速さで
- * 変わってしまう */
-uint64_t aarch64_timer_ticks(void);
-uint64_t aarch64_timer_freq(void);
+/* **時間待ちは CNTPCT_EL0 で測る。**空回しの回数だと CPU の速さで変わる。
+ *
+ * ★ **aarch64_timer_ticks() を使ってはいけない。**あれは
+ * 「**タイマ割り込みが入った回数**」であって 54MHz のカウンタではない。
+ * 取り違えて 200us のつもりで 10800 割り込み (≒ 100 秒以上) 待つ関数を
+ * 書き、**実機が固まった。**「ハードウェアが書き込みで固まる」と誤診
+ * しかけた (2026-08-16)。
+ *
+ * emmc2.c と runtime.c は最初から CNTPCT_EL0 を読んでいる。そちらに倣う */
+static inline uint64_t pcie_cntpct(void) {
+    uint64_t v;
+    __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(v));
+    return v;
+}
+static inline uint64_t pcie_cntfrq(void) {
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(v));
+    return v;
+}
 
 __attribute__((unused))
 static void pcie_delay_us(uint32_t us) {
-    uint64_t f = aarch64_timer_freq();
-    uint64_t want = (f / 1000000ULL) * us;
-    uint64_t t0 = aarch64_timer_ticks();
+    uint64_t f = pcie_cntfrq();
+    uint64_t t0, want;
     if (f == 0) { for (volatile uint32_t i = 0; i < us * 100U; i++) { } return; }
-    while (aarch64_timer_ticks() - t0 < want) { __asm__ volatile("yield"); }
+    want = (f / 1000000ULL) * (uint64_t)us;
+    t0 = pcie_cntpct();
+    while (pcie_cntpct() - t0 < want) { __asm__ volatile("yield"); }
 }
 
 int aarch64_pcie_brcm_init(void) {
