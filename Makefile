@@ -410,15 +410,31 @@ AARCH64_OBJS = $(patsubst kernel/aarch64/%.c, $(BUILD_DIR)/aarch64/kernel/%.o, $
 	$(patsubst kernel/%.c, $(BUILD_DIR)/aarch64/shared/%.o, $(AARCH64_SHARED_C_SRCS)) \
 	$(patsubst kernel/aarch64/%.S, $(BUILD_DIR)/aarch64/kernel/%_asm.o, $(AARCH64_ASM_SRCS))
 
-$(BUILD_DIR)/aarch64/kernel/%.o: kernel/aarch64/%.c
+# ---- CFLAGS が変わったら組み直す ------------------------------------------
+#
+# **make はコマンド行の変化を追わない。** ソースが変わっていなければ、
+# 番地の差し替え (AARCH64_EMMC2_BASE など) や探針の有効化
+# (AARCH64_USB_KBD_PROBE) を指定しても**前のビルドがそのまま使われる。**
+#
+# 実際これで嵌まった: スモークを続けて回すと、**先に回したスモークが
+# 作ったカーネルを次のスモークが使い**、探針が入っていないまま
+# 「探針まで来なかった」で落ちた。**実行順で結果が変わる**状態だった。
+#
+# CFLAGS を書いた印を置き、中身が変わったときだけ更新する。
+# オブジェクトはこれに依存させる
+AARCH64_CFLAGS_STAMP = $(BUILD_DIR)/aarch64/.cflags
+$(shell mkdir -p $(BUILD_DIR)/aarch64)
+$(shell printf '%s' '$(AARCH64_CFLAGS)' > $(BUILD_DIR)/aarch64/.cflags.new;         cmp -s $(BUILD_DIR)/aarch64/.cflags.new $(AARCH64_CFLAGS_STAMP)           || cp $(BUILD_DIR)/aarch64/.cflags.new $(AARCH64_CFLAGS_STAMP);         rm -f $(BUILD_DIR)/aarch64/.cflags.new)
+
+$(BUILD_DIR)/aarch64/kernel/%.o: kernel/aarch64/%.c $(AARCH64_CFLAGS_STAMP)
 	@mkdir -p $(@D)
 	$(AARCH64_CC) $(AARCH64_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/aarch64/shared/%.o: kernel/%.c
+$(BUILD_DIR)/aarch64/shared/%.o: kernel/%.c $(AARCH64_CFLAGS_STAMP)
 	@mkdir -p $(@D)
 	$(AARCH64_CC) $(AARCH64_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/aarch64/kernel/%_asm.o: kernel/aarch64/%.S
+$(BUILD_DIR)/aarch64/kernel/%_asm.o: kernel/aarch64/%.S $(AARCH64_CFLAGS_STAMP)
 	@mkdir -p $(@D)
 	$(AARCH64_CC) $(AARCH64_CFLAGS) -c $< -o $@
 
@@ -533,6 +549,13 @@ aarch64-doom-vnc: $(AARCH64_DOOM_ELF)
 aarch64-doom-key-smoke: $(AARCH64_DOOM_ELF)
 	$(MAKE) -C $(CURDIR) aarch64-kernel8 AARCH64_INIT_PATH_VALUE=/bin/doom
 	bash ./tests/aarch64_doom_key_smoke.sh
+
+# **USB キーボードで ash を打てること。**これが通ると「HDMI とキーボード
+# だけで完結した計算機」になる
+# **変数はここより後ろで定義されるので使えない** (前提行は読んだ時点で展開)
+aarch64-kbd-shell-smoke: out/busybox-aarch64-musl.elf
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 AARCH64_INIT_PATH_VALUE=/bin/ash
+	bash ./tests/aarch64_kbd_shell_smoke.sh
 
 aarch64-usb-kbd-smoke:
 	$(MAKE) -C $(CURDIR) aarch64-kernel8 AARCH64_USB_KBD_PROBE=1

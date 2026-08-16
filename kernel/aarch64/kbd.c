@@ -97,6 +97,30 @@ static int map_usage(uint8_t usage, uint8_t* scancode, uint16_t* ascii) {
 static struct key_event g_queue[KBD_QUEUE_SIZE];
 static uint32_t g_head, g_tail;
 
+/* **シェルに文字を渡す口** (kernel/aarch64/console.c)。
+ *
+ * DOOM 用の生イベント列とは**別の出口**にする。同じ待ち行列から両方が
+ * 取ると互いに奪い合い、「シェルに打つと DOOM が取りこぼす」ことになる。
+ * レポートを解いた時点で両方へ配る */
+void aarch64_console_push_char(char c);
+
+/* 修飾キーの状態。**大文字と記号に要る** */
+static uint8_t g_mods;
+
+/* Shift を押しているときの文字。**英字は大文字、数字と記号は別の字**。
+ * 表に無いものはそのまま返す */
+static uint16_t shift_char(uint16_t a) {
+    if (a >= 'a' && a <= 'z') return (uint16_t)(a - 'a' + 'A');
+    switch (a) {
+        case '1': return '!';  case '2': return '@';  case '3': return '#';
+        case '4': return '$';  case '5': return '%';  case '6': return '^';
+        case '7': return '&';  case '8': return '*';  case '9': return '(';
+        case '0': return ')';  case '-': return '_';  case '=': return '+';
+        case '/': return '?';  case '.': return '>';  case ',': return '<';
+        default: return a;
+    }
+}
+
 static void kbd_push(uint8_t pressed, uint8_t scancode, uint16_t ascii) {
     uint32_t next = (g_head + 1U) % KBD_QUEUE_SIZE;
     if (next == g_tail) g_tail = (g_tail + 1U) % KBD_QUEUE_SIZE;   /* 古いものを捨てる */
@@ -133,7 +157,16 @@ static void kbd_apply_report(const uint8_t rep[8]) {
         for (int j = 2; j < 8; j++) if (g_prev[j] == u) { found = 1; break; }
         if (!found) {
             uint8_t sc; uint16_t as;
-            if (map_usage(u, &sc, &as)) kbd_push(1, sc, as);
+            if (map_usage(u, &sc, &as)) {
+                kbd_push(1, sc, as);
+                /* **シェルへは押下のときだけ、文字があるものだけ配る。**
+                 * 矢印などは ascii が 0 なので流れない (端末の
+                 * エスケープ列を作るのは別の話) */
+                if (as != 0) {
+                    uint16_t out = (rep[0] & (MOD_LSHIFT | MOD_RSHIFT)) ? shift_char(as) : as;
+                    aarch64_console_push_char((char)out);
+                }
+            }
         }
     }
     /* 離された: 前回に在って今回に無いもの */
@@ -148,6 +181,7 @@ static void kbd_apply_report(const uint8_t rep[8]) {
         }
     }
     for (int i = 0; i < 8; i++) g_prev[i] = rep[i];
+    g_mods = rep[0];
 }
 
 /* ---- 外から呼ぶ口 ---------------------------------------------------------
@@ -178,4 +212,20 @@ int aarch64_kbd_get_event(struct key_event* ev) {
         return 1;
     }
     return 0;
+}
+
+
+/* ---- タイマから呼ぶ -------------------------------------------------------
+ *
+ * **USB キーボードには割り込みを繋いでいない。**取りに来られたときだけ
+ * ポーリングする作りだと、**シェルが寝ているあいだ誰も起こしに来ない。**
+ * タイマ割り込みから定期的に叩いて、文字が来ていればコンソールのリングへ
+ * 流す (そこで待ち手を起こす)。
+ *
+ * **割り込み文脈なので長く回らないこと。** poll の待ちは短くしてある */
+void aarch64_kbd_tick(void) {
+    uint8_t rep[8];
+    if (!usb_hid_keyboard_ready()) return;
+    if (usb_hid_keyboard_poll(rep) != 0) return;
+    kbd_apply_report(rep);
 }

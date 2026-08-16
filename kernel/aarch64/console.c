@@ -108,6 +108,39 @@ void aarch64_console_rx_irq(void) {
     }
 }
 
+/* ---- USB キーボードからの入力 --------------------------------------------
+ *
+ * **シリアルと同じリングへ入れる。**シェルから見れば入力の出所は 1 つで
+ * よく、「シリアルからも USB からも打てる」状態になる。
+ *
+ * **待ち手を起こすところまでやる。**ここを忘れると、文字は溜まるのに
+ * シェルは寝たままになる (シリアルの割り込み経路と同じ理屈)。
+ *
+ * 呼ばれるのはタイマ割り込みの文脈 (kernel/aarch64/kbd.c の
+ * aarch64_kbd_tick)。**長く回らないこと。** */
+void aarch64_console_push_char(char c) {
+    struct task* waiter;
+    int pushed = 0;
+    uint64_t flags = console_lock();
+    uint32_t next = (g_console_head + 1U) % CONSOLE_BUF_SIZE;
+
+    /* 端末は改行を CR で送る。**USB キーボードの Enter も同じ扱いにする** —
+     * ash は '\n' で行を区切るので、CR のままだと入力が確定しない */
+    if (c == '\r') c = '\n';
+
+    if (next != g_console_tail) {
+        g_console_buf[g_console_head] = (uint8_t)c;
+        g_console_head = next;
+        pushed = 1;
+    }
+    waiter = g_console_waiter;
+    console_unlock(flags);
+
+    if (pushed && waiter && waiter->state == TASK_SLEEPING) {
+        task_wake(waiter);
+    }
+}
+
 /* ---- 共有 kernel/fs.c が呼ぶ入口 ---------------------------------------- */
 
 /* データがあるだけ読む。無ければ 0。
