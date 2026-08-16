@@ -31,12 +31,16 @@
  * MB0 の STATUS (+0x18)。よく出回っている実装は送信でも +0x18 を見ている
  * が、それは MB0 (自分が読む側) の空き具合であって、送信の可否ではない。
  *
- * **MMU を入れる前に呼ぶ。**キャッシュがまだ効いていない (SCTLR.C = 0) ので、
- * バッファへの書き込みがそのまま DRAM に載り、VC から見える。MMU を入れた
- * 後に呼ぶなら、バッファのクリーン/無効化が別途要る。
+ * **MMU の前でも後でも呼べる。**レジスタの番地は触るたびに変換する。
+ *
+ * ただし**バッファの扱いは違う。**MMU の前はキャッシュが効いていない
+ * (SCTLR.C = 0) ので書き込みがそのまま DRAM に載るが、**MMU の後は
+ * キャッシュに留まる可能性がある。**画面の初期化は前、VL805 の
+ * ファームウェア再読み込みは後から呼んでいる。
  */
 #include <stdint.h>
 #include "aarch64/boot.h"
+#include "aarch64/vm.h"
 
 /* Pi 4 (BCM2711) の既定値。DTB から取れれば上書きする。
  * 周辺の基底が 0xfe000000 で、mailbox はそこから +0xb880 */
@@ -59,11 +63,40 @@
 
 static uint64_t g_mbox_base;
 
-static inline uint32_t mbox_r32(uint32_t off) {
-    return *(volatile uint32_t*)(uintptr_t)(g_mbox_base + off);
+/* **MMU の前後で番地の見え方が変わる。**
+ *
+ * 当初は「MMU を入れる前にしか呼ばない」前提で物理番地を直に触って
+ * いたが、**VL805 のファームウェア再読み込み (PCIe の立ち上げ後) で
+ * MMU の後から呼ぶようになった。**そのとき物理番地を触って
+ * translation fault で落ちた (実測: FAR=0xfe00b8b8 = MB1 STATUS)。
+ *
+ * 触るたびに今の走り方で変換する (fb.c / pci.c と同じ理屈) */
+static inline volatile uint32_t* mbox_ptr(uint32_t off) {
+    uint64_t pa = g_mbox_base + off;
+    if (aarch64_vm_mmu_enabled()) return (volatile uint32_t*)(uintptr_t)aarch64_phys_to_virt(pa);
+    return (volatile uint32_t*)(uintptr_t)pa;
 }
-static inline void mbox_w32(uint32_t off, uint32_t v) {
-    *(volatile uint32_t*)(uintptr_t)(g_mbox_base + off) = v;
+static inline uint32_t mbox_r32(uint32_t off) { return *mbox_ptr(off); }
+static inline void mbox_w32(uint32_t off, uint32_t v) { *mbox_ptr(off) = v; }
+
+/* **バッファをキャッシュから追い出す。**
+ *
+ * VideoCore は 0xc0000000 の別名 (L2 を通さない眺め) でバッファを読む。
+ * **MMU を入れた後はこちらの書き込みがキャッシュに留まる**ので、
+ * そのままだと VC が古い内容を読む。返事も同じ理由で読み直しが要る。
+ *
+ * MMU の前 (画面の初期化) はキャッシュが効いていないので何もしない。
+ *
+ * dc civac = クリーンして無効化。**書く前と読む前の両方で使える** */
+static void mbox_cache_flush(volatile uint32_t* buf, uint32_t bytes) {
+    uintptr_t p, e;
+    if (!aarch64_vm_mmu_enabled()) return;
+    /* Cortex-A72 のキャッシュラインは 64 バイト。**小さめに刻むのは安全**
+     * (同じ行を 2 回触るだけ)。大きいと飛ばしてしまう */
+    p = (uintptr_t)buf & ~63UL;
+    e = ((uintptr_t)buf + bytes + 63UL) & ~63UL;
+    for (; p < e; p += 64) __asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
 }
 
 void aarch64_mbox_set_base(uint64_t base) { g_mbox_base = base; }
@@ -111,6 +144,9 @@ int aarch64_mbox_property(volatile uint32_t* buf) {
      * 下位 4 ビットはチャネルに使うので 0 でなければならない */
     word = (uint32_t)((pa | 0xc0000000ULL) & 0xfffffff0ULL) | 8U;
 
+    /* **VC が読む前に、こちらの書き込みを DRAM へ落とす** */
+    mbox_cache_flush(buf, buf[0] ? buf[0] : 64U);
+
     /* 送信: MB1 が満杯でなくなるまで待つ */
     for (spins = 0; (mbox_r32(MBOX_MB1_STATUS) & MBOX_STATUS_FULL) != 0; spins++) {
         if (spins >= MBOX_SPIN_LIMIT) return -2;
@@ -129,6 +165,9 @@ int aarch64_mbox_property(volatile uint32_t* buf) {
         break;
     }
     __asm__ volatile("dsb sy" ::: "memory");
+
+    /* **返事を読む前に、キャッシュの古い内容を捨てる** */
+    mbox_cache_flush(buf, buf[0] ? buf[0] : 64U);
 
     /* **「返事が来た」と「成功した」は別。** 応答コードを見ないと、
      * タグが 1 つも通っていなくても成功に見える */

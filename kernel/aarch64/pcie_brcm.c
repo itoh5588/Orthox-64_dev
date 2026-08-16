@@ -32,6 +32,7 @@
 #include "aarch64/boot.h"
 #include "aarch64/vm.h"
 
+uint64_t aarch64_vm_translate(uint64_t va);
 void aarch64_uart_puts(const char* s);
 void aarch64_uart_putchar(char c);
 
@@ -341,6 +342,63 @@ static void brcm_cfg_w32(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t off, uin
     }
 }
 
+/* ---- VL805 のファームウェアを読み直させる --------------------------------
+ *
+ * **PERST# でリンクをリセットすると VL805 のファームウェアが消える。**
+ * 起動時に Raspberry Pi のブートローダが SPI EEPROM から読み込んで
+ * いるが、リセットで飛ぶ。
+ *
+ * 症状は**「設定空間には応答するがメモリ空間が応答しない」** —
+ * 設定ヘッダはハードウェアに焼かれているので読めるが、機能していない。
+ * 実測でまさにこうなった (2026-08-16):
+ *
+ *   pcie chk : bar=0xc0000004 cmd=0x0006  rc: cmd=0x0006 mem=0xc000c000
+ *   pcie map : va=... -> pa=0x600000000  ok (張られている)
+ *   -> それでも xHCI のレジスタを読むと止まる
+ *
+ * 実機の DTB がそう言っていた:
+ *
+ *   /scb/pcie@7d500000/pci@0,0/usb@0,0   resets = <&firmware-reset 0>
+ *
+ * **ファームウェアに頼む。**mailbox の property:
+ *
+ *   タグ      0x00030058  (NOTIFY_XHCI_RESET)
+ *   payload   PCI_BUS << 20 | PCI_SLOT << 15 | PCI_FUNC << 12
+ *             Pi 4 は 01:00.0 なので 0x100000
+ *
+ * 出所は Linux の reset-raspberrypi.c と raspberrypi-firmware.h
+ * (**値だけ**確認。コードは持ち込んでいない) */
+#define RPI_FW_NOTIFY_XHCI_RESET  0x00030058U
+
+int aarch64_mbox_property(volatile uint32_t* buf);
+uint64_t aarch64_mbox_base(void);
+
+static volatile uint32_t g_mbox_buf[16] __attribute__((aligned(16)));
+
+static int pcie_vl805_reload_firmware(uint8_t bus, uint8_t dev, uint8_t fn) {
+    volatile uint32_t* b = g_mbox_buf;
+    uint32_t i = 0;
+    uint32_t devaddr = ((uint32_t)bus << 20) | ((uint32_t)dev << 15) | ((uint32_t)fn << 12);
+    int rc;
+
+    if (aarch64_mbox_base() == 0) return -1;
+
+    b[i++] = 0;                          /* 全体のバイト数。最後に埋める */
+    b[i++] = 0;                          /* 要求 */
+    b[i++] = RPI_FW_NOTIFY_XHCI_RESET;
+    b[i++] = 4;                          /* 値の大きさ */
+    b[i++] = 4;
+    b[i++] = devaddr;
+    b[i++] = 0;                          /* 終端 */
+    b[0] = i * 4U;
+
+    rc = aarch64_mbox_property(b);
+    aarch64_uart_puts("  pcie fw   : VL805 のファームウェア再読み込み devaddr=");
+    puthex_n(devaddr, 8);
+    aarch64_uart_puts(rc == 0 ? "  ok\n" : "  BAD (mailbox が失敗)\n");
+    return rc;
+}
+
 /* 見つけた xHCI。**CPU から見た BAR の番地**を覚える
  * (PCI 側とは違う。ranges で CPU 0x6_00000000 <-> PCI 0xc0000000) */
 static uint64_t g_xhci_cpu_bar;
@@ -415,6 +473,9 @@ int aarch64_pcie_brcm_scan(void) {
 
             /* xHCI (0x0c0330) を見つけたら BAR を配る */
             if (cls == 0x0c0330U) {
+                /* **BAR を配る前にファームウェアを読み直させる。**
+                 * 読み直すとデバイスがリセットされるので、設定は後 */
+                pcie_vl805_reload_firmware(1, (uint8_t)d, (uint8_t)f);
                 uint32_t orig = brcm_cfg_r32(1, (uint8_t)d, (uint8_t)f, 0x10);
                 uint32_t size_mask, size;
 
@@ -436,6 +497,40 @@ int aarch64_pcie_brcm_scan(void) {
                 }
                 /* **CPU から見た番地はこちら** */
                 g_xhci_cpu_bar = cpu_base;
+
+                /* ---- 触る前に確かめられることを全部出す --------------
+                 *
+                 * **止まってから原因を考えると往復が増える。**
+                 * MMIO を読む前に、設定空間から読み返せるものと
+                 * ページテーブルの状態を出しておく */
+                {
+                    uint32_t bar_rb  = brcm_cfg_r32(1, (uint8_t)d, (uint8_t)f, 0x10);
+                    uint32_t cmd_rb  = brcm_cfg_r32(1, (uint8_t)d, (uint8_t)f, 0x04);
+                    uint32_t rc_cmd  = brcm_cfg_r32(0, 0, 0, 0x04);
+                    uint32_t rc_bus  = brcm_cfg_r32(0, 0, 0, 0x18);
+                    uint32_t rc_mem  = brcm_cfg_r32(0, 0, 0, 0x20);
+                    uint64_t va      = aarch64_phys_to_virt(cpu_base);
+                    uint64_t mapped  = aarch64_vm_translate(va);
+
+                    aarch64_uart_puts("  pcie chk  : bar=");
+                    puthex_n(bar_rb, 8);
+                    aarch64_uart_puts(" cmd=");
+                    puthex_n(cmd_rb & 0xffffU, 4);
+                    aarch64_uart_puts("  rc: cmd=");
+                    puthex_n(rc_cmd & 0xffffU, 4);
+                    aarch64_uart_puts(" bus=");
+                    puthex_n(rc_bus & 0xffffffU, 6);
+                    aarch64_uart_puts(" mem=");
+                    puthex_n(rc_mem, 8);
+                    aarch64_uart_puts("\n");
+
+                    aarch64_uart_puts("  pcie map  : va=");
+                    puthex_n(va, 12);
+                    aarch64_uart_puts(" -> pa=");
+                    puthex_n(mapped, 12);
+                    aarch64_uart_puts(mapped == cpu_base ? "  ok (張られている)\n"
+                                                         : "  BAD (張られていない)\n");
+                }
 
                 aarch64_uart_puts("  pcie xhci : PCI ");
                 puthex_n(pci_base, 8);

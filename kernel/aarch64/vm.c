@@ -459,6 +459,16 @@ static void aarch64_vm_build_kernel(void) {
                              b->pcie_mmio_base, win, VM_DEVICE_RW);
     }
 
+    /* **VideoCore の mailbox。** 画面の初期化は MMU の前なので写像が
+     * 要らなかったが、**VL805 のファームウェア再読み込みは MMU の後から
+     * 呼ぶ**ので、ここで張っておかないと落ちる
+     * (実測: FAR=0xfe00b8b8 で translation fault) */
+    if (b->mbox_base) {
+        aarch64_vm_map_range(aarch64_phys_to_virt(b->mbox_base & ~(AARCH64_PAGE_SIZE - 1)),
+                             b->mbox_base & ~(AARCH64_PAGE_SIZE - 1),
+                             AARCH64_PAGE_SIZE, VM_DEVICE_RW);
+    }
+
     /* Raspberry Pi 4 の PCIe のレジスタ窓。**ECAM とは別物。**
      * **いまは読むだけ**なので窓だけ張る (kernel/aarch64/pcie_brcm.c)。
      * 外向きの MMIO 窓 (CPU 0x6_00000000) はまだ張らない — BAR を配る
