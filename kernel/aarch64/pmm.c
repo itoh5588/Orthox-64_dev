@@ -27,33 +27,48 @@
 #define AARCH64_BOOT_CPUS   8
 #define AARCH64_BOOT_STACK  65536ULL
 
-/* 管理できるページ数の上限。4KB x 1048576 = 4GB。
+/* 管理情報 (ビットマップと refcount) は**管理対象の RAM から切り出す**。
  *
- * **512MB -> 2GB -> 4GB と上げてきた。** DTB が 2GB と言っても pmm が
- * 512MB で頭打ちにしていて、QEMU に -m を積んでも効かなかった
- * (1G と 2G で同じ所で停止することを実測)。
+ * **以前は静的配列だった。** 4KB x 1048576 = 4GB ぶんを .bss に固定で置き、
+ * RAM が何 MB の機械でも bitmap 128KB + refcount 2048KB = 2176KB を必ず食う。
+ * しかも **4GB を超える機械は上限で切り捨てていた** (Pi 4 の 8GB モデル)。
  *
- * 上げる代償は .bss:
- *    512MB  bitmap  16KB + refcount  256KB =  272KB
- *   2048MB  bitmap  64KB + refcount 1024KB = 1088KB
- *   4096MB  bitmap 128KB + refcount 2048KB = 2176KB   <- いまここ
+ * いまは実際の RAM の広さから必要量を計算し、**空き領域の先頭から取って
+ * 自分で使用済みにする**。上限が消え、.bss も 2176KB 減る。
  *
- * **Raspberry Pi 4 (4GB) の実機に合わせた。**2176KB は 4GB に対して 0.05% で、
- * 静的配列のまま賄える。**8GB モデルはこの形では足りない** (4352KB)。
- * そこまで行くなら、ビットマップと refcount を静的配列でなく
- * **管理対象の RAM から切り出す**設計にする。そうすれば上限が消える。 */
-#define AARCH64_PMM_MAX_PAGES 1048576U
+ *   1 ページあたり  bitmap 1/8 バイト + refcount 2 バイト = 約 2.125 バイト
+ *   4GB (1048576 ページ)  約 2.1MB    8GB (2097152 ページ)  約 4.3MB
+ *
+ * **置き場は空き領域の先頭 = カーネルとブートスタックの直後。** そこは
+ * カーネル自身が載っている実在の RAM なので、Pi 4 の「RAM の穴」には
+ * 当たらない。当たっていないことは init の中で確かめる (穴の上に管理情報を
+ * 置くと、ファームウェアの持ち物を黙って壊すため)。 */
 
 extern char __kernel_end[];
 
-static uint8_t g_bitmap[(AARCH64_PMM_MAX_PAGES + 7U) / 8U];
 static uint64_t g_base_pa;      /* 管理領域の先頭 (物理) */
 static uint64_t g_pages;        /* 管理しているページ数 */
 static uint64_t g_used;
+static uint64_t g_bitmap_pa;    /* ビットマップの物理アドレス (管理領域の中) */
+static uint64_t g_refcount_pa;  /* refcount の物理アドレス (同上) */
+static uint64_t g_meta_pages;   /* 管理情報が占めるページ数 */
+static int      g_meta_fault;   /* 管理情報を置けなかった (穴の上だった) */
 
-static void pmm_set(uint64_t page)   { g_bitmap[page / 8U] |= (uint8_t)(1U << (page % 8U)); }
-static void pmm_clear(uint64_t page) { g_bitmap[page / 8U] &= (uint8_t)~(1U << (page % 8U)); }
-static int  pmm_test(uint64_t page)  { return (g_bitmap[page / 8U] >> (page % 8U)) & 1U; }
+/* **管理情報は物理アドレスで持つ。**
+ *
+ * pmm_init は MMU を入れる前 (物理アドレスで走っている) に動くが、
+ * 以後の alloc/free は上位 VA へ移った後から来る。静的配列ならリンカが
+ * 面倒を見てくれたが、切り出した領域は自分で変換しないと、MMU を入れた
+ * 瞬間に届かなくなる。**触るたびに今の走り方で変換する。** */
+static void* pmm_meta_ptr(uint64_t pa) {
+    return (void*)(uintptr_t)(aarch64_vm_running_high() ? aarch64_phys_to_virt(pa) : pa);
+}
+static uint8_t*  pmm_bitmap(void)   { return (uint8_t*)pmm_meta_ptr(g_bitmap_pa); }
+static uint16_t* pmm_refcount(void) { return (uint16_t*)pmm_meta_ptr(g_refcount_pa); }
+
+static void pmm_set(uint64_t page)   { pmm_bitmap()[page / 8U] |= (uint8_t)(1U << (page % 8U)); }
+static void pmm_clear(uint64_t page) { pmm_bitmap()[page / 8U] &= (uint8_t)~(1U << (page % 8U)); }
+static int  pmm_test(uint64_t page)  { return (pmm_bitmap()[page / 8U] >> (page % 8U)) & 1U; }
 
 static uint64_t align_up_page(uint64_t v) {
     return (v + AARCH64_PAGE_SIZE - 1ULL) & ~(AARCH64_PAGE_SIZE - 1ULL);
@@ -66,14 +81,28 @@ static uint64_t sym_pa(const void* p) {
     return aarch64_vm_running_high() ? aarch64_virt_to_phys(a) : a;
 }
 
+/* pa が DTB の言う実在レンジの中か。**レンジが取れていない (既定値に退いた)
+ * ときは全体を実在とみなす** — 従来の振る舞いに合わせる */
+static int pmm_pa_in_ranges(const aarch64_boot_info_t* b, uint64_t pa) {
+    if (b->mem_range_count == 0) return 1;
+    for (uint32_t r = 0; r < b->mem_range_count; r++) {
+        if (pa >= b->mem_range_base[r] &&
+            pa < b->mem_range_base[r] + b->mem_range_size[r]) return 1;
+    }
+    return 0;
+}
+
 void aarch64_pmm_init(void) {
     const aarch64_boot_info_t* b = aarch64_boot_info();
-    uint64_t mem_end, free_base;
+    uint64_t mem_end, free_base, bitmap_bytes, meta_bytes;
 
-    for (uint64_t i = 0; i < sizeof(g_bitmap); i++) g_bitmap[i] = 0xffU;
     g_base_pa = 0;
     g_pages = 0;
     g_used = 0;
+    g_bitmap_pa = 0;
+    g_refcount_pa = 0;
+    g_meta_pages = 0;
+    g_meta_fault = 0;
 
     if (!b || b->memory_size == 0) return;
 
@@ -89,7 +118,47 @@ void aarch64_pmm_init(void) {
 
     g_base_pa = free_base;
     g_pages = (mem_end - free_base) / AARCH64_PAGE_SIZE;
-    if (g_pages > AARCH64_PMM_MAX_PAGES) g_pages = AARCH64_PMM_MAX_PAGES;
+
+    /* ---- 管理情報の置き場を決める ----------------------------------------
+     *
+     * **大きさはページ数から決まり、置き場は管理領域の先頭で固定**なので、
+     * 「ページ数 -> 大きさ -> 使用済みにする」の順で回る。
+     * refcount は uint16_t なので、ビットマップの後ろを 8 バイト境界に揃える */
+    bitmap_bytes = (g_pages + 7U) / 8U;
+    bitmap_bytes = (bitmap_bytes + 7U) & ~7ULL;
+    meta_bytes   = bitmap_bytes + g_pages * sizeof(uint16_t);
+    g_meta_pages = align_up_page(meta_bytes) / AARCH64_PAGE_SIZE;
+
+    /* 管理情報だけで RAM を食い切るなら、その RAM は使い物にならない */
+    if (g_meta_pages >= g_pages) {
+        g_base_pa = 0; g_pages = 0; g_meta_pages = 0;
+        return;
+    }
+
+    /* **書き込む前に、置き場が実在の RAM か確かめる。** 穴 (ファームウェアや
+     * GPU の持ち物) の上に置くと、黙って他人の領域を壊す。
+     * カーネル自身が載っている場所の直後なので普通は当たらないが、
+     * 当たったときに気づけないほうが困る */
+    for (uint64_t i = 0; i < g_meta_pages; i++) {
+        if (!pmm_pa_in_ranges(b, free_base + i * AARCH64_PAGE_SIZE)) {
+            g_meta_fault = 1;
+            g_base_pa = 0; g_pages = 0; g_meta_pages = 0;
+            return;
+        }
+    }
+
+    g_bitmap_pa   = free_base;
+    g_refcount_pa = free_base + bitmap_bytes;
+
+    /* **全部使用済みで始める。** 穴はこのまま残る */
+    {
+        uint8_t* bm = pmm_bitmap();
+        for (uint64_t i = 0; i < bitmap_bytes; i++) bm[i] = 0xffU;
+    }
+    {
+        uint16_t* rc = pmm_refcount();
+        for (uint64_t i = 0; i < g_pages; i++) rc[i] = 0;
+    }
 
     /* **穴は使用済みのまま残す。**
      *
@@ -119,6 +188,17 @@ void aarch64_pmm_init(void) {
         /* **穴のぶんを最初から「使用済み」として数える。** そうしないと
          * 「pmm : 全体 (使用 0)」と出て、実際より多く使えるように見える */
         g_used = g_pages - usable;
+    }
+
+    /* **管理情報が載っているページを使用済みに戻す。**
+     *
+     * 上のレンジ走査は「実在する RAM は全部空き」と塗るので、管理情報の
+     * ぶんも空きにされている。ここで取り返さないと、**ビットマップ自身を
+     * ページとして配ってしまう** (次の alloc が管理情報を上書きする)。
+     *
+     * mem_range_count == 0 の道でも同じことが起きるので、if の外に置く */
+    for (uint64_t i = 0; i < g_meta_pages; i++) {
+        if (!pmm_test(i)) { pmm_set(i); g_used++; }
     }
 
     /* DTB が管理領域の中にあるなら予約する。QEMU virt では RAM の先頭
@@ -171,6 +251,14 @@ uint64_t aarch64_pmm_base(void)  { return g_base_pa; }
 uint64_t aarch64_pmm_total(void) { return g_pages; }
 uint64_t aarch64_pmm_used(void)  { return g_used; }
 
+/* 管理情報が何ページを占めているか。**起動ログに出して確かめる** —
+ * 静的配列をやめた以上、「切り出せた」ことは数字で見えないと分からない */
+uint64_t aarch64_pmm_meta_pages(void) { return g_meta_pages; }
+
+/* 管理情報を実在の RAM に置けなかった。**この場合 pmm は 0 ページで
+ * 返している**ので、起動ログで理由が分かるようにする */
+int aarch64_pmm_meta_fault(void) { return g_meta_fault; }
+
 /* ==========================================================================
  * 共有層から見た形 (M3c-2a)
  *
@@ -184,14 +272,14 @@ uint64_t aarch64_pmm_used(void)  { return g_used; }
  *
  * 参照カウントは fork の copy-on-write などで使う。M3c-1 までの
  * aarch64_pmm_* はカウントを持っていないので、**こちら側で持つ**。
+ * **実体は管理対象の RAM から切り出した領域** (ファイル冒頭を参照)。
+ * ページ数ぶんの uint16_t が並んでいて、pmm_refcount() が先頭を返す。
  * ========================================================================== */
 #include "pmm.h"
 #include "vmm.h"
 
 _Static_assert(PAGE_SIZE == AARCH64_PAGE_SIZE,
                "共有層の PAGE_SIZE と aarch64 のページサイズがずれている");
-
-static uint16_t g_refcount[AARCH64_PMM_MAX_PAGES];
 
 static uint64_t pmm_page_index(uint64_t pa, int* ok) {
     *ok = 0;
@@ -207,7 +295,8 @@ void pmm_init(void) {
      * これを 0 のままにすると PHYS_TO_VIRT が物理を返し、
      * 恒等マッピングを外した後は必ず落ちる */
     g_hhdm_offset = AARCH64_KERNEL_VA_OFFSET;
-    for (uint64_t i = 0; i < AARCH64_PMM_MAX_PAGES; i++) g_refcount[i] = 0;
+    /* **refcount の 0 埋めは aarch64_pmm_init の中でやる。**
+     * 実体は切り出した領域なので、置き場が決まる前には触れない */
     aarch64_pmm_init();
 }
 
@@ -217,7 +306,7 @@ void* pmm_alloc(size_t pages) {
     for (size_t i = 0; i < pages; i++) {
         int ok;
         uint64_t page = pmm_page_index(pa + (uint64_t)i * AARCH64_PAGE_SIZE, &ok);
-        if (ok) g_refcount[page] = 1;
+        if (ok) pmm_refcount()[page] = 1;
     }
     return (void*)(uintptr_t)pa;
 }
@@ -232,9 +321,10 @@ void pmm_free(void* addr, size_t pages) {
         uint64_t pa = base + (uint64_t)i * AARCH64_PAGE_SIZE;
         uint64_t page = pmm_page_index(pa, &ok);
         if (!ok) continue;
-        if (g_refcount[page] > 0) {
-            g_refcount[page]--;
-            if (g_refcount[page] == 0) aarch64_pmm_free(pa, 1);
+        uint16_t* rc = pmm_refcount();
+        if (rc[page] > 0) {
+            rc[page]--;
+            if (rc[page] == 0) aarch64_pmm_free(pa, 1);
         }
     }
 }
@@ -242,13 +332,13 @@ void pmm_free(void* addr, size_t pages) {
 void pmm_incref(void* addr) {
     int ok;
     uint64_t page = pmm_page_index((uint64_t)(uintptr_t)addr, &ok);
-    if (ok && g_refcount[page] < 0xffffU) g_refcount[page]++;
+    if (ok && pmm_refcount()[page] < 0xffffU) pmm_refcount()[page]++;
 }
 
 uint16_t pmm_get_ref(void* addr) {
     int ok;
     uint64_t page = pmm_page_index((uint64_t)(uintptr_t)addr, &ok);
-    return ok ? g_refcount[page] : 0;
+    return ok ? pmm_refcount()[page] : 0;
 }
 
 /* ISA DMA は x86 (16MB 未満 + 64KB 境界) の話。**aarch64 では使わない。**

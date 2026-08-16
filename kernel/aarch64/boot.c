@@ -140,6 +140,8 @@ void aarch64_vm_init(void);
 void aarch64_pmm_init(void);
 uint64_t aarch64_pmm_total(void);
 uint64_t aarch64_pmm_used(void);
+uint64_t aarch64_pmm_meta_pages(void);
+int aarch64_pmm_meta_fault(void);
 void aarch64_vm_fault_probe(void);
 void aarch64_vm_drop_identity(void);
 uint64_t aarch64_read_sctlr(void);
@@ -432,6 +434,21 @@ void aarch64_early_main(uint64_t dtb_phys) {
     aarch64_uart_puts(" ページ (使用 ");
     put_hex64(aarch64_pmm_used());
     aarch64_uart_puts(")\n");
+
+    /* **管理情報 (ビットマップ + refcount) は RAM から切り出している。**
+     * 静的配列をやめたので、「何ページ取れたか」は数字で見えないと
+     * 確かめようがない。0 ページなら切り出しに失敗している */
+    aarch64_uart_puts("  pmm meta  : ");
+    put_hex64(aarch64_pmm_meta_pages());
+    aarch64_uart_puts(" ページ");
+    if (aarch64_pmm_meta_fault()) {
+        aarch64_uart_puts("  BAD (実在しない RAM の上に置こうとした)");
+    } else if (aarch64_pmm_meta_pages() == 0) {
+        aarch64_uart_puts("  BAD (切り出せていない)");
+    } else {
+        aarch64_uart_puts("  ok (RAM から切り出した)");
+    }
+    aarch64_uart_puts("\n");
 
     /* **0 のまま進んでいないことを出させる。** 値が正しいことと、
      * 設定されたことは別 (日報2026-08-09 追-7)。共有層はここを使って
