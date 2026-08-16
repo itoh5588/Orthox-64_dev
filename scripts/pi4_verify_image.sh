@@ -29,8 +29,18 @@ fail=0
 # 出たら「既定ビルドを掴んでいる」と分かる
 init_found=$(strings "$IMG" | grep -oE "^/bin/(ash|hello|doom)$" | sort -u | tr '\n' ' ')
 echo "  init パス候補 : ${init_found:-(見つからない)}"
+# **grep -q を pipefail の下で使わないこと。**
+#
+# grep -q は最初の一致で終了するので strings に SIGPIPE が飛び、
+# set -o pipefail がそれを失敗と見なす。**読みが遅い相手 (SD の drvfs)
+# でだけ起きる**ので、ローカルで試すと通ってしまう (実測でそうなった)。
+# 数を数える形にする
+count_in_image() {   # $1 = パターン
+    strings "$IMG" | grep -c -- "$1" || true
+}
+
 if [ -n "$WANT_INIT" ]; then
-    if strings "$IMG" | grep -qx "$WANT_INIT"; then
+    if [ "$(strings "$IMG" | grep -cx -- "$WANT_INIT" || true)" -gt 0 ]; then
         echo "    -> $WANT_INIT を含む  ok"
     else
         echo "    -> *** $WANT_INIT が無い" >&2
@@ -39,18 +49,18 @@ if [ -n "$WANT_INIT" ]; then
 fi
 
 # **有効時にしか存在しない印。** #ifdef の中にある文字列を選ぶこと
-n_init=$(strings "$IMG" | grep -c "pcie init" || true)
+n_init=$(count_in_image "pcie init")
 echo "  PCIe 立ち上げ : $n_init 段  ($([ "$n_init" -ge 6 ] && echo 有効 || echo 無効))"
 
-n_probe=$(strings "$IMG" | grep -c "pcie probe" || true)
+n_probe=$(count_in_image "pcie probe")
 echo "  PCIe 探針     : $([ "$n_probe" -gt 0 ] && echo 有効 || echo 無効)"
 
-n_kbd=$(strings "$IMG" | grep -c "usb-kbd-probe-start" || true)
+n_kbd=$(count_in_image "usb-kbd-probe-start")
 echo "  USB キー探針  : $([ "$n_kbd" -gt 0 ] && echo 有効 || echo 無効)"
 
 # 常に入っているべきもの (入っていなければビルドが壊れている)
 for pat in "pcie xhci :" "dma offset" "HID keyboard if=" "fb console"; do
-    if strings "$IMG" | grep -q "$pat"; then
+    if [ "$(count_in_image "$pat")" -gt 0 ]; then
         printf "  %-18s : ok\n" "$pat"
     else
         printf "  %-18s : *** 無い\n" "$pat" >&2
