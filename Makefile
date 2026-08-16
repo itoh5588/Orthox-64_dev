@@ -528,6 +528,12 @@ aarch64-doom-vnc: $(AARCH64_DOOM_ELF)
 
 # USB キーボード。**実機の Pi 4 では踏めない** (raspi4b は PCIe が無い)。
 # QEMU virt が唯一の検証の場
+# DOOM を USB キーボードで操作できること。**全段を通す**
+# (USB -> xHCI -> 変換 -> syscall -> DOOM)。virt でしか揃わない
+aarch64-doom-key-smoke: $(AARCH64_DOOM_ELF)
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 AARCH64_INIT_PATH_VALUE=/bin/doom
+	bash ./tests/aarch64_doom_key_smoke.sh
+
 aarch64-usb-kbd-smoke:
 	$(MAKE) -C $(CURDIR) aarch64-kernel8 AARCH64_USB_KBD_PROBE=1
 	bash ./tests/aarch64_usb_kbd_smoke.sh
