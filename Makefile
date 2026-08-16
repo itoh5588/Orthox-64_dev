@@ -243,7 +243,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-smoke aarch64-pi4-sd-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-usb-kbd-smoke aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-smoke aarch64-pi4-sd-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -299,7 +299,7 @@ AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer
 	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/emmc2.c kernel/aarch64/runtime.c \
 	kernel/aarch64/stubs.c kernel/aarch64/syscall.c kernel/aarch64/console.c \
 	kernel/aarch64/mailbox.c kernel/aarch64/fb.c kernel/aarch64/fbcon.c kernel/aarch64/font8x8.c \
-	kernel/aarch64/pci.c
+	kernel/aarch64/pci.c kernel/aarch64/kbd.c
 # 共有層のうち、**いま繋がるものだけ**を取り込む (M3c-2a)。
 # どれが入るかは推測せず、llvm-nm -u で未解決シンボルを実測して決めた。
 #
@@ -387,6 +387,13 @@ AARCH64_EARLY_GICC ?= 0x08010000
 # QEMU の raspi4b は SD カードを旧 sdhci (0xFE300000) に繋いでいて EMMC2 は
 # 空なので、ドライバの中身を確かめるときだけここに 0xFE300000 を渡す。
 # **実機向けには渡さない** (実機の 0xFE300000 は WiFi の SDIO)
+# **USB キーボードの探針。** スモークでだけ立てる。通常の起動では
+# 12 秒もキーを待たれると困る
+AARCH64_USB_KBD_PROBE ?=
+ifneq ($(AARCH64_USB_KBD_PROBE),)
+AARCH64_CFLAGS += -DAARCH64_USB_KBD_PROBE=1
+endif
+
 AARCH64_EMMC2_BASE ?=
 ifneq ($(AARCH64_EMMC2_BASE),)
 AARCH64_CFLAGS += -DAARCH64_EMMC2_BASE_OVERRIDE=$(AARCH64_EMMC2_BASE)ULL
@@ -518,6 +525,12 @@ aarch64-doom-vnc: $(AARCH64_DOOM_ELF)
 	$(QEMU_RASPI4B) -machine raspi4b -vnc :1 \
 	    -kernel out/kernel8.img -dtb tests/dtb/bcm2711-rpi-4-b.dtb \
 	    -drive file=out/aarch64-doom-disk.img,if=sd,format=raw
+
+# USB キーボード。**実機の Pi 4 では踏めない** (raspi4b は PCIe が無い)。
+# QEMU virt が唯一の検証の場
+aarch64-usb-kbd-smoke:
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 AARCH64_USB_KBD_PROBE=1
+	bash ./tests/aarch64_usb_kbd_smoke.sh
 
 aarch64-doom-run: $(AARCH64_DOOM_ELF)
 	$(MAKE) -C $(CURDIR) aarch64-kernel8 \

@@ -15,6 +15,7 @@
 #include "aarch64/fb.h"
 #include "aarch64/task.h"
 #include "aarch64/vm.h"
+#include "syscall.h"
 #include "pmm.h"
 #include "vmm.h"
 
@@ -189,6 +190,7 @@ int usb_is_ready(void);
 int usb_hid_keyboard_init(void);
 int usb_hid_keyboard_poll(uint8_t report[8]);
 uint64_t arch_time_now_ms(void);
+int aarch64_kbd_get_event(struct key_event* ev);
 
 /* MMU の探針 (vm.c)。「未マップの VA を読んだら fault が上がるはず」の
  * やりとりに使う。上がった fault はここで拾って呼び出し元に返す */
@@ -702,29 +704,36 @@ void aarch64_boot_continue(void) {
                         aarch64_uart_puts("BAD\n");
                     }
                 }
-                /* **押したキーが読めるかを実測する。** 初期化が通ることと
-                 * レポートが届くことは別。QEMU なら monitor の sendkey で
-                 * 送れる。10 秒ほど回して、来たものを出す */
+                /* **通常は探針を出さない。** ORTH_SYS_GET_KEY_EVENT が
+                 * 呼ばれたときにポーリングする (kernel/aarch64/kbd.c)。
+                 *
+                 * スモーク用にだけ、変換した結果を出す口を残す:
+                 *   make ... AARCH64_USB_KBD_PROBE=1
+                 * **押した / 離した と scancode / ascii まで見ないと、
+                 * 変換と差分が正しいか確かめられない** */
+#ifdef AARCH64_USB_KBD_PROBE
                 {
-                    uint8_t rep[8];
+                    struct key_event ev;
                     uint64_t t0 = arch_time_now_ms();
                     int seen = 0;
-                    aarch64_uart_puts("  usb kbd   : 10 秒キーを待つ (sendkey で送れる)\n");
-                    while (arch_time_now_ms() - t0 < 10000 && seen < 12) {
-                        if (usb_hid_keyboard_poll(rep) == 0) {
-                            if (rep[0] == 0 && rep[2] == 0) continue;   /* 離した通知 */
-                            aarch64_uart_puts("  [key] mod=");
-                            put_dec(rep[0]);
-                            aarch64_uart_puts(" code=");
-                            put_dec(rep[2]);
+                    aarch64_uart_puts("usb-kbd-probe-start\n");
+                    while (arch_time_now_ms() - t0 < 12000 && seen < 24) {
+                        if (aarch64_kbd_get_event(&ev)) {
+                            aarch64_uart_puts("  [kbd] ");
+                            aarch64_uart_puts(ev.pressed ? "down" : "up  ");
+                            aarch64_uart_puts(" sc=");
+                            put_dec(ev.scancode);
+                            aarch64_uart_puts(" ascii=");
+                            put_dec(ev.ascii);
                             aarch64_uart_puts("\n");
                             seen++;
                         }
                     }
-                    aarch64_uart_puts("  usb kbd   : 待ち終わり 受け取り=");
+                    aarch64_uart_puts("usb-kbd-probe-done count=");
                     put_dec((uint64_t)seen);
                     aarch64_uart_puts("\n");
                 }
+#endif
             } else {
                 aarch64_uart_puts("無し / 初期化できない\n");
             }

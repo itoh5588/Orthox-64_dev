@@ -82,6 +82,7 @@ void arch_halt_forever(void) {
  * (共有スケジューラの task_poll_sleep_wakeups が拾う)。
  * riscv64 も 07-31 にスピン待ちを廃止している (`c3ec630`) */
 uint64_t arch_time_now_ms(void);
+int aarch64_kbd_get_event(struct key_event* ev);
 void kernel_yield(void);
 
 int64_t sys_sleep_ms(uint64_t ms) {
@@ -186,9 +187,12 @@ int arch_orth_syscall(arch_syscall_frame_t* frame, uint64_t number) {
                 (uint64_t)sys_sleep_ms(arch_syscall_arg0(frame)));
             return 1;
         case ORTH_SYS_GET_KEY_EVENT: {
-            /* **まだキーの経路が無い。** 空を返す (DOOM はデモを流す)。
-             * シリアルのキーを流すのは次の段 */
-            arch_syscall_set_return(frame, 0);
+            /* **USB HID キーボードから取る** (kernel/aarch64/kbd.c)。
+             * 割り込みは使っていないので、ここでポーリングする。
+             * DOOM は毎フレーム呼ぶので間隔としては足りる。
+             * キーボードが無ければ 0 (= 何も無い) を返し、DOOM はデモを流す */
+            struct key_event* ev = (struct key_event*)(uintptr_t)arch_syscall_arg0(frame);
+            arch_syscall_set_return(frame, ev ? (uint64_t)aarch64_kbd_get_event(ev) : 0);
             return 1;
         }
         default:
