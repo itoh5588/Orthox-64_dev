@@ -119,3 +119,79 @@ int sys_tcsetpgrp(int fd, int pgrp) {
     g_tty_pgrp = pgrp;
     return 0;
 }
+
+/* ---- 私物 syscall (ORTH_SYS_*) -------------------------------------------
+ *
+ * **画面とキーのように「その機械にしか無いもの」をここで受ける。**
+ * 共有の linux_syscall.c は弱いシンボルで「何も扱えない」を既定にしており、
+ * aarch64 だけがこれを上書きする (riscv64 は従来どおり ENOSYS)。
+ *
+ * x86 は kernel/syscall.c で同じ番号を扱っているが、あちらは Limine が
+ * 用意した framebuffer を前提にしていて共有できない。**番号と struct の
+ * 形だけを揃えてある**ので、ユーザー側 (DOOM) は同じコードで動く。
+ */
+#include "aarch64/fb.h"
+#include "syscall.h"
+#include "vmm.h"
+
+uint64_t aarch64_vm_map_fb_user(arch_address_space_t as, uint64_t uva);
+uint64_t arch_time_now_ms(void);
+
+/* ユーザーに見せるフレームバッファの VA。
+ *
+ * **ユーザーの text (0x400000) / heap / stack と離す。** DOOM の musl は
+ * mmap をここまで伸ばさないので衝突しない。固定にしているのは、
+ * 2 回呼ばれても同じ番地を返すため (DOOM は 1 回しか呼ばないが、
+ * 張り直しで別の番地を返すと古いポインタが生き残る) */
+#define AARCH64_FB_USER_VA 0x0000000060000000ULL
+
+int arch_orth_syscall(arch_syscall_frame_t* frame, uint64_t number) {
+    switch (number) {
+        case ORTH_SYS_GET_VIDEO_INFO: {
+            struct video_info* info =
+                (struct video_info*)(uintptr_t)arch_syscall_arg0(frame);
+            const aarch64_fb_info_t* fb = aarch64_fb_info();
+            if (!info || !fb || fb->base == 0) {
+                arch_syscall_set_return(frame, (uint64_t)-1);
+                return 1;
+            }
+            info->width  = fb->width;
+            info->height = fb->height;
+            info->pitch  = fb->pitch;
+            info->bpp    = fb->depth;
+            arch_syscall_set_return(frame, 0);
+            return 1;
+        }
+        case ORTH_SYS_MAP_FRAMEBUFFER: {
+            struct task* cur = get_current_task();
+            uint64_t va;
+            /* **いまのユーザー空間は ctx.root_pa (TTBR0)。**
+             * カーネルスレッドなら 0 で、そこには張れない */
+            if (!cur || cur->ctx.root_pa == 0) {
+                arch_syscall_set_return(frame, 0);
+                return 1;
+            }
+            va = aarch64_vm_map_fb_user(cur->ctx.root_pa, AARCH64_FB_USER_VA);
+            /* **張ったら TLB を捨てる。** 直前まで未マップだった番地なので、
+             * 古い「無い」という記憶が残っていると最初の書き込みで落ちる */
+            if (va) arch_syscall_flush_tlb();
+            arch_syscall_set_return(frame, va);
+            return 1;
+        }
+        case ORTH_SYS_GET_TICKS_MS:
+            arch_syscall_set_return(frame, arch_time_now_ms());
+            return 1;
+        case ORTH_SYS_SLEEP_MS:
+            arch_syscall_set_return(frame,
+                (uint64_t)sys_sleep_ms(arch_syscall_arg0(frame)));
+            return 1;
+        case ORTH_SYS_GET_KEY_EVENT: {
+            /* **まだキーの経路が無い。** 空を返す (DOOM はデモを流す)。
+             * シリアルのキーを流すのは次の段 */
+            arch_syscall_set_return(frame, 0);
+            return 1;
+        }
+        default:
+            return 0;
+    }
+}

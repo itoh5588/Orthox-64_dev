@@ -243,7 +243,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-smoke aarch64-pi4-sd-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: aarch64-doom aarch64-doom-run aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-smoke aarch64-pi4-sd-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -470,6 +470,33 @@ aarch64-pi4-sd-smoke: $(AARCH64_USER_HELLO)
 	    AARCH64_EARLY_GICD=0xFF841000 AARCH64_EARLY_GICC=0xFF842000 \
 	    AARCH64_EMMC2_BASE=0xFE300000
 	bash ./tests/aarch64_pi4_sd_smoke.sh
+
+# ---- DOOM (aarch64) --------------------------------------------------------
+#
+# **user/doomgeneric/doomgeneric/Makefile は使わない。** あちらは clang と
+# x86 / newlib を前提にした分岐が積んであり、aarch64 の本物のクロス GCC とは
+# 噛み合わない。ソースの一覧だけ SRC_DOOM から借りて、組むのは自前の
+# scripts/build_doom_aarch64.sh
+AARCH64_DOOM_ELF = out/doomgeneric-aarch64.elf
+
+aarch64-doom: $(AARCH64_DOOM_ELF)
+
+# **AARCH64_MUSL_SYSROOT はここより後ろで定義されるので使えない。**
+# 前提行は読んだ時点で展開されるため、空になって '/lib/libc.a' を探しに行く
+$(AARCH64_DOOM_ELF): ports/musl-install-aarch64/lib/libc.a
+	bash ./scripts/build_doom_aarch64.sh $(abspath $(AARCH64_DOOM_ELF))
+
+# QEMU の raspi4b で DOOM を動かす。**実機と同じ道** (mailbox の
+# フレームバッファ + EMMC2 の xv6fs) を通る。
+# **番地は pi4-sd-smoke と同じ差し替えが要る** — raspi4b の SD は
+# 旧 sdhci (0xFE300000) に繋がっている
+aarch64-doom-run: $(AARCH64_DOOM_ELF)
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
+	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \
+	    AARCH64_CNTFRQ_HZ=54000000 \
+	    AARCH64_EARLY_GICD=0xFF841000 AARCH64_EARLY_GICC=0xFF842000 \
+	    AARCH64_EMMC2_BASE=0xFE300000 AARCH64_INIT_PATH_VALUE=/bin/doom
+	bash ./tests/aarch64_doom_run.sh
 
 aarch64-run: $(AARCH64_KERNEL_ELF)
 	qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 512M -smp 1 \

@@ -104,10 +104,17 @@ int aarch64_fb_init(uint32_t want_w, uint32_t want_h) {
     b[i++] = TAG_SET_DEPTH; b[i++] = 4; b[i++] = 4;
     b[i++] = FB_DEFAULT_DEPTH;
 
-    /* pixel order: 0 = BGR、1 = RGB。**どちらで来ているかは画面を見れば
-     * 分かる** — テストパターンの赤と青が入れ替わっていたらここを疑う */
+    /* pixel order。**0 を渡す。**
+     *
+     * タグの言う「RGB」「BGR」は**メモリ上のバイトの並び**であって、
+     * こちらが uint32 に詰める順ではない。1 (RGB) にすると
+     * バイト列が R,G,B,A になり、リトルエンディアンの uint32 では
+     * 0xAABBGGRR になる。**0xRRGGBB で書くこちらとは赤と青が逆。**
+     *
+     * 実測 (raspi4b): 1 のとき、0x00RRGGBB の r が画面の青、b が赤に出た。
+     * DOOM も画面全体が青に寄った。0 にすると 0xRRGGBB がそのまま出る */
     b[i++] = TAG_SET_PIXEL_ORDER; b[i++] = 4; b[i++] = 4;
-    b[i++] = 1;
+    b[i++] = 0;
 
     /* 確保。要求側の 4 バイトは**境界**の指定 (返りでは番地になる) */
     uint32_t alloc_at = i;

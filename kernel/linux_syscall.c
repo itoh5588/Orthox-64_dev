@@ -1506,8 +1506,33 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
     }
 }
 
+/* アーキ固有の私物 syscall (ORTH_SYS_*)。**扱えたら 1 を返す。**
+ *
+ * 画面やキーのように「その機械にしか無いもの」はここで受ける。
+ * **既定は「何も扱えない」**の弱いシンボルで、必要なアーキだけ上書きする
+ * (kernel/fs.c の arch_console_echo_enabled と同じ形)。
+ * riscv64 は上書きしていないので、従来どおり ENOSYS になる */
+__attribute__((weak))
+int arch_orth_syscall(arch_syscall_frame_t* frame, uint64_t number) {
+    (void)frame; (void)number;
+    return 0;
+}
+
 void linux_syscall_dispatch(arch_syscall_frame_t* frame) {
     if (!frame) return;
+
+    /* **Linux の番号空間より上は先に横取りする。** ORTH_SYS_BASE = 1000 で、
+     * 下の巨大な switch には入れない (番号がぶつからないようにしてある) */
+    if (arch_syscall_number(frame) >= ORTH_SYS_BASE) {
+        if (arch_orth_syscall(frame, arch_syscall_number(frame))) {
+            arch_syscall_advance_pc(frame);
+            return;
+        }
+        linux_report_unimplemented_syscall(arch_syscall_number(frame));
+        arch_syscall_set_return(frame, (uint64_t)-38);
+        arch_syscall_advance_pc(frame);
+        return;
+    }
 
     // fork は clone(SIGCHLD, 0) のみで受ける。riscv64 に fork(2) は無く、
     // musl の fork() は clone を出す。

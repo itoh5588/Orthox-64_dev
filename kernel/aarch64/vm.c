@@ -143,6 +143,9 @@ extern char aarch64_user_entry[];
  * UXN と PXN は別のビットで、片方だけでは塞げない。 */
 #define VM_USER_TEXT    (VM_ATTR_NORMAL | AARCH64_PTE_AP_RO_EL0 | AARCH64_PTE_PXN | AARCH64_PTE_nG)
 #define VM_USER_RW      (VM_ATTR_NORMAL | AARCH64_PTE_AP_RW_EL0 | AARCH64_PTE_UXN | AARCH64_PTE_PXN | AARCH64_PTE_nG)
+/* ユーザーに見せるフレームバッファ。**カーネル側と同じ Normal NC。**
+ * ここだけ Normal WB にすると、DOOM が書いた絵がキャッシュに留まる */
+#define VM_USER_FB      (VM_ATTR_NORMAL_NC | AARCH64_PTE_AP_RW_EL0 | AARCH64_PTE_UXN | AARCH64_PTE_PXN | AARCH64_PTE_nG)
 
 /* 移行のあいだだけ TTBR0 に張る恒等マッピング。**実行もできる必要がある。**
  * MMU を入れた瞬間、PC はまだ物理を指しているので、そこが実行可能で
@@ -1091,4 +1094,23 @@ void aarch64_vm_init(void) {
 
 uint64_t aarch64_vm_root_pa(void) {
     return g_kernel_root_pa;
+}
+
+
+/* ---- フレームバッファをユーザー空間に見せる (DOOM 用) --------------------
+ *
+ * **カーネルの写像 (AARCH64_FB_VA_BASE) とは別に張る。**あちらは TTBR1 で
+ * EL0 からは触れない。同じ物理を TTBR0 側にも、同じ属性 (Normal NC) で張る。
+ *
+ * 返すのはユーザーから見た VA。0 なら失敗 */
+uint64_t aarch64_vm_map_fb_user(arch_address_space_t as, uint64_t uva) {
+    const aarch64_fb_info_t* fb = aarch64_fb_info();
+    uint64_t size;
+    if (!as || !fb || fb->base == 0 || fb->size == 0) return 0;
+    size = ((uint64_t)fb->size + AARCH64_PAGE_SIZE - 1) & ~(AARCH64_PAGE_SIZE - 1);
+    /* **4KB ページで張る** (arch_vm_map_range と同じ道)。ユーザーの
+     * ページテーブルに 2MB ブロックを混ぜると、後から権限を重ねるときに
+     * 衝突する (日報2026-08-09 追2-5) */
+    WITH_ROOT(as, aarch64_vm_map_pages(uva, fb->base, size, VM_USER_FB));
+    return uva;
 }
