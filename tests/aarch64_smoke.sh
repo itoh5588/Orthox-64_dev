@@ -35,7 +35,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# 5 通りで回す。
+# 6 通りで回す。
 #   virt                    既定。EL1 から始まる
 #   virt,virtualization=on  **EL2 から始まる**。Raspberry Pi 4 の
 #                           ファームウェアと同じ条件を QEMU で再現できる
@@ -43,6 +43,10 @@ trap cleanup EXIT
 #                           構成 (kernel_old=1) と、セキュア側 GIC の設定
 #   virt (-m 1G)            **DTB を本当に読んでいるかの確認。**
 #                           直書きの 512MB では追随できない
+#   virt (-m 8G)            **4GB を超える RAM。**pmm の管理情報を静的配列で
+#                           持っていた頃は 1048576 ページ (4GB) で頭打ちに
+#                           していて、8GB を積んでも半分しか使えなかった。
+#                           **8GB の実機は持っていないので、ここでしか踏めない**
 #
 # 降格を入れる前は 2 通り目で ticks が 0 になった (EL2 では VBAR_EL1 の表が
 # 使われないため)。実機が無くても EL2 経路を検証できる。
@@ -376,6 +380,33 @@ grep -aq "(入口 EL3)" LOGs/aarch64-serial-el3.log
 run_one "virt" LOGs/aarch64-serial-1g.log 1G
 check_one "RAM 1GB (DTB 追随)" LOGs/aarch64-serial-1g.log 0x0000000040000000 0x000000007fffffff
 
+# ---- 4GB を超える RAM -----------------------------------------------------
+#
+# **8GB の実機 (Raspberry Pi 4 の 8GB モデル) は持っていない。**
+# QEMU の virt なら -m で好きなだけ積めるので、上限の撤廃はここで見る。
+# ホストの RAM は要らない — カーネルが実際に触るのは管理情報 (4.25MB) と
+# ページテーブルだけで、QEMU の割り当ては遅延する
+run_one "virt" LOGs/aarch64-serial-8g.log 8G
+check_one "RAM 8GB (4GB 上限の撤廃)" LOGs/aarch64-serial-8g.log 0x0000000200000000 0x000000023fffffff
+
+echo "--- 4GB 超の判定 ---"
+# **管理ページ数が上限ちょうどなら切り捨てが復活している。**
+# 静的配列だった頃は 1048576 ページ (4GB) で頭打ちで、8GB を積んでも
+# 半分しか使えなかった (実測: pmm : 0x0000000000100000)。
+# **ページ数をべた書きしない** — カーネルの大きさで空き領域の先頭が動く
+pages_8g=$(grep -a "  pmm       : " LOGs/aarch64-serial-8g.log | head -1 | sed 's/.*: 0x\([0-9a-f]*\) .*/\1/')
+pages_8g_dec=$((16#$pages_8g))
+echo "  8GB のときの管理ページ数: $pages_8g_dec"
+if [ "$pages_8g_dec" -le 1048576 ]; then
+    echo "*** 4GB (1048576 ページ) を超えられていない ($pages_8g_dec)" >&2
+    echo "*** pmm が上限で切り捨てている。管理情報を静的配列に戻していないか" >&2
+    exit 1
+fi
+# 管理情報を RAM から切り出せていること。**8GB ぶんは 1088 ページ (4.25MB)** で、
+# 静的配列では現実的でない大きさ
+grep -aqE "pmm meta  : 0x[0-9a-f]{16} ページ  ok \(RAM から切り出した\)" LOGs/aarch64-serial-8g.log
+must_not "pmm meta  : 0x0000000000000000 ページ" LOGs/aarch64-serial-8g.log "管理情報を切り出せていない"
+
 # M4: virtio-blk を付けて起動する。**付けない 3 通りでは
 # aarch64-virtio-none になる** (デバイスが無いことを正しく検出している)
 run_one "virt" LOGs/aarch64-serial-disk.log 512M with-disk
@@ -423,7 +454,7 @@ must_not "xv6bio: disk" LOGs/aarch64-serial-disk.log
 # (「無い」と「壊れた」を混ぜない)
 grep -aq "aarch64-fs-none" LOGs/aarch64-serial.log
 
-echo "aarch64 smoke test: PASS (M0-M4, EL1 / EL2 / EL3 降格 / RAM 1GB / virtio-blk の 5 通り)"
+echo "aarch64 smoke test: PASS (M0-M4, EL1 / EL2 / EL3 降格 / RAM 1GB / RAM 8GB / virtio-blk の 6 通り)"
 }
 
 # ==========================================================================
