@@ -144,6 +144,13 @@ typedef struct aarch64_boot_info {
     uint64_t pcie_brcm_pci_base;    /* PCI 側 */
     uint64_t pcie_brcm_cpu_base;    /* CPU 側 (物理) */
     uint64_t pcie_brcm_win_size;
+    /* 内向き (DMA) の窓。**恒等とは限らない。**
+     * 実機は PCI 0x4_00000000 <-> CPU 0x0 で、デバイスに渡す番地は
+     * ARM の物理 + (pci_base - cpu_base)。**ここを間違えると
+     * 「初期化は通るのに転送だけ動かない」** */
+    uint64_t pcie_dma_pci_base;
+    uint64_t pcie_dma_cpu_base;
+    uint64_t pcie_dma_size;
     uint32_t flags;
 } aarch64_boot_info_t;
 

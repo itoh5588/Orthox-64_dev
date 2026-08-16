@@ -435,3 +435,21 @@ int aarch64_pcie_brcm_scan(void) {
  * PCIe の先で見つけた xHCI の **CPU から見た** MMIO 番地を返す。
  * 見つけていなければ 0 で、あちらは従来どおり PCI (ECAM) から探す */
 uint64_t usb_arch_xhci_mmio(void) { return g_xhci_cpu_bar; }
+
+/* **共有の kernel/usb.c から呼ばれる。**
+ *
+ * Raspberry Pi 4 の内向き窓は恒等ではない:
+ *
+ *     PCI 0x4_00000000  <->  CPU 物理 0x0    (3GB)
+ *
+ * デバイスに渡す番地は ARM の物理 + この値。**リンクを立ち上げて
+ * いなければ 0** (QEMU virt などでは変換が要らない) */
+uint64_t usb_arch_dma_offset(void) {
+    const aarch64_boot_info_t* b;
+    if (g_xhci_cpu_bar == 0) return 0;          /* この経路で見つけていない */
+    b = aarch64_boot_info();
+    if (!b) return 0;
+    /* dma-ranges の「PCI 側の番地」から「CPU 側の番地」を引いたぶん。
+     * 実機では 0x4_00000000 - 0 = 0x4_00000000 */
+    return b->pcie_dma_pci_base - b->pcie_dma_cpu_base;
+}

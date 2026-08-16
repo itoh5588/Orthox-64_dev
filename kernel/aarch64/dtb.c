@@ -207,6 +207,9 @@ typedef struct dtb_node_state {
      * (子 <= 2 セル) では読めない。PCIe のときだけ自分で読み直す */
     const uint8_t* ranges_data;
     uint32_t ranges_len;
+    /* **内向きの窓。**PCI の dma-ranges も子が 3 セルなので自分で読む */
+    const uint8_t* dma_ranges_data;
+    uint32_t dma_ranges_len;
     /* このノードが**バスとして**持つ ranges。子の reg に適用する */
     dtb_range_t ranges[MAX_RANGES_PER_NODE];
     uint32_t range_count;
@@ -229,6 +232,8 @@ static void node_state_clear(dtb_node_state_t* n) {
     n->has_ranges = 0;
     n->ranges_data = 0;
     n->ranges_len = 0;
+    n->dma_ranges_data = 0;
+    n->dma_ranges_len = 0;
 }
 
 /* 深さ depth のノードの reg を、ルートから見た物理アドレスに直す。
@@ -509,6 +514,17 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                         break;
                     }
                 }
+                /* **内向きの窓。**組の形は ranges と同じ 7 セル */
+                if (n->dma_ranges_data && n->dma_ranges_len >= 28U) {
+                    for (uint32_t o = 0; o + 28U <= n->dma_ranges_len; o += 28U) {
+                        const uint8_t* r = n->dma_ranges_data + o;
+                        if ((aarch64_dtb_read_be32(r) & 0x03000000U) != 0x02000000U) continue;
+                        info->pcie_dma_pci_base = aarch64_dtb_read_be64(r + 4);
+                        info->pcie_dma_cpu_base = aarch64_dtb_read_be64(r + 12);
+                        info->pcie_dma_size     = aarch64_dtb_read_be64(r + 20);
+                        break;
+                    }
+                }
             }
 
             /* timer の interrupts は <type num flags> の 3 セル x 4 本
@@ -587,6 +603,11 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                 if (len > 0 && !str_eq(v, "okay") && !str_eq(v, "ok")) {
                     nodes[depth].is_disabled = 1;
                 }
+            } else if (str_eq(prop_name, "dma-ranges")) {
+                /* **中身は解釈しない。**PCI のものは子が 3 セルで、
+                 * 下の汎用の解釈では読めない。使う側で読み直す */
+                nodes[depth].dma_ranges_data = data;
+                nodes[depth].dma_ranges_len = len;
             } else if (str_eq(prop_name, "ranges")) {
                 /* **1 組は「子のアドレス + 親のアドレス + 長さ」。**
                  * セル数は 子=このノードの #address-cells /

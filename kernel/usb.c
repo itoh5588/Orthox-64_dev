@@ -28,6 +28,45 @@ void puthex(uint64_t v);
 __attribute__((weak))
 uint64_t usb_arch_xhci_mmio(void) { return 0; }
 
+/* ---- DMA の番地変換 -------------------------------------------------------
+ *
+ * **デバイスから見た番地と CPU の物理が一致するとは限らない。**
+ *
+ * Raspberry Pi 4 では PCIe の内向き窓が
+ *
+ *     PCI 0x4_00000000  <->  CPU 物理 0x0    (3GB)
+ *
+ * になっている (実機の dma-ranges と Linux の dmesg で確認)。**リングや
+ * バッファの番地をそのまま渡すと、デバイスは別の場所を読みに行く。**
+ * 「初期化は通るのに転送だけ動かない」という最悪の形で嵌まる。
+ *
+ * ---- どう扱うか ------------------------------------------------------------
+ *
+ * **確保した時点でデバイス視点の番地にしてしまう。** g_*_phys に入るのは
+ * 全部「デバイスから見た番地」で、CPU が中身を触るときだけ引き算する。
+ *
+ * こうすると、デバイスに番地を渡している 30 か所以上に手を入れずに済む。
+ * **触るのは確保 (usb_alloc_dma) と参照 (USB_VIRT) の 2 か所だけ**で、
+ * 数で検証できる。
+ *
+ * **MMIO には使わない。** xHCI のレジスタは CPU の物理番地で、
+ * DMA の窓とは無関係 */
+__attribute__((weak))
+uint64_t usb_arch_dma_offset(void) { return 0; }
+
+static uint64_t g_usb_dma_offset;
+
+/* 確保してデバイス視点の番地を返す */
+static void* usb_alloc_dma(size_t pages) {
+    void* p = pmm_alloc(pages);  /* ここだけは素の pmm_alloc */
+    if (!p) return 0;
+    return (void*)((uint64_t)(uintptr_t)p + g_usb_dma_offset);
+}
+
+/* デバイス視点の番地の中身を CPU から触る */
+#define PHYS_TO_VIRT_MMIO(pa) PHYS_TO_VIRT(pa)
+#define USB_VIRT(dma) PHYS_TO_VIRT((void*)((uint64_t)(uintptr_t)(dma) - g_usb_dma_offset))
+
 static int g_usb_ready = 0;
 static int g_usb_mass_ready = 0;
 static int g_xhci_rings_ready = 0;
@@ -180,7 +219,7 @@ static uint32_t xhci_ctx_offset_dw(uint8_t dci) {
 }
 
 static void xhci_ring_reset(uint64_t ring_phys) {
-    volatile uint32_t* ring = (volatile uint32_t*)PHYS_TO_VIRT((void*)ring_phys);
+    volatile uint32_t* ring = (volatile uint32_t*)USB_VIRT((void*)ring_phys);
     memzero((void*)ring, PAGE_SIZE);
     ring[255 * 4 + 0] = (uint32_t)(ring_phys & 0xFFFFFFFFU);
     ring[255 * 4 + 1] = (uint32_t)(ring_phys >> 32);
@@ -208,7 +247,7 @@ static int xhci_wait_bits(volatile uint8_t* op, uint32_t off, uint32_t mask, uin
 static int xhci_poll_cmd_completion(uint64_t* out_cmd_ptr, uint8_t* out_cc, uint8_t* out_slot_id, uint32_t loops) {
     if (!g_rt_regs || !out_cmd_ptr || !out_cc || !out_slot_id) return -1;
 
-    volatile uint32_t* ev_ring = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_event_ring_phys);
+    volatile uint32_t* ev_ring = (volatile uint32_t*)USB_VIRT((void*)g_event_ring_phys);
     const uint32_t intr0 = 0x20;
 
     for (uint32_t i = 0; i < loops; i++) {
@@ -250,7 +289,7 @@ static int xhci_poll_cmd_completion(uint64_t* out_cmd_ptr, uint8_t* out_cc, uint
 
 static uint64_t xhci_cmd_submit(uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3_no_cycle) {
     if (!g_db_regs || g_cmd_ring_phys == 0) return 0;
-    volatile uint32_t* cmd_ring = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_cmd_ring_phys);
+    volatile uint32_t* cmd_ring = (volatile uint32_t*)USB_VIRT((void*)g_cmd_ring_phys);
 
     uint32_t idx = g_cmd_enqueue_idx;
     volatile uint32_t* trb = &cmd_ring[idx * 4];
@@ -276,7 +315,7 @@ static uint64_t xhci_cmd_submit(uint32_t d0, uint32_t d1, uint32_t d2, uint32_t 
 static int xhci_cmd_noop(void) {
     g_evt_dequeue_idx = 0;
     g_evt_cycle = 1;
-    memzero(PHYS_TO_VIRT((void*)g_event_ring_phys), PAGE_SIZE);
+    memzero(USB_VIRT((void*)g_event_ring_phys), PAGE_SIZE);
     mmio_write64(g_rt_regs, 0x20 + 0x18, (g_event_ring_phys & ~0xFULL));
 
     uint64_t cmd_ptr = xhci_cmd_submit(0, 0, 0, (23U << 10)); // No-Op Command TRB
@@ -308,7 +347,7 @@ static int xhci_cmd_noop(void) {
         uint32_t iman = mmio_read32(g_rt_regs, 0x20 + 0x00);
         uint64_t erdp = ((uint64_t)mmio_read32(g_rt_regs, 0x20 + 0x1C) << 32) |
                         (uint64_t)mmio_read32(g_rt_regs, 0x20 + 0x18);
-        volatile uint32_t* ev0 = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_event_ring_phys);
+        volatile uint32_t* ev0 = (volatile uint32_t*)USB_VIRT((void*)g_event_ring_phys);
         puts("[usb] noop timeout usbcmd=0x");
         puthex(usbcmd);
         puts(" usbsts=0x");
@@ -371,7 +410,7 @@ static int xhci_wait_cmd_completion(uint64_t cmd_ptr, uint8_t slot_expect, uint8
 static int xhci_poll_transfer_event(uint8_t slot_expect, uint8_t ep_expect, uint64_t trb_expect,
                                     uint32_t loops, uint8_t* out_cc, uint32_t* out_residual) {
     if (!g_rt_regs) return -1;
-    volatile uint32_t* ev_ring = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_event_ring_phys);
+    volatile uint32_t* ev_ring = (volatile uint32_t*)USB_VIRT((void*)g_event_ring_phys);
     const uint32_t intr0 = 0x20;
     for (uint32_t i = 0; i < loops; i++) {
         volatile uint32_t* trb = &ev_ring[g_evt_dequeue_idx * 4];
@@ -411,27 +450,27 @@ static int xhci_cmd_address_device(uint8_t slot_id, uint8_t port_id) {
     if (slot_id == 0 || port_id == 0) return -1;
     if (g_xhci_ctx_size != 32 && g_xhci_ctx_size != 64) return -2;
 
-    void* in_ctx = pmm_alloc(1);
-    void* out_ctx = pmm_alloc(1);
-    void* ep0_ring = pmm_alloc(1);
+    void* in_ctx = usb_alloc_dma(1);
+    void* out_ctx = usb_alloc_dma(1);
+    void* ep0_ring = usb_alloc_dma(1);
     if (!in_ctx || !out_ctx || !ep0_ring) return -3;
 
     g_input_ctx_phys = (uint64_t)in_ctx;
     g_output_ctx_phys = (uint64_t)out_ctx;
     g_ep0_ring_phys = (uint64_t)ep0_ring;
     if (!g_ep0_buf_phys) {
-        void* ep0_buf = pmm_alloc(1);
+        void* ep0_buf = usb_alloc_dma(1);
         if (!ep0_buf) return -3;
-        memzero(PHYS_TO_VIRT(ep0_buf), PAGE_SIZE);
+        memzero(USB_VIRT(ep0_buf), PAGE_SIZE);
         g_ep0_buf_phys = (uint64_t)ep0_buf;
     }
 
-    memzero(PHYS_TO_VIRT(in_ctx), PAGE_SIZE);
-    memzero(PHYS_TO_VIRT(out_ctx), PAGE_SIZE);
-    memzero(PHYS_TO_VIRT(ep0_ring), PAGE_SIZE);
+    memzero(USB_VIRT(in_ctx), PAGE_SIZE);
+    memzero(USB_VIRT(out_ctx), PAGE_SIZE);
+    memzero(USB_VIRT(ep0_ring), PAGE_SIZE);
 
     // EP0 transfer ring: set Link TRB at tail to make a cycle ring.
-    volatile uint32_t* ep = (volatile uint32_t*)PHYS_TO_VIRT(ep0_ring);
+    volatile uint32_t* ep = (volatile uint32_t*)USB_VIRT(ep0_ring);
     ep[255 * 4 + 0] = (uint32_t)(g_ep0_ring_phys & 0xFFFFFFFFU);
     ep[255 * 4 + 1] = (uint32_t)(g_ep0_ring_phys >> 32);
     ep[255 * 4 + 2] = 0;
@@ -440,10 +479,10 @@ static int xhci_cmd_address_device(uint8_t slot_id, uint8_t port_id) {
     g_ep0_cycle = 1;
 
     // DCBAA[slot_id] -> output device context.
-    volatile uint64_t* dcbaa = (volatile uint64_t*)PHYS_TO_VIRT((void*)g_dcbaap_phys);
+    volatile uint64_t* dcbaa = (volatile uint64_t*)USB_VIRT((void*)g_dcbaap_phys);
     dcbaa[slot_id] = g_output_ctx_phys;
 
-    volatile uint32_t* ic = (volatile uint32_t*)PHYS_TO_VIRT(in_ctx);
+    volatile uint32_t* ic = (volatile uint32_t*)USB_VIRT(in_ctx);
     uint32_t stride_dw = g_xhci_ctx_size / 4U;
     // Input Control Context: Add Slot + EP0 context.
     ic[1] = 0x00000003U;
@@ -488,7 +527,7 @@ static int xhci_cmd_address_device(uint8_t slot_id, uint8_t port_id) {
 static int xhci_cmd_configure_endpoint(uint8_t slot_id) {
     if (slot_id == 0 || g_input_ctx_phys == 0) return -1;
 
-    volatile uint32_t* ic = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_input_ctx_phys);
+    volatile uint32_t* ic = (volatile uint32_t*)USB_VIRT((void*)g_input_ctx_phys);
     // For Configure Endpoint, A1 must stay clear; EP0 context does not apply.
     ic[0] = 0;           // Drop flags
     ic[1] = 0x00000001U; // Add flags: slot only
@@ -512,7 +551,7 @@ static int xhci_cmd_configure_endpoint(uint8_t slot_id) {
 static int xhci_ep0_get_device_descriptor(uint8_t slot_id) {
     if (slot_id == 0 || g_ep0_ring_phys == 0 || g_ep0_buf_phys == 0) return -1;
 
-    volatile uint32_t* ep = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_ep0_ring_phys);
+    volatile uint32_t* ep = (volatile uint32_t*)USB_VIRT((void*)g_ep0_ring_phys);
     uint32_t idx = g_ep0_enqueue_idx;
     uint32_t cycle = g_ep0_cycle & 1U;
 
@@ -554,7 +593,7 @@ static int xhci_ep0_get_device_descriptor(uint8_t slot_id) {
     if (xhci_poll_transfer_event(slot_id, 1, 0, 8000000, &cc, &residual) < 0) return -2;
     if (cc != 1) return -3;
 
-    volatile uint8_t* d = (volatile uint8_t*)PHYS_TO_VIRT((void*)g_ep0_buf_phys);
+    volatile uint8_t* d = (volatile uint8_t*)USB_VIRT((void*)g_ep0_buf_phys);
     if (d[1] != 1) return -4; // bDescriptorType must be DEVICE
 
     g_usb_vid = (uint16_t)d[8] | ((uint16_t)d[9] << 8);
@@ -570,7 +609,7 @@ static int xhci_ep0_get_device_descriptor(uint8_t slot_id) {
 static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_phys, uint32_t len) {
     if (slot_id == 0 || g_ep0_ring_phys == 0 || data_phys == 0 || len == 0 || len > 4096) return -1;
 
-    volatile uint32_t* ep = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_ep0_ring_phys);
+    volatile uint32_t* ep = (volatile uint32_t*)USB_VIRT((void*)g_ep0_ring_phys);
     uint32_t idx = g_ep0_enqueue_idx;
     uint32_t cycle = g_ep0_cycle & 1U;
 
@@ -614,7 +653,7 @@ static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_ph
 static int xhci_ep0_control_no_data(uint8_t slot_id, uint64_t setup) {
     if (slot_id == 0 || g_ep0_ring_phys == 0) return -1;
 
-    volatile uint32_t* ep = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_ep0_ring_phys);
+    volatile uint32_t* ep = (volatile uint32_t*)USB_VIRT((void*)g_ep0_ring_phys);
     uint32_t idx = g_ep0_enqueue_idx;
     uint32_t cycle = g_ep0_cycle & 1U;
 
@@ -661,13 +700,13 @@ static uint64_t usb_setup_packet(uint8_t bm_request_type, uint8_t b_request,
 static int xhci_ep0_get_config_descriptor(uint8_t slot_id) {
     if (slot_id == 0) return -1;
     if (!g_ep0_cfg_buf_phys) {
-        void* b = pmm_alloc(1);
+        void* b = usb_alloc_dma(1);
         if (!b) return -2;
-        memzero(PHYS_TO_VIRT(b), PAGE_SIZE);
+        memzero(USB_VIRT(b), PAGE_SIZE);
         g_ep0_cfg_buf_phys = (uint64_t)b;
     }
 
-    volatile uint8_t* cfg = (volatile uint8_t*)PHYS_TO_VIRT((void*)g_ep0_cfg_buf_phys);
+    volatile uint8_t* cfg = (volatile uint8_t*)USB_VIRT((void*)g_ep0_cfg_buf_phys);
     memzero((void*)cfg, PAGE_SIZE);
 
     // 1) First read config header (9 bytes) to get wTotalLength.
@@ -805,17 +844,17 @@ static int xhci_setup_bulk_endpoints(uint8_t slot_id) {
     if (g_usb_bulk_out_dci == 0 || g_usb_bulk_in_dci == 0) return -2;
 
     if (!g_bulk_out_ring_phys) {
-        void* p = pmm_alloc(1);
+        void* p = usb_alloc_dma(1);
         if (!p) return -3;
         g_bulk_out_ring_phys = (uint64_t)p;
     }
     if (!g_bulk_in_ring_phys) {
-        void* p = pmm_alloc(1);
+        void* p = usb_alloc_dma(1);
         if (!p) return -4;
         g_bulk_in_ring_phys = (uint64_t)p;
     }
     if (!g_bulk_buf_phys) {
-        void* p = pmm_alloc(USB_BULK_BUF_PAGES);
+        void* p = usb_alloc_dma(USB_BULK_BUF_PAGES);
         if (!p) return -5;
         g_bulk_buf_phys = (uint64_t)p;
     }
@@ -825,15 +864,15 @@ static int xhci_setup_bulk_endpoints(uint8_t slot_id) {
     g_bulk_out_cycle = 1;
     g_bulk_in_enqueue_idx = 0;
     g_bulk_in_cycle = 1;
-    memzero(PHYS_TO_VIRT((void*)g_bulk_buf_phys), USB_BULK_BUF_SIZE);
+    memzero(USB_VIRT((void*)g_bulk_buf_phys), USB_BULK_BUF_SIZE);
 
-    volatile uint32_t* ic = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_input_ctx_phys);
+    volatile uint32_t* ic = (volatile uint32_t*)USB_VIRT((void*)g_input_ctx_phys);
     memzero((void*)ic, PAGE_SIZE);
     // Input context begins with Input Control Context. Copy the current device
     // context payload after it so controller sees current slot/EP0 state plus our adds.
     {
         uint32_t stride_dw = g_xhci_ctx_size / 4U;
-        volatile uint32_t* oc = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_output_ctx_phys);
+        volatile uint32_t* oc = (volatile uint32_t*)USB_VIRT((void*)g_output_ctx_phys);
         for (uint32_t dci = 0; dci <= 31; dci++) {
             uint32_t in_off = stride_dw * (1U + dci);
             uint32_t out_off = stride_dw * dci;
@@ -902,7 +941,7 @@ static int xhci_bulk_transfer_ex(uint8_t slot_id, uint8_t dci, uint64_t ring_phy
     (void)log_errors;   /* いまは常に出す。呼び分けは未使用 */
     if (slot_id == 0 || dci == 0 || ring_phys == 0 || data_phys == 0) return -1;
 
-    volatile uint32_t* ring = (volatile uint32_t*)PHYS_TO_VIRT((void*)ring_phys);
+    volatile uint32_t* ring = (volatile uint32_t*)USB_VIRT((void*)ring_phys);
     uint32_t* idx = in_dir ? &g_bulk_in_enqueue_idx : &g_bulk_out_enqueue_idx;
     uint32_t* cycle = in_dir ? &g_bulk_in_cycle : &g_bulk_out_cycle;
     uint32_t trb = *idx;
@@ -946,25 +985,25 @@ static int xhci_setup_interrupt_endpoint(uint8_t slot_id) {
     if (g_usb_int_in_dci == 0) return -2;
 
     if (!g_int_ring_phys) {
-        void* p = pmm_alloc(1);
+        void* p = usb_alloc_dma(1);
         if (!p) return -3;
         g_int_ring_phys = (uint64_t)p;
     }
     if (!g_int_buf_phys) {
-        void* p = pmm_alloc(1);
+        void* p = usb_alloc_dma(1);
         if (!p) return -4;
         g_int_buf_phys = (uint64_t)p;
     }
     xhci_ring_reset(g_int_ring_phys);
     g_int_enqueue_idx = 0;
     g_int_cycle = 1;
-    memzero(PHYS_TO_VIRT((void*)g_int_buf_phys), PAGE_SIZE);
+    memzero(USB_VIRT((void*)g_int_buf_phys), PAGE_SIZE);
 
-    volatile uint32_t* ic = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_input_ctx_phys);
+    volatile uint32_t* ic = (volatile uint32_t*)USB_VIRT((void*)g_input_ctx_phys);
     memzero((void*)ic, PAGE_SIZE);
     {
         uint32_t stride_dw = g_xhci_ctx_size / 4U;
-        volatile uint32_t* oc = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_output_ctx_phys);
+        volatile uint32_t* oc = (volatile uint32_t*)USB_VIRT((void*)g_output_ctx_phys);
         for (uint32_t dci = 0; dci <= 31; dci++) {
             uint32_t in_off = stride_dw * (1U + dci);
             uint32_t out_off = stride_dw * dci;
@@ -1067,10 +1106,10 @@ int usb_hid_keyboard_poll(uint8_t report[8]) {
     if (!g_usb_kbd_ready || !report) return -1;
 
     if (!g_int_outstanding) {
-        volatile uint32_t* ring = (volatile uint32_t*)PHYS_TO_VIRT((void*)g_int_ring_phys);
+        volatile uint32_t* ring = (volatile uint32_t*)USB_VIRT((void*)g_int_ring_phys);
         uint32_t trb = g_int_enqueue_idx;
         uint32_t pcs = g_int_cycle & 1U;
-        memzero(PHYS_TO_VIRT((void*)g_int_buf_phys), 8);
+        memzero(USB_VIRT((void*)g_int_buf_phys), 8);
         ring[trb * 4 + 0] = (uint32_t)(g_int_buf_phys & 0xFFFFFFFFU);
         ring[trb * 4 + 1] = (uint32_t)(g_int_buf_phys >> 32);
         ring[trb * 4 + 2] = 8;
@@ -1090,7 +1129,7 @@ int usb_hid_keyboard_poll(uint8_t report[8]) {
     if (cc != 1 && cc != 13) return -2;   /* 13 = Short Packet。8 未満でも可 */
 
     {
-        const volatile uint8_t* b = (const volatile uint8_t*)PHYS_TO_VIRT((void*)g_int_buf_phys);
+        const volatile uint8_t* b = (const volatile uint8_t*)USB_VIRT((void*)g_int_buf_phys);
         for (int i = 0; i < 8; i++) report[i] = b[i];
     }
     return 0;
@@ -1138,7 +1177,7 @@ static int usb_msc_bot_command(const uint8_t* cdb, uint8_t cdb_len, void* data, 
     if (usb_msc_refresh_bulk_rings_if_needed() < 0) return -6;
 
     for (int attempt = 0; attempt < 2; attempt++) {
-        volatile uint8_t* buf = (volatile uint8_t*)PHYS_TO_VIRT((void*)g_bulk_buf_phys);
+        volatile uint8_t* buf = (volatile uint8_t*)USB_VIRT((void*)g_bulk_buf_phys);
         memzero((void*)buf, USB_BULK_BUF_SIZE);
 
         struct usb_msc_cbw* cbw = (struct usb_msc_cbw*)((void*)buf);
@@ -1308,11 +1347,11 @@ static int xhci_setup_rings(volatile uint8_t* cap, volatile uint8_t* op, uint32_
     const uint32_t max_slots = hcsparams1 & 0xFF;
 
     // 1) Allocate and clear DCBAA.
-    void* dcbaa_page = pmm_alloc(1);
+    void* dcbaa_page = usb_alloc_dma(1);
     if (!dcbaa_page) return -1;
-    memzero(PHYS_TO_VIRT(dcbaa_page), PAGE_SIZE);
+    memzero(USB_VIRT(dcbaa_page), PAGE_SIZE);
     g_dcbaap_phys = (uint64_t)dcbaa_page;
-    volatile uint64_t* dcbaa = (volatile uint64_t*)PHYS_TO_VIRT(dcbaa_page);
+    volatile uint64_t* dcbaa = (volatile uint64_t*)USB_VIRT(dcbaa_page);
 
     // Scratchpad buffer support (required when Max Scratchpad Buffers > 0).
     uint32_t sp_hi = (hcsparams2 >> 27) & 0x1F;
@@ -1321,27 +1360,27 @@ static int xhci_setup_rings(volatile uint8_t* cap, volatile uint8_t* op, uint32_
     g_scratchpad_count = sp_count;
     g_scratchpad_array_phys = 0;
     if (sp_count > 0) {
-        void* sp_array_page = pmm_alloc(1);
+        void* sp_array_page = usb_alloc_dma(1);
         if (!sp_array_page) return -1;
-        memzero(PHYS_TO_VIRT(sp_array_page), PAGE_SIZE);
+        memzero(USB_VIRT(sp_array_page), PAGE_SIZE);
         g_scratchpad_array_phys = (uint64_t)sp_array_page;
 
-        volatile uint64_t* sp_array = (volatile uint64_t*)PHYS_TO_VIRT(sp_array_page);
+        volatile uint64_t* sp_array = (volatile uint64_t*)USB_VIRT(sp_array_page);
         for (uint32_t i = 0; i < sp_count; i++) {
-            void* sp_buf = pmm_alloc(1);
+            void* sp_buf = usb_alloc_dma(1);
             if (!sp_buf) return -1;
-            memzero(PHYS_TO_VIRT(sp_buf), PAGE_SIZE);
+            memzero(USB_VIRT(sp_buf), PAGE_SIZE);
             sp_array[i] = (uint64_t)sp_buf;
         }
         dcbaa[0] = g_scratchpad_array_phys;
     }
 
     // 2) Allocate command ring page (TRBs). Link TRB at tail points to head.
-    void* cmd_page = pmm_alloc(1);
+    void* cmd_page = usb_alloc_dma(1);
     if (!cmd_page) return -1;
-    memzero(PHYS_TO_VIRT(cmd_page), PAGE_SIZE);
+    memzero(USB_VIRT(cmd_page), PAGE_SIZE);
     g_cmd_ring_phys = (uint64_t)cmd_page;
-    volatile uint32_t* cmd = (volatile uint32_t*)PHYS_TO_VIRT(cmd_page);
+    volatile uint32_t* cmd = (volatile uint32_t*)USB_VIRT(cmd_page);
     // 256 TRBs per 4KiB. Reserve the last one as Link TRB.
     const uint32_t link_index = 255;
     uint64_t cmd_ring_target = g_cmd_ring_phys & ~0xFULL;
@@ -1352,15 +1391,15 @@ static int xhci_setup_rings(volatile uint8_t* cap, volatile uint8_t* op, uint32_
     cmd[link_index * 4 + 3] = (6U << 10) | (1U << 1) | 1U;
 
     // 3) Allocate one ERST entry and one Event Ring page.
-    void* erst_page = pmm_alloc(1);
-    void* evt_page = pmm_alloc(1);
+    void* erst_page = usb_alloc_dma(1);
+    void* evt_page = usb_alloc_dma(1);
     if (!erst_page || !evt_page) return -1;
-    memzero(PHYS_TO_VIRT(erst_page), PAGE_SIZE);
-    memzero(PHYS_TO_VIRT(evt_page), PAGE_SIZE);
+    memzero(USB_VIRT(erst_page), PAGE_SIZE);
+    memzero(USB_VIRT(evt_page), PAGE_SIZE);
     g_erst_phys = (uint64_t)erst_page;
     g_event_ring_phys = (uint64_t)evt_page;
 
-    volatile uint32_t* erst = (volatile uint32_t*)PHYS_TO_VIRT(erst_page);
+    volatile uint32_t* erst = (volatile uint32_t*)USB_VIRT(erst_page);
     const uint32_t erst_size = 256; // number of TRBs in event ring segment
     erst[0] = (uint32_t)(g_event_ring_phys & 0xFFFFFFFFU);
     erst[1] = (uint32_t)(g_event_ring_phys >> 32);
@@ -1455,6 +1494,15 @@ void usb_init(void) {
     g_xhci_port_id = 0;
     g_xhci_mmio = 0;
 
+    /* **確保より前に決めること。** 後だと、先に確保したものだけ
+     * 変換されないまま残る */
+    g_usb_dma_offset = usb_arch_dma_offset();
+    if (g_usb_dma_offset) {
+        puts("[usb] dma offset 0x");
+        puthex(g_usb_dma_offset);
+        puts("\r\n");
+    }
+
     /* **アーキ側が別の経路で見つけていたら、そちらを使う。**
      *
      * Raspberry Pi 4 の xHCI (VL805) は PCIe の先にいて、設定空間が
@@ -1487,7 +1535,8 @@ void usb_init(void) {
         }
     }
 
-    volatile uint8_t* cap = (volatile uint8_t*)PHYS_TO_VIRT(mmio_phys);
+    /* **ここは MMIO。DMA の窓とは無関係なので USB_VIRT を使わない** */
+    volatile uint8_t* cap = (volatile uint8_t*)PHYS_TO_VIRT_MMIO(mmio_phys);
     g_cap_regs = cap;
     uint8_t caplen = cap[0];
     uint16_t hciversion = (uint16_t)cap[2] | ((uint16_t)cap[3] << 8);
