@@ -467,6 +467,28 @@ void aarch64_early_main(uint64_t dtb_phys) {
     }
     aarch64_uart_puts("\n");
 
+    /* PCIe。**QEMU virt にはあるが raspi4b には無い。**
+     * 実機の USB は PCIe の先の VL805 なので、ここが 0 のままだと
+     * 「この機械では USB を探しに行けない」ことを意味する */
+    {
+        const aarch64_boot_info_t* b2 = aarch64_boot_info();
+        aarch64_uart_puts("  pcie ecam : ");
+        if (b2->pcie_ecam_base) {
+            put_hex64(b2->pcie_ecam_base);
+            aarch64_uart_puts(" size ");
+            put_hex64(b2->pcie_ecam_size);
+            aarch64_uart_puts("  (dtb)\n");
+            aarch64_uart_puts("  pcie mmio : ");
+            put_hex64(b2->pcie_mmio_base);
+            aarch64_uart_puts(" size ");
+            put_hex64(b2->pcie_mmio_size);
+            aarch64_uart_puts(b2->pcie_mmio_base ? "  (BAR の置き場)\n"
+                                                 : "  BAD (32bit 窓が無い)\n");
+        } else {
+            aarch64_uart_puts("無し (この機械には ECAM の PCIe が無い)\n");
+        }
+    }
+
     /* ---- 画面 (Raspberry Pi のみ) ---------------------------------------
      *
      * **MMU より前。** mailbox のバッファにキャッシュ管理が要らないのと、

@@ -185,6 +185,9 @@ typedef struct dtb_node_state {
     /* VideoCore の mailbox。**画面を取るのに要る唯一の口。**
      * /soc/mailbox@7e00b880 で、soc の ranges を通して 0xfe00b880 になる */
     int is_mbox;
+    /* PCIe のホストブリッジ (ECAM)。**QEMU virt にはあるが raspi4b には無い。**
+     * reg が ECAM の窓、ranges が BAR を置ける空間を指す */
+    int is_pcie;
     int is_memory;
     int is_timer;
     int is_cpu;
@@ -198,6 +201,10 @@ typedef struct dtb_node_state {
     uint32_t reg_len;
     const uint8_t* intr_data;
     uint32_t intr_len;
+    /* **生の ranges。** PCI の ranges は子が 3 セルで、下の汎用の解釈
+     * (子 <= 2 セル) では読めない。PCIe のときだけ自分で読み直す */
+    const uint8_t* ranges_data;
+    uint32_t ranges_len;
     /* このノードが**バスとして**持つ ranges。子の reg に適用する */
     dtb_range_t ranges[MAX_RANGES_PER_NODE];
     uint32_t range_count;
@@ -208,6 +215,7 @@ static void node_state_clear(dtb_node_state_t* n) {
     n->is_uart = n->is_gic = n->is_virtio = 0;
     n->is_emmc2 = 0;
     n->is_mbox = 0;
+    n->is_pcie = 0;
     n->is_memory = n->is_timer = n->is_cpu = 0;
     n->is_disabled = 0;
     n->reg_data = 0;
@@ -216,6 +224,8 @@ static void node_state_clear(dtb_node_state_t* n) {
     n->intr_len = 0;
     n->range_count = 0;
     n->has_ranges = 0;
+    n->ranges_data = 0;
+    n->ranges_len = 0;
 }
 
 /* 深さ depth のノードの reg を、ルートから見た物理アドレスに直す。
@@ -447,6 +457,34 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                 info->flags |= AARCH64_BOOT_FLAG_MBOX_FROM_DTB;
             }
 
+            /* PCIe のホストブリッジ (ECAM)。
+             *
+             * **reg が設定空間、ranges の 32bit MMIO 窓が BAR の置き場。**
+             * -kernel で直接起動すると BAR は未設定なので、こちらで配る
+             * (kernel/aarch64/pci.c)。
+             *
+             * PCI の ranges は 1 組 7 セル:
+             *   子 3 セル (先頭が空間の種別) + 親 2 セル + 長さ 2 セル
+             * 種別の下位 2 ビットが 0b10 = 32bit MMIO。**そこだけ使う** —
+             * I/O 空間は aarch64 に無く、64bit 窓は要らない */
+            if (n->is_pcie && !n->is_disabled && n->reg_data &&
+                reg_entry_phys(nodes, depth, n->reg_data, n->reg_len, ac, sc, 0, &base, &size) &&
+                base != 0 && info->pcie_ecam_base == 0) {
+                info->pcie_ecam_base = base;
+                info->pcie_ecam_size = size;
+                info->flags |= AARCH64_BOOT_FLAG_PCIE_FROM_DTB;
+                if (n->ranges_data && n->ranges_len >= 28U) {
+                    for (uint32_t o = 0; o + 28U <= n->ranges_len; o += 28U) {
+                        const uint8_t* r = n->ranges_data + o;
+                        uint32_t space = aarch64_dtb_read_be32(r) & 0x03000000U;
+                        if (space != 0x02000000U) continue;
+                        info->pcie_mmio_base = aarch64_dtb_read_be64(r + 12);
+                        info->pcie_mmio_size = aarch64_dtb_read_be64(r + 20);
+                        break;
+                    }
+                }
+            }
+
             /* timer の interrupts は <type num flags> の 3 セル x 4 本
              * (secure / non-secure physical / virtual / hyp)。
              * 2 本目 (index 1) が非セキュア物理タイマ。
@@ -506,6 +544,10 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                 if (compatible_has(c, len, "brcm,bcm2711-emmc2")) n->is_emmc2 = 1;
                 /* **Pi 4 でも名乗りは bcm2835-mbox のまま。**世代で変わらない */
                 if (compatible_has(c, len, "brcm,bcm2835-mbox")) n->is_mbox = 1;
+                /* **ECAM の総称ドライバ名だけを見る。** QEMU virt が名乗るのは
+                 * これ。実機の brcm,bcm2711-pcie は設定空間の出し方が違うので
+                 * ここでは拾わない (拾うと ECAM として読んで沈黙する) */
+                if (compatible_has(c, len, "pci-host-ecam-generic")) n->is_pcie = 1;
             } else if (str_eq(prop_name, "device_type")) {
                 if (len >= 7U && str_eq((const char*)data, "memory")) nodes[depth].is_memory = 1;
             } else if (str_eq(prop_name, "reg")) {
@@ -533,6 +575,8 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                 uint32_t stride = (cac + pac + csc) * 4U;
                 nodes[depth].has_ranges = 1;
                 nodes[depth].range_count = 0;
+                nodes[depth].ranges_data = data;
+                nodes[depth].ranges_len = len;
                 if (stride > 0 && cac <= 2 && pac <= 2 && csc <= 2) {
                     for (uint32_t o = 0;
                          o + stride <= len && nodes[depth].range_count < MAX_RANGES_PER_NODE;

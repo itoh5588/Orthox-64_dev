@@ -117,6 +117,20 @@ typedef struct aarch64_boot_info {
      * DTB には HDMI の framebuffer が載っていないので、解像度もアドレスも
      * ファームウェアに聞くしかない。**QEMU virt には無い**ので 0 のまま */
     uint64_t mbox_base;
+    /* PCIe (ECAM)。**QEMU virt にはあるが、Raspberry Pi 4 の raspi4b には
+     * 無い** (QEMU が brcm,bcm2711-pcie を無効にしている)。実機の USB は
+     * PCIe の先の VL805 なので、そちらは別途ルートコンプレックスの
+     * 初期化が要る。0 = この機械には無い */
+    uint64_t pcie_ecam_base;
+    uint64_t pcie_ecam_size;
+    /* ranges の 32bit MMIO 窓 (child high cell が 0x02000000 のもの)。
+     * **BAR はここから割り当てる。**ファームウェアを経由せずに -kernel で
+     * 起動すると BAR が未設定なので、自分で配る必要がある */
+    uint64_t pcie_mmio_base;
+    uint64_t pcie_mmio_size;
+    /* **いまはバス 0 しか見ない。** QEMU virt は qemu-xhci をバス 0 に置く。
+     * ブリッジの先まで辿るのは必要になってから */
+    uint32_t pcie_bus_max;
     uint32_t flags;
 } aarch64_boot_info_t;
 
@@ -132,6 +146,7 @@ typedef struct aarch64_boot_info {
 #define AARCH64_BOOT_FLAG_UART_IRQ_FROM_DTB (1U << 9)
 #define AARCH64_BOOT_FLAG_EMMC2_FROM_DTB  (1U << 10)
 #define AARCH64_BOOT_FLAG_MBOX_FROM_DTB   (1U << 11)
+#define AARCH64_BOOT_FLAG_PCIE_FROM_DTB   (1U << 12)
 
 /* 直書きの既定値で埋めてから DTB で上書きする。
  * DTB が無くても QEMU virt では動き続ける */
