@@ -29,6 +29,7 @@
  * している)。**実機でしか通らない道** なので、ここは QEMU で検証できない。
  */
 #include <stdint.h>
+#include <stddef.h>
 #include "aarch64/boot.h"
 #include "aarch64/vm.h"
 
@@ -179,8 +180,50 @@ int aarch64_pcie_brcm_probe(void) {
 #define MISC_MISC_CTRL        0x4008
 #define MISC_MEM_WIN0_LO      0x400c
 #define MISC_PCIE_STATUS      0x4068
+#define MISC_MEM_WIN0_HI      0x4010
 #define MISC_MEM_WIN0_LIMIT   0x4070
+/* ★ **CPU 側の番地が 4GB を超えるとき、上位 [39:32] はここに入る。**
+ *
+ * 0x4070 は下位 12 ビットしか持てない。実測の 0x3FF00000 は
+ * base 0x000 / limit 0x3FF で、**上位の 0x6 はこちらに入るべきものだった。**
+ *
+ *   CPU base  0x6_00000000 >> 20 = 0x6000  -> 下位 0x000 / 上位 0x6
+ *   CPU limit 0x6_3FFFFFFF >> 20 = 0x63FF  -> 下位 0x3FF / 上位 0x6
+ *
+ * **ここを設定し忘れていたので窓が 0x0_00000000 付近を覆い、
+ * 0x6_00000000 へのアクセスをルートコンプレックスが捨てていた**
+ * (実測: 何を読んでも 0xdeaddead = Unsupported Request) */
+#define MISC_MEM_WIN0_BASE_HI  0x4080
+#define MISC_MEM_WIN0_LIMIT_HI 0x4084
 #define MISC_HARD_DEBUG       0x4204
+
+/* ★ **内向き (DMA) の窓。** デバイスが RAM を読むための経路。
+ *
+ * **BAR2 が BCM2711 の主たる内向き窓** (BAR1 は使わない。実測でも
+ * 0x402c / 0x4030 はどちらも 0 だった)。
+ *
+ *   LO  下位 32 ビットの PCI 番地 + [4:0] に大きさの符号
+ *   HI  上位 32 ビットの PCI 番地
+ *
+ * 大きさの符号は 64KB〜64GB で log2(size) - 15。
+ *
+ * **ここを設定しないと「MMIO は通るのに DMA だけ動かない」**という形に
+ * なる。実測でまさにそうなった (2026-08-16): xHCI のレジスタは読めるのに
+ * コマンドリングのイベントが 1 つも返らなかった */
+#define MISC_RC_BAR2_CONFIG_LO 0x4034
+#define MISC_RC_BAR2_CONFIG_HI 0x4038
+
+/* **MISC_CTRL の SCB0_SIZE と同じ値でなければならない。**
+ *
+ * 内向き窓の大きさは 2 か所に書く。RC_BAR2 の下位 5 ビットと、
+ * MISC_CTRL (0x4008) の bits[31:27]。Linux は同じ変数から両方を作る。
+ *
+ * 実機の動いている MISC_CTRL は **0x88003480** で、上位 5 ビットは
+ * 0x88003480 >> 27 = **0x11 = 17** → 2^(17+15) = **4GB**。
+ * dma-ranges は 3GB だが 2 のべき乗に切り上げられるのでこうなる。
+ *
+ * 最初 0x10 (2GB) を書いて食い違わせた。**2 か所を別々に決めない** */
+#define RC_BAR2_SIZE_4GB 0x11U
 
 /* PCIE_STATUS。**3 つ揃って初めてリンクが上がったと言える** */
 #define STATUS_PORT           0x00000080U
@@ -261,8 +304,42 @@ int aarch64_pcie_brcm_init(void) {
 
     aarch64_uart_puts("  pcie init : 4 MISC_CTRL と外向き窓\n");
     wr32(MISC_MISC_CTRL, MISC_CTRL_UP_VALUE);
-    wr32(MISC_MEM_WIN0_LO, MEM_WIN0_LO_VALUE);
+    wr32(MISC_MEM_WIN0_LO, MEM_WIN0_LO_VALUE);   /* PCI 側の番地 (下位) */
+    wr32(MISC_MEM_WIN0_HI, 0);                   /* PCI 側の番地 (上位) */
     wr32(MISC_MEM_WIN0_LIMIT, MEM_WIN0_LIMIT_VALUE);
+    /* **CPU 側の番地の上位。**DTB の cpu_base から作る */
+    {
+        const aarch64_boot_info_t* bi = aarch64_boot_info();
+        uint64_t cpu_lo = bi ? bi->pcie_brcm_cpu_base : 0;
+        uint64_t cpu_hi = cpu_lo + (bi && bi->pcie_brcm_win_size ? bi->pcie_brcm_win_size : 0x40000000ULL) - 1;
+        wr32(MISC_MEM_WIN0_BASE_HI,  (uint32_t)((cpu_lo >> 32) & 0xffU));
+        wr32(MISC_MEM_WIN0_LIMIT_HI, (uint32_t)((cpu_hi >> 32) & 0xffU));
+
+        /* **内向きの窓。** デバイスから見た番地 (dma-ranges の PCI 側) を
+         * 入れる。これが無いと DMA が届かない */
+        {
+            uint64_t dma_pci = bi ? bi->pcie_dma_pci_base : 0x400000000ULL;
+            wr32(MISC_RC_BAR2_CONFIG_LO,
+                 (uint32_t)(dma_pci & 0xffffffffU) | RC_BAR2_SIZE_4GB);
+            wr32(MISC_RC_BAR2_CONFIG_HI, (uint32_t)(dma_pci >> 32));
+            aarch64_uart_puts("  pcie ibar : pci ");
+            puthex_n(dma_pci, 10);
+            aarch64_uart_puts("  lo=");
+            puthex_n((uint32_t)(dma_pci & 0xffffffffU) | RC_BAR2_SIZE_4GB, 8);
+            aarch64_uart_puts(" hi=");
+            puthex_n((uint32_t)(dma_pci >> 32), 8);
+            aarch64_uart_puts("\n");
+        }
+        aarch64_uart_puts("  pcie win  : cpu ");
+        puthex_n(cpu_lo, 10);
+        aarch64_uart_puts("..");
+        puthex_n(cpu_hi, 10);
+        aarch64_uart_puts("  base_hi=");
+        puthex_n((cpu_lo >> 32) & 0xffU, 2);
+        aarch64_uart_puts(" limit_hi=");
+        puthex_n((cpu_hi >> 32) & 0xffU, 2);
+        aarch64_uart_puts("\n");
+    }
 
     aarch64_uart_puts("  pcie init : 5 PERST を落とす\n");
     wr32(RGR1_SW_INIT_1, 0);
@@ -476,6 +553,9 @@ int aarch64_pcie_brcm_scan(void) {
                 /* **BAR を配る前にファームウェアを読み直させる。**
                  * 読み直すとデバイスがリセットされるので、設定は後 */
                 pcie_vl805_reload_firmware(1, (uint8_t)d, (uint8_t)f);
+                /* **落ち着く時間を置く。**ファームウェアを入れ直した
+                 * 直後はデバイスがまだ立ち上がっていない可能性がある */
+                pcie_delay_us(200000);   /* 200ms */
                 uint32_t orig = brcm_cfg_r32(1, (uint8_t)d, (uint8_t)f, 0x10);
                 uint32_t size_mask, size;
 
@@ -532,6 +612,85 @@ int aarch64_pcie_brcm_scan(void) {
                                                          : "  BAD (張られていない)\n");
                 }
 
+                /* ---- Linux が動いている状態と突き合わせる ------------
+                 *
+                 * **推測を重ねない。**Raspberry Pi OS が立ち上げた後の値を
+                 * 実測してある (Docs/pi4-pcie-notes.md §5c)。同じ番地を
+                 * 出して**どこが違うか**を見れば、設定し忘れが分かる。
+                 *
+                 * 期待値を並べて出すので、目で照合できる */
+                {
+                    static const struct { uint32_t off; uint32_t want; } expect[] = {
+                        { 0x0000, 0x271114E4 }, { 0x0004, 0x00100006 },
+                        { 0x0008, 0x06040010 }, { 0x000c, 0x00010000 },
+                        { 0x0018, 0x00010100 }, { 0x04dc, 0x00315E12 },
+                        { 0x1804, 0x00AC4800 }, { 0x4008, 0x88003480 },
+                        { 0x400c, 0xC0000000 }, { 0x4010, 0x00000000 },
+                        { 0x402c, 0x00000000 }, { 0x4030, 0x00000000 },
+                        { 0x4044, 0xFFFFFFFD }, { 0x4064, 0x00000000 },
+                        { 0x4068, 0x000000B0 }, { 0x4070, 0x3FF00000 },
+                        { 0x4204, 0x00200000 }, { 0x9210, 0x00000000 },
+                        /* **実測していない。**0x4070 の値から導いたもの
+                         * (CPU 0x6_00000000..0x6_3fffffff の [39:32]) */
+                        { 0x4080, 0x00000006 }, { 0x4084, 0x00000006 },
+                    };
+                    aarch64_uart_puts("  pcie diff : (番地 いま 期待) 違うものだけ\n");
+                    for (uint32_t k = 0; k < sizeof(expect)/sizeof(expect[0]); k++) {
+                        uint32_t got = rd32(expect[k].off);
+                        if (got == expect[k].want) continue;
+                        aarch64_uart_puts("    +");
+                        puthex_n(expect[k].off, 4);
+                        aarch64_uart_puts(" = ");
+                        puthex_n(got, 8);
+                        aarch64_uart_puts("  期待 ");
+                        puthex_n(expect[k].want, 8);
+                        aarch64_uart_puts("\n");
+                    }
+                    aarch64_uart_puts("  pcie diff : おわり\n");
+                }
+
+                /* **xHCI のレジスタが本当にそこにあるか確かめる。**
+                 *
+                 * 実測 (2026-08-16): ファームウェア再読み込みで応答は
+                 * するようになったが、**caplen を 0x8d と読んで
+                 * 0xad へ 32 ビットアクセスし、アライメント違反で落ちた。**
+                 * Device メモリは境界を揃えないアクセスを許さない。
+                 *
+                 * 先頭の 4 語を**32 ビット境界で**読む。xHCI なら
+                 * 語 0 = (HCIVERSION << 16) | CAPLENGTH で、
+                 * 1.0 なら 0x0100_00xx になるはず */
+                {
+                    volatile uint32_t* r =
+                        (volatile uint32_t*)(uintptr_t)aarch64_phys_to_virt(cpu_base);
+                    /* **時間の問題かを 1 回の起動で切り分ける。**
+                     *
+                     * 0xdeaddead はルートコンプレックスが「相手が応答
+                     * しなかった」ときに返す値。**待てば応答するのか、
+                     * 何度待っても駄目なのか**で原因が分かれる。
+                     *
+                     * 500ms ごとに 10 回読む。**途中で変われば時間の問題、
+                     * 最後まで同じなら設定の問題。**
+                     *
+                     * あわせて VL805 側の status (設定空間 0x06) も見る —
+                     * エラーを記録していれば、そこに出る */
+                    for (uint32_t attempt = 0; attempt < 10; attempt++) {
+                        uint32_t w0 = r[0];
+                        uint32_t st = brcm_cfg_r32(1, (uint8_t)d, (uint8_t)f, 0x04) >> 16;
+                        aarch64_uart_puts("  pcie regs : ");
+                        puthex_n(attempt, 2);
+                        aarch64_uart_puts(" w0=");
+                        puthex_n(w0, 8);
+                        aarch64_uart_puts(" vl805-status=");
+                        puthex_n(st, 4);
+                        if (w0 != 0xdeaddeadU && w0 != 0xffffffffU && w0 != 0) {
+                            aarch64_uart_puts("  ★ 応答した\n");
+                            break;
+                        }
+                        aarch64_uart_puts("\n");
+                        pcie_delay_us(500000);
+                    }
+                }
+
                 aarch64_uart_puts("  pcie xhci : PCI ");
                 puthex_n(pci_base, 8);
                 aarch64_uart_puts(" -> CPU ");
@@ -576,4 +735,20 @@ uint64_t usb_arch_dma_offset(void) {
     /* dma-ranges の「PCI 側の番地」から「CPU 側の番地」を引いたぶん。
      * 実機では 0x4_00000000 - 0 = 0x4_00000000 */
     return b->pcie_dma_pci_base - b->pcie_dma_cpu_base;
+}
+
+/* **共有の kernel/usb.c から呼ばれる。**
+ *
+ * xHCI のリング類を **非キャッシュ (Normal-NC)** の領域から取る。
+ * 根拠は実機の DTB — `pcie@7d500000` に **`dma-coherent` が無い**
+ * (Docs/pi4-pcie-notes.md §5b の採取結果)。つまり BCM2711 の PCIe は
+ * CPU のキャッシュを覗かない。詳しくは kernel/aarch64/vm.c の
+ * 「非キャッシュ DMA プール」の節。
+ *
+ * **QEMU virt でもこちらを通す。**キャッシュを模擬しないので結果は
+ * 変わらないが、経路が 1 本になって「実機でだけ通る道」を作らずに済む。
+ * プールが作れなかった機械 (RAM が小さい) では 0 を返し、あちらは
+ * 従来どおり pmm から取る */
+uint64_t usb_arch_dma_alloc_phys(size_t pages) {
+    return aarch64_vm_dma_alloc((uint64_t)pages);
 }
