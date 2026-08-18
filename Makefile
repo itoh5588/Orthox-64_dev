@@ -576,6 +576,14 @@ aarch64-usb-kbd-smoke:
 	$(MAKE) -C $(CURDIR) aarch64-kernel8 AARCH64_USB_KBD_PROBE=1
 	bash ./tests/aarch64_usb_kbd_smoke.sh
 
+# **キーボードを USB2 ハブの先に置いた形。**実機の Raspberry Pi 4 では
+# 4 つの Type-A が VL805 内蔵ハブの向こうにあり、**ハブを列挙しないと
+# キーボードに一生届かない。**実機の往復は 1 回 5 分かかるので、
+# ここで潰せるものは潰す
+aarch64-usb-hub-smoke:
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 AARCH64_USB_KBD_PROBE=1
+	ORTHOX_USB_KBD_HUB=1 bash ./tests/aarch64_usb_kbd_smoke.sh
+
 aarch64-doom-run: $(AARCH64_DOOM_ELF)
 	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
 	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \

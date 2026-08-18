@@ -50,6 +50,16 @@ trap cleanup EXIT
 if [ -n "${ORTHOX_USB_KBD_FLAT:-}" ]; then
     USB_ARGS=(-device qemu-xhci -device usb-kbd)
     echo "(バス 0 に直付け)"
+elif [ -n "${ORTHOX_USB_KBD_HUB:-}" ]; then
+    # **実機の Raspberry Pi 4 と同じ配線。**
+    # 4 つの Type-A は VL805 内蔵の USB2 ハブの先にあり、xHCI から見えるのは
+    # ハブ 1 台だけ (2026-08-17 実機で vid=0x2109 class=0x09 を確認)。
+    # **ハブを挟まない構成だけ試していると、B-3 がまるごと未検証になる**
+    USB_ARGS=(-device pcie-root-port,id=rp0,chassis=1
+              -device qemu-xhci,id=xhci,bus=rp0
+              -device usb-hub,bus=xhci.0,port=1,id=hub1
+              -device usb-kbd,bus=xhci.0,port=1.1)
+    echo "(ルートポート -> xHCI -> USB2 ハブ -> キーボード = 実機と同じ形)"
 else
     USB_ARGS=(-device pcie-root-port,id=rp0,chassis=1
               -device qemu-xhci,bus=rp0 -device usb-kbd)
