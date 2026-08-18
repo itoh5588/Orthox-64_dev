@@ -131,6 +131,8 @@ extern char aarch64_user_entry[];
 /* フレームバッファ。**Normal NC** — 速さと可視性の折り合い (vm.h の MAIR_IDX_NORMAL_NC) */
 #define VM_ATTR_NORMAL_NC (AARCH64_PTE_ATTRINDX(MAIR_IDX_NORMAL_NC) | AARCH64_PTE_AF)
 #define VM_FB_RW        (VM_ATTR_NORMAL_NC | AARCH64_PTE_AP_RW_EL1 | AARCH64_PTE_UXN | AARCH64_PTE_PXN)
+/* DMA 用。**フレームバッファと同じ Normal NC** (理由は下の DMA プールの節) */
+#define VM_DMA_RW       (VM_ATTR_NORMAL_NC | AARCH64_PTE_AP_RW_EL1 | AARCH64_PTE_UXN | AARCH64_PTE_PXN)
 
 /* ---- EL0 から使えるページ (M3a) -----------------------------------------
  *
@@ -333,6 +335,95 @@ uint64_t aarch64_vm_translate(uint64_t va) {
 
 #define AARCH64_UART_SIZE   0x00001000ULL
 
+/* ---- 非キャッシュ DMA プール ---------------------------------------------
+ *
+ * **BCM2711 の PCIe は CPU のキャッシュとコヒーレントではない。**
+ *
+ * 実機の DTB の `pcie@7d500000` のプロパティ一覧に **`dma-coherent` が無い**
+ * (2026-08-16 に実機から採取。Docs/pi4-pcie-notes.md §5b)。Linux も同じ
+ * 判断をしていて、xHCI のリングは非キャッシュのメモリから取っている。
+ *
+ * HHDM の Normal-WB (キャッシュ有効) に置いたままだと、こうなる:
+ *
+ *   - こちらが書いたコマンド TRB がキャッシュに留まり、**デバイスは
+ *     DRAM の古い内容 (0) を読む** → コマンドが実行されない
+ *   - デバイスがイベントを DRAM に書いても、**こちらはキャッシュの
+ *     古い 0 を読む** → イベントが 1 つも来ないように見える
+ *
+ * **QEMU では絶対に再現しない。** TCG はキャッシュを模擬しないので、
+ * 同じコードが virt では全段通る。実機で「MMIO は正しく読めるのに
+ * イベントが 1 つも来ない」という形でだけ出た。
+ *
+ * ---- なぜ「張り直す」方式か ------------------------------------------------
+ *
+ * **別名 (alias) を作らない。** 同じ物理を Normal-WB と Normal-NC の
+ * 両方で張ると、アーキテクチャ的に未定義の領域に入る (どちらの属性で
+ * 見えるか保証がない)。そこで **HHDM の該当範囲そのものを NC に張り替える。**
+ * 触れる道は HHDM の 1 本だけのままになる。
+ *
+ * 2MB 境界に揃えて確保するので、張り替えは L2 のブロック記述子を
+ * 上書きするだけで済む (テーブルの分割が要らない)。 */
+#define VM_DMA_POOL_BYTES  (2ULL * 1024 * 1024)
+/* xHCI の scratchpad は実機の VL805 で **31 ページ**要求される
+ * (hcsparams2 = 0xfc000031 の実測)。当初 992 ページ (3.9MB) と読んで 8MB
+ * 取っていたが、**HCSPARAMS2 の Hi/Lo を逆に読んでいた**だけだった
+ * (kernel/usb.c の注記)。リングや context を足しても 2MB で足りる。
+ *
+ * **2MB ちょうどにすると L2 のブロック 1 枚で張り替えられる。** */
+
+static uint64_t g_dma_pool_pa;
+static uint64_t g_dma_pool_next;
+static uint64_t g_dma_pool_end;
+
+/* **ページテーブルを組む前に確保する。** そうすれば HHDM を張るときに
+ * 同じ範囲を NC で上書きできる。RAM が小さい機械では作らない
+ * (作れなければ従来どおり pmm から取る = 今までと同じ挙動) */
+static void aarch64_vm_reserve_dma_pool(uint64_t ram_size) {
+    uint64_t raw;
+    if (ram_size < (64ULL << 20)) return;
+    /* 2MB に揃えるぶん余分に取る */
+    raw = (uint64_t)(uintptr_t)pmm_alloc(
+              (size_t)((VM_DMA_POOL_BYTES + AARCH64_BLOCK_SIZE) / AARCH64_PAGE_SIZE));
+    if (!raw) return;
+    g_dma_pool_pa   = aarch64_align_up(raw, AARCH64_BLOCK_SIZE);
+    g_dma_pool_next = g_dma_pool_pa;
+    g_dma_pool_end  = g_dma_pool_pa + VM_DMA_POOL_BYTES;
+}
+
+uint64_t aarch64_vm_dma_pool_base(void) { return g_dma_pool_pa; }
+uint64_t aarch64_vm_dma_pool_bytes(void) { return g_dma_pool_pa ? VM_DMA_POOL_BYTES : 0; }
+
+/* 非キャッシュ領域から切り出す。**返すのは物理番地。**
+ *
+ * 解放は用意しない。USB の初期化で一度取ったら以後放さないため。 */
+uint64_t aarch64_vm_dma_alloc(uint64_t pages) {
+    uint64_t pa = g_dma_pool_next;
+    uint64_t bytes = pages * AARCH64_PAGE_SIZE;
+    uint64_t p, e, i;
+    volatile uint8_t* va;
+
+    if (!g_dma_pool_pa || pages == 0) return 0;
+    if (pa + bytes > g_dma_pool_end) return 0;
+    g_dma_pool_next = pa + bytes;
+
+    va = (volatile uint8_t*)(uintptr_t)aarch64_phys_to_virt(pa);
+
+    /* **この物理に残っているかもしれない古い行を捨てる。**
+     * MMU を入れる前 (キャッシュ off) に触った分と、恒等マップ
+     * (Normal WB) が生きているあいだに投機的に載った分がありうる。
+     * dc civac は PoC まで clean + invalidate するので、NC の VA から
+     * 呼んでも物理で効く */
+    p = (uint64_t)(uintptr_t)va & ~63ULL;
+    e = ((uint64_t)(uintptr_t)va + bytes + 63ULL) & ~63ULL;
+    for (; p < e; p += 64) __asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    /* pmm_alloc と違って使い回すので、**必ず自分で 0 にする** */
+    for (i = 0; i < bytes; i++) va[i] = 0;
+    __asm__ volatile("dsb sy" ::: "memory");
+    return pa;
+}
+
 /* ---- TTBR1: カーネルの上位 VA (M3b) --------------------------------------
  *
  * **ここを組み立てているとき、C はまだ物理アドレスで走っている。**
@@ -346,6 +437,10 @@ static void aarch64_vm_build_kernel(void) {
     uint64_t kblk_start = aarch64_align_down(aarch64_vm_ptr_pa(__kernel_start), AARCH64_BLOCK_SIZE);
     uint64_t kblk_end   = aarch64_align_up(kend_pa, AARCH64_BLOCK_SIZE);
     uint64_t virtio_size;
+
+    /* **HHDM を張る前に確保する。** 張った後だと NC で上書きする範囲が
+     * 決まらない (下で同じ範囲を張り直す) */
+    aarch64_vm_reserve_dma_pool(b->memory_size);
 
     g_kernel_root_pa = aarch64_vm_alloc_table();
     if (!g_kernel_root_pa) return;
@@ -361,6 +456,13 @@ static void aarch64_vm_build_kernel(void) {
     if (kblk_end < ram_end) {
         aarch64_vm_map_range(aarch64_phys_to_virt(kblk_end), kblk_end,
                              ram_end - kblk_end, VM_KERNEL_RW);
+    }
+    /* **DMA プールだけ Normal-NC に張り直す。** 上の一括マッピングの
+     * 後でなければ意味がない (順序を逆にすると WB に戻る)。
+     * 2MB 境界・2MB の倍数なので L2 のブロックを差し替えるだけ */
+    if (g_dma_pool_pa) {
+        aarch64_vm_map_range(aarch64_phys_to_virt(g_dma_pool_pa), g_dma_pool_pa,
+                             VM_DMA_POOL_BYTES, VM_DMA_RW);
     }
     /* カーネルが載っている 2MB ブロックの中は **必ず 4KB ページで**張る。
      * ここに後から区画ごとの権限を重ねるので、ブロックで張ると衝突する。

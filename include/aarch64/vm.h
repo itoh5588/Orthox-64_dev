@@ -171,6 +171,18 @@ static inline int aarch64_vm_mmu_enabled(void) {
     return (int)(v & 1ULL);
 }
 
+/* ---- 非キャッシュ DMA プール ---------------------------------------------
+ *
+ * **PCIe は CPU のキャッシュとコヒーレントでない機械がある** (Pi 4 がそう。
+ * 実機の DTB の pcie ノードに dma-coherent が無い)。xHCI のリングを
+ * Normal-WB に置くと、デバイスは古い内容を読み、こちらは古い内容を見る。
+ * ここから取ったメモリは HHDM が **Normal-NC** で張ってある。
+ *
+ * 返るのは **物理番地**。中身は 0 で埋めてある。解放は無い */
+uint64_t aarch64_vm_dma_alloc(uint64_t pages);
+uint64_t aarch64_vm_dma_pool_base(void);
+uint64_t aarch64_vm_dma_pool_bytes(void);
+
 /* いま上位 VA で走っているか。恒等マッピングを外してよいかの判断に使う */
 static inline int aarch64_vm_running_high(void) {
     uint64_t pc;

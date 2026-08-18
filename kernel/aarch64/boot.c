@@ -720,6 +720,15 @@ void aarch64_boot_continue(void) {
      * 実機で「PCIe は上がったのに usb_init が一度も呼ばれない」に
      * なっていた (2026-08-16 実測) */
     if (aarch64_pci_ready() || usb_arch_xhci_mmio() != 0) {
+        /* **DMA に使う領域が非キャッシュで取れているか。**
+         * ここが 0 だと従来どおり pmm (Normal-WB) から取るので、
+         * PCIe がコヒーレントでない機械では DMA が動かない */
+        aarch64_uart_puts("  dma pool  : pa ");
+        aarch64_uart_puthex64(aarch64_vm_dma_pool_base());
+        aarch64_uart_puts(" size ");
+        aarch64_uart_puthex64(aarch64_vm_dma_pool_bytes());
+        aarch64_uart_puts(aarch64_vm_dma_pool_base() ? "  非キャッシュ (Normal-NC)\n"
+                                                     : "  *** 取れていない\n");
         usb_init();
         aarch64_uart_puts("  usb       : ");
         aarch64_uart_puts(usb_is_ready() ? "ok\n" : "見つからない / 初期化できない\n");
