@@ -299,6 +299,7 @@ AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer
 	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/emmc2.c kernel/aarch64/runtime.c \
 	kernel/aarch64/stubs.c kernel/aarch64/syscall.c kernel/aarch64/console.c \
 	kernel/aarch64/mailbox.c kernel/aarch64/fb.c kernel/aarch64/fbcon.c kernel/aarch64/font12x24.c \
+	kernel/aarch64/sound.c \
 	kernel/aarch64/pci.c kernel/aarch64/kbd.c kernel/aarch64/pcie_brcm.c kernel/aarch64/fb_pci.c
 # 共有層のうち、**いま繋がるものだけ**を取り込む (M3c-2a)。
 # どれが入るかは推測せず、llvm-nm -u で未解決シンボルを実測して決めた。
@@ -392,6 +393,14 @@ AARCH64_EARLY_GICC ?= 0x08010000
 # **BCM2711 の PCIe を触る探針。既定では無効。**
 # 実測で 4 語目を読むと固まる (2026-08-16、実機)。有効にするときは
 # 巻き戻せる状態で
+# **PWM で 3.5mm ジャックに音を出す。既定では無効。**
+# QEMU の raspi4b は PWM1 (0xFE20C800) を持たないので、触ると
+# external abort で落ちる (ESR=0x96000050)。実機でしか試せない
+AARCH64_SOUND ?=
+ifneq ($(AARCH64_SOUND),)
+AARCH64_CFLAGS += -DAARCH64_SOUND=1
+endif
+
 # **BCM2711 の PCIe を立ち上げる。既定では無効。**
 # QEMU で一切検証できないので、実機で 1 段ずつ確かめる用
 AARCH64_PCIE_BRCM_INIT ?=
@@ -484,10 +493,14 @@ aarch64-kernel8: $(AARCH64_KERNEL8_IMG)
 #   早期 UART   0xFE201000  DTB を読む前の出力先 (Pi 4 の PL011)
 #   CNTFRQ      54000000    EL3 で飛んできたときだけ使う (BCM2711 の OSC_FREQ)
 #   GICD/GICC   0xFF841000 / 0xFF842000  同上。armstub を経由すれば不要
+# **AARCH64_SOUND=1 はこの target だけ。**3.5mm ジャックは PWM1
+# (0xFE20C800) が鳴らすが、**QEMU の raspi4b は PWM1 を持たない**
+# (QEMU にあるのは PWM0 の 0x20C000 だけ)。触ると external abort で
+# 落ちるので、実機向けのここでだけ有効にする (2026-08-19 実測)
 aarch64-pi4-boot:
 	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
 	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \
-	    AARCH64_CNTFRQ_HZ=54000000 \
+	    AARCH64_CNTFRQ_HZ=54000000 AARCH64_SOUND=1 \
 	    AARCH64_EARLY_GICD=0xFF841000 AARCH64_EARLY_GICC=0xFF842000
 	@mkdir -p out/pi4-boot
 	cp out/kernel8.img out/pi4-boot/

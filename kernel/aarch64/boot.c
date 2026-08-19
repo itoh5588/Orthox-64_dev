@@ -195,6 +195,8 @@ int aarch64_fb_init_pci(uint32_t w, uint32_t h);
 int aarch64_pci_ready(void);
 void usb_init(void);
 int usb_is_ready(void);
+void sound_init(void);
+void aarch64_sound_selftest(void);
 int usb_hid_keyboard_init(void);
 int usb_hid_keyboard_poll(uint8_t report[8]);
 uint64_t arch_time_now_ms(void);
@@ -722,6 +724,21 @@ void aarch64_boot_continue(void) {
      * 立ち上げた先で見つかる。**そちらで見つけていたら呼ぶ** —
      * 実機で「PCIe は上がったのに usb_init が一度も呼ばれない」に
      * なっていた (2026-08-16 実測) */
+    /* ---- 音 (PWM -> 3.5mm ジャック) ----
+     *
+     * **耳でしか確かめられない。**実機にイヤホンを挿して聞くのが
+     * 唯一の確認になる。ラ (440) -> 1kHz -> 高いラ (880) を 0.4 秒ずつ。
+     *
+     * **QEMU では有効にできない。**raspi4b は PWM1 (0xFE20C800) を
+     * 持たず、触ると external abort になる (ESR=0x96000050)。
+     * QEMU にあるのは PWM0 の 0x20C000 だけ。したがって
+     * **AARCH64_SOUND=1 は aarch64-pi4-boot でしか付けない** */
+#ifdef AARCH64_SOUND
+    aarch64_uart_puts("--- 音: PWM -> 3.5mm ジャック ---\n");
+    sound_init();
+    aarch64_sound_selftest();
+#endif
+
     if (aarch64_pci_ready() || usb_arch_xhci_mmio() != 0) {
         /* **DMA に使う領域が非キャッシュで取れているか。**
          * ここが 0 だと従来どおり pmm (Normal-WB) から取るので、

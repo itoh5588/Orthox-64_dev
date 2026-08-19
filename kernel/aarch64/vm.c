@@ -27,6 +27,7 @@
 #include "aarch64/boot.h"
 #include "aarch64/fb.h"
 #include "aarch64/vm.h"
+#include "aarch64/bcm_periph.h"
 #include "aarch64/usermode.h"
 /* **ユーザーページは参照カウント付きの pmm_alloc / pmm_free で扱う。**
  * aarch64_pmm_alloc (生) で取ると refcount が 0 のままになり、pmm_free は
@@ -569,6 +570,26 @@ static void aarch64_vm_build_kernel(void) {
         aarch64_vm_map_range(aarch64_phys_to_virt(b->mbox_base & ~(AARCH64_PAGE_SIZE - 1)),
                              b->mbox_base & ~(AARCH64_PAGE_SIZE - 1),
                              AARCH64_PAGE_SIZE, VM_DEVICE_RW);
+    }
+
+    /* **音のための 3 ページ (GPIO / クロック管理 / PWM1)。**
+     *
+     * 3.5mm ジャックは PWM1 が GPIO 40/41 に出す。番地は
+     * include/aarch64/bcm_periph.h (実機の DTB から取った)。
+     *
+     * **張り忘れると、番地は合っているのに translation fault になる**
+     * (実測: FAR=0xfe20c800 / ESR=0x96000047 = level 3 の translation
+     * fault)。mailbox と同じで「Pi かどうか」で分ける */
+    if (b->mbox_base || b->emmc2_base) {
+        static const uint64_t snd_pa[3] = {
+            AARCH64_BCM_GPIO_BASE, AARCH64_BCM_CM_BASE, AARCH64_BCM_PWM1_BASE
+        };
+        int i;
+        for (i = 0; i < 3; i++) {
+            uint64_t pa = snd_pa[i] & ~(AARCH64_PAGE_SIZE - 1);
+            aarch64_vm_map_range(aarch64_phys_to_virt(pa), pa,
+                                 AARCH64_PAGE_SIZE, VM_DEVICE_RW);
+        }
     }
 
     /* Raspberry Pi 4 の PCIe のレジスタ窓。**ECAM とは別物。**
