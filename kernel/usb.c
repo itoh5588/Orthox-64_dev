@@ -562,6 +562,8 @@ static int xhci_wait_cmd_completion(uint64_t cmd_ptr, uint8_t slot_expect, uint8
  * これが無いと Setup / Data / Status のどの段で落ちたかが分からない
  * (2026-08-18 codex 相談) */
 static uint64_t g_last_evt_trb = 0;
+static uint8_t  g_last_cc = 0;
+static uint32_t g_last_residual = 0;
 
 static int xhci_poll_transfer_event(uint8_t slot_expect, uint8_t ep_expect, uint64_t trb_expect,
                                     uint32_t loops, uint8_t* out_cc, uint32_t* out_residual) {
@@ -583,6 +585,8 @@ static int xhci_poll_transfer_event(uint8_t slot_expect, uint8_t ep_expect, uint
         if (out_cc) *out_cc = (uint8_t)((d[2] >> 24) & 0xFF);
         if (out_residual) *out_residual = (d[2] & 0x00FFFFFFU);
         g_last_evt_trb = trb_ptr;
+        g_last_cc = (uint8_t)((d[2] >> 24) & 0xFF);
+        g_last_residual = (d[2] & 0x00FFFFFFU);
         return 0;
     }
     return -1;
@@ -802,14 +806,14 @@ static int xhci_ep0_get_device_descriptor(uint8_t slot_id) {
     ep[idx * 4 + 0] = (uint32_t)(setup & 0xFFFFFFFFU);
     ep[idx * 4 + 1] = (uint32_t)(setup >> 32);
     ep[idx * 4 + 2] = 8; // setup packet is 8 bytes
-    ep[idx * 4 + 3] = (2U << 10) | (1U << 6) | (3U << 16) | (1U << 4) | cycle; // Setup, IDT, TRT=IN, CHAIN
+    ep[idx * 4 + 3] = (2U << 10) | (1U << 6) | (3U << 16) | cycle; // Setup TD: IDT, TRT=IN (CH は立てない)
 
     // Data Stage TRB (IN, 18 bytes)
     idx++;
     ep[idx * 4 + 0] = (uint32_t)(g_ep0_buf_phys & 0xFFFFFFFFU);
     ep[idx * 4 + 1] = (uint32_t)(g_ep0_buf_phys >> 32);
     ep[idx * 4 + 2] = 18;
-    ep[idx * 4 + 3] = (3U << 10) | (1U << 16) | (1U << 4) | cycle; // Data IN, CHAIN
+    ep[idx * 4 + 3] = (3U << 10) | (1U << 16) | cycle; // Data TD: DIR=IN (CH は立てない)
 
     // Status Stage TRB (OUT status, IOC)
     idx++;
@@ -877,6 +881,17 @@ static int xhci_ep0_get_device_descriptor_retry(uint8_t slot_id, uint32_t tries)
     return rc;
 }
 
+/* **制御転送の 3 段は、それぞれ別の TD にする。**
+ *
+ * リング上に 3 つ続けて置き、ドアベルを 1 回叩くのは構わないが、
+ * **Chain ビットで繋いで 1 つの TD にしてはいけない** (xHCI の
+ * TD Usage Rules 違反)。Setup TRB は IDT=1 なので、同じ TD に他の
+ * Transfer TRB を含めること自体が違反になる。
+ *
+ * 以前ここは Setup / Data に CH を立てていた。**MPS=8 では通っていたが、
+ * MPS を 16 以上にすると Status 段で cc=6 (Stall Error) になり、EP0 が
+ * Halted に落ちた** (実機 2026-08-19 の測定)。壊れた 1-TD 構成では
+ * short packet の処理が次に進む先を誤る (2026-08-19 codex 相談) */
 static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_phys, uint32_t len) {
     if (slot_id == 0 || g_ep0_ring_phys == 0 || data_phys == 0 || len == 0 || len > 4096) return -1;
 
@@ -887,13 +902,13 @@ static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_ph
     ep[idx * 4 + 0] = (uint32_t)(setup & 0xFFFFFFFFU);
     ep[idx * 4 + 1] = (uint32_t)(setup >> 32);
     ep[idx * 4 + 2] = 8;
-    ep[idx * 4 + 3] = (2U << 10) | (1U << 6) | (3U << 16) | (1U << 4) | cycle; // Setup, IDT, TRT=IN, CHAIN
+    ep[idx * 4 + 3] = (2U << 10) | (1U << 6) | (3U << 16) | cycle; // Setup TD: IDT, TRT=IN (CH は立てない)
 
     idx++;
     ep[idx * 4 + 0] = (uint32_t)(data_phys & 0xFFFFFFFFU);
     ep[idx * 4 + 1] = (uint32_t)(data_phys >> 32);
     ep[idx * 4 + 2] = len;
-    ep[idx * 4 + 3] = (3U << 10) | (1U << 16) | (1U << 4) | cycle; // Data IN, CHAIN
+    ep[idx * 4 + 3] = (3U << 10) | (1U << 16) | cycle; // Data TD: DIR=IN (CH は立てない)
 
     idx++;
     ep[idx * 4 + 0] = 0;
@@ -932,7 +947,7 @@ static int xhci_ep0_control_no_data(uint8_t slot_id, uint64_t setup) {
     ep[idx * 4 + 0] = (uint32_t)(setup & 0xFFFFFFFFU);
     ep[idx * 4 + 1] = (uint32_t)(setup >> 32);
     ep[idx * 4 + 2] = 8;
-    ep[idx * 4 + 3] = (2U << 10) | (1U << 6) | (1U << 4) | cycle; // Setup, IDT, TRT=No Data, CHAIN
+    ep[idx * 4 + 3] = (2U << 10) | (1U << 6) | cycle; // Setup TD: IDT, TRT=No Data (CH は立てない)
 
     idx++;
     ep[idx * 4 + 0] = 0;
@@ -1072,7 +1087,7 @@ static uint8_t  g_sv_speed[2];
 static void xhci_dump_dev_ctx(const char* tag, uint64_t out_ctx_phys) {
     volatile uint32_t* oc;
     uint32_t stride_dw = g_xhci_ctx_size / 4U;
-    uint32_t s0, s1, s2, s3, e0, e1, e4;
+    uint32_t s0, s1, s2, s3, e0, e1, e2, e3, e4;
 
     if (out_ctx_phys == 0) {
         puts("[ctx] ");
@@ -1083,6 +1098,9 @@ static void xhci_dump_dev_ctx(const char* tag, uint64_t out_ctx_phys) {
     oc = (volatile uint32_t*)USB_VIRT((void*)out_ctx_phys);
     s0 = oc[0]; s1 = oc[1]; s2 = oc[2]; s3 = oc[3];
     e0 = oc[stride_dw + 0]; e1 = oc[stride_dw + 1]; e4 = oc[stride_dw + 4];
+    /* **TR Dequeue Pointer も見る。**Evaluate Context が取り出し位置に
+     * 触っていないことは、ここを出さないと言えない (2026-08-19) */
+    e2 = oc[stride_dw + 2]; e3 = oc[stride_dw + 3];
 
     puts("[ctx] ");
     puts(tag);
@@ -1105,6 +1123,9 @@ static void xhci_dump_dev_ctx(const char* tag, uint64_t out_ctx_phys) {
     puts(tag);
     puts(" ep0 dw=");
     puthex(e0); puts(" "); puthex(e1); puts(" "); puthex(e4);
+    puts("\r\n[ctx]   deq=");
+    puthex(((uint64_t)e3 << 32) | (uint64_t)(e2 & 0xFFFFFFF0U));
+    puts(" dcs="); putdec(e2 & 1U);
     /* EP State: 0=Disabled 1=Running 2=Halted 3=Stopped 4=Error */
     puts("\r\n[ctx]   epstate="); putdec(e0 & 7U);
     puts(" cerr="); putdec((e1 >> 1) & 3U);
@@ -1165,6 +1186,29 @@ static int usb_probe_desc(const char* tag, uint8_t slot_id, uint32_t len) {
     rc = xhci_ep0_control_in(slot_id, usb_setup_packet(0x80, 0x06, 0x0100, 0, (uint16_t)len),
                              g_ep0_buf_phys, len);
 
+    /* **積んだ TRB の dword3 を読み戻して出す。**CH が本当に落ちているか、
+     * ログだけで確かめられるようにする (2026-08-19 codex 相談) */
+    {
+        volatile uint32_t* r = (volatile uint32_t*)USB_VIRT((void*)ring);
+        puts("[pb] ");
+        puts(tag);
+        puts(" dw3=");
+        puthex(r[idx * 4 + 3]); puts(" ");
+        puthex(r[(idx + 1U) * 4 + 3]); puts(" ");
+        puthex(r[(idx + 2U) * 4 + 3]);
+        puts(" ch=");
+        putdec((r[idx * 4 + 3] >> 4) & 1U);
+        putdec((r[(idx + 1U) * 4 + 3] >> 4) & 1U);
+        putdec((r[(idx + 2U) * 4 + 3] >> 4) & 1U);
+        puts(" evt=");
+        puthex(g_last_evt_trb);
+        puts(" cc=");
+        putdec(g_last_cc);
+        puts(" resid=");
+        putdec(g_last_residual);
+        puts("\r\n");
+    }
+
     puts("[pb] ");
     puts(tag);
     if (rc == 0) {
@@ -1173,6 +1217,9 @@ static int usb_probe_desc(const char* tag, uint8_t slot_id, uint32_t len) {
         puts(" ok");
         for (k = 0; k < n; k++) { puts(" "); puthex_byte(d[k]); }
         puts("\r\n");
+        /* **通ったときも EP0 の状態と取り出し位置を出す。**
+         * Running のまま進んでいることを毎回確かめる */
+        xhci_dump_dev_ctx(tag, g_output_ctx_phys);
         return 0;
     }
 
@@ -1190,6 +1237,23 @@ static int usb_probe_desc(const char* tag, uint8_t slot_id, uint32_t len) {
      * Halted なら xHC は本当に相手からの STALL を受けている */
     xhci_dump_dev_ctx(tag, g_output_ctx_phys);
     return rc;
+}
+
+/* **Evaluate Context を 1 段出して、結果と文脈を出す。**
+ * 梯子 (8 -> 16 -> 32 -> 64) を測るための道具で、駆動側の手順は変えない。
+ * 値を渡すだけで、コマンドの出し方は本番と同じ経路を通る (2026-08-19) */
+static int usb_probe_eval(const char* tag, uint8_t slot_id, uint32_t mps) {
+    int er = xhci_cmd_evaluate_context_mps(slot_id, mps);
+    puts("[pb] Eval ");
+    puts(tag);
+    puts(" mps ");
+    putdec(g_usb_ep0_mps);
+    puts(" -> ");
+    putdec(mps);
+    puts(er == 0 ? "  ok\r\n" : "  *** 失敗\r\n");
+    if (er == 0) g_usb_ep0_mps = (uint16_t)mps;
+    xhci_dump_dev_ctx(tag, g_output_ctx_phys);
+    return er;
 }
 
 /* ---- EP0 が STALL したときの復帰 -------------------------------------------
@@ -2626,25 +2690,45 @@ void usb_init(void) {
                                             /* A: リセットも MPS 変更もしていない状態で、
                                              *    同じ要求をもう一度 */
                                             if (ok) ok = (usb_probe_desc("A", dev_slot, 8) == 0);
-                                            /* MPS を入れ替える */
-                                            if (ok && learned_mps != g_usb_ep0_mps) {
-                                                int er = xhci_cmd_evaluate_context_mps(dev_slot, learned_mps);
-                                                puts("[pb] Evaluate Context mps ");
-                                                putdec(g_usb_ep0_mps);
-                                                puts(" -> ");
-                                                putdec(learned_mps);
-                                                puts(er == 0 ? "  ok\r\n" : "  *** 失敗\r\n");
-                                                if (er == 0) {
-                                                    g_usb_ep0_mps = (uint16_t)learned_mps;
-                                                    xhci_dump_dev_ctx("eval後", g_output_ctx_phys);
-                                                } else {
-                                                    ok = 0;
-                                                }
+
+                                            /* ---- 測定: TD を分けたあとの確認 (2026-08-19) ----
+                                             *
+                                             * 直したのは 1 つだけ。**制御転送の 3 段を
+                                             * Chain で 1 つの TD にしていたのをやめ、
+                                             * それぞれ別の TD にした。**
+                                             *
+                                             * 前回の測定で分かっていたこと:
+                                             *   - Evaluate Context というコマンド自体は無害
+                                             *   - 8 -> 64 -> 8 と往復させても傷は残らない
+                                             *   - **MPS が 8 でないと Status 段で cc=6。**
+                                             *     64 固有ではなく 16 でも落ちた
+                                             *
+                                             * codex の指示どおり、**MPS=16 を固定して
+                                             * 長さを 8 -> 16 -> 18 と上げる。**18 は
+                                             * MPS=16 に対して最後が 2 バイトになるので、
+                                             * **短い最終 packet を含む正しい制御転送**の
+                                             * 確認になる。そのあと本番の MPS に上げる。
+                                             *
+                                             * **落ちたらそこで止める。**STALL は EP0 を
+                                             * Halted にするので、続けると以後が読めない */
+                                            if (ok && learned_mps >= 16U) {
+                                                ok = (usb_probe_eval("→16", dev_slot, 16) == 0);
+                                                if (ok) ok = (usb_probe_desc("16/8",  dev_slot, 8) == 0);
+                                                if (ok) ok = (usb_probe_desc("16/16", dev_slot, 16) == 0);
+                                                /* **18 バイトはここでは出せない。**
+                                                 * この相手の実 MPS は 64 なので、18 バイトを
+                                                 * 1 packet で返してくる。文脈に 16 と嘘を
+                                                 * 入れている状態では xHC が Babble (cc=3) を
+                                                 * 上げるのが正しい。実際 4 回目の起動で
+                                                 * 段=Data / cc=3 / resid=18 になった。
+                                                 * **長い読みは本当の MPS に上げてから出す** */
                                             }
-                                            /* B: MPS だけ動かした状態で、同じ 8 バイト読み */
-                                            if (ok) ok = (usb_probe_desc("B", dev_slot, 8) == 0);
-                                            /* C: 本番の 18 バイト読み */
-                                            if (ok) ok = (usb_probe_desc("C", dev_slot, 18) == 0);
+                                            /* 本番の MPS に上げて、同じ 3 本をもう一度 */
+                                            if (ok && learned_mps != g_usb_ep0_mps) {
+                                                ok = (usb_probe_eval("→本番", dev_slot, learned_mps) == 0);
+                                                if (ok) ok = (usb_probe_desc("本/8",  dev_slot, 8) == 0);
+                                                if (ok) ok = (usb_probe_desc("本/18", dev_slot, 18) == 0);
+                                            }
                                             puts(ok ? "[pb] A/B/C 全部通った\r\n"
                                                     : "[pb] ここで止めた\r\n");
                                         }
