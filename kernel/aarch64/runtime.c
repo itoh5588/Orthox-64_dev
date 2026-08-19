@@ -152,8 +152,17 @@ void puts(const char* s) {
     aarch64_uart_puts(s);
 }
 
+/* **"0x" は付けない。**呼ぶ側が `puts("0x")` を書く前提で、x86_64 の
+ * `kernel/init.c` の puthex がそうなっている。ここだけ prefix を付けていたので
+ * 共有層 (usb.c など) のログが `0x0x0000000000000009` になっていた
+ * (2026-08-19)。**"0x" 付きが欲しいときは aarch64_uart_puthex64 を直に呼ぶ** */
 void puthex(uint64_t value) {
-    aarch64_uart_puthex64(value);
+    static const char digits[] = "0123456789abcdef";
+    char buf[17];
+    int i;
+    for (i = 0; i < 16; i++) buf[i] = digits[(value >> ((15 - i) * 4)) & 0xfU];
+    buf[16] = '\0';
+    puts(buf);
 }
 
 int64_t sys_write_serial(const char* buf, size_t count) {

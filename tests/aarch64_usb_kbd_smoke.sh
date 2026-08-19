@@ -103,7 +103,8 @@ wait "$QEMU_PID" 2>/dev/null || true
 QEMU_PID=""
 
 echo "--- USB キーボード Serial Output ---"
-grep -aE "\[usb\]|usb |pci |\[kbd\]|usb-kbd-probe" "$LOG" | head -40
+# [ctx] は出力デバイス文脈のダンプ。落ちたときの唯一の手がかりなので落とさない
+grep -aE "\[usb\]|usb |pci |\[kbd\]|\[ctx\]|usb-kbd-probe" "$LOG" | head -60
 echo "-----------------------------------"
 
 LOGN="$LOG.nocr"

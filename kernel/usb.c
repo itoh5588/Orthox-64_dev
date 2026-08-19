@@ -59,6 +59,19 @@ static void puthex_byte(uint8_t v) {
     puts(out);
 }
 
+/* **桁数を指定して 16 進で出す。**puthex は 64bit を丸ごと 16 桁で出すので、
+ * vid/pid のような 16bit の値が 0x0000000000001a81 になって読みにくい */
+static void puthex_n(uint64_t v, int digits) {
+    static const char hex[] = "0123456789abcdef";
+    char out[17];
+    int i;
+    if (digits < 1) digits = 1;
+    if (digits > 16) digits = 16;
+    for (i = 0; i < digits; i++) out[i] = hex[(v >> ((digits - 1 - i) * 4)) & 0xFU];
+    out[digits] = 0;
+    puts(out);
+}
+
 static void putdec(uint64_t v) {
     char rev[21];
     char out[21];
@@ -445,7 +458,7 @@ static int xhci_cmd_noop(void) {
     uint32_t stale = xhci_evt_drain();
     if (stale) {
         puts("[usb] 滞留イベントを ");
-        puthex(stale);
+        putdec(stale);
         puts(" 個捨てた\r\n");
     }
 
@@ -503,7 +516,7 @@ static int xhci_cmd_noop(void) {
                 volatile uint32_t* t = ev0 + i * 4U;
                 if (!t[0] && !t[1] && !t[2] && !t[3]) continue;
                 puts("[usb] evt[");
-                puthex(i);
+                putdec(i);
                 puts("] d0=0x");
                 puthex(t[0]);
                 puts(" d1=0x");
@@ -696,7 +709,7 @@ static int xhci_cmd_address_device_full(uint8_t slot_id, uint8_t port_id, uint32
          * 19 = Context State Error (そのスロットの状態からは出せない命令)
          * 17 = Parameter Error (文脈の中身が不正) */
         puts("[usb] address device cc=");
-        puthex(cc);
+        putdec(cc);
         puts("\r\n");
         return -6;
     }
@@ -822,7 +835,7 @@ static int xhci_ep0_get_device_descriptor(uint8_t slot_id) {
          * 3 = Babble (相手のパケットがこちらの MPS より長い)
          * 4 = USB Transaction Error / 6 = STALL */
         puts("[usb] device desc cc=");
-        puthex(cc);
+        putdec(cc);
         puts(" mps=");
         putdec(g_usb_ep0_mps);
         puts(" speed=");
@@ -936,9 +949,9 @@ static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_ph
         else                                                          puts("不明");
         puts(" evt=0x");
         puthex(g_last_evt_trb);
-        puts(" dw3=");
-        puthex(ep[idx0 * 4 + 3]); puts(" ");
-        puthex(ep[(idx0 + 1U) * 4 + 3]); puts(" ");
+        puts(" dw3=0x");
+        puthex(ep[idx0 * 4 + 3]); puts(" 0x");
+        puthex(ep[(idx0 + 1U) * 4 + 3]); puts(" 0x");
         puthex(ep[(idx0 + 2U) * 4 + 3]);
         puts("\r\n");
         xhci_dump_dev_ctx("失敗", g_output_ctx_phys);
@@ -972,10 +985,10 @@ static int xhci_ep0_control_no_data(uint8_t slot_id, uint64_t setup) {
     uint32_t residual = 0;
     if (xhci_poll_transfer_event(slot_id, 1, 0, 8000000, &cc, &residual) < 0) return -2;
     if (cc != 1) {
-        puts("[usb] ep0 no-data cc=0x");
-        puthex(cc);
-        puts(" residual=0x");
-        puthex(residual);
+        puts("[usb] ep0 no-data cc=");
+        putdec(cc);
+        puts(" residual=");
+        putdec(residual);
         puts(" setup=0x");
         puthex(setup);
         puts("\r\n");
@@ -1056,9 +1069,9 @@ static void xhci_dump_dev_ctx(const char* tag, uint64_t out_ctx_phys) {
 
     puts("[ctx] ");
     puts(tag);
-    puts(" slot dw=");
-    puthex(s0); puts(" "); puthex(s1); puts(" "); puthex(s2); puts(" "); puthex(s3);
-    puts("\r\n[ctx]   route="); puthex(s0 & 0xFFFFFU);
+    puts(" slot dw=0x");
+    puthex(s0); puts(" 0x"); puthex(s1); puts(" 0x"); puthex(s2); puts(" 0x"); puthex(s3);
+    puts("\r\n[ctx]   route=0x"); puthex_n(s0 & 0xFFFFFU, 5);
     puts(" speed="); putdec((s0 >> 20) & 0xFU);
     puts(" mtt="); putdec((s0 >> 25) & 1U);
     puts(" hub="); putdec((s0 >> 26) & 1U);
@@ -1073,9 +1086,9 @@ static void xhci_dump_dev_ctx(const char* tag, uint64_t out_ctx_phys) {
     puts(" slotstate="); putdec((s3 >> 27) & 0x1FU);
     puts("\r\n[ctx] ");
     puts(tag);
-    puts(" ep0 dw=");
-    puthex(e0); puts(" "); puthex(e1); puts(" "); puthex(e4);
-    puts("\r\n[ctx]   deq=");
+    puts(" ep0 dw=0x");
+    puthex(e0); puts(" 0x"); puthex(e1); puts(" 0x"); puthex(e4);
+    puts("\r\n[ctx]   deq=0x");
     puthex(((uint64_t)e3 << 32) | (uint64_t)(e2 & 0xFFFFFFF0U));
     puts(" dcs="); putdec(e2 & 1U);
     /* EP State: 0=Disabled 1=Running 2=Halted 3=Stopped 4=Error */
@@ -1244,7 +1257,7 @@ static int usb_hub_find_device(uint8_t slot_id, uint8_t nbr_ports,
         if (usb_hub_get_port_status(slot_id, p, &st) < 0) continue;
         puts("[usb] hub port ");
         putdec(p);
-        puts(" status=");
+        puts(" status=0x");
         puthex(st);
         puts((st & HUB_PORT_CONNECTION) ? "  接続あり\r\n" : "\r\n");
         if (!(st & HUB_PORT_CONNECTION)) continue;
@@ -1257,7 +1270,7 @@ static int usb_hub_find_device(uint8_t slot_id, uint8_t nbr_ports,
 
         puts("[usb] hub port ");
         putdec(p);
-        puts(" reset -> status=");
+        puts(" reset -> status=0x");
         puthex(st);
         puts((st & HUB_PORT_ENABLE) ? "  有効になった\r\n" : "  *** 有効にならなかった\r\n");
         if (!(st & HUB_PORT_ENABLE)) continue;
@@ -1295,8 +1308,8 @@ static int xhci_ep0_get_config_descriptor(uint8_t slot_id) {
     {
         int rc = xhci_ep0_control_in(slot_id, setup, g_ep0_cfg_buf_phys, 9);
         if (rc < 0) {
-            puts("[usb] GET_DESCRIPTOR(Config hdr) rc=0x");
-            puthex((uint64_t)(uint32_t)(-rc));
+            puts("[usb] GET_DESCRIPTOR(Config hdr) rc=");
+            putdec((uint64_t)(uint32_t)(-rc));
             puts("\r\n");
             return -3;
         }
@@ -1315,10 +1328,10 @@ static int xhci_ep0_get_config_descriptor(uint8_t slot_id) {
     {
         int rc = xhci_ep0_control_in(slot_id, setup, g_ep0_cfg_buf_phys, total_len);
         if (rc < 0) {
-            puts("[usb] GET_DESCRIPTOR(Config body) rc=0x");
-            puthex((uint64_t)(uint32_t)(-rc));
-            puts(" total=0x");
-            puthex(total_len);
+            puts("[usb] GET_DESCRIPTOR(Config body) rc=");
+            putdec((uint64_t)(uint32_t)(-rc));
+            puts(" total=");
+            putdec(total_len);
             puts("\r\n");
             return -6;
         }
@@ -1506,8 +1519,8 @@ static int xhci_setup_bulk_endpoints(uint8_t slot_id) {
     if (w < 0) return -7;
     (void)slot;
     if (cc != 1) {
-        puts("[usb] Configure Endpoint(BULK) cc=0x");
-        puthex(cc);
+        puts("[usb] Configure Endpoint(BULK) cc=");
+        putdec(cc);
         puts("\r\n");
     }
     return (cc == 1) ? 0 : -8;
@@ -1538,14 +1551,14 @@ static int xhci_bulk_transfer_ex(uint8_t slot_id, uint8_t dci, uint64_t ring_phy
     if (cc != 1) {
         puts("[usb] bulk ");
         puts(in_dir ? "IN" : "OUT");
-        puts(" dci=0x");
-        puthex(dci);
-        puts(" cc=0x");
-        puthex(cc);
-        puts(" residual=0x");
-        puthex(residual);
-        puts(" len=0x");
-        puthex(len);
+        puts(" dci=");
+        putdec(dci);
+        puts(" cc=");
+        putdec(cc);
+        puts(" residual=");
+        putdec(residual);
+        puts(" len=");
+        putdec(len);
         puts("\r\n");
     }
     return (cc == 1) ? 0 : -3;
@@ -1628,8 +1641,8 @@ static int xhci_setup_interrupt_endpoint(uint8_t slot_id) {
     if (xhci_wait_cmd_completion(cmd_ptr, slot_id, &cc, &slot) < 0) return -6;
     (void)slot;
     if (cc != 1) {
-        puts("[usb] Configure Endpoint(INT) cc=0x");
-        puthex(cc);
+        puts("[usb] Configure Endpoint(INT) cc=");
+        putdec(cc);
         puts("\r\n");
         return -7;
     }
@@ -1907,9 +1920,9 @@ static int usb_try_qemu_bulk_fallback(uint8_t slot_id) {
         g_usb_bulk_out_dci = xhci_dci_from_epaddr(g_usb_bulk_out_ep);
         g_usb_bulk_in_dci = xhci_dci_from_epaddr(g_usb_bulk_in_ep);
         puts("[usb] trying QEMU bulk pair out=0x");
-        puthex(g_usb_bulk_out_ep);
+        puthex_n(g_usb_bulk_out_ep, 2);
         puts(" in=0x");
-        puthex(g_usb_bulk_in_ep);
+        puthex_n(g_usb_bulk_in_ep, 2);
         puts("\r\n");
         if (xhci_setup_bulk_endpoints(slot_id) == 0) {
             g_usb_msc_inquiry_ok = 0;
@@ -2127,7 +2140,7 @@ static void xhci_scan_protocols(volatile uint8_t* cap, uint32_t hccparams1) {
             putdec(p_off);
             puts("..");
             putdec(p_off + p_cnt - 1U);
-            puts(" name=");
+            puts(" name=0x");
             puthex(d1);
             puts("\r\n");
 
@@ -2183,7 +2196,7 @@ static int xhci_port_reset(volatile uint8_t* op, uint8_t port) {
     putdec(port);
     puts(" (USB");
     putdec(major);
-    puts(") reset -> portsc=");
+    puts(") reset -> portsc=0x");
     puthex(portsc);
     puts((portsc & PORTSC_PED) ? "  有効になった\r\n" : "  *** 有効にならなかった\r\n");
 
@@ -2260,7 +2273,7 @@ void usb_init(void) {
          * いないので断る。**アーキ側が渡してきた場合は別** — あちらは
          * 自分で張ったうえで渡してくる (Pi 4 の BAR は 0x6_00000000) */
         if (mmio_phys >= 0x100000000ULL) {
-            puts("[usb] xHCI BAR0 above 4GiB is not mapped yet\r\n");
+            puts("[usb] xHCI BAR0 above 4GiB is not mapped yet phys=0x");
             puthex(mmio_phys);
             puts("\r\n");
             return;
@@ -2349,7 +2362,7 @@ void usb_init(void) {
 
     if (!g_xhci_cmd_ready) {
         puts("[usb] xHCI command ring probe failed code=");
-        puthex((uint64_t)(uint32_t)(-cmd_probe));
+        putdec((uint64_t)(uint32_t)(-cmd_probe));
         puts("\r\n");
     } else {
         uint8_t slot_id = 0;
@@ -2357,7 +2370,7 @@ void usb_init(void) {
         if (es == 0) {
             g_xhci_slot_id = slot_id;
             puts("[usb] Enable Slot OK slot=");
-            puthex(slot_id);
+            putdec(slot_id);
             puts("\r\n");
 
             /* **接続のあるポートを、リセットして有効にしてから選ぶ。**
@@ -2368,7 +2381,7 @@ void usb_init(void) {
                 uint32_t portsc = mmio_read32(op, xhci_portsc_off(p));
                 puts("[usb] portsc[");
                 putdec(p);
-                puts("]=");
+                puts("]=0x");
                 puthex(portsc);
                 puts(" USB");
                 putdec((p < XHCI_MAX_PORTS_TRACKED) ? g_port_major[p] : 0U);
@@ -2387,36 +2400,36 @@ void usb_init(void) {
                 if (ad == 0) {
                     g_xhci_addr_ready = 1;
                     puts("[usb] Address Device OK port=");
-                    puthex(g_xhci_port_id);
+                    putdec(g_xhci_port_id);
                     puts("\r\n");
 
                     int ce = xhci_cmd_configure_endpoint(g_xhci_slot_id);
                     if (ce == 0) {
                         g_xhci_cfg_ready = 1;
                         puts("[usb] Configure Endpoint OK slot=");
-                        puthex(g_xhci_slot_id);
+                        putdec(g_xhci_slot_id);
                         puts("\r\n");
                     } else {
                         // For default EP0 path, many controllers allow proceeding
                         // after Address Device even if Configure Endpoint is rejected.
                         g_xhci_cfg_ready = 1;
                         puts("[usb] Configure Endpoint skipped code=");
-                        puthex((uint64_t)(uint32_t)(-ce));
+                        putdec((uint64_t)(uint32_t)(-ce));
                         puts(" (continue with EP0)\r\n");
                     }
 
                     int gd = xhci_ep0_get_device_descriptor(g_xhci_slot_id);
                     if (gd == 0) {
                         puts("[usb] GET_DESCRIPTOR(Device) OK vid=0x");
-                        puthex(g_usb_vid);
+                        puthex_n(g_usb_vid, 4);
                         puts(" pid=0x");
-                        puthex(g_usb_pid);
+                        puthex_n(g_usb_pid, 4);
                         puts(" class=0x");
-                        puthex(g_usb_dev_class);
+                        puthex_n(g_usb_dev_class, 2);
                         puts("\r\n");
                     } else {
                         puts("[usb] GET_DESCRIPTOR(Device) failed code=");
-                        puthex((uint64_t)(uint32_t)(-gd));
+                        putdec((uint64_t)(uint32_t)(-gd));
                         puts("\r\n");
                     }
 
@@ -2440,7 +2453,7 @@ void usb_init(void) {
                                 puts("ok\r\n");
                             } else {
                                 puts("*** 失敗 code=");
-                                puthex((uint64_t)(uint32_t)(-hc));
+                                putdec((uint64_t)(uint32_t)(-hc));
                                 puts("\r\n");
                                 (void)xhci_ep0_recover_stall(g_hub_slot_id);
                             }
@@ -2539,20 +2552,20 @@ void usb_init(void) {
                                         puts("[usb] hub 先 GET_DESCRIPTOR(Device) ");
                                         if (gd2 == 0) {
                                             puts("OK vid=0x");
-                                            puthex(g_usb_vid);
+                                            puthex_n(g_usb_vid, 4);
                                             puts(" pid=0x");
-                                            puthex(g_usb_pid);
+                                            puthex_n(g_usb_pid, 4);
                                             puts(" class=0x");
-                                            puthex(g_usb_dev_class);
+                                            puthex_n(g_usb_dev_class, 2);
                                             puts("\r\n");
                                         } else {
                                             puts("failed code=");
-                                            puthex((uint64_t)(uint32_t)(-gd2));
+                                            putdec((uint64_t)(uint32_t)(-gd2));
                                             puts("\r\n");
                                         }
                                     } else {
                                         puts("  *** 失敗 code=");
-                                        puthex((uint64_t)(uint32_t)(-ad2));
+                                        putdec((uint64_t)(uint32_t)(-ad2));
                                         puts("\r\n");
                                     }
                                 }
@@ -2566,37 +2579,37 @@ void usb_init(void) {
 
                     int gc = xhci_ep0_get_config_descriptor(g_xhci_slot_id);
                     if (gc == 0 && g_usb_hid_if_ready) {
-                        puts("[usb] HID keyboard if=0x");
-                        puthex(g_usb_hid_if_number);
+                        puts("[usb] HID keyboard if=");
+                        putdec(g_usb_hid_if_number);
                         puts(" ep=0x");
-                        puthex(g_usb_int_in_ep);
-                        puts(" mps=0x");
-                        puthex(g_usb_int_in_mps);
-                        puts(" interval=0x");
-                        puthex(g_usb_int_in_interval);
-                        puts(" dci=0x");
-                        puthex(g_usb_int_in_dci);
+                        puthex_n(g_usb_int_in_ep, 2);
+                        puts(" mps=");
+                        putdec(g_usb_int_in_mps);
+                        puts(" interval=");
+                        putdec(g_usb_int_in_interval);
+                        puts(" dci=");
+                        putdec(g_usb_int_in_dci);
                         puts("\r\n");
                     }
                     if (gc == 0) {
                         puts("[usb] GET_DESCRIPTOR(Config) MSC if class=0x");
-                        puthex(g_usb_msc_if_class);
+                        puthex_n(g_usb_msc_if_class, 2);
                         puts(" sub=0x");
-                        puthex(g_usb_msc_if_subclass);
+                        puthex_n(g_usb_msc_if_subclass, 2);
                         puts(" proto=0x");
-                        puthex(g_usb_msc_if_proto);
-                        puts(" cfg=0x");
-                        puthex(g_usb_cfg_value);
-                        puts(" if=0x");
-                        puthex(g_usb_msc_if_number);
+                        puthex_n(g_usb_msc_if_proto, 2);
+                        puts(" cfg=");
+                        putdec(g_usb_cfg_value);
+                        puts(" if=");
+                        putdec(g_usb_msc_if_number);
                         puts(" epout=0x");
-                        puthex(g_usb_bulk_out_ep);
+                        puthex_n(g_usb_bulk_out_ep, 2);
                         puts(" epin=0x");
-                        puthex(g_usb_bulk_in_ep);
+                        puthex_n(g_usb_bulk_in_ep, 2);
                         puts("\r\n");
                     } else {
                         puts("[usb] GET_DESCRIPTOR(Config) failed code=");
-                        puthex((uint64_t)(uint32_t)(-gc));
+                        putdec((uint64_t)(uint32_t)(-gc));
                         puts("\r\n");
                         // QEMU usb-storage fallback: device class is often 0x00
                         // and interface descriptor fetch may be flaky in early stack.
@@ -2630,7 +2643,7 @@ void usb_init(void) {
                             can_continue = 1;
                         } else {
                             puts("[usb] SET_CONFIGURATION failed code=");
-                            puthex((uint64_t)(uint32_t)(-sc));
+                            putdec((uint64_t)(uint32_t)(-sc));
                             puts("\r\n");
                         }
 
@@ -2646,10 +2659,10 @@ void usb_init(void) {
                                 int rc = usb_msc_scsi_read_capacity10();
                                 if (iq == 0 && rc == 0) {
                                     g_usb_msc_bot_ready = 1;
-                                    puts("[usb] MSC BOT ready blocks=0x");
-                                    puthex(g_usb_block_count);
-                                    puts(" block_size=0x");
-                                    puthex(g_usb_block_size);
+                                    puts("[usb] MSC BOT ready blocks=");
+                                    putdec(g_usb_block_count);
+                                    puts(" block_size=");
+                                    putdec(g_usb_block_size);
                                     puts("\r\n");
                                 } else {
                                     puts("[usb] MSC BOT probe failed inquiry=0x");
@@ -2660,20 +2673,20 @@ void usb_init(void) {
                                 }
                             } else {
                                 puts("[usb] bulk endpoint setup failed code=");
-                                    puthex((uint64_t)(uint32_t)(-be));
+                                    putdec((uint64_t)(uint32_t)(-be));
                                     puts("\r\n");
                             }
                         }
                     }
                 } else {
                     puts("[usb] Address Device failed code=");
-                    puthex((uint64_t)(uint32_t)(-ad));
+                    putdec((uint64_t)(uint32_t)(-ad));
                     puts("\r\n");
                 }
             }
         } else {
             puts("[usb] Enable Slot failed code=");
-            puthex((uint64_t)(uint32_t)(-es));
+            putdec((uint64_t)(uint32_t)(-es));
             puts("\r\n");
         }
     }
@@ -2683,10 +2696,10 @@ void usb_init(void) {
 
     puts("[usb] xHCI capability mapped at phys=0x");
     puthex(mmio_phys);
-    puts(" caplen=0x");
-    puthex(caplen);
+    puts(" caplen=");
+    putdec(caplen);
     puts(" hciver=0x");
-    puthex(hciversion);
+    puthex_n(hciversion, 4);
     puts(" hcsparams1=0x");
     puthex(hcsparams1);
     puts(" hcsparams2=0x");
@@ -2708,11 +2721,11 @@ void usb_init(void) {
     puts(" mscif=");
     puts(g_usb_msc_if_ready ? "ok" : "fail");
     puts(" slot=");
-    puthex(g_xhci_slot_id);
+    putdec(g_xhci_slot_id);
     puts(" port=");
-    puthex(g_xhci_port_id);
+    putdec(g_xhci_port_id);
     puts(" sp=");
-    puthex(g_scratchpad_count);
+    putdec(g_scratchpad_count);
     puts("\r\n");
 
     // Probe connected ports. Full enumeration/BOT/SCSI is next phase.
@@ -2727,11 +2740,11 @@ void usb_init(void) {
         g_usb_mass_ready = 1;
     }
     puts("[usb] ports: max=");
-    puthex(g_xhci_max_ports);
+    putdec(g_xhci_max_ports);
     puts(" connected=");
-    puthex(connected);
+    putdec(connected);
     puts(" enabled=");
-    puthex(enabled);
+    putdec(enabled);
     puts(" rings=");
     puts(g_xhci_rings_ready ? "ready" : "not-ready");
     puts(" cmd=");
@@ -2749,9 +2762,9 @@ void usb_init(void) {
     puts(" bot=");
     puts(g_usb_msc_bot_ready ? "ok" : "fail");
     puts(" slot=");
-    puthex(g_xhci_slot_id);
+    putdec(g_xhci_slot_id);
     puts(" port=");
-    puthex(g_xhci_port_id);
+    putdec(g_xhci_port_id);
     puts("\r\n");
 
     if (!g_usb_mass_ready) {
@@ -2781,9 +2794,9 @@ void usb_dump_status(void) {
     puts(" bot=");
     puts(g_usb_msc_bot_ready ? "ok" : "fail");
     puts(" slot=");
-    puthex(g_xhci_slot_id);
+    putdec(g_xhci_slot_id);
     puts(" port=");
-    puthex(g_xhci_port_id);
+    putdec(g_xhci_port_id);
     puts(" mmio=0x");
     puthex(g_xhci_mmio);
     puts(" dcbaa=0x");
@@ -2792,8 +2805,8 @@ void usb_dump_status(void) {
     puthex(g_cmd_ring_phys);
     puts(" er=0x");
     puthex(g_event_ring_phys);
-    puts(" sp=0x");
-    puthex(g_scratchpad_array_phys);
+    puts(" sp=");
+    putdec(g_scratchpad_array_phys);
     puts(" inctx=0x");
     puthex(g_input_ctx_phys);
     puts(" outctx=0x");
@@ -2801,42 +2814,42 @@ void usb_dump_status(void) {
     puts(" ep0=0x");
     puthex(g_ep0_ring_phys);
     puts(" vid=0x");
-    puthex(g_usb_vid);
+    puthex_n(g_usb_vid, 4);
     puts(" pid=0x");
-    puthex(g_usb_pid);
+    puthex_n(g_usb_pid, 4);
     puts(" cls=0x");
-    puthex(g_usb_dev_class);
+    puthex_n(g_usb_dev_class, 2);
     puts(" sub=0x");
-    puthex(g_usb_dev_subclass);
+    puthex_n(g_usb_dev_subclass, 2);
     puts(" pr=0x");
-    puthex(g_usb_dev_proto);
+    puthex_n(g_usb_dev_proto, 2);
     puts(" ifc=0x");
-    puthex(g_usb_msc_if_class);
+    puthex_n(g_usb_msc_if_class, 2);
     puts(" ifs=0x");
-    puthex(g_usb_msc_if_subclass);
+    puthex_n(g_usb_msc_if_subclass, 2);
     puts(" ifp=0x");
-    puthex(g_usb_msc_if_proto);
-    puts(" cfgv=0x");
-    puthex(g_usb_cfg_value);
-    puts(" ifn=0x");
-    puthex(g_usb_msc_if_number);
+    puthex_n(g_usb_msc_if_proto, 2);
+    puts(" cfgv=");
+    putdec(g_usb_cfg_value);
+    puts(" ifn=");
+    putdec(g_usb_msc_if_number);
     puts(" epout=0x");
-    puthex(g_usb_bulk_out_ep);
+    puthex_n(g_usb_bulk_out_ep, 2);
     puts(" epin=0x");
-    puthex(g_usb_bulk_in_ep);
-    puts(" dciout=0x");
-    puthex(g_usb_bulk_out_dci);
-    puts(" dciin=0x");
-    puthex(g_usb_bulk_in_dci);
+    puthex_n(g_usb_bulk_in_ep, 2);
+    puts(" dciout=");
+    putdec(g_usb_bulk_out_dci);
+    puts(" dciin=");
+    putdec(g_usb_bulk_in_dci);
     puts(" bot=");
     puts(g_usb_msc_bot_ready ? "ok" : "fail");
     puts(" iq=");
     puts(g_usb_msc_inquiry_ok ? "ok" : "fail");
     puts(" cap=");
     puts(g_usb_msc_capacity_ok ? "ok" : "fail");
-    puts(" blocks=0x");
-    puthex(g_usb_block_count);
-    puts(" blksz=0x");
-    puthex(g_usb_block_size);
+    puts(" blocks=");
+    putdec(g_usb_block_count);
+    puts(" blksz=");
+    putdec(g_usb_block_size);
     puts("\r\n");
 }
