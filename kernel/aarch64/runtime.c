@@ -193,7 +193,7 @@ void kernel_panic(const char* file, int line, const char* func, const char* expr
     puts("expr: "); puts(expr ? expr : "(null)");
     puts("\nfunc: "); puts(func ? func : "(null)");
     puts("\nfile: "); puts(file ? file : "(null)");
-    puts(":0x"); puthex((uint64_t)(uint32_t)line);
+    puts(":"); aarch64_uart_putdec64((uint64_t)(uint32_t)line);
     puts("\nHALTING...\n");
     aarch64_console_end();
     for (;;) {
@@ -286,9 +286,9 @@ done:
     pages_after = pmm_get_allocated_pages();
     aarch64_console_begin();
     puts("  pages     : ");
-    puthex(pages_before);
+    aarch64_uart_putdec64(pages_before);
     puts(" -> ");
-    puthex(pages_after);
+    aarch64_uart_putdec64(pages_after);
     /* **P3-4 で「完全に戻る」に変わった。**
      *
      * それまでは arch_vm_destroy_user_address_space が root 1 枚しか返さず、
@@ -408,7 +408,7 @@ int aarch64_shared_task_selftest(void) {
 
     aarch64_console_begin();
     puts("  sleep     : ");
-    puthex(elapsed);
+    aarch64_uart_putdec64(elapsed);
     /* 即座に戻ってきたら切り替えていない。**しきい値は境界に乗せない** —
      * 要求 50ms に対して 40ms 以上を合格とする (日報2026-08-09 追2-3) */
     puts(elapsed >= (SHARED_SLEEP_MS - 10) ? " ms  ok (寝て、タイマに起こされた)\n"

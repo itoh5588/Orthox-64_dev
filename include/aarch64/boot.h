@@ -178,6 +178,8 @@ const aarch64_boot_info_t* aarch64_boot_info(void);
 void aarch64_uart_puts(const char* s);
 void aarch64_uart_putchar(char c);
 void aarch64_uart_puthex64(uint64_t v);
+/* 人が読む数は 10 進で。回数・時間・個数はこちら */
+void aarch64_uart_putdec64(uint64_t v);
 void aarch64_uart_set_base(uint64_t base);
 
 /* 出力の 1 単位を囲む。**この間はタスクが切り替わらない**ので、

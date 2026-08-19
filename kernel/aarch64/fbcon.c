@@ -7,10 +7,12 @@
  *
  * ---- 描き方 ----------------------------------------------------------------
  *
- * 字形は kernel/aarch64/font8x8.c (scripts/gen_font8x8.py が生成)。
- * 8x8 の升目を **AARCH64_FBCON_SCALE 倍**に拡大して描く。1024x768 のとき
- * 2 倍で 64 桁 x 48 行。等倍だと 128 桁 x 96 行になるが、テレビに繋いだとき
- * 字が小さすぎて読めない。
+ * 字形は kernel/aarch64/font12x24.c (scripts/gen_font12x24.py が生成)。
+ * **1024x768 で等倍 12x24 = 85 桁 x 32 行。**
+ *
+ * 以前は 8x8 を 2 倍に引き伸ばして 16x16 の升目にしていた。**縦の情報量が
+ * 8 ドットしか無いものを 2 倍にしても情報は増えない**ので、角ばって読み
+ * にくかった。12x24 は本物の字形なので、拡大せずにそのまま描く。
  *
  * ---- 遅さについて ----------------------------------------------------------
  *
@@ -25,15 +27,16 @@
 #include "aarch64/fb.h"
 #include "aarch64/vm.h"
 
-/* 96 個目は「表に無い文字」の升目 (scripts/gen_font8x8.py) */
+/* 96 個目は「表に無い文字」の升目 (scripts/gen_font12x24.py) */
 #define FONT_MISSING 95
-extern const uint8_t aarch64_font8x8[96][8];
+/* **1 行 16bit で、上位 12bit が字形 (bit15 が左端)** */
+extern const uint16_t aarch64_font12x24[96][24];
 
-#define FONT_W 8U
-#define FONT_H 8U
+#define FONT_W 12U
+#define FONT_H 24U
 
-/* 拡大率。**1024x768 で 2 倍 = 64 桁 x 48 行** */
-#define AARCH64_FBCON_SCALE 2U
+/* 拡大率。**本物の 12x24 字形なので等倍。**1024x768 で 85 桁 x 32 行 */
+#define AARCH64_FBCON_SCALE 1U
 
 #define FBCON_FG 0x00c8c8c8U     /* 明るすぎない灰。白は目が疲れる */
 #define FBCON_BG 0x00000000U
@@ -84,7 +87,7 @@ uint32_t aarch64_fbcon_rows(void) { return g_rows; }
 
 static void fbcon_draw_glyph(uint32_t cx, uint32_t cy, char ch) {
     volatile uint32_t* p = fbcon_ptr();
-    const uint8_t* g;
+    const uint16_t* g;
     uint32_t gx, gy, sx, sy;
     uint32_t px0 = cx * g_cell_w;
     uint32_t py0 = cy * g_cell_h;
@@ -96,15 +99,16 @@ static void fbcon_draw_glyph(uint32_t cx, uint32_t cy, char ch) {
      * **日本語 (UTF-8) はここを通る。** 1 文字が 3 バイトなので升目が
      * 3 つ並ぶ。起動ログの説明文はほぼこれになる */
     if (c < 0x20 || c > 0x7e) {
-        g = aarch64_font8x8[FONT_MISSING];
+        g = aarch64_font12x24[FONT_MISSING];
     } else {
-        g = aarch64_font8x8[c - 0x20];
+        g = aarch64_font12x24[c - 0x20];
     }
 
     for (gy = 0; gy < FONT_H; gy++) {
-        uint8_t bits = g[gy];
+        uint16_t bits = g[gy];
         for (gx = 0; gx < FONT_W; gx++) {
-            uint32_t v = (bits & (0x80U >> gx)) ? FBCON_FG : FBCON_BG;
+            /* **bit15 が左端。**下位 4bit は使わない (12bit を 16bit に収めている) */
+            uint32_t v = (bits & (0x8000U >> gx)) ? FBCON_FG : FBCON_BG;
             for (sy = 0; sy < AARCH64_FBCON_SCALE; sy++) {
                 uint32_t row = (py0 + gy * AARCH64_FBCON_SCALE + sy) * g_stride
                              + px0 + gx * AARCH64_FBCON_SCALE;

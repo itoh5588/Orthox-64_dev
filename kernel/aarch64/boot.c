@@ -121,14 +121,17 @@ static void put_hex64(uint64_t v) {
 }
 
 /* 10 進。**解像度やピッチは 16 桁の 16 進で出しても読めない**ので、
- * 人が見る数はこちらで出す (emmc2.c が同じ理由で putdec を持っている) */
-static void put_dec(uint64_t v) {
+ * 人が見る数はこちらで出す (emmc2.c が同じ理由で putdec を持っている)。
+ * **他のファイルからも使うので外に出してある** (2026-08-19) */
+void aarch64_uart_putdec64(uint64_t v) {
     char buf[24];
     int i = 0;
     if (v == 0) { aarch64_uart_putchar('0'); return; }
     while (v > 0 && i < (int)sizeof(buf)) { buf[i++] = (char)('0' + (int)(v % 10U)); v /= 10U; }
     while (i > 0) aarch64_uart_putchar(buf[--i]);
 }
+
+static void put_dec(uint64_t v) { aarch64_uart_putdec64(v); }
 
 static uint64_t read_current_el(void) {
     uint64_t v;

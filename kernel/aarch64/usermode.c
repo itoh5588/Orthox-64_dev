@@ -470,7 +470,7 @@ int aarch64_user_run(void) {
     if (aarch64_task_counter(k1) != 200 || aarch64_task_counter(k2) != 200) ok = 0;
 
     aarch64_uart_puts("  switches  : ");
-    aarch64_uart_puthex64(aarch64_task_switch_count());
+    aarch64_uart_putdec64(aarch64_task_switch_count());
     aarch64_uart_puts(aarch64_task_switch_count() > 0 ? "  ok\n" : "  BAD\n");
     if (aarch64_task_switch_count() == 0) ok = 0;
 
