@@ -60,17 +60,21 @@
 #define PWM_STA         0x04U
 #define PWM_RNG1        0x10U
 #define PWM_DAT1        0x14U
+#define PWM_FIF1        0x18U   /* ch1/ch2 で共有。交互に振り分けられる */
 #define PWM_RNG2        0x20U
 #define PWM_DAT2        0x24U
 
 #define PWM_CTL_PWEN1   (1U << 0)
 #define PWM_CTL_MSEN1   (1U << 7)
 #define PWM_CTL_CLRF1   (1U << 6)
+#define PWM_CTL_USEF1   (1U << 5)
 #define PWM_CTL_PWEN2   (1U << 8)
+#define PWM_CTL_USEF2   (1U << 13)
 #define PWM_CTL_MSEN2   (1U << 15)
 
 /* STA のビット。**bit8 は STA1 ではなく BERR** — ここを読み違えると
  * 「送出中」と「バスエラー」を取り違える (2026-08-20 に実際に取り違えた) */
+#define PWM_STA_FULL1   (1U << 0)
 #define PWM_STA_EMPT1   (1U << 1)
 #define PWM_STA_BERR    (1U << 8)
 #define PWM_STA_STA1    (1U << 9)
@@ -78,9 +82,15 @@
 
 /* 源発振 (上のコメントの前提) */
 #define OSC_HZ          54000000U
-/* PWM のクロック。**54 / 54 = ちょうど 1MHz** にして計算を見やすくする。
- * ビープの分解能は 1us 刻みで、可聴域には十分 */
-#define PWM_DIVI        54U
+/* PWM のクロック。**54 / 2 = 27MHz**。
+ *
+ * ビープだけなら 1MHz で足りるが、**PCM は 1 サンプルの長さが
+ * range = クロック / 標本化周波数**で決まる。1MHz だと 22050Hz で
+ * range=45 しか取れず、8 ビットの音を載せられない。27MHz なら
+ * range=1224 あり、u8 の 256 段が余裕で入る。
+ * Linux も この板では PWM を 50MHz で回している (DTB の
+ * assigned-clock-rates = 0x2faf080) */
+#define PWM_DIVI        2U
 #define PWM_CLK_HZ      (OSC_HZ / PWM_DIVI)
 
 static int g_ready;
@@ -244,6 +254,14 @@ void sound_init(void) {
         aarch64_uart_puts("\n");
     }
 
+    {
+        uint64_t f;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+        aarch64_uart_puts("  cntfrq    : ");
+        aarch64_uart_putdec64(f);
+        aarch64_uart_puts(" Hz (armstub が入れた値。触っていない)\n");
+    }
+
     aarch64_uart_puts("  pwm clk   : ");
     aarch64_uart_putdec64(PWM_CLK_HZ);
     aarch64_uart_puts(" Hz (osc ");
@@ -308,10 +326,127 @@ void sound_beep_stop(void) {
     w32(PWM1_BASE, PWM_CTL, 0);
 }
 
-/* PCM はまだ。**FIFO に流し込む口を別に作る** (段階 2) */
+/* **段階 2: PCM を FIFO に流し込む。**
+ *
+ * ビープは RNG/DAT を据え置いて矩形波を出しっぱなしにするが、PCM は
+ * **1 サンプルごとに DAT を差し替える**。それを CPU から間に合わせるのは
+ * 無理なので、PWM の FIFO を使う (USEF=1)。FIFO は 16 語で ch1/ch2 に
+ * 交互に振り分けられるため、**モノラルでも 1 サンプルにつき 2 語**書く。
+ *
+ * **MSEN は立てない。**M/S はパルスを 1 か所に固めるので、可聴域に
+ * 折り返しが乗る。既定の PWM アルゴリズムはパルスをばらけさせるので、
+ * ジャックの RC を通したあとの波形がなめらかになる。
+ *
+ * いまは CPU から直接流し込む (FULL1 を見ながら書く)。**再生中は
+ * この関数から戻らない。**長い音が要るようになったら DMA へ移す */
 int sound_pcm_play_u8(const uint8_t* data, uint32_t len, uint32_t sample_rate) {
-    (void)data; (void)len; (void)sample_rate;
-    return -1;
+    uint32_t range, i, spin;
+
+    if (!g_ready) return -1;
+    if (!data || len == 0U) return 0;
+    /* x86 側の sound.c と同じ範囲に揃える */
+    if (sample_rate < 4000U)  sample_rate = 4000U;
+    if (sample_rate > 44100U) sample_rate = 44100U;
+
+    /* **1 サンプルの長さ。**これが標本化周期そのものになる */
+    range = PWM_CLK_HZ / sample_rate;
+    if (range < 2U) range = 2U;
+
+    w32(PWM1_BASE, PWM_CTL, 0);                 delay_us(10);
+    w32(PWM1_BASE, PWM_CTL, PWM_CTL_CLRF1);     delay_us(10);
+    w32(PWM1_BASE, PWM_STA, PWM_STA_BERR);      delay_us(10);
+    w32(PWM1_BASE, PWM_RNG1, range);            delay_us(10);
+    w32(PWM1_BASE, PWM_RNG2, range);            delay_us(10);
+    w32(PWM1_BASE, PWM_CTL,
+        PWM_CTL_PWEN1 | PWM_CTL_USEF1 |
+        PWM_CTL_PWEN2 | PWM_CTL_USEF2);         delay_us(10);
+
+    for (i = 0; i < len; i++) {
+        /* u8 の 0..255 を 0..range に伸ばす */
+        uint32_t v = ((uint32_t)data[i] * range) / 255U;
+        int ch;
+        for (ch = 0; ch < 2; ch++) {    /* L と R に同じ値 (モノラル) */
+            /* **FIFO が空くのを待つ。**待てなければ諦めて戻る —
+             * ここで無限に回ると音のために OS が止まる */
+            for (spin = 0; spin < 10000000U; spin++) {
+                if (!(r32(PWM1_BASE, PWM_STA) & PWM_STA_FULL1)) break;
+            }
+            if (spin >= 10000000U) {
+                w32(PWM1_BASE, PWM_CTL, 0);
+                return -1;
+            }
+            w32(PWM1_BASE, PWM_FIF1, v);
+        }
+    }
+
+    /* **最後まで流し切ってから止める。**空になった直後はまだ最終
+     * サンプルを出している最中なので、1 サンプル分だけ余計に待つ */
+    for (spin = 0; spin < 10000000U; spin++) {
+        if (r32(PWM1_BASE, PWM_STA) & PWM_STA_EMPT1) break;
+    }
+    delay_us((range * 2U) / (PWM_CLK_HZ / 1000000U) + 1U);
+    w32(PWM1_BASE, PWM_CTL, 0);
+    return (int)len;
+}
+
+/* **段階 2 の確認。耳と時計の両方で見る。**
+ *
+ * 耳: ビープ (矩形波) と三角波は音色がはっきり違う。「ピー」のあとに
+ *     「ブー」寄りの音が来れば FIFO の道が通っている。
+ *
+ * 時計: **ここが本題。**サンプル数と標本化周波数は分かっているので、
+ *     再生に何 ms かかるべきかは計算で出る。実測がそこから外れていたら
+ *     **PWM のクロックが思っている値ではない**。
+ *     OSC_HZ を 54MHz と仮定しているが、Pi 3 までの 19.2MHz だとすると
+ *     実クロックは 2.8125 倍遅いので、再生も 2.8125 倍長くかかる。
+ *     **耳で音程を当てるより、こちらのほうが確実に切り分けられる** */
+#define PCM_RATE    8000U
+#define PCM_LEN     4000U       /* 0.5 秒 */
+static uint8_t g_pcm_buf[PCM_LEN];
+
+static void pcm_selftest(void) {
+    uint32_t i, phase = 0U;
+    /* 440Hz の三角波。**矩形波と音色を変えて、FIFO の道を通ったことが
+     * 耳でも分かるようにする。**位相は 16.16 の固定小数 */
+    const uint32_t inc = (440U * 65536U) / PCM_RATE;
+    uint64_t t0, ms;
+    int n;
+
+    for (i = 0; i < PCM_LEN; i++) {
+        uint32_t p = (phase >> 8) & 0xFFU;      /* 0..255 の のこぎり */
+        g_pcm_buf[i] = (uint8_t)((p < 128U) ? (p * 2U) : (255U - (p - 128U) * 2U));
+        phase += inc;
+    }
+
+    aarch64_uart_puts("  pcm       : ");
+    aarch64_uart_putdec64(PCM_LEN);
+    aarch64_uart_puts(" サンプル @");
+    aarch64_uart_putdec64(PCM_RATE);
+    aarch64_uart_puts("Hz 三角波 440Hz  range=");
+    aarch64_uart_putdec64(PWM_CLK_HZ / PCM_RATE);
+    aarch64_uart_puts("\n");
+
+    t0 = arch_time_now_ms();
+    n  = sound_pcm_play_u8(g_pcm_buf, PCM_LEN, PCM_RATE);
+    ms = arch_time_now_ms() - t0;
+
+    aarch64_uart_puts("            返り値=");
+    aarch64_uart_putdec64((uint64_t)(n < 0 ? 0 : n));
+    if (n < 0) aarch64_uart_puts(" (失敗)");
+    aarch64_uart_puts("  期待 ");
+    aarch64_uart_putdec64((uint64_t)PCM_LEN * 1000ULL / PCM_RATE);
+    aarch64_uart_puts(" ms  実測 ");
+    aarch64_uart_putdec64(ms);
+    aarch64_uart_puts(" ms\n            ");
+    /* **ここで OSC_HZ の当否が出る** */
+    if (ms >= 400ULL && ms <= 620ULL) {
+        aarch64_uart_puts("→ 一致。OSC_HZ=54MHz の仮定は正しい");
+    } else if (ms >= 1200ULL && ms <= 1650ULL) {
+        aarch64_uart_puts("→ 約 2.8 倍長い。**OSC は 54MHz ではなく 19.2MHz**");
+    } else {
+        aarch64_uart_puts("→ どちらでもない。FIFO の待ちかクロックを見直す");
+    }
+    aarch64_uart_puts("\n");
 }
 
 /* **鳴らして確かめる。**耳で聞くしか確認の手が無いので、
@@ -370,4 +505,6 @@ void aarch64_sound_selftest(void) {
         delay_ms(500);
     }
     aarch64_uart_puts("  beep      : 3 音おわり\n");
+
+    pcm_selftest();
 }
