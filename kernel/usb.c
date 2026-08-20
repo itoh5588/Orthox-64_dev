@@ -392,34 +392,137 @@ static int xhci_evt_dequeue(uint32_t out[4]) {
 /* **滞留しているイベントをサイクル不一致まで捨てる。**
  * ポートに何か挿さっていれば Port Status Change Event が必ず入っていて、
  * 残したままだとこちらの取り出し位置がずれ続ける。戻り値は捨てた数 */
+static void xhci_evt_stash_clear(void);   /* 定義は下の「イベントの置き場」 */
+
 static uint32_t xhci_evt_drain(void) {
     uint32_t d[4];
     uint32_t n = 0;
     while (n < XHCI_EVT_RING_TRBS && xhci_evt_dequeue(d)) n++;
+    /* **置き場も一緒に空にする。**残しておくと、作り直したリングの
+     * イベントに古いものが混ざる */
+    xhci_evt_stash_clear();
     return n;
 }
 
+/* ---- イベントの置き場 ------------------------------------------------------
+ *
+ * **イベントリングは 1 本しかない。**コマンド完了も、全スロット・全
+ * エンドポイントの転送完了も、同じ列に順不同で並ぶ。
+ *
+ * 待っている相手と違うイベントを捨てると、**そのイベントを待っている側は
+ * 永久に取り逃す**。いまは起動時の列挙が終わるまでキーボードのポーリングが
+ * 始まらないので害が出ていないが、動作中にハブへ制御転送を投げるように
+ * なると (B-1)、**キー入力のイベントが消える**。
+ * usb_hid_keyboard_poll() は割り込み TRB を積んだまま戻るので、
+ * キーのイベントはいつ来るか分からない。
+ *
+ * そこで、一致しないイベントは捨てずにここへ退避し、待っている側が
+ * 後から拾えるようにする。**B-2 (割り込み化) でも同じ土台が要る**。
+ *
+ * **並行性は未対処。**ここは今のところタイマ割り込み (キーボード) と
+ * タスク文脈 (列挙) の両方から触られる。イベントリング自体が元から
+ * 同じ状態なので B-1a では悪化させないが、抜き差しの定期確認を
+ * 足すときに手当てが要る */
+#define XHCI_EVT_STASH_CAP 16
+
+typedef struct { uint32_t d[4]; } xhci_evt_t;
+static xhci_evt_t g_evt_stash[XHCI_EVT_STASH_CAP];
+static uint32_t g_evt_stash_head;
+static uint32_t g_evt_stash_count;
+static uint32_t g_evt_stash_dropped;   /* 溢れて捨てた数。測れるようにしておく */
+static uint32_t g_evt_stash_peak;
+
+/* type: 32 = Transfer Event / 33 = Command Completion Event。
+ * slot/ep/trb は 0 なら「問わない」 */
+static int xhci_evt_matches(const uint32_t d[4], uint32_t want_type, uint8_t slot_expect,
+                            uint8_t ep_expect, uint64_t trb_expect) {
+    uint32_t type = (d[3] >> 10) & 0x3F;
+    if (type != want_type) return 0;
+    if (want_type == 32) {
+        uint8_t slot = (uint8_t)((d[3] >> 24) & 0xFF);
+        uint8_t ep = (uint8_t)((d[3] >> 16) & 0x1F);
+        uint64_t trb_ptr = (((uint64_t)d[1] << 32) | d[0]) & ~0xFULL;
+        if (slot_expect && slot != slot_expect) return 0;
+        if (ep_expect && ep != ep_expect) return 0;
+        if (trb_expect && trb_ptr != (trb_expect & ~0xFULL)) return 0;
+    }
+    return 1;
+}
+
+static void xhci_evt_stash_push(const uint32_t d[4]) {
+    uint32_t idx;
+    if (g_evt_stash_count >= XHCI_EVT_STASH_CAP) {
+        /* **溢れたら一番古いものを落とす。**新しいほうが役に立つ */
+        g_evt_stash_head = (g_evt_stash_head + 1U) % XHCI_EVT_STASH_CAP;
+        g_evt_stash_count--;
+        g_evt_stash_dropped++;
+    }
+    idx = (g_evt_stash_head + g_evt_stash_count) % XHCI_EVT_STASH_CAP;
+    g_evt_stash[idx].d[0] = d[0];
+    g_evt_stash[idx].d[1] = d[1];
+    g_evt_stash[idx].d[2] = d[2];
+    g_evt_stash[idx].d[3] = d[3];
+    g_evt_stash_count++;
+    if (g_evt_stash_count > g_evt_stash_peak) g_evt_stash_peak = g_evt_stash_count;
+}
+
+/* 条件に合うものを 1 つ取り出して詰める。見つからなければ 0 */
+static int xhci_evt_stash_take(uint32_t want_type, uint8_t slot_expect, uint8_t ep_expect,
+                               uint64_t trb_expect, uint32_t out[4]) {
+    uint32_t i;
+    for (i = 0; i < g_evt_stash_count; i++) {
+        uint32_t idx = (g_evt_stash_head + i) % XHCI_EVT_STASH_CAP;
+        if (!xhci_evt_matches(g_evt_stash[idx].d, want_type, slot_expect, ep_expect, trb_expect)) {
+            continue;
+        }
+        out[0] = g_evt_stash[idx].d[0];
+        out[1] = g_evt_stash[idx].d[1];
+        out[2] = g_evt_stash[idx].d[2];
+        out[3] = g_evt_stash[idx].d[3];
+        /* 取り出した穴を後ろから詰める */
+        for (; i + 1U < g_evt_stash_count; i++) {
+            uint32_t a = (g_evt_stash_head + i) % XHCI_EVT_STASH_CAP;
+            uint32_t b = (g_evt_stash_head + i + 1U) % XHCI_EVT_STASH_CAP;
+            g_evt_stash[a] = g_evt_stash[b];
+        }
+        g_evt_stash_count--;
+        return 1;
+    }
+    return 0;
+}
+
+static void xhci_evt_stash_clear(void) {
+    g_evt_stash_head = 0;
+    g_evt_stash_count = 0;
+}
+
 static int xhci_poll_cmd_completion(uint64_t* out_cmd_ptr, uint8_t* out_cc, uint8_t* out_slot_id, uint32_t loops) {
+    uint32_t d[4];
     if (!g_rt_regs || !out_cmd_ptr || !out_cc || !out_slot_id) return -1;
 
-    for (uint32_t i = 0; i < loops; i++) {
-        uint32_t d[4];
-        if (!xhci_evt_dequeue(d)) continue;
+    /* **先に置き場を見る。**先に来てしまった完了がここに居ることがある */
+    if (xhci_evt_stash_take(33, 0, 0, 0, d)) goto got;
 
-        uint32_t type = (d[3] >> 10) & 0x3F;
-        if (type == 33) { // Command Completion Event
-            *out_cmd_ptr = ((uint64_t)d[1] << 32) | d[0];
-            *out_cc = (uint8_t)((d[2] >> 24) & 0xFF);
-            *out_slot_id = (uint8_t)((d[3] >> 24) & 0xFF);
-        } else {
-            *out_cmd_ptr = 0;
-            *out_cc = 0xFF;
-            *out_slot_id = 0;
-        }
-        return (type == 33) ? 0 : 1;
+    for (uint32_t i = 0; i < loops; i++) {
+        if (!xhci_evt_dequeue(d)) continue;
+        if (xhci_evt_matches(d, 33, 0, 0, 0)) goto got;
+
+        /* **転送完了だった。捨てずに残す** — 呼ぶ側は 1 を
+         * 「まだコマンドの番ではない」と読んで回り続ける */
+        xhci_evt_stash_push(d);
+        *out_cmd_ptr = 0;
+        *out_cc = 0xFF;
+        *out_slot_id = 0;
+        return 1;
     }
 
     return -1;
+
+got:
+    *out_cmd_ptr = ((uint64_t)d[1] << 32) | d[0];
+    *out_cc = (uint8_t)((d[2] >> 24) & 0xFF);
+    *out_slot_id = (uint8_t)((d[3] >> 24) & 0xFF);
+    return 0;
 }
 
 static uint64_t xhci_cmd_submit(uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3_no_cycle) {
@@ -580,29 +683,33 @@ static uint32_t g_last_residual = 0;
 
 static int xhci_poll_transfer_event(uint8_t slot_expect, uint8_t ep_expect, uint64_t trb_expect,
                                     uint32_t loops, uint8_t* out_cc, uint32_t* out_residual) {
+    uint32_t d[4];
     if (!g_rt_regs) return -1;
+
+    /* **先に置き場を見る。**他のエンドポイントを待っている間に来た
+     * ぶんがここに溜まっている */
+    if (xhci_evt_stash_take(32, slot_expect, ep_expect, trb_expect, d)) goto got;
+
     for (uint32_t i = 0; i < loops; i++) {
-        uint32_t d[4];
         if (!xhci_evt_dequeue(d)) continue;
+        if (xhci_evt_matches(d, 32, slot_expect, ep_expect, trb_expect)) goto got;
 
-        uint32_t type = (d[3] >> 10) & 0x3F;
-        uint8_t slot = (uint8_t)((d[3] >> 24) & 0xFF);
-        uint8_t ep = (uint8_t)((d[3] >> 16) & 0x1F);
+        /* **待っている相手ではない。捨てずに残す。**
+         * ここで捨てると、そのイベントを待っている側が永久に取り逃す */
+        xhci_evt_stash_push(d);
+    }
+    return -1;
+
+got:
+    {
         uint64_t trb_ptr = (((uint64_t)d[1] << 32) | d[0]) & ~0xFULL;
-
-        if (type != 32) continue; // Transfer Event
-        if (slot_expect && slot != slot_expect) continue;
-        if (ep_expect && ep != ep_expect) continue;
-        if (trb_expect && trb_ptr != (trb_expect & ~0xFULL)) continue;
-
         if (out_cc) *out_cc = (uint8_t)((d[2] >> 24) & 0xFF);
         if (out_residual) *out_residual = (d[2] & 0x00FFFFFFU);
         g_last_evt_trb = trb_ptr;
         g_last_cc = (uint8_t)((d[2] >> 24) & 0xFF);
         g_last_residual = (d[2] & 0x00FFFFFFU);
-        return 0;
     }
-    return -1;
+    return 0;
 }
 
 /* ---- Address Device ------------------------------------------------------
@@ -2761,6 +2868,13 @@ void usb_init(void) {
     puts(g_usb_msc_if_ready ? "ok" : "fail");
     puts(" bot=");
     puts(g_usb_msc_bot_ready ? "ok" : "fail");
+    /* **イベントの置き場の使われ方。**溢れていれば取りこぼしている */
+    puts(" evtstash=");
+    putdec(g_evt_stash_count);
+    puts("/peak=");
+    putdec(g_evt_stash_peak);
+    puts("/drop=");
+    putdec(g_evt_stash_dropped);
     puts(" slot=");
     putdec(g_xhci_slot_id);
     puts(" port=");
@@ -2793,6 +2907,13 @@ void usb_dump_status(void) {
     puts(g_usb_msc_if_ready ? "ok" : "fail");
     puts(" bot=");
     puts(g_usb_msc_bot_ready ? "ok" : "fail");
+    /* **イベントの置き場の使われ方。**溢れていれば取りこぼしている */
+    puts(" evtstash=");
+    putdec(g_evt_stash_count);
+    puts("/peak=");
+    putdec(g_evt_stash_peak);
+    puts("/drop=");
+    putdec(g_evt_stash_dropped);
     puts(" slot=");
     putdec(g_xhci_slot_id);
     puts(" port=");
@@ -2843,6 +2964,13 @@ void usb_dump_status(void) {
     putdec(g_usb_bulk_in_dci);
     puts(" bot=");
     puts(g_usb_msc_bot_ready ? "ok" : "fail");
+    /* **イベントの置き場の使われ方。**溢れていれば取りこぼしている */
+    puts(" evtstash=");
+    putdec(g_evt_stash_count);
+    puts("/peak=");
+    putdec(g_evt_stash_peak);
+    puts("/drop=");
+    putdec(g_evt_stash_dropped);
     puts(" iq=");
     puts(g_usb_msc_inquiry_ok ? "ok" : "fail");
     puts(" cap=");
