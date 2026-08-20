@@ -44,8 +44,10 @@
 
 /* GPFSEL は 10 ピンで 1 語、1 ピン 3 ビット。**40,41 は GPFSEL4** */
 #define GPFSEL4         0x10U
-/* BCM2711 のプル制御。**BCM2835 の GPPUD/GPPUDCLK とは別物** */
-#define GPIO_PUP_PDN2   0xE8U   /* ピン 32..47。1 ピン 2 ビット */
+/* BCM2711 のプル制御。**BCM2835 の GPPUD/GPPUDCLK とは別物**。
+ * REG0=0xE4 (0..15) / REG1=0xE8 (16..31) / **REG2=0xEC (32..47)** /
+ * REG3=0xF0 (48..57)。**40,41 は REG2** — 0xE8 は GPIO 24/25 に当たる */
+#define GPIO_PUP_PDN2   0xECU   /* ピン 32..47。1 ピン 2 ビット */
 
 #define CM_PWMCTL       0xA0U
 #define CM_PWMDIV       0xA4U
@@ -67,6 +69,13 @@
 #define PWM_CTL_PWEN2   (1U << 8)
 #define PWM_CTL_MSEN2   (1U << 15)
 
+/* STA のビット。**bit8 は STA1 ではなく BERR** — ここを読み違えると
+ * 「送出中」と「バスエラー」を取り違える (2026-08-20 に実際に取り違えた) */
+#define PWM_STA_EMPT1   (1U << 1)
+#define PWM_STA_BERR    (1U << 8)
+#define PWM_STA_STA1    (1U << 9)
+#define PWM_STA_STA2    (1U << 10)
+
 /* 源発振 (上のコメントの前提) */
 #define OSC_HZ          54000000U
 /* PWM のクロック。**54 / 54 = ちょうど 1MHz** にして計算を見やすくする。
@@ -86,6 +95,25 @@ static inline volatile uint32_t* reg_ptr(uint64_t base, uint32_t off) {
 static inline uint32_t r32(uint64_t b, uint32_t o) { return *reg_ptr(b, o); }
 static inline void w32(uint64_t b, uint32_t o, uint32_t v) { *reg_ptr(b, o) = v; }
 
+/* **us 単位の待ち。**PWM は遅いクロック領域にいるので、レジスタを
+ * 続けて叩くとバスエラー (STA の BERR) になる。ms の API では粗すぎるので
+ * 汎用タイマを直接読む */
+static void delay_us(uint32_t us) {
+    uint64_t f, t0, n;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    if (f == 0) return;
+    n = (f * (uint64_t)us) / 1000000ULL;
+    if (n == 0) n = 1;
+    __asm__ volatile("isb");
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t0));
+    for (;;) {
+        uint64_t t;
+        __asm__ volatile("isb");
+        __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
+        if ((t - t0) >= n) break;
+    }
+}
+
 /* **空回しではなく時刻で待つ。**回数は最適化と CPU の速さで変わる */
 static void delay_ms(uint32_t ms) {
     uint64_t t0 = arch_time_now_ms();
@@ -96,6 +124,8 @@ static void delay_ms(uint32_t ms) {
  * bias-disable) */
 static void gpio_to_pwm(void) {
     uint32_t v = r32(GPIO_BASE, GPFSEL4);
+    uint32_t before = v;
+
     v &= ~(0x7U << 0);          /* GPIO40 */
     v &= ~(0x7U << 3);          /* GPIO41 */
     v |=  (0x4U << 0);          /* ALT0 */
@@ -106,6 +136,29 @@ static void gpio_to_pwm(void) {
     v &= ~(0x3U << 16);         /* GPIO40: プル無し */
     v &= ~(0x3U << 18);         /* GPIO41 */
     w32(GPIO_BASE, GPIO_PUP_PDN2, v);
+
+    /* **書いたものが本当に入ったかを読み戻す。**ここを測っていなかったので
+     * 「PWM は動いているのに音が出ない」の切り分けが GPIO 側で止まっていた。
+     * fsel は 0=in 1=out 4=ALT0。**40 も 41 も 4 でなければ経路が繋がらない** */
+    {
+        uint32_t after = r32(GPIO_BASE, GPFSEL4);
+        uint32_t pud   = r32(GPIO_BASE, GPIO_PUP_PDN2);
+        aarch64_uart_puts("  gpio fsel4: ");
+        aarch64_uart_puthex64(before);
+        aarch64_uart_puts(" -> ");
+        aarch64_uart_puthex64(after);
+        aarch64_uart_puts("  gpio40=");
+        aarch64_uart_putdec64(after & 0x7U);
+        aarch64_uart_puts(" gpio41=");
+        aarch64_uart_putdec64((after >> 3) & 0x7U);
+        aarch64_uart_puts(" (4=ALT0)\n  gpio pud2 : ");
+        aarch64_uart_puthex64(pud);
+        aarch64_uart_puts("  p40=");
+        aarch64_uart_putdec64((pud >> 16) & 0x3U);
+        aarch64_uart_puts(" p41=");
+        aarch64_uart_putdec64((pud >> 18) & 0x3U);
+        aarch64_uart_puts(" (0=プル無し)\n");
+    }
 }
 
 /* PWM のクロックを源発振から作る。**止めてから設定して、また回す** */
@@ -146,10 +199,19 @@ void sound_init(void) {
         aarch64_uart_puts("  sound     : 無し (PWM が無い機械)\n");
         return;
     }
-    w32(PWM1_BASE, PWM_CTL, 0);          /* 先に止める */
-    gpio_to_pwm();
+    /* **クロックが先。**PWM はクロックが止まった状態で書くとバスエラーに
+     * なり、STA の BERR (bit8) が立ったまま残る。2026-08-19 の版は
+     * PWM_CTL を先に叩いており、実測で sta=0x102 (BERR=1 / STA1=0) だった */
     pwm_clock_setup();
+    gpio_to_pwm();
+
+    w32(PWM1_BASE, PWM_CTL, 0);          /* 止める */
+    delay_us(10);
     w32(PWM1_BASE, PWM_CTL, PWM_CTL_CLRF1);
+    delay_us(10);
+    /* BERR は書いて消す (write-1-to-clear)。**残骸を持ち越さない** */
+    w32(PWM1_BASE, PWM_STA, PWM_STA_BERR);
+    delay_us(10);
     g_ready = 1;
 
     /* **クロックが本当に回っているかを読み戻す。**
@@ -159,7 +221,7 @@ void sound_init(void) {
     {
         uint32_t ctl = r32(CM_BASE, CM_PWMCTL);
         uint32_t div = r32(CM_BASE, CM_PWMDIV);
-        aarch64_uart_puts("  cm pwmctl : 0x");
+        aarch64_uart_puts("  cm pwmctl : ");
         aarch64_uart_puthex64(ctl);
         aarch64_uart_puts("  src=");
         aarch64_uart_putdec64(ctl & 0xFU);
@@ -167,7 +229,15 @@ void sound_init(void) {
         aarch64_uart_putdec64((ctl >> 4) & 1U);
         aarch64_uart_puts(" busy=");
         aarch64_uart_putdec64((ctl >> 7) & 1U);
-        aarch64_uart_puts("\n  cm pwmdiv : 0x");
+        {
+            uint32_t sta = r32(PWM1_BASE, PWM_STA);
+            aarch64_uart_puts("\n  pwm sta0  : ");
+            aarch64_uart_puthex64(sta);
+            aarch64_uart_puts("  berr=");
+            aarch64_uart_putdec64((sta & PWM_STA_BERR) ? 1U : 0U);
+            aarch64_uart_puts("  ← クリア後。1 なら初期化中の書き込みで出ている");
+        }
+        aarch64_uart_puts("\n  cm pwmdiv : ");
         aarch64_uart_puthex64(div);
         aarch64_uart_puts("  divi=");
         aarch64_uart_putdec64((div >> 12) & 0xFFFU);
@@ -181,6 +251,27 @@ void sound_init(void) {
     aarch64_uart_puts(" / ");
     aarch64_uart_putdec64(PWM_DIVI);
     aarch64_uart_puts(")\n");
+}
+
+/* **どの書き込みが BERR を立てるかを 1 回の起動で特定する。**
+ * 立っていなければ何も出さないので、平常時は静か */
+static int g_probe;
+static void probe_step(const char* what) {
+    uint32_t sta;
+    delay_us(10);
+    if (!g_probe) return;
+    sta = r32(PWM1_BASE, PWM_STA);
+    aarch64_uart_puts("    step ");
+    aarch64_uart_puts(what);
+    aarch64_uart_puts(" sta=");
+    aarch64_uart_puthex64(sta);
+    aarch64_uart_puts(" berr=");
+    aarch64_uart_putdec64((sta & PWM_STA_BERR) ? 1U : 0U);
+    aarch64_uart_puts(" sta1=");
+    aarch64_uart_putdec64((sta & PWM_STA_STA1) ? 1U : 0U);
+    aarch64_uart_puts(" sta2=");
+    aarch64_uart_putdec64((sta & PWM_STA_STA2) ? 1U : 0U);
+    aarch64_uart_puts("\n");
 }
 
 /* **duty 50% の矩形波を可聴域で出す。**
@@ -197,15 +288,19 @@ void sound_beep_start(uint32_t freq_hz) {
     range = PWM_CLK_HZ / freq_hz;
     if (range < 2U) range = 2U;
 
-    w32(PWM1_BASE, PWM_CTL, 0);
-    w32(PWM1_BASE, PWM_RNG1, range);
-    w32(PWM1_BASE, PWM_DAT1, range / 2U);
-    w32(PWM1_BASE, PWM_RNG2, range);
-    w32(PWM1_BASE, PWM_DAT2, range / 2U);
+    /* **1 つ書くごとに間を空ける。**PWM は PWM クロック (いまは 1MHz) で
+     * 動いており、CPU の速さで続けて叩くとバスエラーになる */
+    w32(PWM1_BASE, PWM_CTL, 0);                 probe_step("ctl=0");
+    w32(PWM1_BASE, PWM_STA, PWM_STA_BERR);      probe_step("berr clr");
+    w32(PWM1_BASE, PWM_RNG1, range);            probe_step("rng1");
+    w32(PWM1_BASE, PWM_DAT1, range / 2U);       probe_step("dat1");
+    w32(PWM1_BASE, PWM_RNG2, range);            probe_step("rng2");
+    w32(PWM1_BASE, PWM_DAT2, range / 2U);       probe_step("dat2");
     /* mark-space = duty がそのまま出る。**これを入れないと
      * パルスがばらけて矩形波にならない** */
     w32(PWM1_BASE, PWM_CTL,
         PWM_CTL_PWEN1 | PWM_CTL_MSEN1 | PWM_CTL_PWEN2 | PWM_CTL_MSEN2);
+    probe_step("ctl=on");
 }
 
 void sound_beep_stop(void) {
@@ -245,16 +340,27 @@ void aarch64_sound_selftest(void) {
         aarch64_uart_putdec64(tone[i]);
         aarch64_uart_puts(" Hz range=");
         aarch64_uart_putdec64(PWM_CLK_HZ / tone[i]);
+        aarch64_uart_puts("\n");
+        /* **1 音目だけ、書き込み 1 つごとに STA を出す。**
+         * どの書き込みで BERR が立つかがこれで分かる */
+        g_probe = (i == 0);
         sound_beep_start(tone[i]);
+        g_probe = 0;
         /* **鳴らしている最中のレジスタを読む。**
-         * STA の bit9 (STA1) は「チャネル 1 が送出中」。
-         * ここが 0 なら、設定は入っているのに出ていない */
+         * STA1 (bit9) が「チャネル 1 が送出中」。**bit8 は BERR** で、
+         * ここを取り違えると「送出中」と読めてしまう */
         sta = r32(PWM1_BASE, PWM_STA);
         ctl = r32(PWM1_BASE, PWM_CTL);
         dat = r32(PWM1_BASE, PWM_DAT1);
-        aarch64_uart_puts("  sta=0x");
+        aarch64_uart_puts("            sta=");
         aarch64_uart_puthex64(sta);
-        aarch64_uart_puts(" ctl=0x");
+        aarch64_uart_puts(" berr=");
+        aarch64_uart_putdec64((sta & PWM_STA_BERR) ? 1U : 0U);
+        aarch64_uart_puts(" sta1=");
+        aarch64_uart_putdec64((sta & PWM_STA_STA1) ? 1U : 0U);
+        aarch64_uart_puts(" sta2=");
+        aarch64_uart_putdec64((sta & PWM_STA_STA2) ? 1U : 0U);
+        aarch64_uart_puts(" ctl=");
         aarch64_uart_puthex64(ctl);
         aarch64_uart_puts(" dat=");
         aarch64_uart_putdec64(dat);
