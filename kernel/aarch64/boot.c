@@ -18,6 +18,7 @@
 #include "syscall.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "usb.h"          /* usb_xhci_irq (A-1) */
 
 /* PL011 UART。QEMU は初期化なしでも DR に書けば出るが、実機と手順を
  * 揃えておく (M1 以降で割り込み受信を足すときに効く)
@@ -865,6 +866,18 @@ void aarch64_boot_continue(void) {
 }
 
 /* 例外ベクタから呼ばれる。IRQ の入口 */
+/* xHCI (VL805) の INTID。導出は include/aarch64/boot.h の注釈にある */
+uint32_t aarch64_xhci_intid(void) {
+    return AARCH64_XHCI_SPI + AARCH64_SPI_INTID_BASE;
+}
+
+/* **usb.c から呼ばれる (A-1)。**PCI 側で INTx を開けたあと、GIC の口も
+ * 開ける。**片方だけだと「有効にしたつもり」になる** — virtio-blk と
+ * コンソールで同じ形を踏んでいる */
+void usb_arch_irq_enable(void) {
+    aarch64_gic_enable_irq(aarch64_xhci_intid());
+}
+
 void aarch64_irq_handler(void) {
     uint32_t iar = aarch64_gic_claim();
     uint32_t intid = iar & 0x3ffU;
@@ -876,6 +889,10 @@ void aarch64_irq_handler(void) {
     } else if (intid && intid == aarch64_uart_intid()) {
         /* コンソール入力 (P3)。リングへ移して待ち手を起こす */
         aarch64_console_rx_irq();
+    } else if (intid == aarch64_xhci_intid()) {
+        /* xHCI (A-1)。イベントリングを置き場へ吸い出す。
+         * **INTx はレベル駆動**なので、発生源は usb_xhci_irq() が落とす */
+        usb_xhci_irq();
     }
     /* 1023 は「上がっていなかった」を意味する偽物。EOI してはいけない */
     if (intid < 1020U) {

@@ -69,6 +69,20 @@
 #define AARCH64_UART_SPI_DEFAULT        1
 #define AARCH64_SPI_INTID_BASE          32
 
+/* **VL805 (xHCI) のレガシー INTx。**Pi 4 の xHCI は PCIe の先に居るので、
+ * 割り込みは RC (pcie@7d500000) が GIC に流す。実機の DTB から:
+ *
+ *   interrupt-map      INTA -> SPI 0x8f(143)  INTB -> 144  INTC -> 145  INTD -> 146
+ *   interrupts         pcie -> SPI 0x93(147)   msi -> SPI 0x94(148)
+ *
+ * lspci が「Interrupt: pin A」なので INTA。**INTID = 143 + 32 = 175。**
+ *
+ * Linux は MSI (Count=4) を使うが、MSI は RC 側の MSI コントローラを組んで
+ * 多重化を解く必要がある。**INTx なら配線済みで足りる** */
+#ifndef AARCH64_XHCI_SPI
+#define AARCH64_XHCI_SPI                143
+#endif
+
 /* memory ノードの reg エントリの上限。
  *
  * **Raspberry Pi 4 (4GB) は RAM が 2 つに割れている。**低位 942MB の後ろに

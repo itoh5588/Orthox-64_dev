@@ -570,10 +570,16 @@ int aarch64_pcie_brcm_scan(void) {
                 if ((orig & 0x6U) == 0x4U) {   /* 64bit BAR なら上位も */
                     brcm_cfg_w32(1, (uint8_t)d, (uint8_t)f, 0x14, 0);
                 }
-                /* MEM デコードと bus master を開ける */
+                /* MEM デコードと bus master を開け、**INTx を塞がない**。
+                 *
+                 * bit10 = INTX_DISABLE。既定は 0 (有効) だが、ファーム
+                 * ウェアが立てていることがあるので明示的に落とす。
+                 * **A-1 の割り込みはこの線で上がる** — VL805 は pin A で、
+                 * RC の interrupt-map から GIC SPI 143 (INTID 175) */
                 {
                     uint32_t cmd = brcm_cfg_r32(1, (uint8_t)d, (uint8_t)f, 0x04);
-                    brcm_cfg_w32(1, (uint8_t)d, (uint8_t)f, 0x04, cmd | 0x6U);
+                    brcm_cfg_w32(1, (uint8_t)d, (uint8_t)f, 0x04,
+                                 (cmd | 0x6U) & ~0x400U);
                 }
                 /* **CPU から見た番地はこちら** */
                 g_xhci_cpu_bar = cpu_base;

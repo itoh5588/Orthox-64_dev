@@ -58,6 +58,7 @@ static void puthex_n(uint64_t v, int digits) {
 #define PCI_COMMAND_IO      (1U << 0)
 #define PCI_COMMAND_MEMORY  (1U << 1)
 #define PCI_COMMAND_MASTER  (1U << 2)
+#define PCI_COMMAND_INTX_DISABLE (1U << 10)
 
 /* BAR の下位ビット。**大きさを測るときはここを落とす** */
 #define PCI_BAR_IO          (1U << 0)
@@ -329,6 +330,14 @@ void pci_enable_mmio_busmaster(const struct pci_device_info* dev) {
     if (!g_ready || !dev) return;
     cmd = cfg_r16(dev->bus, dev->device, dev->function, PCI_COMMAND);
     cmd |= PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER;
+    cfg_w16(dev->bus, dev->device, dev->function, PCI_COMMAND, cmd);
+}
+
+void pci_enable_intx(const struct pci_device_info* dev) {
+    uint16_t cmd;
+    if (!dev) return;
+    cmd = cfg_r16(dev->bus, dev->device, dev->function, PCI_COMMAND);
+    cmd &= (uint16_t)~PCI_COMMAND_INTX_DISABLE;
     cfg_w16(dev->bus, dev->device, dev->function, PCI_COMMAND, cmd);
 }
 

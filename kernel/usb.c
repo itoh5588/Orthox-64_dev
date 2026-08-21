@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include "usb.h"
 #include "pci.h"
+#include "spinlock.h"   /* irq_save_disable / irq_restore */
 #include "vmm.h"
 #include "pmm.h"
 
@@ -476,6 +477,10 @@ static uint32_t g_evt_stash_head;
 static uint32_t g_evt_stash_count;
 static uint32_t g_evt_stash_dropped;   /* 溢れて捨てた数。測れるようにしておく */
 static uint32_t g_evt_stash_peak;
+/* **置き場に何か入るたびに増える。**待っている側は、この値が動いたときだけ
+ * 置き場を舐め直す。8000000 回の空回りで毎回 16 個を照合すると、
+ * 待ち時間の意味が変わってしまう */
+static volatile uint32_t g_evt_stash_gen;
 
 /* type: 32 = Transfer Event / 33 = Command Completion Event。
  * slot/ep/trb は 0 なら「問わない」 */
@@ -495,6 +500,9 @@ static int xhci_evt_matches(const uint32_t d[4], uint32_t want_type, uint8_t slo
 }
 
 static uint32_t g_evt_pscd_count;   /* Port Status Change Event の数 */
+static uint32_t g_evt_pscd_port;    /* 最後に変化したポート */
+/* 定義は下の「PORTSC を書くときのビット」のところ */
+static void xhci_ack_port_change(uint8_t port);
 
 static void xhci_evt_stash_push(const uint32_t d[4]) {
     uint32_t idx;
@@ -504,7 +512,12 @@ static void xhci_evt_stash_push(const uint32_t d[4]) {
      * 置き場に積むと 16 個をこれで埋めてしまい、本当に要る転送完了を
      * 押し出す。数えて落とす (codex 相談 (c)) */
     if (type == 34U) {
+        /* **変化ビットを落とす (A-2)。**落とさないと xHC は同じ変化を
+         * 上げ続ける。ポーリングのうちは「うるさいだけ」で済んでいたが、
+         * **INTx はレベル駆動なので、落とさないと割り込み嵐になる。**
+         * ポート番号は dword0 の bits 31:24 */
         g_evt_pscd_count++;
+        xhci_ack_port_change((uint8_t)((d[0] >> 24) & 0xFFU));
         return;
     }
     /* 転送完了 (32) とコマンド完了 (33) 以外も待ち手が居ない */
@@ -523,6 +536,7 @@ static void xhci_evt_stash_push(const uint32_t d[4]) {
     g_evt_stash[idx].d[3] = d[3];
     g_evt_stash_count++;
     if (g_evt_stash_count > g_evt_stash_peak) g_evt_stash_peak = g_evt_stash_count;
+    g_evt_stash_gen++;
 }
 
 /* 条件に合うものを 1 つ取り出して詰める。見つからなければ 0 */
@@ -555,24 +569,94 @@ static void xhci_evt_stash_clear(void) {
     g_evt_stash_count = 0;
 }
 
+/* ---- イベントリングを吸い出す。**唯一の消費者** ---------------------------
+ *
+ * codex の指摘 (2026-08-20): 「INTE を立てたままハンドラが無いのは中途半端。
+ * ハンドラを実装するなら、イベントリングの消費者を 1 か所に決めるべき」。
+ *
+ * **ハードウェアのリングを触るのはこの関数だけ。**待っている側は置き場
+ * (g_evt_stash) しか見ない。呼ばれるのは 2 か所:
+ *
+ *   - usb_xhci_irq()  割り込み文脈
+ *   - 待っている側    割り込みが来なくても進めるための保険
+ *
+ * **保険は外さない。**割り込みが配線どおりに来なければ、動きは今までと
+ * 同じポーリングに戻るだけで、抜き差しは壊れない。
+ *
+ * 割り込みを止めてから触る。止めないと、置き場の更新中に割り込みが入って
+ * 同じ場所を書く */
+static uint32_t xhci_evt_pump(void) {
+    uint32_t d[4];
+    uint32_t n = 0;
+    uint64_t flags = irq_save_disable();
+    /* **上限を置く。**壊れたリングで永久に回らないように */
+    while (n < XHCI_EVT_RING_TRBS && xhci_evt_dequeue(d)) {
+        xhci_evt_stash_push(d);
+        n++;
+    }
+    irq_restore(flags);
+    return n;
+}
+
+static uint32_t g_xhci_irq_count;      /* 割り込みが実際に来た回数 */
+static uint32_t g_xhci_irq_events;     /* 割り込みで拾ったイベントの数 */
+
+/* **口の開け方を知らないアーキでは何もしない。**動きはポーリングのまま。
+ * aarch64 は kernel/aarch64/boot.c の強い定義が勝つ */
+__attribute__((weak)) void usb_arch_irq_enable(void) {}
+
+/* **xHCI の割り込み入口 (A-1)。**アーキ側の IRQ ハンドラから呼ばれる。
+ *
+ * **発生源を先に落とす。**INTx はレベル駆動なので、落とさないまま戻ると
+ * 同じ割り込みが上がり続けて何も進まなくなる。落とすのは 2 つ:
+ *
+ *   USBSTS.EINT (bit 3)      RW1C
+ *   IMAN.IP     (bit 0)      RW1C
+ *
+ * 落としてから吸い出す。順番を逆にすると、吸い出しの最中に来たイベントの
+ * ぶんの表明を消してしまう */
+void usb_xhci_irq(void) {
+    uint32_t n;
+    g_xhci_irq_count++;
+    if (!g_op_regs || !g_rt_regs) return;
+
+    {
+        uint32_t sts = mmio_read32(g_op_regs, 0x04);
+        if (sts & (1U << 3)) mmio_write32(g_op_regs, 0x04, (1U << 3));
+    }
+    {
+        uint32_t iman = mmio_read32(g_rt_regs, 0x20 + 0x00);
+        if (iman & 1U) mmio_write32(g_rt_regs, 0x20 + 0x00, iman | 1U);
+    }
+
+    n = xhci_evt_pump();
+    g_xhci_irq_events += n;
+}
+
 static int xhci_poll_cmd_completion(uint64_t* out_cmd_ptr, uint8_t* out_cc, uint8_t* out_slot_id, uint32_t loops) {
     uint32_t d[4];
     if (!g_rt_regs || !out_cmd_ptr || !out_cc || !out_slot_id) return -1;
 
-    /* **先に置き場を見る。**先に来てしまった完了がここに居ることがある */
+    /* **先に置き場を見る。**先に来てしまった完了がここに居ることがある。
+     * 割り込みが拾ったものもここに入っている */
     if (xhci_evt_stash_take(33, 0, 0, 0, d)) goto got;
 
-    for (uint32_t i = 0; i < loops; i++) {
-        if (!xhci_evt_dequeue(d)) continue;
-        if (xhci_evt_matches(d, 33, 0, 0, 0)) goto got;
+    {
+        uint32_t gen = g_evt_stash_gen;
+        for (uint32_t i = 0; i < loops; i++) {
+            /* **保険。**割り込みが来ていれば置き場は既に埋まっている */
+            (void)xhci_evt_pump();
+            if (g_evt_stash_gen == gen) continue;   /* 何も増えていない */
+            gen = g_evt_stash_gen;
+            if (xhci_evt_stash_take(33, 0, 0, 0, d)) goto got;
 
-        /* **転送完了だった。捨てずに残す** — 呼ぶ側は 1 を
-         * 「まだコマンドの番ではない」と読んで回り続ける */
-        xhci_evt_stash_push(d);
-        *out_cmd_ptr = 0;
-        *out_cc = 0xFF;
-        *out_slot_id = 0;
-        return 1;
+            /* **転送完了だけが来た** — 呼ぶ側は 1 を
+             * 「まだコマンドの番ではない」と読んで回り続ける */
+            *out_cmd_ptr = 0;
+            *out_cc = 0xFF;
+            *out_slot_id = 0;
+            return 1;
+        }
     }
 
     return -1;
@@ -758,16 +842,19 @@ static int xhci_poll_transfer_event(uint8_t slot_expect, uint8_t ep_expect, uint
     if (!g_rt_regs) return -1;
 
     /* **先に置き場を見る。**他のエンドポイントを待っている間に来た
-     * ぶんがここに溜まっている */
+     * ぶんがここに溜まっている。割り込みが拾ったものもここに入る */
     if (xhci_evt_stash_take(32, slot_expect, ep_expect, trb_expect, d)) goto got;
 
-    for (uint32_t i = 0; i < loops; i++) {
-        if (!xhci_evt_dequeue(d)) continue;
-        if (xhci_evt_matches(d, 32, slot_expect, ep_expect, trb_expect)) goto got;
-
-        /* **待っている相手ではない。捨てずに残す。**
-         * ここで捨てると、そのイベントを待っている側が永久に取り逃す */
-        xhci_evt_stash_push(d);
+    {
+        uint32_t gen = g_evt_stash_gen;
+        for (uint32_t i = 0; i < loops; i++) {
+            /* **保険。**割り込みが来ていれば置き場は既に埋まっている */
+            (void)xhci_evt_pump();
+            if (g_evt_stash_gen == gen) continue;   /* 何も増えていない */
+            gen = g_evt_stash_gen;
+            /* 待っている相手でなければ置き場に残る。捨てない */
+            if (xhci_evt_stash_take(32, slot_expect, ep_expect, trb_expect, d)) goto got;
+        }
     }
     return -1;
 
@@ -996,6 +1083,9 @@ static int xhci_cmd_evaluate_context_mps(uint8_t slot_id, uint32_t mps) {
  *
  * Link は**「今の」サイクルで書いてから**反転する。順番を逆にすると
  * xHC から見て Link が「まだ積まれていない」ことになる */
+/* リングが一周した回数。**印字は 4 回で止めるが、数は取り続ける** (A-3) */
+static uint32_t g_ring_wrap_count;
+
 static uint32_t xhci_ring_push(uint64_t ring_phys, uint32_t* idx, uint32_t* cycle,
                                uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3) {
     volatile uint32_t* ring = (volatile uint32_t*)USB_VIRT((void*)ring_phys);
@@ -1016,6 +1106,7 @@ static uint32_t xhci_ring_push(uint64_t ring_phys, uint32_t* idx, uint32_t* cycl
         ring[255 * 4 + 3] = (6U << 10) | (1U << 1) | (*cycle & 1U); /* Link, TC=1 */
         USB_MB();   /* xHC に見せてから自分のサイクルを反転する */
 
+        g_ring_wrap_count++;
         /* **最初の 4 回だけ出す。**次に終端がらみを疑うとき、まず要るのは
          * 「一周は起きているのか」で、それは数行あれば足りる。
          * 抜き差しのポーリングは 10 秒で一周するので、出しっぱなしにすると
@@ -2568,6 +2659,32 @@ static uint32_t xhci_portsc_off(uint8_t port) {
     return 0x400U + ((uint32_t)port - 1U) * 0x10U;
 }
 
+/* ---- A-2: Port Status Change Event の後始末 -------------------------------
+ *
+ * ルートポートの状態が変わると xHC は type 34 のイベントを上げる。**変化
+ * ビットを落とすまで、xHC は同じ変化を上げ続ける。**
+ *
+ * ポーリングのうちは「置き場を埋めるだけ」で済んでいたので、数えて落として
+ * いた。**割り込みにすると話が変わる。**INTx はレベル駆動なので、発生源を
+ * 消さないと戻った瞬間にまた上がる — 割り込み嵐になって何も進まない。
+ *
+ * **読んだ値をそのまま書き戻さない。**PORTSC_KEEP の注釈のとおり、PED や
+ * 変化ビットを書き戻すと「有効にしようとして無効にする」ことになる。
+ * **立っている変化ビットだけ**を 1 で書いて落とす */
+static void xhci_ack_port_change(uint8_t port) {
+    uint32_t o, v, chg;
+    if (!g_op_regs || port == 0 || port > g_xhci_max_ports) return;
+
+    o = xhci_portsc_off(port);
+    v = mmio_read32(g_op_regs, o);
+    /* bits 17..23 = CSC / PEC / WRC / OCC / PRC / PLC / CEC。すべて RW1C */
+    chg = v & (0x7FU << 17);
+    if (!chg) return;
+
+    g_evt_pscd_port = port;
+    mmio_write32(g_op_regs, o, (v & PORTSC_KEEP) | chg);
+}
+
 /* ---- B-1: xECP の Supported Protocol Capability を読む ---------------------
  *
  * HCCPARAMS1 の bits 31:16 が拡張ケーパビリティへの入口 (dword 単位)。
@@ -2834,6 +2951,8 @@ static void usb_hotplug_release(void) {
     g_xhci_slot_id = g_hub_slot_id;
 }
 
+static uint64_t g_usb_heartbeat_next_ms;   /* A-3 の要約を次に出す時刻 */
+
 void usb_hotplug_poll(void) {
     uint8_t p;
     uint64_t now;
@@ -2875,6 +2994,43 @@ void usb_hotplug_poll(void) {
     now = USB_NOW_MS();
     if (now < g_hub_poll_next_ms) return;
     g_hub_poll_next_ms = now + 500ULL;
+
+    /* ---- A-3: 60 秒ごとに 1 行だけ要約を出す ------------------------------
+     *
+     * 実機のシェルは busybox ash で、`usb` コマンド (usb_dump_status) が
+     * 使えない。**起動時の 1 行だけでは長時間の様子が分からない。**
+     *
+     * 1 分 1 行なら何時間動かしてもログは埋まらない。見るのはこの 4 つ:
+     *
+     *   irq=   増え続けていれば割り込みが生きている。**止まったら A-1 が
+     *          効いていない** (動きはポーリングに落ちるだけで壊れはしない)
+     *   drop=  0 でなければイベントを取りこぼしている
+     *   pscd=  増え続けるなら変化ビットを落とせていない (A-2 の失敗)
+     *   wrap=  リングの一周。止まっていれば制御転送が流れていない */
+    if (now >= g_usb_heartbeat_next_ms) {
+        g_usb_heartbeat_next_ms = now + 60000ULL;
+        puts("[usb] 経過 poll=");
+        putdec(g_hub_poll_count);
+        puts(" irq=");
+        putdec(g_xhci_irq_count);
+        puts("/");
+        putdec(g_xhci_irq_events);
+        puts(" stash=");
+        putdec(g_evt_stash_count);
+        puts("/peak=");
+        putdec(g_evt_stash_peak);
+        puts("/drop=");
+        putdec(g_evt_stash_dropped);
+        puts(" pscd=");
+        putdec(g_evt_pscd_count);
+        puts(" wrap=");
+        putdec(g_ring_wrap_count);
+        puts(" in/out=");
+        putdec(g_hub_attach_count);
+        puts("/");
+        putdec(g_hub_detach_count);
+        puts("\r\n");
+    }
 
     g_usb_busy = 1;
     for (p = 1; p <= g_hub_nbr_ports && p <= HUB_MAX_PORTS; p++) {
@@ -3135,12 +3291,25 @@ void usb_init(void) {
         mmio_write32(op, 0x04, 0xFFFFFFFFU);
 
         usbcmd = mmio_read32(op, 0x00);
-        // Run + INTE (interrupts); events are still polled path for now.
+        /* Run + INTE。**INTE を立てるだけでは何も来ない。**
+         * ホスト側の口 (GIC / PIC) も開けないと「有効にしたつもり」になる。
+         * それは下の usb_arch_irq_enable() が受け持つ (A-1) */
         mmio_write32(op, 0x00, usbcmd | 1U | (1U << 2)); // RS=1, INTE=1
         if (xhci_wait_bits(op, 0x04, (1U << 0), 0, 2000000) < 0) {
             puts("[usb] xHCI run timeout\r\n");
             return;
         }
+
+        /* ---- 割り込みの口を開ける (A-1) --------------------------------
+         *
+         * **走り出してから開ける。**止まっている間に上がった表明を
+         * 拾っても意味が無い。
+         *
+         * **保険は外していない。**待っている側は割り込みが来なくても
+         * 自分で xhci_evt_pump() を回すので、配線が違っていても動きは
+         * 今までのポーリングに戻るだけ */
+        usb_arch_irq_enable();
+        puts("[usb] 割り込みの口を開けた (来た数は [usb] ports: の irq= を見る)\r\n");
 
         cmd_probe = xhci_cmd_noop();
         if (cmd_probe == 0) {
@@ -3480,6 +3649,13 @@ void usb_init(void) {
     putdec(g_evt_stash_dropped);
     puts("/pscd=");
     putdec(g_evt_pscd_count);
+    /* **割り込みが本当に来ているか (A-1)。**「来た数/拾ったイベント数」。
+     * 0/0 のままなら配線が違う。その場合でも待っている側が自分で
+     * 吸い出すので、動きはポーリングのまま止まらない */
+    puts(" irq=");
+    putdec(g_xhci_irq_count);
+    puts("/");
+    putdec(g_xhci_irq_events);
     puts(" slot=");
     putdec(g_xhci_slot_id);
     puts(" port=");
@@ -3529,6 +3705,13 @@ void usb_dump_status(void) {
     putdec(g_evt_stash_dropped);
     puts("/pscd=");
     putdec(g_evt_pscd_count);
+    /* **割り込みが本当に来ているか (A-1)。**「来た数/拾ったイベント数」。
+     * 0/0 のままなら配線が違う。その場合でも待っている側が自分で
+     * 吸い出すので、動きはポーリングのまま止まらない */
+    puts(" irq=");
+    putdec(g_xhci_irq_count);
+    puts("/");
+    putdec(g_xhci_irq_events);
     puts(" slot=");
     putdec(g_xhci_slot_id);
     puts(" port=");
@@ -3600,6 +3783,10 @@ void usb_dump_status(void) {
     putdec(g_evt_stash_dropped);
     puts("/pscd=");
     putdec(g_evt_pscd_count);
+    puts(" irq=");
+    putdec(g_xhci_irq_count);
+    puts("/");
+    putdec(g_xhci_irq_events);
     puts(" iq=");
     puts(g_usb_msc_inquiry_ok ? "ok" : "fail");
     puts(" cap=");

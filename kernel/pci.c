@@ -303,6 +303,16 @@ void pci_enable_mmio_busmaster(const struct pci_device_info* dev) {
     }
 }
 
+void pci_enable_intx(const struct pci_device_info* dev) {
+    if (!dev) return;
+    uint32_t reg = pci_config_read32(dev->bus, dev->device, dev->function, 0x04);
+    /* Command register bit10 = INTX_DISABLE。**落とすと INTx が上がる** */
+    uint32_t new_reg = reg & ~(1U << 10);
+    if (new_reg != reg) {
+        pci_config_write32(dev->bus, dev->device, dev->function, 0x04, new_reg);
+    }
+}
+
 void pci_enable_io_busmaster(const struct pci_device_info* dev) {
     if (!dev) return;
     uint32_t reg = pci_config_read32(dev->bus, dev->device, dev->function, 0x04);
