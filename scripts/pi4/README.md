@@ -34,6 +34,150 @@ kernel8.img を置くだけでよい (ファームウェア一式は既にある
 設定を変えたくなったら `scripts/pi4/config.txt` を直してから組み直す
 — そうすれば「実機で動いた設定」が git に残る。
 
+## netboot — SD の抜き差しをやめる
+
+**2026-08-21 に作った。**一週間で 100 回を超える抜き差しをやらせていたので、
+道具のほうを直した。
+
+Pi 4 の **EEPROM ブートローダが LAN から起動一式を TFTP で取る。**
+これは**カーネルが走る前**の話なので、**Orthox-64 側に NIC ドライバは要らない**
+(Pi 4 の実 NIC は BCM GENET で、`kernel/virtio_net.c` は QEMU 用の別物)。
+
+**SD は挿しっぱなしでよい。**rootfs (xv6fs) は別パーティションにあり、
+そちらは今までどおり SD から読む。LAN から来るのは boot パーティションの
+中身だけ。
+
+### なぜサーバを Windows 側で走らせるのか
+
+| | |
+|---|---|
+| WSL2 は NAT の中 | `172.19.127.105/20`。LAN (`192.168.11.0/24`) に居ない |
+| `netsh portproxy` | **TCP のみ。UDP を転送しない**ので TFTP を通せない |
+| mirrored networking | 使える版だが **Docker のブリッジ 3 本と衝突する**懸念。WSL 全体に影響する |
+| **Windows で Python** | **採用。**標準ライブラリだけ。入れる物ゼロ |
+
+`scripts/pi4/tftp_server.py` は**読み出し専用**で、WRQ は `ERROR` で断る。
+
+### 置き場所
+
+    C:\Users\itoh5\pi4-netboot\
+        tftp_server.py     scripts/pi4/ の写し (正はリポジトリ側)
+        tftp_server.bat    起動用。ダブルクリックでもよい
+        root\              ここが配信ルート
+
+`root\` に要るもの:
+
+    start4.elf  fixup4.dat  bcm2711-rpi-4-b.dtb   ← SD の boot から 1 度だけ
+    overlays\disable-bt.dtbo                       ← config.txt が使う
+    config.txt  kernel8.img                        ← make が毎回入れ替える
+
+### 使い方
+
+Windows 側でサーバを立てておく (立てっぱなしでよい):
+
+    C:\Users\itoh5\pi4-netboot\tftp_server.bat
+
+WSL 側で作って流し込む:
+
+    make aarch64-pi4-netboot AARCH64_PCIE_BRCM_INIT=1 AARCH64_INIT_PATH_VALUE=/bin/ash
+
+**`kernel8.img` と `config.txt` を 2 つで 1 組**として入れ替えるのは
+SD のときと同じ。**netboot では config.txt も LAN から来る**ので、
+**設定を変えるのにも SD を触らなくてよくなった** — これは SD 運用に無かった利点。
+
+あとは **Pi の電源を入れ直すだけ。**
+
+### シリアル番号のディレクトリは気にしなくてよい
+
+Pi 4 のブートローダは既定で `<シリアル番号>/start4.elf` のように前置きして
+要求する。**サーバ側が 1 段落として読み直す**ので、`root\` の直下に置けば
+どちらの形でも当たる。**要求名はログに出る**ので、そこでシリアル番号が読める。
+
+### ホスト側の下ごしらえ (2026-08-21 に実施済み)
+
+**1. ファイアウォール。**イーサネットのプロファイルが `Public` なので、
+UDP 69 の受信を **LAN からに限って**開ける (管理者の PowerShell で 1 回だけ)。
+`C:\Users\itoh5\pi4-netboot\add-firewall-rule.ps1` に置いてある。
+
+    New-NetFirewallRule -DisplayName "Orthox Pi4 TFTP" -Direction Inbound `
+      -Protocol UDP -LocalPort 69 -RemoteAddress 192.168.11.0/24 `
+      -Profile Any -Action Allow
+
+消すときは `Remove-NetFirewallRule -DisplayName "Orthox Pi4 TFTP"`。
+
+**2. この PC の IP を固定する。****`TFTP_IP` は EEPROM に焼き込む**ので、
+DHCP で番地が変わると netboot が死ぬ (SD には退くので起動はする)。
+`192.168.11.23/24` を静的にした (`set-static-ip.ps1`)。DHCP に戻すなら:
+
+    Set-NetIPInterface -InterfaceIndex 7 -Dhcp Enabled
+    Set-DnsClientServerAddress -InterfaceIndex 7 -ResetServerAddresses
+
+### EEPROM の設定 (SD を触る最後の 1 回)
+
+**`C:\Users\itoh5\pi4-netboot\eeprom-staging\` に用意してある。**
+SD の boot パーティション直下に **3 つ**置いて電源を入れるだけ。
+
+    pieeprom.upd  pieeprom.sig  recovery.bin
+
+次の起動で ROM が `recovery.bin` を走らせて EEPROM を書き換え、成功すると
+`recovery.bin` は自分を `recovery.000` に改名する (rpi-eeprom の README)。
+**2 回目以降は普通に起動する。**
+
+焼く設定 (元は `firmware-2711/default` の `pieeprom-2026-05-17.bin`):
+
+| | |
+|---|---|
+| `BOOT_ORDER=0xf12` | **右から左に読む。**`2`=NETWORK `1`=SD `f`=RESTART。**LAN が駄目なら SD に退く**ので、PC を落としていても起動する |
+| `TFTP_IP=192.168.11.23` | DHCP の server-ip を上書きする。**家庭用ルータが DHCP option 66 を吐けなくてよくなる** |
+| `BOOT_UART=1` | ブートローダのログが GPIO14/15 に 115200 で出る。**いままで見えていなかった段** |
+| `NET_INSTALL_AT_POWER_ON=0` | 既定は 1。起動のたびに network install の画面を出させない |
+| `DHCP_TIMEOUT=15000` | 既定 45000。**PC が落ちているときに SD へ退くまでを短く** |
+| `TFTP_FILE_TIMEOUT=10000` | 既定 30000。同上 |
+
+**失敗してもブリックにはならない。**Raspberry Pi Imager の
+「Misc utility images」で予備の SD に復旧イメージを書けば工場出荷に戻せる
+(rpi-eeprom の README「Reset to factory defaults」)。
+
+#### ★ 焼くと**ブートローダの版が変わる**
+
+いま Pi に載っている版は **`BOOT_UART=0` のため分からない**。
+**ファームウェアが残す PCIe / xHCI の状態は USB の切り分けの前提そのもの**
+なので、**USB の計測を取り終える前に焼かないこと。**
+
+### 動いているかの見分け
+
+サーバのログに要求が並ぶ。**1 行も出ないならブートローダが TFTP まで
+来ていない** — EEPROM の `BOOT_ORDER` かファイアウォールを疑う。
+
+    [tftp] 送出 b5a02594/start4.elf -> 192.168.11.4:xxxxx  2305632 バイト  blksize=1468 ...
+    [tftp] 完了 ...
+
+**この Pi の実測値 (2026-08-21):**
+
+| | |
+|---|---|
+| シリアル番号 | `b5a02594` (TFTP の前置きに使われる) |
+| MAC | `dc:a6:32:93:45:82` (ルータで DHCP 予約するなら) |
+| 取る IP | `192.168.11.4` (ルータの DHCP) |
+| リンク | 1000 Mbps full duplex |
+| **ネットワーク段** | **リンク確立から start4.elf 起動まで 1.9 秒** |
+| start4.elf の転送 | 2305632 バイトを 0.93 秒 |
+
+### ★ `打ち切り ... 相手が降りた` は異常ではない
+
+ブートローダは **「その名前があるか」を確かめるためだけに RRQ を投げる**。
+`start4.elf` を 1 度要求し、**OACK の `tsize` を見た時点で目的を達して
+転送を放棄する** (公式文書の `TFTP_PREFIX`: prefixed ディレクトリに
+`start4.elf` が無ければ prefix を消す、の判定がこれ)。
+
+**降りた相手に投げ続けても意味が無い**ので、**block 1 だけ再送を 3 回で
+打ち切る** (2 個目から先は通常の 7 回)。ログもそれと分かる文言にしてある。
+
+    [tftp] 打ち切り start4.elf  相手が降りた (存在確認の探針とみられる)
+
+**ログの出る順は実時間の順ではない。**打ち切りの行は、その転送が始まった
+数秒後に出る。**失敗 → 再試行に見えるが、そうではない。**
+
 ## シリアルの見方
 
 **HDMI には何も出ない。** シリアルが唯一の出力。

@@ -243,7 +243,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-usb-kbd-smoke aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-smoke aarch64-pi4-sd-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-usb-kbd-smoke aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-netboot aarch64-pi4-smoke aarch64-pi4-sd-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -508,6 +508,31 @@ aarch64-pi4-boot:
 	@echo "=== out/pi4-boot/ ==="
 	@ls -la out/pi4-boot/
 	@echo "SD カードの boot パーティション直下に置く (scripts/pi4/README.md)"
+
+# netboot で配る所へ流し込む。**SD の抜き差しをやめるための道具**
+# (scripts/pi4/README.md の「netboot」)。
+#
+# 配信ルートは Windows 側に置く。**WSL2 は NAT の中に居て LAN に出られず、
+# netsh portproxy は UDP を転送しない**ので、TFTP サーバは Windows で走らせる。
+# 場所を変えたいときは PI4_NETBOOT_ROOT を渡す
+PI4_NETBOOT_ROOT ?= /mnt/c/Users/itoh5/pi4-netboot/root
+
+aarch64-pi4-netboot: aarch64-pi4-boot
+	@test -d "$(PI4_NETBOOT_ROOT)" || { \
+	    echo "ERROR: 配信ルートが無い: $(PI4_NETBOOT_ROOT)" >&2; \
+	    echo "scripts/pi4/README.md の「netboot」の手順で作る" >&2; \
+	    exit 1; }
+	cp out/pi4-boot/kernel8.img out/pi4-boot/config.txt "$(PI4_NETBOOT_ROOT)/"
+	@echo "=== $(PI4_NETBOOT_ROOT) ==="
+	@ls -la "$(PI4_NETBOOT_ROOT)/"
+	@missing=""; for f in start4.elf fixup4.dat bcm2711-rpi-4-b.dtb; do \
+	    test -f "$(PI4_NETBOOT_ROOT)/$$f" || missing="$$missing $$f"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+	    echo "警告: ファームウェアが足りない:$$missing" >&2; \
+	    echo "  SD の boot パーティションから 1 度だけコピーする" >&2; \
+	fi
+	@echo "Pi の電源を入れ直せば LAN から読まれる。SD は抜かない"
 
 # Pi 4 の起動確認 (QEMU の raspi4b)。**実機の代わりにはならない**が、
 # 起動形式 / DTB / GIC-400 / MMU / EL0 までは実機なしで回帰を見られる。
