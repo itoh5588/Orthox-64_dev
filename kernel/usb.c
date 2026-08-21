@@ -194,6 +194,13 @@ static uint64_t g_int_buf_phys = 0;
 static uint32_t g_int_enqueue_idx = 0;
 static uint32_t g_int_cycle = 1;
 static int      g_usb_kbd_ready = 0;
+/* **タイマ割り込みとの排他。**イベントリングの取り出し位置は
+ * g_evt_dequeue_idx ひとつしかなく、usb_hid_keyboard_poll() (タイマ IRQ)
+ * と usb_hotplug_poll() (idle) が同時に進めると壊れる。
+ * 割り込みを止めて守るには制御転送は長すぎる (ms 単位) ので、
+ * **抜き差しを見ている間はキーボードのポーリングを休ませる**。
+ * 休むのは最長でも 500ms に 1 回の確認の間だけ */
+static volatile int g_usb_busy = 0;
 
 static uint8_t g_usb_bulk_out_ep = 0;
 static uint8_t g_usb_bulk_in_ep = 0;
@@ -239,11 +246,26 @@ static uint32_t g_evt_dequeue_idx = 0;
 static uint32_t g_evt_cycle = 1;
 static uint64_t g_input_ctx_phys = 0;
 static uint64_t g_output_ctx_phys = 0;
-static uint64_t g_ep0_ring_phys = 0;
 static uint64_t g_ep0_buf_phys = 0;
 static uint64_t g_ep0_cfg_buf_phys = 0;
-static uint32_t g_ep0_enqueue_idx = 0;
-static uint32_t g_ep0_cycle = 1;
+
+/* ---- EP0 のリングはスロットごと ------------------------------------------
+ *
+ * **1 本のグローバルで持っていたのが 2026-08-20 の詰まりの原因だった。**
+ * Address Device のたびに上書きされるので、ハブ (slot 1) を掴んだあとに
+ * キーボード (slot 2) を掴むと、**ハブ宛の制御転送がキーボードのリングに
+ * TRB を積んでハブのドアベルを叩く**。ハブのデバイス文脈に登録されている
+ * リングには何も来ないので、転送イベントが返らず黙ってタイムアウトする。
+ * 起動時の列挙が通っていたのは、キーボードを掴む前だったから。
+ *
+ * **slot_id は uint8_t なので、256 個持てば範囲外が起きない。**
+ * 4KB の .bss と引き換えに、添字の確認を全部無くす */
+#define XHCI_EP0_SLOTS 256
+static struct {
+    uint64_t ring_phys;
+    uint32_t enq_idx;
+    uint32_t cycle;
+} g_ep0_slot[XHCI_EP0_SLOTS];
 static uint64_t g_bulk_out_ring_phys = 0;
 static uint64_t g_bulk_in_ring_phys = 0;
 static uint64_t g_bulk_buf_phys = 0;
@@ -319,10 +341,33 @@ static void xhci_ring_reset(uint64_t ring_phys) {
     ring[255 * 4 + 3] = (6U << 10) | (1U << 1) | 1U;
 }
 
-static void xhci_ring_enqueue_advance(uint32_t* idx, uint32_t* cycle, uint32_t count) {
+/* **一周したら Link TRB のサイクルビットを書き換える。**
+ *
+ * xHC は TRB のサイクルビットが自分の CCS と一致する間だけ消費する。
+ * Link TRB は xhci_ring_reset() が cycle=1 で置いたきり更新していなかった
+ * ので、2 周目 (積む側のサイクルが 0) に入ると **Link のところで
+ * 一致しなくなり、xHC がそこで止まる**。そのエンドポイントは以後
+ * 永久に沈黙する。
+ *
+ * 規格どおりの手順は「Link TRB のサイクルを**今の** PCS に合わせて
+ * 書いてから、TC=1 なので PCS を反転する」。
+ *
+ * 2026-08-20 の実機で嵌まった。抜き差しのポーリングが 500ms ごとに
+ * 12 TRB 積むので 10 秒ほどで一周し、そこから GET_STATUS が返らなく
+ * なった。EP0 だけでなく**割り込みリングもバルクも同じ関数を使って
+ * いる** — キーボードも 255 回ぶん積めば同じように黙る */
+static void xhci_ring_enqueue_advance(uint64_t ring_phys, uint32_t* idx,
+                                      uint32_t* cycle, uint32_t count) {
     while (count--) {
         (*idx)++;
         if (*idx == 255) {
+            if (ring_phys) {
+                volatile uint32_t* ring =
+                    (volatile uint32_t*)USB_VIRT((void*)ring_phys);
+                uint32_t d3 = ring[255 * 4 + 3];
+                ring[255 * 4 + 3] = (d3 & ~1U) | (*cycle & 1U);
+                USB_MB();   /* xHC に見せてから自分のサイクルを反転する */
+            }
             *idx = 0;
             *cycle ^= 1U;
         }
@@ -449,8 +494,22 @@ static int xhci_evt_matches(const uint32_t d[4], uint32_t want_type, uint8_t slo
     return 1;
 }
 
+static uint32_t g_evt_pscd_count;   /* Port Status Change Event の数 */
+
 static void xhci_evt_stash_push(const uint32_t d[4]) {
     uint32_t idx;
+    uint32_t type = (d[3] >> 10) & 0x3F;
+
+    /* **Port Status Change Event (34) を待っている者は居ない。**
+     * 置き場に積むと 16 個をこれで埋めてしまい、本当に要る転送完了を
+     * 押し出す。数えて落とす (codex 相談 (c)) */
+    if (type == 34U) {
+        g_evt_pscd_count++;
+        return;
+    }
+    /* 転送完了 (32) とコマンド完了 (33) 以外も待ち手が居ない */
+    if (type != 32U && type != 33U) return;
+
     if (g_evt_stash_count >= XHCI_EVT_STASH_CAP) {
         /* **溢れたら一番古いものを落とす。**新しいほうが役に立つ */
         g_evt_stash_head = (g_evt_stash_head + 1U) % XHCI_EVT_STASH_CAP;
@@ -674,6 +733,18 @@ static int xhci_wait_cmd_completion(uint64_t cmd_ptr, uint8_t slot_expect, uint8
     return -1;
 }
 
+/* Disable Slot。**抜かれたスロットを返す。**返さないと抜き差しを
+ * 繰り返すうちにスロットを使い切る (この xHC は 32 本) */
+static int xhci_cmd_disable_slot(uint8_t slot_id) {
+    uint8_t cc = 0xFF, slot = 0;
+    uint64_t cmd_ptr;
+    if (slot_id == 0) return -1;
+    cmd_ptr = xhci_cmd_submit(0, 0, 0, (10U << 10) | ((uint32_t)slot_id << 24));
+    if (!cmd_ptr) return -2;
+    if (xhci_wait_cmd_completion(cmd_ptr, slot_id, &cc, &slot) != 0) return -3;
+    return (cc == 1) ? 0 : -4;
+}
+
 /* **イベントが指す TRB の番地も返す。**
  * これが無いと Setup / Data / Status のどの段で落ちたかが分からない
  * (2026-08-18 codex 相談) */
@@ -737,7 +808,7 @@ static int xhci_cmd_address_device_full(uint8_t slot_id, uint8_t port_id, uint32
 
     g_input_ctx_phys = (uint64_t)in_ctx;
     g_output_ctx_phys = (uint64_t)out_ctx;
-    g_ep0_ring_phys = (uint64_t)ep0_ring;
+    g_ep0_slot[slot_id].ring_phys = (uint64_t)ep0_ring;
     if (!g_ep0_buf_phys) {
         void* ep0_buf = usb_alloc_dma(1);
         if (!ep0_buf) return -3;
@@ -751,12 +822,12 @@ static int xhci_cmd_address_device_full(uint8_t slot_id, uint8_t port_id, uint32
 
     // EP0 transfer ring: set Link TRB at tail to make a cycle ring.
     volatile uint32_t* ep = (volatile uint32_t*)USB_VIRT(ep0_ring);
-    ep[255 * 4 + 0] = (uint32_t)(g_ep0_ring_phys & 0xFFFFFFFFU);
-    ep[255 * 4 + 1] = (uint32_t)(g_ep0_ring_phys >> 32);
+    ep[255 * 4 + 0] = (uint32_t)(g_ep0_slot[slot_id].ring_phys & 0xFFFFFFFFU);
+    ep[255 * 4 + 1] = (uint32_t)(g_ep0_slot[slot_id].ring_phys >> 32);
     ep[255 * 4 + 2] = 0;
     ep[255 * 4 + 3] = (6U << 10) | (1U << 1) | 1U;
-    g_ep0_enqueue_idx = 0;
-    g_ep0_cycle = 1;
+    g_ep0_slot[slot_id].enq_idx = 0;
+    g_ep0_slot[slot_id].cycle = 1;
 
     // DCBAA[slot_id] -> output device context.
     volatile uint64_t* dcbaa = (volatile uint64_t*)USB_VIRT((void*)g_dcbaap_phys);
@@ -791,8 +862,8 @@ static int xhci_cmd_address_device_full(uint8_t slot_id, uint8_t port_id, uint32
     /* EP_TYPE=Control(4) は bits[5:3]。**CErr (bits[2:1]) に 3 を入れる。**
      * 0 のままだと再試行なしで、1 回の取りこぼしがそのまま失敗になる */
     ic[ep0_off + 1] = (4U << 3) | (3U << 1) | ((uint32_t)g_usb_ep0_mps << 16);
-    ic[ep0_off + 2] = (uint32_t)((g_ep0_ring_phys & ~0xFULL) | 1U); // TR Dequeue + DCS
-    ic[ep0_off + 3] = (uint32_t)(g_ep0_ring_phys >> 32);
+    ic[ep0_off + 2] = (uint32_t)((g_ep0_slot[slot_id].ring_phys & ~0xFULL) | 1U); // TR Dequeue + DCS
+    ic[ep0_off + 3] = (uint32_t)(g_ep0_slot[slot_id].ring_phys >> 32);
     /* **Average TRB Length。制御エンドポイントは 8 が必須で、0 は不可。**
      * 仕様上 0 以外が要求される欄で、Linux も制御 EP には 8 を入れている。
      * QEMU は見ないが実機は見る (2026-08-18 codex 相談) */
@@ -893,12 +964,88 @@ static int xhci_cmd_evaluate_context_mps(uint8_t slot_id, uint32_t mps) {
     return (cc == 1) ? 0 : -4;
 }
 
-static int xhci_ep0_get_device_descriptor(uint8_t slot_id) {
-    if (slot_id == 0 || g_ep0_ring_phys == 0 || g_ep0_buf_phys == 0) return -1;
+/* ---- TRB を 1 個ずつ積む --------------------------------------------------
+ *
+ * **書いた枠の index を返す。**TD が Link をまたぐと、Setup の次が
+ * idx+1 とは限らなくなる。落ちたときにどの段かを言うには、3 つの実 index を
+ * 覚えておくしかない。
+ *
+ * ## なぜ「予約して飛ぶ」のをやめたか
+ *
+ * 2026-08-20 に入れた xhci_ring_reserve() は、n 個が枠 255 に届くなら
+ * **積む前に Link を越えて idx を 0 に戻す**作りだった。TD が Link を
+ * またがなくなる代わりに、**[idx, 254] が書かれないまま残る**。
+ *
+ * 2026-08-21 の実機でそこが壊れていることを実測した。
+ *
+ *   [ring] ... idx=254 n=3 隙間=1 cycle 1 -> 0
+ *   [snap] tail[253] type=4 cy=1     直前の TD。xHC は CCS=1 で消費
+ *   [snap] tail[254] type=0 cy=0   ★ 隙間。cy=0 だが xHC の CCS は 1
+ *   [snap] tail[255] type=6 cy=1     Link は正しい。**ここまで届かない**
+ *
+ * **xHC は 254 で止まる。**サイクルが合わないので「まだ積まれていない」と
+ * 読み、Link に到達しない。usbsts は健全、epstate も 1 (Running)、
+ * イベントリングも空 — **ただ待っているだけ**の状態になる。
+ *
+ * ## 直し方 (MikanOS の Ring::Push と同じ)
+ *
+ * **1 個ずつ書き、枠 255 に来たらその場で Link を書いてサイクルを反転する。**
+ * 毎枠を順に埋めるので隙間が生じない。**TD が Link をまたぐのは許す** —
+ * xHC は Link を辿って先頭に戻り、TC=1 で自分の CCS も反転するので、
+ * またいだ先の TRB とも一致する。
+ *
+ * Link は**「今の」サイクルで書いてから**反転する。順番を逆にすると
+ * xHC から見て Link が「まだ積まれていない」ことになる */
+static uint32_t xhci_ring_push(uint64_t ring_phys, uint32_t* idx, uint32_t* cycle,
+                               uint32_t d0, uint32_t d1, uint32_t d2, uint32_t d3) {
+    volatile uint32_t* ring = (volatile uint32_t*)USB_VIRT((void*)ring_phys);
+    uint32_t at = *idx;
 
-    volatile uint32_t* ep = (volatile uint32_t*)USB_VIRT((void*)g_ep0_ring_phys);
-    uint32_t idx = g_ep0_enqueue_idx;
-    uint32_t cycle = g_ep0_cycle & 1U;
+    ring[at * 4 + 0] = d0;
+    ring[at * 4 + 1] = d1;
+    ring[at * 4 + 2] = d2;
+    /* **サイクルビットは呼び出し側から渡させない。**d3 の bit0 は必ずここで
+     * 入れる。渡す側が忘れると、その TRB は永久に消費されない */
+    ring[at * 4 + 3] = (d3 & ~1U) | (*cycle & 1U);
+
+    (*idx)++;
+    if (*idx == 255U) {
+        ring[255 * 4 + 0] = (uint32_t)(ring_phys & 0xFFFFFFFFU);
+        ring[255 * 4 + 1] = (uint32_t)(ring_phys >> 32);
+        ring[255 * 4 + 2] = 0;
+        ring[255 * 4 + 3] = (6U << 10) | (1U << 1) | (*cycle & 1U); /* Link, TC=1 */
+        USB_MB();   /* xHC に見せてから自分のサイクルを反転する */
+
+        /* **最初の 4 回だけ出す。**次に終端がらみを疑うとき、まず要るのは
+         * 「一周は起きているのか」で、それは数行あれば足りる。
+         * 抜き差しのポーリングは 10 秒で一周するので、出しっぱなしにすると
+         * 長く動かしたときにログが埋まる (2026-08-21 実機で 80 周) */
+        {
+            static uint32_t told;
+            if (told < 4U) {
+                told++;
+                puts("[ring] 枠 255 で Link を書いた ring=0x");
+                puthex(ring_phys);
+                puts(" cycle ");
+                putdec(*cycle);
+                puts(" -> ");
+                putdec((*cycle) ^ 1U);
+                puts(told == 4U ? "  (以降は出さない)\r\n" : "\r\n");
+            }
+        }
+
+        *idx = 0;
+        *cycle ^= 1U;
+    }
+    return at;
+}
+
+static int xhci_ep0_get_device_descriptor(uint8_t slot_id) {
+    if (slot_id == 0 || g_ep0_slot[slot_id].ring_phys == 0 || g_ep0_buf_phys == 0) return -1;
+
+    uint64_t base = g_ep0_slot[slot_id].ring_phys;
+    uint32_t* pidx = &g_ep0_slot[slot_id].enq_idx;
+    uint32_t* pcy  = &g_ep0_slot[slot_id].cycle;
 
     // USB Device Descriptor request (18 bytes):
     // bmRequestType=0x80, bRequest=GET_DESCRIPTOR(6), wValue=0x0100, wIndex=0, wLength=18
@@ -909,30 +1056,22 @@ static int xhci_ep0_get_device_descriptor(uint8_t slot_id) {
     setup |= (uint64_t)0 << 32;
     setup |= (uint64_t)18 << 48;
 
-    // Setup Stage TRB (TRT=IN => 3)
-    ep[idx * 4 + 0] = (uint32_t)(setup & 0xFFFFFFFFU);
-    ep[idx * 4 + 1] = (uint32_t)(setup >> 32);
-    ep[idx * 4 + 2] = 8; // setup packet is 8 bytes
-    ep[idx * 4 + 3] = (2U << 10) | (1U << 6) | (3U << 16) | cycle; // Setup TD: IDT, TRT=IN (CH は立てない)
-
-    // Data Stage TRB (IN, 18 bytes)
-    idx++;
-    ep[idx * 4 + 0] = (uint32_t)(g_ep0_buf_phys & 0xFFFFFFFFU);
-    ep[idx * 4 + 1] = (uint32_t)(g_ep0_buf_phys >> 32);
-    ep[idx * 4 + 2] = 18;
-    ep[idx * 4 + 3] = (3U << 10) | (1U << 16) | cycle; // Data TD: DIR=IN (CH は立てない)
-
-    // Status Stage TRB (OUT status, IOC)
-    idx++;
-    ep[idx * 4 + 0] = 0;
-    ep[idx * 4 + 1] = 0;
-    ep[idx * 4 + 2] = 0;
-    ep[idx * 4 + 3] = (4U << 10) | (1U << 5) | cycle; // Status, IOC
+    /* **1 個ずつ積む。**枠 255 に来たら push がその場で Link を書いて
+     * サイクルを反転する。**TD が Link をまたぐのは許す** */
+    (void)xhci_ring_push(base, pidx, pcy,                      /* Setup: IDT, TRT=IN */
+                         (uint32_t)(setup & 0xFFFFFFFFU),
+                         (uint32_t)(setup >> 32), 8,
+                         (2U << 10) | (1U << 6) | (3U << 16));
+    (void)xhci_ring_push(base, pidx, pcy,                      /* Data: DIR=IN */
+                         (uint32_t)(g_ep0_buf_phys & 0xFFFFFFFFU),
+                         (uint32_t)(g_ep0_buf_phys >> 32), 18,
+                         (3U << 10) | (1U << 16));
+    (void)xhci_ring_push(base, pidx, pcy, 0, 0, 0,             /* Status + IOC */
+                         (4U << 10) | (1U << 5));
 
     USB_MB(); /* TRB を書き終えてからドアベル */
     // Ring EP0 doorbell (DB[slot], target endpoint 1)
     mmio_write32(g_db_regs, (uint32_t)slot_id * 4U, 1U);
-    xhci_ring_enqueue_advance(&g_ep0_enqueue_idx, &g_ep0_cycle, 3);
 
     uint8_t cc = 0xFF;
     uint32_t residual = 0;
@@ -1002,43 +1141,87 @@ static void xhci_dump_dev_ctx(const char* tag, uint64_t out_ctx_phys);
  * MPS を 16 以上にすると Status 段で cc=6 (Stall Error) になり、EP0 が
  * Halted に落ちた** (実機 2026-08-19 の測定)。壊れた 1-TD 構成では
  * short packet の処理が次に進む先を誤る (2026-08-19 codex 相談) */
+static uint32_t g_ep0_seq = 0;
+
+/* 定義は下の「止まった瞬間を丸ごと写す」 */
+static int g_snap_done = 0;
+static void xhci_freeze_snapshot(const char* tag, uint8_t slot_id, uint32_t idx0);
+
+/* **要求 1 つずつに連番を振って出す。**どこまで通ってどこで止まったかを
+ * 後から並べ直せないと、失敗位置の照合ができない (codex 相談 (e)-2)。
+ * 最初の 60 件だけ。以降は静かにする */
+static void ep0_trace(uint8_t slot_id, const char* kind, uint64_t setup, uint32_t idx0) {
+    g_ep0_seq++;
+    if (g_ep0_seq > 60U) return;
+    puts("[ep0] seq="); putdec(g_ep0_seq);
+    puts(" slot="); putdec(slot_id);
+    puts(" "); puts(kind);
+    puts(" bReq=0x"); puthex_n((uint32_t)((setup >> 8) & 0xFFU), 2);
+    puts(" wIndex="); putdec((setup >> 32) & 0xFFFFU);
+    puts(" idx0="); putdec(idx0);
+    puts(" cy="); putdec(g_ep0_slot[slot_id].cycle);
+    puts("\r\n");
+}
+
 static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_phys, uint32_t len) {
-    if (slot_id == 0 || g_ep0_ring_phys == 0 || data_phys == 0 || len == 0 || len > 4096) return -1;
+    if (slot_id == 0 || g_ep0_slot[slot_id].ring_phys == 0 || data_phys == 0 || len == 0 || len > 4096) return -1;
 
-    volatile uint32_t* ep = (volatile uint32_t*)USB_VIRT((void*)g_ep0_ring_phys);
-    uint32_t idx0 = g_ep0_enqueue_idx;
-    uint32_t idx = idx0;
-    uint32_t cycle = g_ep0_cycle & 1U;
+    volatile uint32_t* ep = (volatile uint32_t*)USB_VIRT((void*)g_ep0_slot[slot_id].ring_phys);
+    uint64_t base = g_ep0_slot[slot_id].ring_phys;
+    uint32_t* pidx = &g_ep0_slot[slot_id].enq_idx;
+    uint32_t* pcy  = &g_ep0_slot[slot_id].cycle;
+    uint32_t i_setup, i_data, i_status;
 
-    ep[idx * 4 + 0] = (uint32_t)(setup & 0xFFFFFFFFU);
-    ep[idx * 4 + 1] = (uint32_t)(setup >> 32);
-    ep[idx * 4 + 2] = 8;
-    ep[idx * 4 + 3] = (2U << 10) | (1U << 6) | (3U << 16) | cycle; // Setup TD: IDT, TRT=IN (CH は立てない)
+    /* **1 個ずつ積む。**枠 255 に来たら push がその場で Link を書く。
+     * **書いた枠を覚えておく** — TD が Link をまたぐと i_setup+1 が
+     * Data とは限らないので、落ちたときにどの段かを言えなくなる */
+    i_setup  = xhci_ring_push(base, pidx, pcy,                 /* Setup: IDT, TRT=IN */
+                              (uint32_t)(setup & 0xFFFFFFFFU),
+                              (uint32_t)(setup >> 32), 8,
+                              (2U << 10) | (1U << 6) | (3U << 16));
+    i_data   = xhci_ring_push(base, pidx, pcy,                 /* Data: DIR=IN */
+                              (uint32_t)(data_phys & 0xFFFFFFFFU),
+                              (uint32_t)(data_phys >> 32), len,
+                              (3U << 10) | (1U << 16));
+    i_status = xhci_ring_push(base, pidx, pcy, 0, 0, 0,        /* Status + IOC */
+                              (4U << 10) | (1U << 5));
 
-    idx++;
-    ep[idx * 4 + 0] = (uint32_t)(data_phys & 0xFFFFFFFFU);
-    ep[idx * 4 + 1] = (uint32_t)(data_phys >> 32);
-    ep[idx * 4 + 2] = len;
-    ep[idx * 4 + 3] = (3U << 10) | (1U << 16) | cycle; // Data TD: DIR=IN (CH は立てない)
-
-    idx++;
-    ep[idx * 4 + 0] = 0;
-    ep[idx * 4 + 1] = 0;
-    ep[idx * 4 + 2] = 0;
-    ep[idx * 4 + 3] = (4U << 10) | (1U << 5) | cycle; // Status + IOC
-
+    ep0_trace(slot_id, "IN ", setup, i_setup);
     USB_MB(); /* TRB を書き終えてからドアベル */
     mmio_write32(g_db_regs, (uint32_t)slot_id * 4U, 1U);
-    xhci_ring_enqueue_advance(&g_ep0_enqueue_idx, &g_ep0_cycle, 3);
     uint8_t cc = 0xFF;
     uint32_t residual = 0;
-    if (xhci_poll_transfer_event(slot_id, 1, 0, 8000000, &cc, &residual) < 0) return -2;
+    if (xhci_poll_transfer_event(slot_id, 1, 0, 8000000, &cc, &residual) < 0) {
+        /* **イベントが 1 つも来ないまま待ち切れた。**
+         * ここは長いあいだ無言だった。CC が付く失敗と違って
+         * 「そもそも返ってこない」ことが見えないと切り分けられない */
+        puts("[usb] ep0 IN *** イベントが来ない slot=");
+        putdec(slot_id);
+        puts(" seq=");
+        putdec(g_ep0_seq);
+        puts(" trb=");
+        putdec(i_setup);
+        puts("/");
+        putdec(i_data);
+        puts("/");
+        putdec(i_status);        /* **またいでいれば番号が飛ぶ。**それが見える */
+        puts(" enq=");
+        putdec(g_ep0_slot[slot_id].enq_idx);
+        puts(" cy=");
+        putdec(g_ep0_slot[slot_id].cycle);
+        puts("\r\n");
+        /* **最初の 1 回だけ、直す前に全部写す** */
+        if (!g_snap_done) {
+            g_snap_done = 1;
+            xhci_freeze_snapshot("ep0 IN timeout", slot_id, i_setup);
+        }
+        return -2;
+    }
     if (cc != 1) {
         /* **落ちたときに要るものを 1 か所で全部出す。**
          * どの段で落ちたか (イベントが指す TRB の番地から)、積んだ 3 つの
          * dword3 (CH が落ちているか)、EP0 の状態と取り出し位置。
          * これが無いと「STALL した」以上のことが言えない */
-        uint64_t base = g_ep0_ring_phys;
         puts("[usb] ep0 IN *** cc=");
         putdec(cc);
         puts(" resid=");
@@ -1050,16 +1233,18 @@ static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_ph
         puts(" setup=0x");
         puthex(setup);
         puts("\r\n[usb]   段=");
-        if (g_last_evt_trb == base + (uint64_t)idx0 * 16U)             puts("Setup");
-        else if (g_last_evt_trb == base + (uint64_t)(idx0 + 1U) * 16U) puts("Data");
-        else if (g_last_evt_trb == base + (uint64_t)(idx0 + 2U) * 16U) puts("Status");
-        else                                                          puts("不明");
+        /* **積んだ枠から引く。**TD が Link をまたぐと連番ではなくなるので、
+         * idx0+1 / idx0+2 で当てにいくと段を取り違える */
+        if (g_last_evt_trb == base + (uint64_t)i_setup * 16U)       puts("Setup");
+        else if (g_last_evt_trb == base + (uint64_t)i_data * 16U)   puts("Data");
+        else if (g_last_evt_trb == base + (uint64_t)i_status * 16U) puts("Status");
+        else                                                        puts("不明");
         puts(" evt=0x");
         puthex(g_last_evt_trb);
         puts(" dw3=0x");
-        puthex(ep[idx0 * 4 + 3]); puts(" 0x");
-        puthex(ep[(idx0 + 1U) * 4 + 3]); puts(" 0x");
-        puthex(ep[(idx0 + 2U) * 4 + 3]);
+        puthex(ep[i_setup * 4 + 3]); puts(" 0x");
+        puthex(ep[i_data * 4 + 3]); puts(" 0x");
+        puthex(ep[i_status * 4 + 3]);
         puts("\r\n");
         xhci_dump_dev_ctx("失敗", g_output_ctx_phys);
         return -3;
@@ -1068,26 +1253,22 @@ static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_ph
 }
 
 static int xhci_ep0_control_no_data(uint8_t slot_id, uint64_t setup) {
-    if (slot_id == 0 || g_ep0_ring_phys == 0) return -1;
+    if (slot_id == 0 || g_ep0_slot[slot_id].ring_phys == 0) return -1;
 
-    volatile uint32_t* ep = (volatile uint32_t*)USB_VIRT((void*)g_ep0_ring_phys);
-    uint32_t idx = g_ep0_enqueue_idx;
-    uint32_t cycle = g_ep0_cycle & 1U;
+    uint64_t base = g_ep0_slot[slot_id].ring_phys;
+    uint32_t* pidx = &g_ep0_slot[slot_id].enq_idx;
+    uint32_t* pcy  = &g_ep0_slot[slot_id].cycle;
 
-    ep[idx * 4 + 0] = (uint32_t)(setup & 0xFFFFFFFFU);
-    ep[idx * 4 + 1] = (uint32_t)(setup >> 32);
-    ep[idx * 4 + 2] = 8;
-    ep[idx * 4 + 3] = (2U << 10) | (1U << 6) | cycle; // Setup TD: IDT, TRT=No Data (CH は立てない)
-
-    idx++;
-    ep[idx * 4 + 0] = 0;
-    ep[idx * 4 + 1] = 0;
-    ep[idx * 4 + 2] = 0;
-    ep[idx * 4 + 3] = (4U << 10) | (1U << 5) | (1U << 16) | cycle; // Status IN + IOC
+    /* Setup / Status の 2 つ (データ無し) を 1 個ずつ積む */
+    (void)xhci_ring_push(base, pidx, pcy,                  /* Setup: IDT, TRT=No Data */
+                         (uint32_t)(setup & 0xFFFFFFFFU),
+                         (uint32_t)(setup >> 32), 8,
+                         (2U << 10) | (1U << 6));
+    (void)xhci_ring_push(base, pidx, pcy, 0, 0, 0,         /* Status IN + IOC */
+                         (4U << 10) | (1U << 5) | (1U << 16));
 
     USB_MB(); /* TRB を書き終えてからドアベル */
     mmio_write32(g_db_regs, (uint32_t)slot_id * 4U, 1U);
-    xhci_ring_enqueue_advance(&g_ep0_enqueue_idx, &g_ep0_cycle, 2);
     uint8_t cc = 0xFF;
     uint32_t residual = 0;
     if (xhci_poll_transfer_event(slot_id, 1, 0, 8000000, &cc, &residual) < 0) return -2;
@@ -1145,6 +1326,10 @@ static uint64_t usb_setup_packet(uint8_t bm_request_type, uint8_t b_request,
 #define HUB_PORT_RESET      (1U << 4)
 #define HUB_PORT_LOW_SPEED  (1U << 9)
 #define HUB_PORT_HIGH_SPEED (1U << 10)
+/* **変化ビットは上位 16 ビット側。**GET_STATUS は wPortStatus と
+ * wPortChange を 2 語続けて返し、こちらは 32 ビットに詰めて持っている。
+ * 起動時の実測でも 0x00010101 = 接続あり + 電源 + **接続が変化した** */
+#define HUB_C_PORT_CONNECTION (1U << 16)
 
 static uint8_t g_hub_slot_id = 0;
 static uint8_t g_hub_nbr_ports = 0;
@@ -1156,6 +1341,27 @@ static uint8_t g_hub_nbr_ports = 0;
  *
  * 出力文脈は index 0 = Slot Context / index 1 = EP0 Context。
  * 入力文脈と違って先頭に Input Control Context が無い */
+/* **スロット番号から出力デバイス文脈を引く。**
+ *
+ * g_output_ctx_phys は「最後に Address Device したデバイス」のもので、
+ * ハブ (slot 1) を見たいときにキーボード (slot 2) の文脈を出してしまう。
+ * DCBAA を引けば正しいものが取れる (codex 相談 2026-08-20 (e)-1) */
+static uint64_t xhci_dev_ctx_of(uint8_t slot_id) {
+    volatile uint64_t* dcbaa;
+    if (g_dcbaap_phys == 0 || slot_id == 0) return 0;
+    dcbaa = (volatile uint64_t*)USB_VIRT((void*)g_dcbaap_phys);
+    return dcbaa[slot_id];
+}
+
+/* EP0 の EP State を取る。0=Disabled 1=Running 2=Halted 3=Stopped 4=Error */
+static uint32_t xhci_ep0_state(uint8_t slot_id) {
+    uint64_t ctx = xhci_dev_ctx_of(slot_id);
+    volatile uint32_t* oc;
+    if (!ctx) return 0xFFU;
+    oc = (volatile uint32_t*)USB_VIRT((void*)ctx);
+    return oc[(g_xhci_ctx_size / 4U) + 0] & 7U;
+}
+
 static void xhci_dump_dev_ctx(const char* tag, uint64_t out_ctx_phys) {
     volatile uint32_t* oc;
     uint32_t stride_dw = g_xhci_ctx_size / 4U;
@@ -1207,6 +1413,118 @@ static void xhci_dump_dev_ctx(const char* tag, uint64_t out_ctx_phys) {
     puts("\r\n");
 }
 
+
+/* ---- 止まった瞬間を丸ごと写す ----------------------------------------------
+ *
+ * **recovery より前に、一度だけ。**recovery はリングを作り直すので、
+ * 最初に壊れた状態を消してしまう。1 回の電源投入で最大の情報を取るには
+ * 「最初の timeout を凍らせてから直す」しかない (codex 相談 2026-08-20 (e))。
+ *
+ * 出すもの:
+ *   1. DCBAA から引いた slot の EP0 文脈 (EP State / TR Dequeue / DCS)
+ *   2. こちら側のリングの状態と、積んだ 3 つの TRB の生 dword
+ *   3. イベントリングの取り出し位置と、そこから 8 個の生 TRB
+ *   4. 置き場の中身と各カウンタ
+ *   5. USBSTS / USBCMD / IMAN / ERDP / ERSTBA / ERSTSZ / CRCR */
+static void xhci_freeze_snapshot(const char* tag, uint8_t slot_id, uint32_t idx0) {
+    uint64_t ring = g_ep0_slot[slot_id].ring_phys;
+    uint32_t i;
+
+    puts("\r\n===== [snap] "); puts(tag);
+    puts(" slot="); putdec(slot_id);
+    puts(" =====\r\n");
+
+    /* 1. EP0 文脈 (DCBAA から引く) */
+    xhci_dump_dev_ctx("snap", xhci_dev_ctx_of(slot_id));
+
+    /* 2. こちら側のリングと、積んだ TRB */
+    puts("[snap] ring=0x"); puthex(ring);
+    puts(" idx0="); putdec(idx0);
+    puts(" enq="); putdec(g_ep0_slot[slot_id].enq_idx);
+    puts(" cycle="); putdec(g_ep0_slot[slot_id].cycle);
+    puts("\r\n");
+    if (ring) {
+        volatile uint32_t* r = (volatile uint32_t*)USB_VIRT((void*)ring);
+        for (i = 0; i < 3U; i++) {
+            uint32_t t = (idx0 + i) % 255U;
+            puts("[snap] trb["); putdec(t); puts("] 0x");
+            puthex(r[t * 4 + 0]); puts(" 0x");
+            puthex(r[t * 4 + 1]); puts(" 0x");
+            puthex(r[t * 4 + 2]); puts(" 0x");
+            puthex(r[t * 4 + 3]); puts("\r\n");
+        }
+        /* **終端の手前 8 個。**飛び越したときに書かれずに残る隙間が
+         * ここに当たる。サイクルビットが xHC の CCS と違えば、
+         * xHC はそこで止まって Link まで到達しない */
+        for (i = 248U; i <= 255U; i++) {
+            puts("[snap] tail["); putdec(i); puts("] 0x");
+            puthex(r[i * 4 + 0]); puts(" 0x");
+            puthex(r[i * 4 + 3]);
+            puts(" type="); putdec((r[i * 4 + 3] >> 10) & 0x3FU);
+            puts(" cy="); putdec(r[i * 4 + 3] & 1U);
+            puts("\r\n");
+        }
+    }
+
+    /* 3. イベントリングの生データ */
+    puts("[snap] evt idx="); putdec(g_evt_dequeue_idx);
+    puts(" cycle="); putdec(g_evt_cycle);
+    puts(" ring=0x"); puthex(g_event_ring_phys);
+    puts("\r\n");
+    if (g_event_ring_phys) {
+        volatile uint32_t* e = (volatile uint32_t*)USB_VIRT((void*)g_event_ring_phys);
+        for (i = 0; i < 8U; i++) {
+            uint32_t t = (g_evt_dequeue_idx + i) % XHCI_EVT_RING_TRBS;
+            puts("[snap] evt["); putdec(t); puts("] 0x");
+            puthex(e[t * 4 + 0]); puts(" 0x");
+            puthex(e[t * 4 + 1]); puts(" 0x");
+            puthex(e[t * 4 + 2]); puts(" 0x");
+            puthex(e[t * 4 + 3]);
+            puts(" type="); putdec((e[t * 4 + 3] >> 10) & 0x3FU);
+            puts(" cy="); putdec(e[t * 4 + 3] & 1U);
+            puts("\r\n");
+        }
+    }
+
+    /* 4. 置き場 */
+    puts("[snap] stash count="); putdec(g_evt_stash_count);
+    puts(" peak="); putdec(g_evt_stash_peak);
+    puts(" drop="); putdec(g_evt_stash_dropped);
+    puts(" pscd="); putdec(g_evt_pscd_count);
+    puts("\r\n");
+    for (i = 0; i < g_evt_stash_count; i++) {
+        uint32_t k = (g_evt_stash_head + i) % XHCI_EVT_STASH_CAP;
+        puts("[snap] stash["); putdec(i); puts("] type=");
+        putdec((g_evt_stash[k].d[3] >> 10) & 0x3FU);
+        puts(" slot="); putdec((g_evt_stash[k].d[3] >> 24) & 0xFFU);
+        puts(" ep="); putdec((g_evt_stash[k].d[3] >> 16) & 0x1FU);
+        puts(" cc="); putdec((g_evt_stash[k].d[2] >> 24) & 0xFFU);
+        puts("\r\n");
+    }
+
+    /* 5. レジスタ */
+    if (g_op_regs) {
+        uint32_t sts = mmio_read32(g_op_regs, 0x04);
+        puts("[snap] usbcmd=0x"); puthex(mmio_read32(g_op_regs, 0x00));
+        puts(" usbsts=0x"); puthex(sts);
+        puts(" hch="); putdec(sts & 1U);
+        puts(" hse="); putdec((sts >> 2) & 1U);
+        puts(" eint="); putdec((sts >> 3) & 1U);
+        puts(" hce="); putdec((sts >> 12) & 1U);
+        puts(" cnr="); putdec((sts >> 11) & 1U);
+        puts("\r\n[snap] crcr=0x"); puthex(mmio_read32(g_op_regs, 0x18));
+        puts("\r\n");
+    }
+    if (g_rt_regs) {
+        puts("[snap] iman=0x"); puthex(mmio_read32(g_rt_regs, 0x20 + 0x00));
+        puts(" erstsz=0x"); puthex(mmio_read32(g_rt_regs, 0x20 + 0x08));
+        puts(" erstba=0x"); puthex(mmio_read32(g_rt_regs, 0x20 + 0x10));
+        puts(" erdp=0x"); puthex(mmio_read32(g_rt_regs, 0x20 + 0x18));
+        puts("\r\n");
+    }
+    puts("===== [snap] おわり =====\r\n");
+}
+
 /* ---- EP0 が STALL したときの復帰 -------------------------------------------
  *
  * **STALL (cc=6) を受けると EP0 は Halted になり、以後の転送は完了イベントを
@@ -1219,25 +1537,62 @@ static void xhci_dump_dev_ctx(const char* tag, uint64_t out_ctx_phys) {
 static int xhci_ep0_recover_stall(uint8_t slot_id) {
     uint64_t cmd_ptr;
     uint8_t cc = 0xFF, slot = 0;
-    if (slot_id == 0 || g_ep0_ring_phys == 0) return -1;
+    if (slot_id == 0 || g_ep0_slot[slot_id].ring_phys == 0) return -1;
 
-    cmd_ptr = xhci_cmd_submit(0, 0, 0,
-                              (14U << 10) | (1U << 16) | ((uint32_t)slot_id << 24));
-    if (!cmd_ptr) return -2;
-    if (xhci_wait_cmd_completion(cmd_ptr, slot_id, &cc, &slot) < 0) return -3;
-    if (cc != 1) return -4;
+    /* **直す前後の EP 状態と、各コマンドの完了コードを必ず残す。**
+     * Reset Endpoint は Halted のときしか成功しない (それ以外は
+     * Context State Error)。握り潰すと「直そうとして何もしなかった」が
+     * ログから消える (codex 相談 (c)) */
+    /* **状態で使うコマンドが違う。**
+     *   Halted  → Reset Endpoint で落としてから Set TR Dequeue
+     *   Running → Stop Endpoint で止めてから Set TR Dequeue
+     *   Stopped / Error → そのまま Set TR Dequeue
+     * Reset Endpoint は Halted 以外だと Context State Error (cc=19) で
+     * 何も起きない。今まで Running で詰まったときに「直そうとして何も
+     * していなかった」(codex 相談 2026-08-20 (c)/(e)) */
+    {
+        uint32_t st = xhci_ep0_state(slot_id);
+        uint32_t type;
+        puts("[recov] slot="); putdec(slot_id);
+        puts(" epstate="); putdec(st);
+        puts(st == 1U ? " (Running → Stop Endpoint)\r\n" :
+             st == 2U ? " (Halted → Reset Endpoint)\r\n" :
+                        " (Stopped/Error → そのまま Set TR Dequeue)\r\n");
 
-    xhci_ring_reset(g_ep0_ring_phys);
-    g_ep0_enqueue_idx = 0;
-    g_ep0_cycle = 1;
+        if (st == 1U || st == 2U) {
+            /* 15 = Stop Endpoint / 14 = Reset Endpoint */
+            type = (st == 2U) ? 14U : 15U;
+            cmd_ptr = xhci_cmd_submit(0, 0, 0,
+                                      (type << 10) | (1U << 16) | ((uint32_t)slot_id << 24));
+            if (!cmd_ptr) return -2;
+            if (xhci_wait_cmd_completion(cmd_ptr, slot_id, &cc, &slot) < 0) {
+                puts("[recov] 完了イベントが来ない\r\n");
+                return -3;
+            }
+            puts(st == 2U ? "[recov] Reset Endpoint cc=" : "[recov] Stop Endpoint cc=");
+            putdec(cc);
+            puts(cc == 1 ? "  ok\r\n" : "  *** 失敗 (19=Context State Error)\r\n");
+            if (cc != 1) return -4;
+        }
+    }
+
+    xhci_ring_reset(g_ep0_slot[slot_id].ring_phys);
+    g_ep0_slot[slot_id].enq_idx = 0;
+    g_ep0_slot[slot_id].cycle = 1;
     USB_MB();
 
     cc = 0xFF;
-    cmd_ptr = xhci_cmd_submit((uint32_t)((g_ep0_ring_phys & ~0xFULL) | 1ULL),
-                              (uint32_t)(g_ep0_ring_phys >> 32), 0,
+    cmd_ptr = xhci_cmd_submit((uint32_t)((g_ep0_slot[slot_id].ring_phys & ~0xFULL) | 1ULL),
+                              (uint32_t)(g_ep0_slot[slot_id].ring_phys >> 32), 0,
                               (16U << 10) | (1U << 16) | ((uint32_t)slot_id << 24));
     if (!cmd_ptr) return -5;
-    if (xhci_wait_cmd_completion(cmd_ptr, slot_id, &cc, &slot) < 0) return -6;
+    if (xhci_wait_cmd_completion(cmd_ptr, slot_id, &cc, &slot) < 0) {
+        puts("[recov] Set TR Dequeue 完了イベントが来ない\r\n");
+        return -6;
+    }
+    puts("[recov] Set TR Dequeue cc="); putdec(cc);
+    puts(cc == 1 ? "  ok\r\n" : "  *** 失敗\r\n");
+    xhci_dump_dev_ctx("recov-post", xhci_dev_ctx_of(slot_id));
     return (cc == 1) ? 0 : -7;
 }
 
@@ -1590,8 +1945,8 @@ static int xhci_setup_bulk_endpoints(uint8_t slot_id) {
         uint32_t off = xhci_ctx_offset_dw(1);
         ic[off + 0] = 0;
         ic[off + 1] = (4U << 3) | ((uint32_t)g_usb_ep0_mps << 16);
-        ic[off + 2] = (uint32_t)((g_ep0_ring_phys & ~0xFULL) | 1U);
-        ic[off + 3] = (uint32_t)(g_ep0_ring_phys >> 32);
+        ic[off + 2] = (uint32_t)((g_ep0_slot[slot_id].ring_phys & ~0xFULL) | 1U);
+        ic[off + 3] = (uint32_t)(g_ep0_slot[slot_id].ring_phys >> 32);
         ic[off + 4] = 8;
     }
 
@@ -1651,7 +2006,7 @@ static int xhci_bulk_transfer_ex(uint8_t slot_id, uint8_t dci, uint64_t ring_phy
 
     USB_MB(); /* TRB を書き終えてからドアベル */
     mmio_write32(g_db_regs, (uint32_t)slot_id * 4U, dci);
-    xhci_ring_enqueue_advance(idx, cycle, 1);
+    xhci_ring_enqueue_advance(ring_phys, idx, cycle, 1);
     uint8_t cc = 0xFF;
     uint32_t residual = 0;
     if (xhci_poll_transfer_event(slot_id, dci, trb_phys, 8000000, &cc, &residual) < 0) return -2;
@@ -1719,8 +2074,8 @@ static int xhci_setup_interrupt_endpoint(uint8_t slot_id) {
         uint32_t off = xhci_ctx_offset_dw(1);
         ic[off + 0] = 0;
         ic[off + 1] = (4U << 3) | ((uint32_t)g_usb_ep0_mps << 16);
-        ic[off + 2] = (uint32_t)((g_ep0_ring_phys & ~0xFULL) | 1U);
-        ic[off + 3] = (uint32_t)(g_ep0_ring_phys >> 32);
+        ic[off + 2] = (uint32_t)((g_ep0_slot[slot_id].ring_phys & ~0xFULL) | 1U);
+        ic[off + 3] = (uint32_t)(g_ep0_slot[slot_id].ring_phys >> 32);
         ic[off + 4] = 8;
     }
 
@@ -1802,6 +2157,8 @@ int usb_hid_keyboard_poll(uint8_t report[8]) {
     uint8_t cc = 0xFF;
     uint32_t residual = 0;
     if (!g_usb_kbd_ready || !report) return -1;
+    /* **抜き差しの確認中は触らない。**イベントリングを取り合うと壊れる */
+    if (g_usb_busy) return 1;
 
     if (!g_int_outstanding) {
         volatile uint32_t* ring = (volatile uint32_t*)USB_VIRT((void*)g_int_ring_phys);
@@ -1814,7 +2171,7 @@ int usb_hid_keyboard_poll(uint8_t report[8]) {
         ring[trb * 4 + 3] = (1U << 10) | (1U << 5) | pcs;   /* Normal TRB + IOC */
         USB_MB(); /* TRB を書き終えてからドアベル */
         mmio_write32(g_db_regs, (uint32_t)g_xhci_slot_id * 4U, g_usb_int_in_dci);
-        xhci_ring_enqueue_advance(&g_int_enqueue_idx, &g_int_cycle, 1);
+        xhci_ring_enqueue_advance(g_int_ring_phys, &g_int_enqueue_idx, &g_int_cycle, 1);
         g_int_outstanding = 1;
     }
 
@@ -2310,6 +2667,335 @@ static int xhci_port_reset(volatile uint8_t* op, uint8_t port) {
     return (portsc & PORTSC_PED) ? 0 : -1;
 }
 
+/* ---- ハブの先のデバイスを掴む ---------------------------------------------
+ *
+ * **起動時の列挙と、抜き差しでの再列挙の両方から呼ぶ。**呼ぶ側は
+ * 「ハブの何番ポートに、どの速度の何かが居る」ところまでを確かめてから
+ * 渡す (usb_hub_find_device / 抜き差しの検出)。
+ *
+ * 中身は usb_init() に埋まっていたものをそのまま移した。**入れ子も含めて
+ * ロジックは変えていない** — 再列挙の入口を作るのが目的で、動きを変えると
+ * 退行したときに切り分けられなくなる。
+ *
+ * 成功すると g_xhci_slot_id がそのデバイスを指す。
+ * 戻り値: 0 = 掴めた / -1 = だめだった */
+static int usb_hub_attach_port(uint8_t hub_slot, uint8_t hub_port, uint32_t dev_speed) {
+    int rc = -1;
+    uint8_t dev_slot = 0;
+    /* 高速ハブの先の低速/全速デバイスは TT が要る */
+    uint8_t tt_slot = (dev_speed < 3) ? hub_slot : 0;
+    uint8_t tt_port = (dev_speed < 3) ? hub_port : 0;
+
+    if (xhci_cmd_enable_slot(&dev_slot) == 0) {
+        uint32_t route = (uint32_t)hub_port & 0xFU; /* Route String 1 段目 */
+        int ad2 = xhci_cmd_address_device_full(
+            dev_slot, g_xhci_port_id, route,
+            dev_speed, tt_slot, tt_port, 0);
+        puts("[usb] hub 先 Address Device slot=");
+        putdec(dev_slot);
+        puts(" port=");
+        putdec(hub_port);
+        puts(" speed=");
+        putdec(dev_speed);
+        if (ad2 == 0) {
+            g_xhci_slot_id = dev_slot;
+            rc = 0;
+            puts("  ok\r\n");
+
+            /* ---- 全速の相手は EP0 の MPS を後から入れ替える ----
+             *
+             * **EP0 の最大パケット長は繋いでみるまで
+             * 分からない** (8/16/32/64)。8 と決め打ちで
+             * 先頭 8 バイトだけ読んで確かめ、
+             * **Evaluate Context (A1) で入れ替える。**
+             * 高速以上は 64 で一意に決まるので要らない。
+             *
+             * **8 バイトで打ち切ることは相手を壊さない。**
+             * wLength=8 と言って 8 バイト受け取るのは
+             * 標準的な列挙手順で、Linux の hub_port_init()
+             * も同じことをする。
+             *
+             * **ポートを再リセットしてやり直す必要も無い。**
+             * 以前ここにあった再リセットの経路は、
+             * 原因が制御転送の TD の作り方だと分かった時点で
+             * 消した (2026-08-19) */
+            if (dev_speed < 3U) {
+                memzero(USB_VIRT((void*)g_ep0_buf_phys), 16);
+                if (xhci_ep0_control_in(
+                        dev_slot,
+                        usb_setup_packet(0x80, 0x06, 0x0100, 0, 8),
+                        g_ep0_buf_phys, 8) == 0) {
+                    volatile uint8_t* d =
+                        (volatile uint8_t*)USB_VIRT((void*)g_ep0_buf_phys);
+                    uint32_t m = d[7]; /* bMaxPacketSize0 */
+                    /* **読めた 8 バイトをそのまま出す。**
+                     * bMaxPacketSize0 が本物かどうかは、
+                     * bLength=18 / bDescriptorType=1 が
+                     * 揃っているかを見ないと言えない */
+                    {
+                        uint32_t k;
+                        puts("[usb] dev desc[0..7]");
+                        for (k = 0; k < 8U; k++) {
+                            puts(" ");
+                            puthex_byte(d[k]);
+                        }
+                        puts("\r\n");
+                    }
+                    if (d[1] != 1 ||
+                        (m != 8 && m != 16 && m != 32 && m != 64)) {
+                        puts("[usb] 先頭 8 バイトが記述子でない\r\n");
+                    } else if (m != g_usb_ep0_mps) {
+                        int er = xhci_cmd_evaluate_context_mps(dev_slot, m);
+                        puts("[usb] ep0 mps ");
+                        putdec(g_usb_ep0_mps);
+                        puts(" -> ");
+                        putdec(m);
+                        puts(er == 0 ? "  ok\r\n" : "  *** 失敗\r\n");
+                        if (er == 0) g_usb_ep0_mps = (uint16_t)m;
+                    }
+                }
+            }
+
+            /* **記述子を読む前に Configure Endpoint は要らない。**
+             * Address Device が通った時点で EP0 は Running。
+             * ハブと違ってポート要求を出すわけでもないので、
+             * Configured へ進める理由が無い (2026-08-18 codex 相談) */
+            int gd2 = xhci_ep0_get_device_descriptor_retry(dev_slot, 3);
+            puts("[usb] hub 先 GET_DESCRIPTOR(Device) ");
+            if (gd2 == 0) {
+                puts("OK vid=0x");
+                puthex_n(g_usb_vid, 4);
+                puts(" pid=0x");
+                puthex_n(g_usb_pid, 4);
+                puts(" class=0x");
+                puthex_n(g_usb_dev_class, 2);
+                puts("\r\n");
+            } else {
+                puts("failed code=");
+                putdec((uint64_t)(uint32_t)(-gd2));
+                puts("\r\n");
+            }
+        } else {
+            puts("  *** 失敗 code=");
+            putdec((uint64_t)(uint32_t)(-ad2));
+            puts("\r\n");
+        }
+    }
+    return rc;
+}
+
+/* ---- 抜き差し (B-1) -------------------------------------------------------
+ *
+ * ハブの各ポートに GET_STATUS を投げ、**bit16 C_PORT_CONNECTION** が
+ * 立っていれば「前に見たときから変わった」。落としてから、接続なら
+ * 列挙し、切断ならスロットを返す。
+ *
+ * **タイマ割り込みからは呼べない。**制御転送は 1 回 ms 単位かかり、
+ * aarch64_kbd_tick() はタイマ IRQ から呼ばれている。task_idle_loop()
+ * から、**500ms に 1 回**に絞って呼ぶ (kernel/sched.c)。
+ *
+ * **キーボードのイベントと同じリングを使う。**usb_hid_keyboard_poll()
+ * は割り込み TRB を積んだまま戻るので、ここで制御転送を投げている間に
+ * キーのイベントが来る。捨てないための土台が B-1a の置き場 */
+static uint64_t g_hub_poll_next_ms = 0;
+static uint8_t  g_hub_dev_port = 0;    /* いま掴んでいるハブのポート。0 = 無し */
+static uint32_t g_hub_poll_count = 0;
+static int      g_hub_scan_told = 0;
+static int      g_hub_poll_announced = 0;
+/* **前回見えていた接続の有無。**変化ビット (C_PORT_CONNECTION) に頼らず、
+ * 接続そのものの変わり目で判断する。ビットの位置を読み違えていても
+ * 取りこぼさない */
+#define HUB_MAX_PORTS 16
+static uint8_t  g_hub_port_conn[HUB_MAX_PORTS + 1];
+static uint32_t g_hub_attach_count = 0;
+static uint32_t g_hub_detach_count = 0;
+
+/* 掴んでいたデバイスを手放す。**スロットを返して、キーボードを止める** */
+static void usb_hotplug_release(void) {
+    uint8_t slot = g_xhci_slot_id;
+
+    g_usb_kbd_ready = 0;
+    g_int_outstanding = 0;      /* 積んだままの TRB は相手ごと消えた */
+    g_usb_hid_if_ready = 0;
+    g_hub_dev_port = 0;
+
+    if (slot != 0 && slot != g_hub_slot_id) {
+        int dr = xhci_cmd_disable_slot(slot);
+        puts("[usb] hotplug: slot ");
+        putdec(slot);
+        puts(dr == 0 ? " を返した\r\n" : " を返せなかった\r\n");
+        /* **返したスロットの EP0 リングも忘れる。**残しておくと、
+         * 同じ番号が再び割り当てられたときに古いリングを使ってしまう */
+        g_ep0_slot[slot].ring_phys = 0;
+        g_ep0_slot[slot].enq_idx = 0;
+        g_ep0_slot[slot].cycle = 1;
+    }
+    /* **ハブ自身のスロットに戻す。**制御転送の宛先が無いと次が投げられない */
+    g_xhci_slot_id = g_hub_slot_id;
+}
+
+void usb_hotplug_poll(void) {
+    uint8_t p;
+    uint64_t now;
+
+    g_hub_poll_count++;
+
+    /* **1 回目は必ず、ガードより前に言う。**ガードの後ろに置くと
+     * 「呼ばれていない」と「ガードで弾かれている」が区別できない
+     * (2026-08-20 codex 相談 (d)) */
+    if (!g_hub_poll_announced) {
+        g_hub_poll_announced = 1;
+        puts("[usb] hotplug: 入った ready=");
+        putdec(g_usb_ready ? 1U : 0U);
+        puts(" hub_slot=");
+        putdec(g_hub_slot_id);
+        puts(" ports=");
+        putdec(g_hub_nbr_ports);
+        puts(" dev_port=");
+        putdec(g_hub_dev_port);
+        puts("\r\n");
+    }
+
+    if (!g_usb_ready || g_hub_slot_id == 0 || g_hub_nbr_ports == 0) {
+        /* **弾かれた理由も 1 回だけ出す** */
+        static int told;
+        if (!told) {
+            told = 1;
+            puts("[usb] hotplug: ガードで戻った ready=");
+            putdec(g_usb_ready ? 1U : 0U);
+            puts(" hub_slot=");
+            putdec(g_hub_slot_id);
+            puts(" ports=");
+            putdec(g_hub_nbr_ports);
+            puts("\r\n");
+        }
+        return;
+    }
+
+    now = USB_NOW_MS();
+    if (now < g_hub_poll_next_ms) return;
+    g_hub_poll_next_ms = now + 500ULL;
+
+    g_usb_busy = 1;
+    for (p = 1; p <= g_hub_nbr_ports && p <= HUB_MAX_PORTS; p++) {
+        uint32_t st = 0;
+        uint8_t now_conn;
+        int changed;
+        int rc = usb_hub_get_port_status(g_hub_slot_id, p, &st);
+
+        /* **最初の 1 巡だけ、4 ポート全部の結果を出す。**
+         * 失敗を continue で流していたので、GET_STATUS が通っているのか
+         * どうかすら分からなかった */
+        if (!g_hub_scan_told) {
+            puts("[usb] hotplug: scan port ");
+            putdec(p);
+            puts(" rc=");
+            putdec((uint64_t)(uint32_t)(-rc));
+            puts(" st=0x");
+            puthex(st);
+            puts("\r\n");
+            if (p >= g_hub_nbr_ports || p >= HUB_MAX_PORTS) g_hub_scan_told = 1;
+        }
+
+        if (rc < 0) {
+            /* **失敗したら 1 巡を打ち切って間を空ける。**4 ポートぶん
+             * 待ち切ると 500ms ごとに長々と回ることになる */
+            g_hub_poll_next_ms = USB_NOW_MS() + 2000ULL;
+            break;
+        }
+
+        /* **変化ビットは立っていたら落とす。**落とさないと立ったままになる。
+         * ただし判断はこれに頼らない (下の接続の変わり目で見る) */
+        changed = (st & HUB_C_PORT_CONNECTION) ? 1 : 0;
+        if (changed) {
+            (void)usb_hub_port_feature(g_hub_slot_id, p, HUB_FEAT_C_CONNECTION, 0);
+        }
+
+        now_conn = (st & HUB_PORT_CONNECTION) ? 1U : 0U;
+        if (now_conn == g_hub_port_conn[p]) {
+            /* **接続ビットが同じでも、変化ビットが立っていたら動きがあった。**
+             * 500ms の間に「抜く→挿す」が終わると接続は元に戻るが、
+             * 掴んでいるスロットと積んだままの TRB は相手ごと消えている。
+             * 掴んでいるポートなら作り直す (codex 相談 (b)) */
+            if (!changed || p != g_hub_dev_port) continue;
+            puts("[usb] hotplug: port ");
+            putdec(p);
+            puts(" 挿し直された (接続ビットは変わらず)\r\n");
+            usb_hotplug_release();
+            g_hub_detach_count++;
+            /* このまま下の「挿された」経路へ落とす */
+        }
+        g_hub_port_conn[p] = now_conn;
+
+        puts("[usb] hotplug: port ");
+        putdec(p);
+        puts(now_conn ? " に挿された status=0x" : " から抜かれた status=0x");
+        puthex(st);
+        puts("\r\n");
+
+        if (!now_conn) {
+            if (g_hub_dev_port == p) {
+                usb_hotplug_release();
+                g_hub_detach_count++;
+            }
+            continue;
+        }
+
+        /* ---- 挿された ---------------------------------------------------- */
+
+        /* **前のものが残っていたら先に手放す。**同じポートに挿し直された
+         * ときは、抜けたことに気付かないまま挿入だけ見えることがある */
+        if (g_hub_dev_port != 0) usb_hotplug_release();
+
+        /* リセットして有効にする。**接続だけでは Address Device は通らない** */
+        {
+            uint32_t rst = 0;
+            (void)usb_hub_reset_port(g_hub_slot_id, p, &rst);
+            puts("[usb] hotplug: port ");
+            putdec(p);
+            puts(" reset -> status=0x");
+            puthex(rst);
+            puts((rst & HUB_PORT_ENABLE) ? "  有効になった\r\n"
+                                         : "  *** 有効にならなかった\r\n");
+            if (!(rst & HUB_PORT_ENABLE)) continue;
+            st = rst;
+        }
+
+        {
+            uint32_t sp = (st & HUB_PORT_LOW_SPEED)  ? 2U :
+                          (st & HUB_PORT_HIGH_SPEED) ? 3U : 1U;
+            if (usb_hub_attach_port(g_hub_slot_id, p, sp) != 0) {
+                puts("[usb] hotplug: 掴めなかった\r\n");
+                g_xhci_slot_id = g_hub_slot_id;
+                continue;
+            }
+        }
+
+        g_hub_dev_port = p;
+        g_hub_attach_count++;
+
+        /* 設定記述子を読んで HID を繋ぐ。**起動時と同じ手順** */
+        if (xhci_ep0_get_config_descriptor(g_xhci_slot_id) == 0 && g_usb_hid_if_ready) {
+            int hk = usb_hid_keyboard_init();
+            puts("[usb] hotplug: HID keyboard ");
+            if (hk == 0) {
+                puts("ok ep=0x");
+                puthex_n(g_usb_int_in_ep, 2);
+                puts(" dci=");
+                putdec(g_usb_int_in_dci);
+                puts("\r\n");
+            } else {
+                puts("*** 失敗 code=");
+                putdec((uint64_t)(uint32_t)(-hk));
+                puts("\r\n");
+            }
+        } else {
+            puts("[usb] hotplug: 設定記述子が読めない / HID ではない\r\n");
+        }
+    }
+    g_usb_busy = 0;
+}
+
 void usb_init(void) {
     g_usb_ready = 0;
     g_usb_mass_ready = 0;
@@ -2577,103 +3263,12 @@ void usb_init(void) {
                             }
 
                             if (usb_hub_find_device(g_hub_slot_id, nbr, &hub_port, &dev_speed) == 0) {
-                                uint8_t dev_slot = 0;
-                                /* 高速ハブの先の低速/全速デバイスは TT が要る */
-                                uint8_t tt_slot = (dev_speed < 3) ? g_hub_slot_id : 0;
-                                uint8_t tt_port = (dev_speed < 3) ? hub_port : 0;
-
-                                if (xhci_cmd_enable_slot(&dev_slot) == 0) {
-                                    uint32_t route = (uint32_t)hub_port & 0xFU; /* Route String 1 段目 */
-                                    int ad2 = xhci_cmd_address_device_full(
-                                        dev_slot, g_xhci_port_id, route,
-                                        dev_speed, tt_slot, tt_port, 0);
-                                    puts("[usb] hub 先 Address Device slot=");
-                                    putdec(dev_slot);
-                                    puts(" port=");
-                                    putdec(hub_port);
-                                    puts(" speed=");
-                                    putdec(dev_speed);
-                                    if (ad2 == 0) {
-                                        g_xhci_slot_id = dev_slot;
-                                        puts("  ok\r\n");
-
-                                        /* ---- 全速の相手は EP0 の MPS を後から入れ替える ----
-                                         *
-                                         * **EP0 の最大パケット長は繋いでみるまで
-                                         * 分からない** (8/16/32/64)。8 と決め打ちで
-                                         * 先頭 8 バイトだけ読んで確かめ、
-                                         * **Evaluate Context (A1) で入れ替える。**
-                                         * 高速以上は 64 で一意に決まるので要らない。
-                                         *
-                                         * **8 バイトで打ち切ることは相手を壊さない。**
-                                         * wLength=8 と言って 8 バイト受け取るのは
-                                         * 標準的な列挙手順で、Linux の hub_port_init()
-                                         * も同じことをする。
-                                         *
-                                         * **ポートを再リセットしてやり直す必要も無い。**
-                                         * 以前ここにあった再リセットの経路は、
-                                         * 原因が制御転送の TD の作り方だと分かった時点で
-                                         * 消した (2026-08-19) */
-                                        if (dev_speed < 3U) {
-                                            memzero(USB_VIRT((void*)g_ep0_buf_phys), 16);
-                                            if (xhci_ep0_control_in(
-                                                    dev_slot,
-                                                    usb_setup_packet(0x80, 0x06, 0x0100, 0, 8),
-                                                    g_ep0_buf_phys, 8) == 0) {
-                                                volatile uint8_t* d =
-                                                    (volatile uint8_t*)USB_VIRT((void*)g_ep0_buf_phys);
-                                                uint32_t m = d[7]; /* bMaxPacketSize0 */
-                                                /* **読めた 8 バイトをそのまま出す。**
-                                                 * bMaxPacketSize0 が本物かどうかは、
-                                                 * bLength=18 / bDescriptorType=1 が
-                                                 * 揃っているかを見ないと言えない */
-                                                {
-                                                    uint32_t k;
-                                                    puts("[usb] dev desc[0..7]");
-                                                    for (k = 0; k < 8U; k++) {
-                                                        puts(" ");
-                                                        puthex_byte(d[k]);
-                                                    }
-                                                    puts("\r\n");
-                                                }
-                                                if (d[1] != 1 ||
-                                                    (m != 8 && m != 16 && m != 32 && m != 64)) {
-                                                    puts("[usb] 先頭 8 バイトが記述子でない\r\n");
-                                                } else if (m != g_usb_ep0_mps) {
-                                                    int er = xhci_cmd_evaluate_context_mps(dev_slot, m);
-                                                    puts("[usb] ep0 mps ");
-                                                    putdec(g_usb_ep0_mps);
-                                                    puts(" -> ");
-                                                    putdec(m);
-                                                    puts(er == 0 ? "  ok\r\n" : "  *** 失敗\r\n");
-                                                    if (er == 0) g_usb_ep0_mps = (uint16_t)m;
-                                                }
-                                            }
-                                        }
-
-                                        /* **記述子を読む前に Configure Endpoint は要らない。**
-                                         * Address Device が通った時点で EP0 は Running。
-                                         * ハブと違ってポート要求を出すわけでもないので、
-                                         * Configured へ進める理由が無い (2026-08-18 codex 相談) */
-                                        int gd2 = xhci_ep0_get_device_descriptor_retry(dev_slot, 3);
-                                        puts("[usb] hub 先 GET_DESCRIPTOR(Device) ");
-                                        if (gd2 == 0) {
-                                            puts("OK vid=0x");
-                                            puthex_n(g_usb_vid, 4);
-                                            puts(" pid=0x");
-                                            puthex_n(g_usb_pid, 4);
-                                            puts(" class=0x");
-                                            puthex_n(g_usb_dev_class, 2);
-                                            puts("\r\n");
-                                        } else {
-                                            puts("failed code=");
-                                            putdec((uint64_t)(uint32_t)(-gd2));
-                                            puts("\r\n");
-                                        }
-                                    } else {
-                                        puts("  *** 失敗 code=");
-                                        putdec((uint64_t)(uint32_t)(-ad2));
-                                        puts("\r\n");
+                                if (usb_hub_attach_port(g_hub_slot_id, hub_port, dev_speed) == 0) {
+                                    /* **抜かれたことに気付けるよう、掴んだ
+                                     * ポートを覚えておく** (B-1) */
+                                    g_hub_dev_port = hub_port;
+                                    if (hub_port <= HUB_MAX_PORTS) {
+                                        g_hub_port_conn[hub_port] = 1;
                                     }
                                 }
                             } else {
@@ -2869,12 +3464,22 @@ void usb_init(void) {
     puts(" bot=");
     puts(g_usb_msc_bot_ready ? "ok" : "fail");
     /* **イベントの置き場の使われ方。**溢れていれば取りこぼしている */
+    puts(" hotplug=");
+    putdec(g_hub_poll_count);
+    puts("poll/");
+    putdec(g_hub_attach_count);
+    puts("in/");
+    putdec(g_hub_detach_count);
+    puts("out port=");
+    putdec(g_hub_dev_port);
     puts(" evtstash=");
     putdec(g_evt_stash_count);
     puts("/peak=");
     putdec(g_evt_stash_peak);
     puts("/drop=");
     putdec(g_evt_stash_dropped);
+    puts("/pscd=");
+    putdec(g_evt_pscd_count);
     puts(" slot=");
     putdec(g_xhci_slot_id);
     puts(" port=");
@@ -2908,12 +3513,22 @@ void usb_dump_status(void) {
     puts(" bot=");
     puts(g_usb_msc_bot_ready ? "ok" : "fail");
     /* **イベントの置き場の使われ方。**溢れていれば取りこぼしている */
+    puts(" hotplug=");
+    putdec(g_hub_poll_count);
+    puts("poll/");
+    putdec(g_hub_attach_count);
+    puts("in/");
+    putdec(g_hub_detach_count);
+    puts("out port=");
+    putdec(g_hub_dev_port);
     puts(" evtstash=");
     putdec(g_evt_stash_count);
     puts("/peak=");
     putdec(g_evt_stash_peak);
     puts("/drop=");
     putdec(g_evt_stash_dropped);
+    puts("/pscd=");
+    putdec(g_evt_pscd_count);
     puts(" slot=");
     putdec(g_xhci_slot_id);
     puts(" port=");
@@ -2932,8 +3547,12 @@ void usb_dump_status(void) {
     puthex(g_input_ctx_phys);
     puts(" outctx=0x");
     puthex(g_output_ctx_phys);
+    /* **いま掴んでいるデバイスの EP0 リング。**スロットごとに持つように
+     * なったので、どのスロットのものかも出す */
+    puts(" ep0slot=");
+    putdec(g_xhci_slot_id);
     puts(" ep0=0x");
-    puthex(g_ep0_ring_phys);
+    puthex(g_ep0_slot[g_xhci_slot_id].ring_phys);
     puts(" vid=0x");
     puthex_n(g_usb_vid, 4);
     puts(" pid=0x");
@@ -2965,12 +3584,22 @@ void usb_dump_status(void) {
     puts(" bot=");
     puts(g_usb_msc_bot_ready ? "ok" : "fail");
     /* **イベントの置き場の使われ方。**溢れていれば取りこぼしている */
+    puts(" hotplug=");
+    putdec(g_hub_poll_count);
+    puts("poll/");
+    putdec(g_hub_attach_count);
+    puts("in/");
+    putdec(g_hub_detach_count);
+    puts("out port=");
+    putdec(g_hub_dev_port);
     puts(" evtstash=");
     putdec(g_evt_stash_count);
     puts("/peak=");
     putdec(g_evt_stash_peak);
     puts("/drop=");
     putdec(g_evt_stash_dropped);
+    puts("/pscd=");
+    putdec(g_evt_pscd_count);
     puts(" iq=");
     puts(g_usb_msc_inquiry_ok ? "ok" : "fail");
     puts(" cap=");

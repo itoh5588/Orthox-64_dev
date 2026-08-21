@@ -5,6 +5,7 @@
 #include "smp.h"
 #include "spinlock.h"
 #include "bottom_half.h"
+#include "usb.h"
 
 extern struct task* task_list;
 extern void arch_context_switch(struct arch_task_context* next_ctx, struct arch_task_context* prev_ctx);
@@ -144,12 +145,21 @@ void task_on_timer_tick(void) {
     task_request_resched();
 }
 
+/* **usb.c を繋いでいないアーキテクチャでは何もしない。**
+ * riscv64 のカーネルは USB を持たず、ここで undefined symbol になる。
+ * usb.c が居るときはそちらの強い定義が勝つ */
+__attribute__((weak)) void usb_hotplug_poll(void) {}
+
 void task_idle_loop(int poll_network) {
     for (;;) {
         bottom_half_run();
         if (poll_network && net_needs_poll_fallback()) {
             net_poll();
         }
+        /* **USB の抜き差しを見る。**タイマ割り込みからは呼べない —
+         * 制御転送は 1 回 ms 単位かかる。ここは通常のタスク文脈で、
+         * 中で 500ms に 1 回に絞っている (kernel/usb.c) */
+        usb_hotplug_poll();
         arch_task_idle_wait_once();
         bottom_half_run();
         if (task_consume_resched()) {
