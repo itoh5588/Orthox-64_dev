@@ -488,3 +488,24 @@ int sound_pcm_play_u8(const uint8_t* data, uint32_t len, uint32_t sample_rate) {
 
     return (int)len;
 }
+
+
+/* ---- D-3 で足した口 (x86 / SB16) ------------------------------------------
+ *
+ * aarch64 (Pi 4) では PWM の FIFO を DMA が埋めるので、
+ * sound_pcm_submit_u8 は**積むだけで戻る。**こちらの SB16 経路は従来どおり
+ * 鳴らし切ってから戻る。**動きを変えない**ため、そのまま転送する。
+ *
+ * ここを非同期にしたくなったら SB16 の自動初期化 DMA と割り込みが要る。
+ * いまは DOOM が x86 でも従来どおり動くことを優先する */
+int sound_pcm_submit_u8(const uint8_t* data, uint32_t len, uint32_t sample_rate) {
+    return sound_pcm_play_u8(data, len, sample_rate);
+}
+
+void sound_pcm_drain(void) {
+    /* 鳴らし切ってから戻る作りなので、待つものが無い */
+}
+
+void sound_tick(void) {
+    /* 円環を回していないので掃除するものが無い */
+}

@@ -572,7 +572,7 @@ static void aarch64_vm_build_kernel(void) {
                              AARCH64_PAGE_SIZE, VM_DEVICE_RW);
     }
 
-    /* **音のための 3 ページ (GPIO / クロック管理 / PWM1)。**
+    /* **音のための 4 ページ (GPIO / クロック管理 / PWM1 / DMA)。**
      *
      * 3.5mm ジャックは PWM1 が GPIO 40/41 に出す。番地は
      * include/aarch64/bcm_periph.h (実機の DTB から取った)。
@@ -581,11 +581,14 @@ static void aarch64_vm_build_kernel(void) {
      * (実測: FAR=0xfe20c800 / ESR=0x96000047 = level 3 の translation
      * fault)。mailbox と同じで「Pi かどうか」で分ける */
     if (b->mbox_base || b->emmc2_base) {
-        static const uint64_t snd_pa[3] = {
-            AARCH64_BCM_GPIO_BASE, AARCH64_BCM_CM_BASE, AARCH64_BCM_PWM1_BASE
+        /* **DMA も要る (D-3)。**PWM の FIFO を CPU で埋めていると
+         * 再生中カーネルが戻らない。DMA に任せる側に移した */
+        static const uint64_t snd_pa[4] = {
+            AARCH64_BCM_GPIO_BASE, AARCH64_BCM_CM_BASE, AARCH64_BCM_PWM1_BASE,
+            AARCH64_BCM_DMA_BASE
         };
         int i;
-        for (i = 0; i < 3; i++) {
+        for (i = 0; i < 4; i++) {
             uint64_t pa = snd_pa[i] & ~(AARCH64_PAGE_SIZE - 1);
             aarch64_vm_map_range(aarch64_phys_to_virt(pa), pa,
                                  AARCH64_PAGE_SIZE, VM_DEVICE_RW);

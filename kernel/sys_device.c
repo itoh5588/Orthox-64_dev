@@ -71,8 +71,12 @@ int sys_sound_off(void) {
     return 0;
 }
 
+/* **積むだけで戻る (D-3)。**鳴らし切ってから戻る版に繋いでいたので、
+ * 512 サンプル @16kHz なら 32ms 呼び出し元が止まっていた。DOOM は
+ * 35 tic/秒 (1 tic = 28.6ms) なので、**音を出すとゲームが 1 tic まるごと
+ * 止まる。**戻り値は受け取ったサンプル数で、0 は「いまは満杯」= 失敗ではない */
 int sys_sound_pcm_u8(const uint8_t* samples, uint32_t count, uint32_t sample_rate) {
-    return sound_pcm_play_u8(samples, count, sample_rate);
+    return sound_pcm_submit_u8(samples, count, sample_rate);
 }
 
 int sys_usb_info(void) {

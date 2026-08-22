@@ -192,6 +192,282 @@ static void pwm_clock_setup(void) {
     }
 }
 
+
+/* ==========================================================================
+ * D-3: PWM の FIFO を DMA で埋める
+ *
+ * **これまでは CPU が 1 サンプルずつ FIFO に書いていた。**FULL1 を見ながら
+ * 回すので、**再生中この関数から戻らない。**512 サンプル @16kHz なら 32ms
+ * 止まる。DOOM は 35 tic/秒 (1 tic = 28.6ms) なので、**音を出すとゲームが
+ * 1 tic まるごと止まる。**鳴らせば止まり、止めなければ鳴らない。
+ *
+ * ---- 出典 ------------------------------------------------------------------
+ *
+ * **他所のコードは持ち込んでいない** (このリポジトリは MIT)。持ち込んだのは
+ * **事実 1 つ**だけ:
+ *
+ *   BCM2711 の PWM1 の DMA DREQ (PERMAP) は **1**
+ *
+ * BCM2711 のデータシートに DREQ の表が無く、Raspberry Pi のフォーラムでも
+ * 「RPi 4 の PWM を DMA で鳴らすときどの DREQ か分かっていない」で
+ * 止まっている。bare-metal の Circle (GPL-2.0) が RASPPI>=4 で
+ * DREQSourcePWM1 = 1 を使っており、**同じ表の HDMI = 10 が
+ * Raspberry Pi 版 Linux の bcm2711.dtsi の hdmi0 dmas = <&dma 10> と
+ * 一致する**ので、表として裏が取れた。**番号は事実であって表現ではない。**
+ *
+ * BCM2835 では 1 は DSI だった。**BCM2711 で割り当て直されている。**
+ *
+ * ---- 作り ------------------------------------------------------------------
+ *
+ * **円環にした制御ブロック (CB) を DMA に延々と回させる。**
+ *
+ *   CB[0] -> CB[1] -> ... -> CB[N-1] -+
+ *     ^                               |
+ *     +-------------------------------+
+ *
+ * 各 CB は 1 ブロック (BLOCK_SAMPLES サンプル) を FIFO へ流す。CPU は
+ * **いま鳴っている場所より先**のブロックを埋める。埋まっていないブロックは
+ * 無音なので、**間に合わなくても雑音ではなく無音になる。**止まりもしない。
+ *
+ * いま鳴っている場所は **CONBLK_AD を読めば分かる** — DMA が実行中の CB の
+ * 番地が入っている。割り込みは要らない。
+ *
+ * **埋めた次のブロックを無音で潰す。**潰さないと、続きが来なかったときに
+ * 一周してから同じ音がもう一度鳴る。
+ * ========================================================================== */
+
+#define DMA_BASE        AARCH64_BCM_DMA_BASE
+#define DMA_CH          5U      /* brcm,dma-channel-mask = 0x7f5 の空き */
+#define DMA_CH_OFF      (DMA_CH * 0x100U)
+
+#define DMA_CS          0x00U
+#define DMA_CONBLK_AD   0x04U
+#define DMA_DEBUG       0x20U
+
+#define DMA_CS_ACTIVE   (1U << 0)
+#define DMA_CS_END      (1U << 1)
+#define DMA_CS_INT      (1U << 2)
+#define DMA_CS_ERROR    (1U << 8)
+#define DMA_CS_ABORT    (1U << 30)
+#define DMA_CS_RESET    (1U << 31)
+/* 優先度は中庸に。上げすぎると他のバス利用者を飢えさせる */
+#define DMA_CS_PRIO     (8U << 16)
+#define DMA_CS_PANICPRIO (8U << 20)
+#define DMA_CS_WAIT_WR  (1U << 28)
+
+#define DMA_TI_WAIT_RESP (1U << 3)
+#define DMA_TI_DEST_DREQ (1U << 6)
+#define DMA_TI_SRC_INC   (1U << 8)
+#define DMA_TI_PERMAP(x) (((uint32_t)(x) & 0x1FU) << 16)
+
+#define DREQ_PWM1        1U     /* 上の「出典」を見ること */
+
+#define PWM_DMAC         0x08U
+#define PWM_DMAC_ENAB    (1U << 31)
+/* FIFO は 16 語。**しきい値はデータシートの既定値**。DREQ は「FIFO の
+ * 残りがこれを下回ったら要求する」、PANIC は「下回ったら優先度を上げる」 */
+#define PWM_DMAC_PANIC(x) (((uint32_t)(x) & 0xFFU) << 8)
+#define PWM_DMAC_DREQ(x)  ((uint32_t)(x) & 0xFFU)
+
+/* **DMA が見る番地は CPU の物理番地とは別。**バスから見た非キャッシュの
+ * 別名に直す。DMA プールは物理 0x00400000 付近 = 低位 1GB なので legacy
+ * DMA (32bit) の射程に入っている */
+#define BUS_ADDR(pa)    ((uint32_t)(((uint64_t)(pa) & ~0xC0000000ULL) | 0xC0000000ULL))
+/* ペリフェラルは 0x7Exxxxxx で見える (CPU からは 0xFExxxxxx) */
+#define BUS_PERI(pa)    ((uint32_t)(((uint64_t)(pa) - AARCH64_BCM_PERI_BASE) + 0x7E000000ULL))
+
+/* **1 ブロックは DOOM の 1 回の提出とそろえる** (ORTHOS_MIX_SAMPLES=512)。
+ * 16kHz で 32ms。8 ブロックで 256ms ぶん先まで貯められる */
+#define SND_BLOCKS       8U
+#define SND_BLOCK_SAMPLES 512U
+/* **モノラルでも 1 サンプルにつき 2 語。**ch1/ch2 が FIFO を共有していて
+ * 交互に振り分けられるため (PWM_FIF1 の注記) */
+#define SND_BLOCK_WORDS  (SND_BLOCK_SAMPLES * 2U)
+
+/* CB は 32 バイト。**並びは BCM2835 のデータシートのとおり** */
+typedef struct {
+    uint32_t ti;
+    uint32_t source_ad;
+    uint32_t dest_ad;
+    uint32_t txfr_len;
+    uint32_t stride;
+    uint32_t nextconbk;
+    uint32_t pad[2];
+} dma_cb_t;
+
+static uint64_t g_cb_pa;        /* CB 配列の物理番地 */
+static uint64_t g_buf_pa;       /* 音のブロックの物理番地 */
+static uint32_t g_dma_running;
+static uint32_t g_write_idx;
+/* **鳴り終わったブロックを無音に戻す位置。**円環は回り続けるので、
+ * 戻さないと一周して同じ音がもう一度鳴る (実機で「鳴るけど止まらない」) */
+static uint32_t g_clean_idx;
+static uint32_t g_dma_range;    /* いまの PWM 分周。無音の値がこれで決まる */
+static uint32_t g_dma_rate;
+
+static inline volatile uint32_t* dma_reg(uint32_t off) {
+    return reg_ptr(DMA_BASE, DMA_CH_OFF + off);
+}
+static inline dma_cb_t* cb_at(uint32_t i) {
+    uint64_t pa = g_cb_pa + (uint64_t)i * sizeof(dma_cb_t);
+    if (aarch64_vm_mmu_enabled()) return (dma_cb_t*)(uintptr_t)aarch64_phys_to_virt(pa);
+    return (dma_cb_t*)(uintptr_t)pa;
+}
+static inline uint32_t* blk_at(uint32_t i) {
+    uint64_t pa = g_buf_pa + (uint64_t)i * SND_BLOCK_WORDS * 4ULL;
+    if (aarch64_vm_mmu_enabled()) return (uint32_t*)(uintptr_t)aarch64_phys_to_virt(pa);
+    return (uint32_t*)(uintptr_t)pa;
+}
+
+/* 無音 = duty 50%。**0 にすると出力が振り切れたままになり、ジャックの RC を
+ * 通ったあとで「ブツッ」と鳴る** */
+static void blk_silence(uint32_t i) {
+    uint32_t* w = blk_at(i);
+    uint32_t v = g_dma_range / 2U;
+    uint32_t k;
+    for (k = 0; k < SND_BLOCK_WORDS; k++) w[k] = v;
+}
+
+/* いま DMA が実行している CB の番号。分からなければ 0 */
+static uint32_t dma_play_idx(void) {
+    uint32_t cur = *dma_reg(DMA_CONBLK_AD);
+    uint32_t base = BUS_ADDR(g_cb_pa);
+    if (cur < base) return 0;
+    return ((cur - base) / (uint32_t)sizeof(dma_cb_t)) % SND_BLOCKS;
+}
+
+/* PWM と DMA を止める。**発生源から順に。**先に DMA を止めないと、
+ * PWM を落とした瞬間に DREQ が来なくなって DMA が宙ぶらりんになる */
+static void dma_stop(void) {
+    *dma_reg(DMA_CS) = DMA_CS_ABORT;
+    delay_us(10);
+    *dma_reg(DMA_CS) = DMA_CS_RESET;
+    delay_us(100);
+    w32(PWM1_BASE, PWM_DMAC, 0);
+    g_dma_running = 0;
+}
+
+/* 円環を組んで回し始める。**sample_rate が変わったら組み直す** */
+static int dma_start(uint32_t sample_rate) {
+    uint32_t range, i;
+
+    if (!g_cb_pa || !g_buf_pa) return -1;
+    if (sample_rate < 4000U)  sample_rate = 4000U;
+    if (sample_rate > 44100U) sample_rate = 44100U;
+
+    if (g_dma_running && g_dma_rate == sample_rate) return 0;
+    if (g_dma_running) dma_stop();
+
+    range = PWM_CLK_HZ / sample_rate;
+    if (range < 2U) range = 2U;
+    g_dma_range = range;
+    g_dma_rate = sample_rate;
+
+    /* 全部を無音で埋めてから回す。**ゴミを鳴らさない** */
+    for (i = 0; i < SND_BLOCKS; i++) blk_silence(i);
+
+    for (i = 0; i < SND_BLOCKS; i++) {
+        dma_cb_t* cb = cb_at(i);
+        cb->ti = DMA_TI_PERMAP(DREQ_PWM1) | DMA_TI_DEST_DREQ |
+                 DMA_TI_SRC_INC | DMA_TI_WAIT_RESP;
+        cb->source_ad = BUS_ADDR(g_buf_pa + (uint64_t)i * SND_BLOCK_WORDS * 4ULL);
+        cb->dest_ad   = BUS_PERI(PWM1_BASE + PWM_FIF1);
+        cb->txfr_len  = SND_BLOCK_WORDS * 4U;
+        cb->stride    = 0;
+        cb->nextconbk = BUS_ADDR(g_cb_pa + (uint64_t)((i + 1U) % SND_BLOCKS) * sizeof(dma_cb_t));
+        cb->pad[0] = 0;
+        cb->pad[1] = 0;
+    }
+    /* **CB とバッファを書き終えてから DMA に見せる。**プールは Normal-NC
+     * なのでキャッシュの掃除は要らないが、並べ替えは止める必要がある */
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    /* PWM を FIFO 経由に。**CLRF1 で残骸を捨ててから** */
+    w32(PWM1_BASE, PWM_CTL, 0);                 delay_us(10);
+    w32(PWM1_BASE, PWM_CTL, PWM_CTL_CLRF1);     delay_us(10);
+    w32(PWM1_BASE, PWM_STA, PWM_STA_BERR);      delay_us(10);
+    w32(PWM1_BASE, PWM_RNG1, range);            delay_us(10);
+    w32(PWM1_BASE, PWM_RNG2, range);            delay_us(10);
+    /* **DMAC は PWEN より先。**後にすると、有効化した瞬間の FIFO が空で
+     * BERR が立つ */
+    w32(PWM1_BASE, PWM_DMAC,
+        PWM_DMAC_ENAB | PWM_DMAC_PANIC(7) | PWM_DMAC_DREQ(7));
+    delay_us(10);
+    w32(PWM1_BASE, PWM_CTL,
+        PWM_CTL_PWEN1 | PWM_CTL_USEF1 |
+        PWM_CTL_PWEN2 | PWM_CTL_USEF2);         delay_us(10);
+
+    /* チャネルを起こす */
+    *dma_reg(DMA_CS) = DMA_CS_RESET;
+    delay_us(100);
+    *dma_reg(DMA_CS) = DMA_CS_INT | DMA_CS_END;
+    *dma_reg(DMA_DEBUG) = 7U;      /* 溜まっていたエラーを落とす (RW1C) */
+    *dma_reg(DMA_CONBLK_AD) = BUS_ADDR(g_cb_pa);
+    __asm__ volatile("dsb sy" ::: "memory");
+    *dma_reg(DMA_CS) = DMA_CS_ACTIVE | DMA_CS_PRIO | DMA_CS_PANICPRIO | DMA_CS_WAIT_WR;
+
+    g_write_idx = 0;
+    g_clean_idx = 0;
+    g_dma_running = 1;
+    return 0;
+}
+
+/* **鳴り終わったブロックを無音に戻す。**タイマ割り込みから 10ms ごとに
+ * 呼ばれる。1 ブロックは 32ms (512 サンプル @16kHz) なので取りこぼさない。
+ *
+ * **DMA の割り込みは使っていない。**掃除に間に合えばよく、そのために
+ * GIC にもう 1 本繋ぐ理由が無い。
+ *
+ * 消すのは**いま鳴っている場所より後ろだけ。**積んだばかりで
+ * まだ鳴っていないブロックには触らない */
+void sound_tick(void) {
+    uint32_t play, guard;
+    if (!g_ready || !g_dma_running) return;
+    play = dma_play_idx();
+    for (guard = 0; guard < SND_BLOCKS && g_clean_idx != play; guard++) {
+        blk_silence(g_clean_idx);
+        g_clean_idx = (g_clean_idx + 1U) % SND_BLOCKS;
+    }
+}
+
+/* **積むだけで戻る。**受け取ったサンプル数を返す。0 は「いまは満杯」で
+ * 失敗ではない。**ここが D-3 の本体** */
+int sound_pcm_submit_u8(const uint8_t* data, uint32_t len, uint32_t sample_rate) {
+    uint32_t play, queued, i;
+    uint32_t* w;
+
+    if (!g_ready) return -1;
+    if (!data || len == 0U) return 0;
+    if (dma_start(sample_rate) < 0) return -1;
+    if (len > SND_BLOCK_SAMPLES) len = SND_BLOCK_SAMPLES;
+
+    play = dma_play_idx();
+    queued = (g_write_idx + SND_BLOCKS - play) % SND_BLOCKS;
+    /* **1 つは鳴っている最中、もう 1 つは無音の緩衝に使う** */
+    if (queued >= SND_BLOCKS - 2U) return 0;
+
+    w = blk_at(g_write_idx);
+    for (i = 0; i < len; i++) {
+        uint32_t v = ((uint32_t)data[i] * g_dma_range) / 255U;
+        w[i * 2U + 0U] = v;     /* L */
+        w[i * 2U + 1U] = v;     /* R (モノラルなので同じ) */
+    }
+    /* 足りないぶんは無音で埋める。**前回の残りを鳴らさない** */
+    for (i = len; i < SND_BLOCK_SAMPLES; i++) {
+        uint32_t v = g_dma_range / 2U;
+        w[i * 2U + 0U] = v;
+        w[i * 2U + 1U] = v;
+    }
+
+    /* **次のブロックを無音で潰す。**続きが来なかったときに、一周してから
+     * 同じ音がもう一度鳴るのを防ぐ */
+    blk_silence((g_write_idx + 1U) % SND_BLOCKS);
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    g_write_idx = (g_write_idx + 1U) % SND_BLOCKS;
+    return (int)len;
+}
+
 /* **この機械に BCM の周辺があるか。**
  *
  * boot.c は QEMU virt でも同じ道を通る。**virt に PWM は無い**ので、
@@ -223,6 +499,49 @@ void sound_init(void) {
     w32(PWM1_BASE, PWM_STA, PWM_STA_BERR);
     delay_us(10);
     g_ready = 1;
+
+    /* ---- D-3: DMA の場所を確保する ------------------------------------
+     *
+     * **非キャッシュのプールから取る。**DMA と CPU が同じ場所を見るので、
+     * キャッシュに載る領域だと食い違う。USB が使っているのと同じプール
+     * (kernel/aarch64/vm.c、物理 0x00400000 付近 / Normal-NC)。
+     *
+     * **低位 1GB に居ることが要る。**legacy DMA は 32bit しか出せない */
+    {
+        uint64_t cb_bytes  = (uint64_t)SND_BLOCKS * sizeof(dma_cb_t);
+        uint64_t buf_bytes = (uint64_t)SND_BLOCKS * SND_BLOCK_WORDS * 4ULL;
+        uint64_t cb_pages  = (cb_bytes  + 4095ULL) / 4096ULL;
+        uint64_t buf_pages = (buf_bytes + 4095ULL) / 4096ULL;
+
+        g_cb_pa  = aarch64_vm_dma_alloc(cb_pages);
+        g_buf_pa = aarch64_vm_dma_alloc(buf_pages);
+
+        aarch64_uart_puts("  sound dma : ");
+        if (!g_cb_pa || !g_buf_pa) {
+            g_cb_pa = 0;
+            g_buf_pa = 0;
+            aarch64_uart_puts("*** プールから取れない (CPU 直書きに退く)\n");
+        } else if ((g_cb_pa >> 32) || (g_buf_pa >> 32)) {
+            /* **32bit を超えたら使えない。**黙って壊れるより先に言う */
+            g_cb_pa = 0;
+            g_buf_pa = 0;
+            aarch64_uart_puts("*** 1GB より上に取れた。legacy DMA から見えない\n");
+        } else {
+            aarch64_uart_puts("cb=0x");
+            aarch64_uart_puthex64(g_cb_pa);
+            aarch64_uart_puts(" buf=0x");
+            aarch64_uart_puthex64(g_buf_pa);
+            aarch64_uart_puts("  ");
+            aarch64_uart_putdec64(SND_BLOCKS);
+            aarch64_uart_puts(" ブロック x ");
+            aarch64_uart_putdec64(SND_BLOCK_SAMPLES);
+            aarch64_uart_puts(" サンプル  ch");
+            aarch64_uart_putdec64(DMA_CH);
+            aarch64_uart_puts(" dreq");
+            aarch64_uart_putdec64(DREQ_PWM1);
+            aarch64_uart_puts("\n");
+        }
+    }
 
     /* **クロックが本当に回っているかを読み戻す。**
      * CM_PWMCTL の BUSY (bit7) が立っていれば回っている。
@@ -326,6 +645,7 @@ void sound_beep_stop(void) {
     w32(PWM1_BASE, PWM_CTL, 0);
 }
 
+
 /* **段階 2: PCM を FIFO に流し込む。**
  *
  * ビープは RNG/DAT を据え置いて矩形波を出しっぱなしにするが、PCM は
@@ -337,56 +657,62 @@ void sound_beep_stop(void) {
  * 折り返しが乗る。既定の PWM アルゴリズムはパルスをばらけさせるので、
  * ジャックの RC を通したあとの波形がなめらかになる。
  *
- * いまは CPU から直接流し込む (FULL1 を見ながら書く)。**再生中は
- * この関数から戻らない。**長い音が要るようになったら DMA へ移す */
+ * **D-3 で DMA に移した。**この関数は「積んで、鳴り終わるまで待つ」形で、
+ * 起動時の自己診断が経過時間からクロックの当否を見るために残してある。
+ * **DOOM のようにゲームループから鳴らす側は sound_pcm_submit_u8 を使う** —
+ * あちらは積むだけで戻る */
 int sound_pcm_play_u8(const uint8_t* data, uint32_t len, uint32_t sample_rate) {
-    uint32_t range, i, spin;
+    uint32_t done = 0;
+    uint64_t guard;
 
     if (!g_ready) return -1;
     if (!data || len == 0U) return 0;
-    /* x86 側の sound.c と同じ範囲に揃える */
     if (sample_rate < 4000U)  sample_rate = 4000U;
     if (sample_rate > 44100U) sample_rate = 44100U;
 
-    /* **1 サンプルの長さ。**これが標本化周期そのものになる */
-    range = PWM_CLK_HZ / sample_rate;
-    if (range < 2U) range = 2U;
-
-    w32(PWM1_BASE, PWM_CTL, 0);                 delay_us(10);
-    w32(PWM1_BASE, PWM_CTL, PWM_CTL_CLRF1);     delay_us(10);
-    w32(PWM1_BASE, PWM_STA, PWM_STA_BERR);      delay_us(10);
-    w32(PWM1_BASE, PWM_RNG1, range);            delay_us(10);
-    w32(PWM1_BASE, PWM_RNG2, range);            delay_us(10);
-    w32(PWM1_BASE, PWM_CTL,
-        PWM_CTL_PWEN1 | PWM_CTL_USEF1 |
-        PWM_CTL_PWEN2 | PWM_CTL_USEF2);         delay_us(10);
-
-    for (i = 0; i < len; i++) {
-        /* u8 の 0..255 を 0..range に伸ばす */
-        uint32_t v = ((uint32_t)data[i] * range) / 255U;
-        int ch;
-        for (ch = 0; ch < 2; ch++) {    /* L と R に同じ値 (モノラル) */
-            /* **FIFO が空くのを待つ。**待てなければ諦めて戻る —
-             * ここで無限に回ると音のために OS が止まる */
-            for (spin = 0; spin < 10000000U; spin++) {
-                if (!(r32(PWM1_BASE, PWM_STA) & PWM_STA_FULL1)) break;
-            }
-            if (spin >= 10000000U) {
-                w32(PWM1_BASE, PWM_CTL, 0);
-                return -1;
-            }
-            w32(PWM1_BASE, PWM_FIF1, v);
+    /* **積み終わるまで待つ。**満杯なら鳴り終わるのを待つだけなので、
+     * 待ちは高々 1 ブロック (32ms @16kHz) */
+    guard = arch_time_now_ms() + 1000ULL +
+            ((uint64_t)len * 1000ULL) / (uint64_t)sample_rate;
+    while (done < len) {
+        int n = sound_pcm_submit_u8(data + done, len - done, sample_rate);
+        if (n < 0) return -1;
+        if (n == 0) {
+            if (arch_time_now_ms() > guard) break;   /* 進まない。諦める */
+            __asm__ volatile("yield");
+            continue;
         }
+        done += (uint32_t)n;
     }
 
-    /* **最後まで流し切ってから止める。**空になった直後はまだ最終
-     * サンプルを出している最中なので、1 サンプル分だけ余計に待つ */
-    for (spin = 0; spin < 10000000U; spin++) {
-        if (r32(PWM1_BASE, PWM_STA) & PWM_STA_EMPT1) break;
+    /* **鳴り終わるまで待つ。**呼ぶ側 (起動時の自己診断) は経過時間で
+     * クロックの当否を見るので、積んだだけで戻ると測れない。
+     * **DOOM が使うのは sound_pcm_submit_u8 のほう** */
+    sound_pcm_drain();
+    return (int)done;
+}
+
+/* 積んだぶんが鳴り終わるまで待つ。**時限つき** */
+void sound_pcm_drain(void) {
+    uint64_t guard;
+    if (!g_ready || !g_dma_running) return;
+    guard = arch_time_now_ms() + 5000ULL;
+    for (;;) {
+        uint32_t play = dma_play_idx();
+        /* 書き位置に追いつき、その 1 つ先 (無音で潰したところ) まで
+         * 進んだら鳴り終わり */
+        if (play == g_write_idx) break;
+        if (arch_time_now_ms() > guard) break;
+        __asm__ volatile("yield");
     }
-    delay_us((range * 2U) / (PWM_CLK_HZ / 1000000U) + 1U);
-    w32(PWM1_BASE, PWM_CTL, 0);
-    return (int)len;
+    /* **鳴り終わったら全部黙らせる。**タイマの掃除に任せると最大 10ms
+     * 遅れるうえ、呼んだ側は「戻ったのにまだ鳴っている」を見ることになる */
+    {
+        uint32_t i;
+        for (i = 0; i < SND_BLOCKS; i++) blk_silence(i);
+        g_clean_idx = g_write_idx;
+        __asm__ volatile("dsb sy" ::: "memory");
+    }
 }
 
 /* **段階 2 の確認。耳と時計の両方で見る。**

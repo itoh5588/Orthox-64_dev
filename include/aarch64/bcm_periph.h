@@ -17,5 +17,10 @@
 #define AARCH64_BCM_GPIO_BASE   (AARCH64_BCM_PERI_BASE + 0x200000ULL)
 #define AARCH64_BCM_CM_BASE     (AARCH64_BCM_PERI_BASE + 0x101000ULL)
 #define AARCH64_BCM_PWM1_BASE   (AARCH64_BCM_PERI_BASE + 0x20C800ULL)
+/* legacy DMA (チャネル 0..10)。**PWM の FIFO を CPU の代わりに埋める** (D-3)。
+ *   /soc/dma-controller@7e007000  reg = <0x7e007000 0xb00>
+ *   同ノードの brcm,dma-channel-mask = 0x7f5 が OS に使えるチャネル
+ *     → 0,2,4,5,6,7,8,9,10 (**1 と 3 はファームウェアが押さえている**) */
+#define AARCH64_BCM_DMA_BASE    (AARCH64_BCM_PERI_BASE + 0x7000ULL)
 
 #endif

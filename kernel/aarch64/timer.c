@@ -71,12 +71,21 @@ void aarch64_task_on_tick(void);
 
 void aarch64_kbd_tick(void);
 
+/* **鳴り終わったブロックを無音に戻す (D-3)。**PWM の FIFO を DMA が
+ * 円環で埋め続けるので、戻さないと一周して同じ音がもう一度鳴る。
+ * 1 ブロック 32ms に対しここは 10ms ごとなので取りこぼさない。
+ * **音を持たない機械では何もしない** */
+void sound_tick(void);
+
 void aarch64_timer_on_tick(void) {
     /* **USB キーボードを拾う。**割り込みを繋いでいないので、ここが唯一の
      * 定期的な機会。文字が来ていればコンソールのリングへ流し、寝ている
      * シェルを起こす (kernel/aarch64/kbd.c)。
      * **キーボードが無い機械では即座に戻る** */
     aarch64_kbd_tick();
+
+    /* 音の後片付け (D-3)。**鳴っていなければ即座に戻る** */
+    sound_tick();
 
     g_ticks++;
     aarch64_task_on_tick();   /* 切り替えの印を立てる (実際の切り替えは IRQ の出口) */
