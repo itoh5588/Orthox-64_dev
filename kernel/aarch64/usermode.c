@@ -27,6 +27,7 @@
 #include "aarch64/vm.h"
 #include "aarch64/task.h"
 #include "linux_syscall.h"
+#include "task.h"   /* get_current_task (S-1) */
 
 /* SAVE_ALL が積んだフレームの並び。vectors.S と対で決まっている。
  *
@@ -70,6 +71,10 @@ void aarch64_enter_el0(uint64_t entry, uint64_t user_sp, uint64_t arg0);
 /* EL0 を終えたときの着地点。aarch64_enter_el0 から見ると「戻ってきた」
  * ことになる。例外ハンドラが戻り先をここに差し替えて eret する */
 void aarch64_user_abort_landing(void);
+
+/* **落ちたユーザープロセスを exit と同じ道で終わらせる (S-1)。**戻らない。
+ * 実体は kernel/linux_syscall.c */
+void linux_task_kill_current(int status);
 
 /* ---- 実行ごとの状態は **タスクごとに持つ** (M3c-1) ----------------------
  *
@@ -275,7 +280,38 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
     aarch64_console_end();
     st->exited = 1;
     st->exit_code = (uint64_t)-1;
-    /* EL0 には戻さず、カーネルの続きへ抜ける */
+
+    /* ---- S-1: タスクなら本当に殺す --------------------------------------
+     *
+     * **下の「戻り先の差し替え」は探針の経路にしか効かない。**
+     * `aarch64_user_abort_landing` は `aarch64_enter_el0` が積んだ
+     * callee-saved を降ろして呼び出し元へ戻る作りで、**そこから EL0 に
+     * 入った場合しか成立しない。**
+     *
+     * `exec` したタスクは文脈切り替えから eret で EL0 に入るので、
+     * 積まれたフレームが無い。**ゴミを pop して ret し、また同じ所で
+     * 落ちる。**2026-08-22 の実機で、gcc が毎秒 58 回この例外を上げ続け、
+     * Ctrl-C も効かず電源断でしか止まらなかった。
+     *
+     * **タスク文脈なら exit と同じ道を通す。**fd を閉じ、ゾンビにして、
+     * 親に知らせる。この関数は戻らない */
+    {
+        struct task* cur = get_current_task();
+        if (cur && cur->ppid != 0) {
+            aarch64_console_begin();
+            aarch64_uart_puts("  [EL1] 落ちたので pid ");
+            aarch64_uart_putdec64((uint64_t)cur->pid);
+            aarch64_uart_puts(" を終了させる\n");
+            aarch64_console_end();
+            /* **割り込みを開けてから。**この先は kernel_yield まで進み、
+             * 閉じたままだと切り替えが来ない */
+            __asm__ volatile("msr daifclr, #2" ::: "memory");
+            linux_task_kill_current(-1);   /* 戻らない */
+        }
+    }
+
+    /* ここに来るのは探針の経路 (aarch64_enter_el0 から入った場合) だけ。
+     * EL0 には戻さず、カーネルの続きへ抜ける */
     frame[FRAME_ELR] = (uint64_t)(uintptr_t)aarch64_user_abort_landing;
     frame[FRAME_SPSR] = SPSR_EL1H;
 }

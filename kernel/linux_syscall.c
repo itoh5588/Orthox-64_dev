@@ -1097,6 +1097,18 @@ static int64_t linux_bootstrap_sys_wait4(int pid, int* wstatus, int options) {
     }
 }
 
+static void linux_bootstrap_sys_exit(int status);
+
+/* **ユーザーが落ちたときにも使う (S-1)。**アーキ側の例外ハンドラから
+ * 呼べるよう外に出した。**戻らない。**
+ *
+ * 2026-08-22 の実機で、EL0 の命令アボートを起こしたプロセスが殺されず、
+ * **同じ例外を毎秒 58 回上げ続けて電源断でしか止まらなかった。**
+ * 落とすところまでを 1 か所に集める */
+void linux_task_kill_current(int status) {
+    linux_bootstrap_sys_exit(status);
+}
+
 static void linux_bootstrap_sys_exit(int status) {
     struct task* current = get_current_task();
 
