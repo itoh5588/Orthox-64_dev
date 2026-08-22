@@ -878,6 +878,28 @@ void usb_arch_irq_enable(void) {
     aarch64_gic_enable_irq(aarch64_xhci_intid());
 }
 
+/* **usb.c の待ちから呼ばれる (A-1b)。**待っているあいだだけ I を開ける。
+ *
+ * **idle タスクは割り込みを閉じて走っている** —
+ * arch_task_idle_wait_once() の wfi の中でだけ開くのに、
+ * usb_hotplug_poll() はその窓の外にある (kernel/sched.c)。そのため
+ * 制御転送のあいだ xHCI の割り込みが 1 つも届いていなかった
+ * (2026-08-22 実機: 82 分で割り込み 9889 回に対し拾ったのは 37 件)。
+ *
+ * **戻すときは元の値をそのまま書かず、I だけを戻す。**他のビット
+ * (F/A/D) を巻き戻すと、呼び出し元が意図して変えたものを消す
+ * (kernel/aarch64/runtime.c の irq_restore と同じ約束) */
+uint64_t usb_arch_irq_window_begin(void) {
+    uint64_t daif;
+    __asm__ volatile("mrs %0, daif" : "=r"(daif));
+    __asm__ volatile("msr daifclr, #2");
+    return daif;
+}
+
+void usb_arch_irq_window_end(uint64_t token) {
+    if (token & (1ULL << 7)) __asm__ volatile("msr daifset, #2");
+}
+
 void aarch64_irq_handler(void) {
     uint32_t iar = aarch64_gic_claim();
     uint32_t intid = iar & 0x3ffU;

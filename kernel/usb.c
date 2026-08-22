@@ -708,7 +708,24 @@ static int xhci_waiter_turn(xhci_waiter_t* w) {
     }
     if (now >= w->deadline) return -1;
     if (w->turns >= XHCI_WAIT_TURN_CAP) return -1;   /* 時計が止まっている */
-    USB_CPU_RELAX();
+
+    /* **A-1b: ここだけ割り込みを開ける。**
+     *
+     * この待ちは割り込み文脈では走らない。キーボードの取り込みは
+     * loops=2000 の従来経路で、waiter を通らない。**開けても入れ子には
+     * ならない。**
+     *
+     * 開けている間に走り得るのは 2 つだけで、どちらも安全:
+     *
+     *   xHCI    usb_xhci_irq() -> xhci_evt_pump()。**これが狙い**
+     *   タイマ  aarch64_kbd_tick() は g_usb_busy で即戻る。
+     *           task_on_timer_tick() は resched_pending を立てるだけで、
+     *           切り替えは idle ループの底でしか起きない */
+    {
+        uint64_t tok = usb_arch_irq_window_begin();
+        USB_CPU_RELAX();
+        usb_arch_irq_window_end(tok);
+    }
     return 0;
 }
 
@@ -821,6 +838,33 @@ static uint32_t g_irq_pcd;             /* 入口で PCD が立っていた回数
 /* **口の開け方を知らないアーキでは何もしない。**動きはポーリングのまま。
  * aarch64 は kernel/aarch64/boot.c の強い定義が勝つ */
 __attribute__((weak)) void usb_arch_irq_enable(void) {}
+
+/* ---- A-1b: 待っているあいだだけ割り込みを開ける --------------------------
+ *
+ * **idle タスクは割り込みを閉じて走っている。**開くのは
+ * arch_task_idle_wait_once() の wfi の中だけで (include/aarch64/task.h)、
+ * usb_hotplug_poll() はその窓の外で呼ばれる (kernel/sched.c)。
+ * したがって**制御転送のあいだ xHCI の割り込みは届かない。**
+ *
+ * 2026-08-22 の実機で確定した。イベントを吸える 3 か所を全部数えると:
+ *
+ *   irq=37  保険=33788  kbd=0     (82 分)
+ *
+ * 割り込みは 82 分で 9889 回上がっているのに、拾ったのは起動時の 37 件で
+ * 止まっている。保険を 1ms → 20ms に延ばしても取りに来ず、待ちの最大が
+ * 素直に 3ms → 20ms に伸びただけだった。**閉じているのだから届きようがない。**
+ *
+ * **開ける範囲は待ちの 1 回転ぶんだけ。**
+ *
+ * 待ち全体を開けっぱなしにする案は採らなかった。**出口が増えるほど
+ * 閉じ忘れが漏れる** — 待ちは転送側とコマンド側で 4 か所あり、それぞれ
+ * 複数の return を持つ。1 回転で閉じる形なら漏れようがない。
+ * 回転は 1ms に数千回あるので、上がっている割り込みは即座に取られる。
+ *
+ * **既定は何もしない。**実装しないアーキでは動きがいままでのポーリングの
+ * ままになるだけで、抜き差しは壊れない */
+__attribute__((weak)) uint64_t usb_arch_irq_window_begin(void) { return 0; }
+__attribute__((weak)) void usb_arch_irq_window_end(uint64_t token) { (void)token; }
 
 /* **xHCI の割り込み入口 (A-1)。**アーキ側の IRQ ハンドラから呼ばれる。
  *
