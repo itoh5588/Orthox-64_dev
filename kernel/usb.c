@@ -1189,6 +1189,8 @@ got:
     {
         uint64_t trb_ptr = (((uint64_t)d[1] << 32) | d[0]) & ~0xFULL;
         if (out_cc) *out_cc = (uint8_t)((d[2] >> 24) & 0xFF);
+        /* **cc=27 (Stopped - Length Invalid) のときこの値は無効。**
+         * 読む側が判断できるよう、ここでは素通しする (E-3 の注記を見ること) */
         if (out_residual) *out_residual = (d[2] & 0x00FFFFFFU);
         g_last_evt_trb = trb_ptr;
         g_last_cc = (uint8_t)((d[2] >> 24) & 0xFF);
@@ -1497,7 +1499,8 @@ static int xhci_ep0_get_device_descriptor(uint8_t slot_id) {
     if (cc != 1) {
         /* **落ちた理由を出す。**cc が無いと推測しかできない。
          * 3 = Babble (相手のパケットがこちらの MPS より長い)
-         * 4 = USB Transaction Error / 6 = STALL */
+         * 4 = USB Transaction Error / 6 = Stall Error
+         * 26/27/28 は Stop Endpoint 系 — 下の注記を見ること */
         puts("[usb] device desc cc=");
         putdec(cc);
         puts(" mps=");
@@ -1942,6 +1945,27 @@ static void xhci_freeze_snapshot(const char* tag, uint8_t slot_id, uint32_t idx0
     }
     puts("===== [snap] おわり =====\r\n");
 }
+
+/* ---- 完了コード (Completion Code) のうち、実機で出会ったもの ---------------
+ *
+ * 出典は xHCI 1.2 の Table 6-4 / 4.17.4。名前は Linux の
+ * 「規格の名前に合わせる」改名 (COMP_* マクロ) で裏を取った (E-3, 2026-08-22)。
+ *
+ *    1  Success
+ *    3  Babble Detected Error      相手のパケットが MPS より長い
+ *    4  USB Transaction Error
+ *    6  Stall Error
+ *   19  Context State Error        文脈が期待した状態にない
+ *   24  Command Ring Stopped
+ *   25  Command Aborted
+ *   26  Stopped                    Stop Endpoint で止めた
+ *   27  Stopped - Length Invalid   同上。**ただし転送長が無効**
+ *   28  Stopped - Short Packet
+ *
+ * **cc=27 のとき residual を読んではいけない。**「止めたので長さは
+ * 当てにするな」という意味のコードで、失敗ではない。復帰処理
+ * (xhci_ep0_recover_stall) が Stop Endpoint を投げた結果として、
+ * 保留中だった転送がこれを返す。**新しい不具合ではない** */
 
 /* ---- EP0 が STALL したときの復帰 -------------------------------------------
  *
