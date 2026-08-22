@@ -617,6 +617,12 @@ void sound_beep_start(uint32_t freq_hz) {
     uint32_t range;
 
     if (!g_ready || freq_hz == 0) return;
+    /* **ビープと PCM は同じ PWM を取り合う (D-3b)。**
+     * ビープは RNG/DAT を据え置く形で、PCM は FIFO を使う形。
+     * 混ぜられないので、**後から来たほうが先に居るほうを降ろす。**
+     * 降ろさずに CTL を書き換えると、DMA は回り続けるのに出口が
+     * 変わってしまい、どちらも鳴らない */
+    if (g_dma_running) dma_stop();
     /* 下は PWM クロック / 2^32 まで出せるが、可聴域の外は意味が無い。
      * 上は range が 2 を切ると duty が刻めない */
     if (freq_hz < 20U) freq_hz = 20U;
@@ -642,6 +648,17 @@ void sound_beep_start(uint32_t freq_hz) {
 
 void sound_beep_stop(void) {
     if (!g_ready) return;
+    /* **DMA が使っている最中なら PWM を落とさない (D-3b)。**
+     *
+     * ここは PWM_CTL を 0 にする = PWEN も USEF も落とすので、
+     * **FIFO が吸われなくなって PCM が無音になる。**
+     *
+     * DOOM は初期化で PCM の探針を打った直後に sound_off() を呼ぶ
+     * (i_orthossound.c)。ビープの後始末のつもりの 1 行が、**始まった
+     * ばかりの PCM を殺していた。**しかも dma_start() は g_dma_running が
+     * 立っているので再開せず、以後ずっと無音のままだった。
+     * 実機で「submit=512 が通っているのに何も聞こえない」の正体 */
+    if (g_dma_running) return;
     w32(PWM1_BASE, PWM_CTL, 0);
 }
 

@@ -47,6 +47,18 @@ SRCS="$SRCS $ROOT/user/orth_syscalls_aarch64.c"
 # **-fcommon が要る。** doom は古い C で、複数の .c が同じ変数を extern
 # 無しで宣言している (GCC 10 以降の既定 -fno-common では重複定義になる)
 CFLAGS="-O2 -std=gnu99 -fcommon -DNORMALUNIX -DLINUX -D_DEFAULT_SOURCE"
+# **音を入れる (D-3b)。** 付けていなかったので、実機の DOOM は無音だった。
+#
+#   FEATURE_SOUND  i_sound.c がこれを見て音のモジュールを繋ぐ。
+#                  無いと sfx_module / music_module が空のままになる
+#   ORTHOS         i_sound.c の SDL_mixer.h の取り込みを止める。
+#                  **FEATURE_SOUND だけ付けると SDL を探しに行って落ちる**
+#
+# 出し先は i_orthossound.c (ミキサ込み) -> sound_pcm_u8 -> PWM の DMA。
+# **カーネル側が積むだけで戻るようになった (D-3) のが前提。** 鳴らし切って
+# から戻る版のままだと、512 サンプル @16kHz の提出ごとに 32ms 止まり、
+# 35 tic/秒 の DOOM は 1 tic まるごと潰れる
+CFLAGS="$CFLAGS -DFEATURE_SOUND -DORTHOS"
 # **-I $ROOT/include を入れてはいけない。** そこにはカーネル側の stdio.h が
 # あり、musl のものを隠して SEEK_END が消える (実測)。
 # syscall.h は DOOM 側が相対パスで拾っているので -I は要らない

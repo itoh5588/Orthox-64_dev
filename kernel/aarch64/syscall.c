@@ -131,6 +131,7 @@ int sys_tcsetpgrp(int fd, int pgrp) {
  * 形だけを揃えてある**ので、ユーザー側 (DOOM) は同じコードで動く。
  */
 #include "aarch64/fb.h"
+#include "sound.h"
 #include "syscall.h"
 
 /* **struct key_event の定義 (syscall.h) より後ろに置くこと。**
@@ -197,6 +198,34 @@ int arch_orth_syscall(arch_syscall_frame_t* frame, uint64_t number) {
              * キーボードが無ければ 0 (= 何も無い) を返し、DOOM はデモを流す */
             struct key_event* ev = (struct key_event*)(uintptr_t)arch_syscall_arg0(frame);
             arch_syscall_set_return(frame, ev ? (uint64_t)aarch64_kbd_get_event(ev) : 0);
+            return 1;
+        }
+        /* ---- 音 (D-3b) ------------------------------------------------
+         *
+         * **ここに無かった。**起動時のビープと PCM はカーネル内の自己診断で
+         * 鳴っていたので気づかなかったが、**ユーザー空間から音を出す道が
+         * 最初から無かった。**DOOM の `[doomsound] init probe=-38` (ENOSYS)
+         * がそれ。x86 は kernel/syscall.c で扱っていて、aarch64 だけが
+         * 抜けていた。
+         *
+         * **共有の sys_device.c は aarch64 に繋いでいない**ので、
+         * カーネルの関数を直に呼ぶ */
+        case ORTH_SYS_SOUND_ON:
+            sound_beep_start((uint32_t)arch_syscall_arg0(frame));
+            arch_syscall_set_return(frame, 0);
+            return 1;
+        case ORTH_SYS_SOUND_OFF:
+            sound_beep_stop();
+            arch_syscall_set_return(frame, 0);
+            return 1;
+        case ORTH_SYS_SOUND_PCM_U8: {
+            /* **積むだけで戻る (D-3)。**鳴らし切ってから戻る版に繋ぐと、
+             * 512 サンプル @16kHz ごとに 32ms 止まって DOOM が 1 tic 潰れる */
+            const uint8_t* samples = (const uint8_t*)(uintptr_t)arch_syscall_arg0(frame);
+            uint32_t count = (uint32_t)arch_syscall_arg1(frame);
+            uint32_t rate  = (uint32_t)arch_syscall_arg2(frame);
+            int r = samples ? sound_pcm_submit_u8(samples, count, rate) : -1;
+            arch_syscall_set_return(frame, (uint64_t)(int64_t)r);
             return 1;
         }
         default:
