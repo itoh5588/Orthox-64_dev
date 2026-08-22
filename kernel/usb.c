@@ -478,8 +478,8 @@ static uint32_t g_evt_stash_count;
 static uint32_t g_evt_stash_dropped;   /* 溢れて捨てた数。測れるようにしておく */
 static uint32_t g_evt_stash_peak;
 /* **置き場に何か入るたびに増える。**待っている側は、この値が動いたときだけ
- * 置き場を舐め直す。8000000 回の空回りで毎回 16 個を照合すると、
- * 待ち時間の意味が変わってしまう */
+ * 置き場を舐め直す。空回りのたびに 16 個を照合すると、待ち時間の意味が
+ * 変わってしまう (A-1 の前は 1 回の待ちで 8000000 回まで回っていた) */
 static volatile uint32_t g_evt_stash_gen;
 
 /* type: 32 = Transfer Event / 33 = Command Completion Event。
@@ -598,8 +598,225 @@ static uint32_t xhci_evt_pump(void) {
     return n;
 }
 
+/* ---- A-1: 待ちを回数から時間に変え、割り込みに仕事をさせる ----------------
+ *
+ * A-2 で測って分かったこと (2026-08-22 実機):
+ *
+ *   空回り 1 回        221ns
+ *   旧上限 8000000 回  1769ms     ← **回数で書いてあった。秒数を誰も知らない**
+ *   実際に待つ最大     3ms        ← 転送完了。コマンド完了は 0.25ms
+ *   上限に達した回数   0 件 (標本 1479 件)
+ *
+ * **必要なのは 3ms、待つ気でいたのは 1769ms。**上限を時間で書き直す。
+ *
+ * それとは別に、**割り込みが仕事をしていなかった** (2026-08-21 §8)。
+ * 待っている側が毎回 pump を呼ぶので、割り込みが届く頃にはリングが空で、
+ * 拾ったイベント数が 33 で止まっていた。待ちの中身を入れ替える:
+ *
+ *   いままで                    これから
+ *   -----------------------     -----------------------------------------
+ *   毎回 pump を呼ぶ            **置き場の世代を見るだけ。埋めるのは割り込み**
+ *   回数で数える (8000000)      時刻で数える (XHCI_WAIT_MS)
+ *
+ * **保険は外さない。**割り込みが配線どおりに来ない機械では置き場が永久に
+ * 埋まらないので、**XHCI_PUMP_FALLBACK_MS のあいだ何も来なければ自分で
+ * 1 回吸う。**そのときの動きは 1ms 刻みのポーリングに落ちるだけで、
+ * 抜き差しは壊れない。
+ *
+ * **CPU は手放していない。**譲る (kernel_yield) 案は見送った —
+ * この待ちが走るのは g_usb_busy が立っている区間、つまり**キーボードの
+ * ポーリングを止めている最中**で、譲ると入力が止まる長さが読めなくなる。
+ * 譲るなら排他の作り直しが先になる */
+#define XHCI_WAIT_MS           100U  /* 待ちの上限。実測最大 3ms の 33 倍 */
+/* 保険。これだけ何も来なければ自分で吸う。
+ *
+ * **いまはこれが本体で、割り込みは仕事をしていない。**理由は保険が速い
+ * ことではなかった (2026-08-22 実機):
+ *
+ *   idle タスクは**割り込みを閉じて走っている。**
+ *   arch_task_idle_wait_once() の wfi の中でだけ開く
+ *   (include/aarch64/task.h)。usb_hotplug_poll() はその窓の外で
+ *   呼ばれる (kernel/sched.c) ので、**制御転送のあいだ割り込みは届かない。**
+ *
+ * 20ms に延ばして確かめた。**それでも割り込みは取りに来ず**、待ちの最大が
+ * 素直に 3ms → 20ms に伸びただけだった。割り込みは巡回 1 回につき 1 度
+ * (2.0/秒 = ハブの 500ms 巡回そのもの)、wfi に着いたときだけ届いていた。
+ *
+ * **したがって 1ms に戻す。**取るのが保険である以上、遅くする理由が無い。
+ * 割り込みに仕事をさせるには idle の割り込み方針を変えることになるが、
+ * 影響は USB だけではない (bottom_half_run も net_poll も同じ窓の外) */
+#define XHCI_PUMP_FALLBACK_MS  1U
+/* **時計が進まない機械で永久に回らないための止め。**
+ * 旧版は回数で縛られていたので必ず終わった。時間で縛ると、USB_NOW_MS() が
+ * 止まっていれば期限が来ない。1 回転は 300ns 前後なので、5000 万回転は
+ * 15 秒に相当し、**100ms の待ちが正常に終わる限り絶対に届かない。**
+ * ここに当たったときは要約の 到達= が増えて 時間が 0ms になる —
+ * **時計を疑う印**として読む */
+#define XHCI_WAIT_TURN_CAP     50000000U
+/* 「上限まで待つ」を表す loops の値。**キーボードの取り込み (loops=2000) と
+ * 区別するための印**で、回数としては使わない */
+#define XHCI_WAIT_FULL         0xFFFFFFFFU
+
+typedef struct {
+    uint64_t t0;
+    uint64_t deadline;
+    uint64_t next_pump;
+    uint32_t gen;
+    uint32_t turns;     /* 回った回数。**較正した空回りとは別物** */
+} xhci_waiter_t;
+
+/* **イベントを誰が取ったかを数える。**
+ *
+ * A-1 を入れた最初の実機で `irq=227/37` — 割り込みは 194 回上がったのに
+ * 拾ったイベントは 4 件だった。**「割り込みが仕事をしていない」ことは
+ * 分かるが、代わりに誰が取っているのかが分からない。**
+ *
+ * イベントを吸えるのは 3 か所しかないので、全部数えて突き合わせる:
+ *
+ *   g_xhci_irq_events    割り込み文脈             usb_xhci_irq()
+ *   g_selfpump_events    待ちの保険 (1ms ごと)    xhci_waiter_turn()
+ *   g_kbdpump_events     キーボードの取り込み     loops=2000 の従来経路
+ *
+ * **3 つの合計が、実際に起きたイベントの数になるはず。**合わなければ
+ * 数え漏らしている経路がもう 1 つあるということ */
+static uint32_t g_selfpump_events;
+static uint32_t g_kbdpump_events;
+
+static void xhci_waiter_begin(xhci_waiter_t* w) {
+    w->t0 = USB_NOW_MS();
+    w->deadline = w->t0 + (uint64_t)XHCI_WAIT_MS;
+    w->next_pump = w->t0;             /* 最初の 1 回だけは自分で吸う */
+    w->gen = g_evt_stash_gen;
+    w->turns = 0;
+}
+
+/* 待ちの 1 回転。**1 = 置き場が動いた (取り出しを試せ) / 0 = まだ /
+ * -1 = 時間切れ** */
+static int xhci_waiter_turn(xhci_waiter_t* w) {
+    uint64_t now = USB_NOW_MS();
+    w->turns++;
+
+    /* 保険。**毎回は呼ばない** — 呼ぶと割り込みの取り分が無くなる */
+    if (now >= w->next_pump) {
+        g_selfpump_events += xhci_evt_pump();
+        w->next_pump = now + (uint64_t)XHCI_PUMP_FALLBACK_MS;
+    }
+
+    if (w->gen != g_evt_stash_gen) {
+        w->gen = g_evt_stash_gen;
+        return 1;
+    }
+    if (now >= w->deadline) return -1;
+    if (w->turns >= XHCI_WAIT_TURN_CAP) return -1;   /* 時計が止まっている */
+    USB_CPU_RELAX();
+    return 0;
+}
+
+/* ---- A-2: 空回りの実時間を測る -------------------------------------------
+ *
+ * **A-1 の根拠。**待ちを時間で決めるには、まず旧上限 8000000 という
+ * **回数**が何秒なのかを知る必要があった。測ったのは 3 つ:
+ *
+ *   ① 空回り 1 回の実時間      → 旧上限まで回ると何 ms になるか (較正)
+ *   ② 完了まで実際に待った時間 → 新しい上限を決める根拠
+ *   ③ 上限に達したときの実時間 → ①の答え合わせ。起きなければ 0 件のまま
+ *
+ * **A-1 を入れた後も較正は残す。**待ちの中身が変わっても、この機械の
+ * 空回り 1 回が何 ns なのかは変わらず、回帰の目安になる
+ *
+ * ① は**回数を決めて時間を測るのではなく、時間を決めて回数を数える。**
+ * USB_NOW_MS() は 1ms 刻みしかないので、短すぎる測定は 0 か 1 の
+ * どちらかになって桁が合わない */
+/* **A-1 で外した旧上限。**各所に 8000000 と直書きされていた回数で、
+ * いまはどこも使っていない。**較正の記録にだけ残す** — この値が何秒
+ * だったのかが A-1 (100ms) の根拠そのものなので、消すと理由が消える */
+#define XHCI_OLD_SPIN_LIMIT   8000000U
+#define XHCI_CALIB_MS     50U        /* 較正に使う時間 */
+#define XHCI_CALIB_CHUNK  256U       /* 時刻を読む間隔 (回) */
+
+static uint32_t g_spin_loops_per_ms;   /* 0 なら未較正 */
+static uint32_t g_spin_calib_loops;
+static uint32_t g_spin_calib_ms;
+
+/* ② 待ちの実測。転送完了 (32) とコマンド完了 (33) は桁が違うので分けて持つ */
+typedef struct {
+    uint32_t calls;        /* 待った回数 */
+    uint32_t immediate;    /* 置き場に既にあって 1 回も回らずに済んだ回数 */
+    uint32_t max_loops;    /* 回った回数の最大 */
+    uint32_t max_ms;       /* 経過 ms の最大 (loops からの換算の答え合わせ) */
+    uint32_t timeouts;     /* ③ 上限まで回って諦めた回数 */
+    uint32_t timeout_ms;   /* そのときの実時間 */
+} xhci_wait_stat_t;
+
+static xhci_wait_stat_t g_wait_xfer;   /* 転送完了待ち */
+static xhci_wait_stat_t g_wait_cmd;    /* コマンド完了待ち */
+
+static void xhci_wait_note(xhci_wait_stat_t* s, uint32_t loops, uint64_t t0) {
+    uint32_t ms = (uint32_t)(USB_NOW_MS() - t0);
+    s->calls++;
+    if (loops == 0) s->immediate++;
+    if (loops > s->max_loops) s->max_loops = loops;
+    if (ms > s->max_ms) s->max_ms = ms;
+}
+
+static void xhci_wait_note_timeout(xhci_wait_stat_t* s, uint64_t t0) {
+    s->calls++;
+    s->timeouts++;
+    s->timeout_ms = (uint32_t)(USB_NOW_MS() - t0);
+}
+
+/* **待ちループの本体と同じことを一定時間くり返して、回数を数える。**
+ *
+ * 時刻を毎回読んではいけない。USB_NOW_MS() は cntpct の読み出しと 64bit の
+ * 除算で、**測ろうとしている pump より重い可能性がある。**それを混ぜると
+ * 測ったものが別物になるので、XHCI_CALIB_CHUNK 回ごとにだけ読む */
+static void xhci_spin_calibrate(void) {
+    uint64_t t0, elapsed;
+    uint32_t n = 0;
+    uint32_t gen = g_evt_stash_gen;
+
+    /* **刻みの境目から始める。**t0 を読んだ瞬間が 1ms の途中だと、
+     * 最初の 1ms が実際より短く数えられる */
+    t0 = USB_NOW_MS();
+    while (USB_NOW_MS() == t0) USB_CPU_RELAX();
+    t0 = USB_NOW_MS();
+
+    while ((USB_NOW_MS() - t0) < (uint64_t)XHCI_CALIB_MS) {
+        uint32_t k;
+        for (k = 0; k < XHCI_CALIB_CHUNK; k++) {
+            /* xhci_poll_transfer_event の空回り 1 回とそろえる */
+            (void)xhci_evt_pump();
+            if (g_evt_stash_gen != gen) gen = g_evt_stash_gen;
+        }
+        n += XHCI_CALIB_CHUNK;
+    }
+    elapsed = USB_NOW_MS() - t0;
+    if (elapsed == 0) elapsed = 1;
+
+    g_spin_calib_loops = n;
+    g_spin_calib_ms = (uint32_t)elapsed;
+    g_spin_loops_per_ms = (uint32_t)((uint64_t)n / elapsed);
+
+    puts("[usb] A-2 較正: ");
+    putdec(g_spin_calib_ms);
+    puts("ms で ");
+    putdec(g_spin_calib_loops);
+    puts(" 回 → 1 回 = ");
+    putdec(g_spin_loops_per_ms ? (1000000ULL / (uint64_t)g_spin_loops_per_ms) : 0ULL);
+    puts("ns、旧上限 ");
+    putdec(XHCI_OLD_SPIN_LIMIT);
+    puts(" 回 = ");
+    putdec(g_spin_loops_per_ms ? ((uint64_t)XHCI_OLD_SPIN_LIMIT / (uint64_t)g_spin_loops_per_ms) : 0ULL);
+    puts("ms 相当 → いまの上限は ");
+    putdec(XHCI_WAIT_MS);
+    puts("ms\r\n");
+}
+
 static uint32_t g_xhci_irq_count;      /* 割り込みが実際に来た回数 */
 static uint32_t g_xhci_irq_events;     /* 割り込みで拾ったイベントの数 */
+static uint32_t g_irq_eint;            /* 入口で EINT が立っていた回数 */
+static uint32_t g_irq_noeint;          /* 立っていなかった回数 (よそのもの) */
+static uint32_t g_irq_pcd;             /* 入口で PCD が立っていた回数 */
 
 /* **口の開け方を知らないアーキでは何もしない。**動きはポーリングのまま。
  * aarch64 は kernel/aarch64/boot.c の強い定義が勝つ */
@@ -622,7 +839,36 @@ void usb_xhci_irq(void) {
 
     {
         uint32_t sts = mmio_read32(g_op_regs, 0x04);
-        if (sts & (1U << 3)) mmio_write32(g_op_regs, 0x04, (1U << 3));
+
+        /* **入口で何が立っていたかを数える。**
+         * 20ms 保険の実機 (2026-08-22) で「イベントが 20ms リングに座って
+         * いるあいだに割り込みが 220 回上がったのに 4 件しか拾えない」と
+         * いう結果が出た。**上がっている割り込みが本当に自分のものなのか**
+         * を、推測ではなく数で分ける */
+        if (sts & (1U << 3)) g_irq_eint++; else g_irq_noeint++;
+        if (sts & (1U << 4)) g_irq_pcd++;
+        /* **ここから UART に出さないこと。**115200 で 1 行 2.6ms かかり、
+         * 割り込み文脈でそれだけ止まる。実際、生の usbsts を 8 行出す
+         * 探針を置いたら**待ちの最大が 3ms から 13ms に化けた** —
+         * 計器が測定対象を壊していた (2026-08-22)。
+         * 数えるだけにして、出すのは 60 秒ごとの要約側に任せる */
+
+        /* **止まっていない発生源を全部落とす。**
+         *
+         *   EINT (bit 3)  RW1C   イベントが載った
+         *   PCD  (bit 4)  RW1C   ポートに変化があった
+         *
+         * **PCD を落としていなかった。**初期化で 1 回消したきりで、
+         * ハンドラは EINT しか触っていない。INTx はレベル駆動なので、
+         * 落とさない発生源が 1 つでもあると線が下がらない。
+         * ポートの変化そのものは Port Status Change Event として
+         * リングにも載り、xhci_evt_stash_push が PORTSC の変化ビットを
+         * 落としている (A-2)。**PCD はその要約ビットなので、
+         * ここで落としても取りこぼしにはならない** */
+        {
+            uint32_t clear = sts & ((1U << 3) | (1U << 4));
+            if (clear) mmio_write32(g_op_regs, 0x04, clear);
+        }
     }
     {
         uint32_t iman = mmio_read32(g_rt_regs, 0x20 + 0x00);
@@ -637,8 +883,11 @@ static int xhci_poll_cmd_completion(uint64_t* out_cmd_ptr, uint8_t* out_cc, uint
     uint32_t d[4];
     if (!g_rt_regs || !out_cmd_ptr || !out_cc || !out_slot_id) return -1;
 
-    /* **先に置き場を見る。**先に来てしまった完了がここに居ることがある。
-     * 割り込みが拾ったものもここに入っている */
+    /* **置き場を見る。**先に来てしまった完了がここに居ることがある。
+     * 割り込みが拾ったものもここに入っている。
+     *
+     * **A-1: 呼ぶ側は loops=0 で入ってくる。**待ちの回転は
+     * xhci_waiter_turn が持っていて、ここは置き場を見るだけ */
     if (xhci_evt_stash_take(33, 0, 0, 0, d)) goto got;
 
     {
@@ -709,14 +958,15 @@ static int xhci_cmd_noop(void) {
     }
 
     uint64_t cmd_ptr = xhci_cmd_submit(0, 0, 0, (23U << 10)); // No-Op Command TRB
+    xhci_waiter_t w;
     if (!cmd_ptr) return -1;
 
-    for (uint32_t i = 0; i < 8000000; i++) {
+    xhci_waiter_begin(&w);
+    for (;;) {
         uint64_t ev_cmd_ptr = 0;
         uint8_t cc = 0xFF;
         uint8_t slot = 0;
-        int r = xhci_poll_cmd_completion(&ev_cmd_ptr, &cc, &slot, 1);
-        if (r < 0) continue;
+        int r = xhci_poll_cmd_completion(&ev_cmd_ptr, &cc, &slot, 0);
         if (r == 0 && ((ev_cmd_ptr & ~0xFULL) == (cmd_ptr & ~0xFULL))) {
             (void)slot;
             return (cc == 1) ? 0 : -2; // 1: Success
@@ -729,6 +979,7 @@ static int xhci_cmd_noop(void) {
             puts("\r\n");
             return 0;
         }
+        if (xhci_waiter_turn(&w) < 0) break;
     }
 
     if (g_op_regs && g_rt_regs) {
@@ -783,37 +1034,45 @@ static int xhci_cmd_noop(void) {
 static int xhci_cmd_enable_slot(uint8_t* out_slot_id) {
     if (out_slot_id) *out_slot_id = 0;
     uint64_t cmd_ptr = xhci_cmd_submit(0, 0, 0, (9U << 10)); // Enable Slot Command
+    xhci_waiter_t w;
     if (!cmd_ptr) return -1;
 
-    for (uint32_t i = 0; i < 8000000; i++) {
+    xhci_waiter_begin(&w);
+    for (;;) {
         uint64_t ev_cmd_ptr = 0;
         uint8_t cc = 0xFF;
         uint8_t slot = 0;
-        int r = xhci_poll_cmd_completion(&ev_cmd_ptr, &cc, &slot, 1);
-        if (r < 0) continue;
+        int r = xhci_poll_cmd_completion(&ev_cmd_ptr, &cc, &slot, 0);
         if (r == 0 && (ev_cmd_ptr & ~0xFULL) == (cmd_ptr & ~0xFULL)) {
+            xhci_wait_note(&g_wait_cmd, w.turns, w.t0);   /* A-2 */
             if (cc != 1) return -2;
             if (out_slot_id) *out_slot_id = slot;
             return (slot != 0) ? 0 : -3;
         }
+        if (xhci_waiter_turn(&w) < 0) break;
     }
+    xhci_wait_note_timeout(&g_wait_cmd, w.t0);   /* A-2 */
     return -4;
 }
 
 static int xhci_wait_cmd_completion(uint64_t cmd_ptr, uint8_t slot_expect, uint8_t* out_cc, uint8_t* out_slot) {
-    for (uint32_t i = 0; i < 8000000; i++) {
+    xhci_waiter_t w;
+    xhci_waiter_begin(&w);
+    for (;;) {
         uint64_t ev_cmd_ptr = 0;
         uint8_t cc = 0xFF;
         uint8_t slot = 0;
-        int r = xhci_poll_cmd_completion(&ev_cmd_ptr, &cc, &slot, 1);
-        if (r < 0) continue;
+        int r = xhci_poll_cmd_completion(&ev_cmd_ptr, &cc, &slot, 0);
         if (r == 0 && (ev_cmd_ptr & ~0xFULL) == (cmd_ptr & ~0xFULL)) {
+            xhci_wait_note(&g_wait_cmd, w.turns, w.t0);   /* A-2 */
             if (out_cc) *out_cc = cc;
             if (out_slot) *out_slot = slot;
             if (slot_expect && slot != slot_expect) return -2;
             return 0;
         }
+        if (xhci_waiter_turn(&w) < 0) break;
     }
+    xhci_wait_note_timeout(&g_wait_cmd, w.t0);   /* A-2 */
     return -1;
 }
 
@@ -843,16 +1102,40 @@ static int xhci_poll_transfer_event(uint8_t slot_expect, uint8_t ep_expect, uint
 
     /* **先に置き場を見る。**他のエンドポイントを待っている間に来た
      * ぶんがここに溜まっている。割り込みが拾ったものもここに入る */
+    if (loops == XHCI_WAIT_FULL) {
+        /* ---- A-1: 時間で待つ。埋めるのは割り込み ---------------------- */
+        xhci_waiter_t w;
+        xhci_waiter_begin(&w);
+        if (xhci_evt_stash_take(32, slot_expect, ep_expect, trb_expect, d)) {
+            xhci_wait_note(&g_wait_xfer, 0, w.t0);   /* 1 回も回らずに済んだ */
+            goto got;
+        }
+        for (;;) {
+            int r = xhci_waiter_turn(&w);
+            if (r < 0) {
+                xhci_wait_note_timeout(&g_wait_xfer, w.t0);
+                return -1;
+            }
+            /* 待っている相手でなければ置き場に残る。捨てない */
+            if (r > 0 && xhci_evt_stash_take(32, slot_expect, ep_expect, trb_expect, d)) {
+                xhci_wait_note(&g_wait_xfer, w.turns, w.t0);
+                goto got;
+            }
+        }
+    }
+
+    /* ---- キーボードの取り込み (loops=2000) -----------------------------
+     *
+     * **ここはタイマ割り込みの中で走る。**戻り値 -1 は「まだ来ていない」で、
+     * 待ちではない。時間で測る意味も、譲る余地も無いので従来のまま */
     if (xhci_evt_stash_take(32, slot_expect, ep_expect, trb_expect, d)) goto got;
 
     {
         uint32_t gen = g_evt_stash_gen;
         for (uint32_t i = 0; i < loops; i++) {
-            /* **保険。**割り込みが来ていれば置き場は既に埋まっている */
-            (void)xhci_evt_pump();
+            g_kbdpump_events += xhci_evt_pump();
             if (g_evt_stash_gen == gen) continue;   /* 何も増えていない */
             gen = g_evt_stash_gen;
-            /* 待っている相手でなければ置き場に残る。捨てない */
             if (xhci_evt_stash_take(32, slot_expect, ep_expect, trb_expect, d)) goto got;
         }
     }
@@ -1166,7 +1449,7 @@ static int xhci_ep0_get_device_descriptor(uint8_t slot_id) {
 
     uint8_t cc = 0xFF;
     uint32_t residual = 0;
-    if (xhci_poll_transfer_event(slot_id, 1, 0, 8000000, &cc, &residual) < 0) return -2;
+    if (xhci_poll_transfer_event(slot_id, 1, 0, XHCI_WAIT_FULL, &cc, &residual) < 0) return -2;
     if (cc != 1) {
         /* **落ちた理由を出す。**cc が無いと推測しかできない。
          * 3 = Babble (相手のパケットがこちらの MPS より長い)
@@ -1282,7 +1565,7 @@ static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_ph
     mmio_write32(g_db_regs, (uint32_t)slot_id * 4U, 1U);
     uint8_t cc = 0xFF;
     uint32_t residual = 0;
-    if (xhci_poll_transfer_event(slot_id, 1, 0, 8000000, &cc, &residual) < 0) {
+    if (xhci_poll_transfer_event(slot_id, 1, 0, XHCI_WAIT_FULL, &cc, &residual) < 0) {
         /* **イベントが 1 つも来ないまま待ち切れた。**
          * ここは長いあいだ無言だった。CC が付く失敗と違って
          * 「そもそも返ってこない」ことが見えないと切り分けられない */
@@ -1362,7 +1645,7 @@ static int xhci_ep0_control_no_data(uint8_t slot_id, uint64_t setup) {
     mmio_write32(g_db_regs, (uint32_t)slot_id * 4U, 1U);
     uint8_t cc = 0xFF;
     uint32_t residual = 0;
-    if (xhci_poll_transfer_event(slot_id, 1, 0, 8000000, &cc, &residual) < 0) return -2;
+    if (xhci_poll_transfer_event(slot_id, 1, 0, XHCI_WAIT_FULL, &cc, &residual) < 0) return -2;
     if (cc != 1) {
         puts("[usb] ep0 no-data cc=");
         putdec(cc);
@@ -2100,7 +2383,7 @@ static int xhci_bulk_transfer_ex(uint8_t slot_id, uint8_t dci, uint64_t ring_phy
     xhci_ring_enqueue_advance(ring_phys, idx, cycle, 1);
     uint8_t cc = 0xFF;
     uint32_t residual = 0;
-    if (xhci_poll_transfer_event(slot_id, dci, trb_phys, 8000000, &cc, &residual) < 0) return -2;
+    if (xhci_poll_transfer_event(slot_id, dci, trb_phys, XHCI_WAIT_FULL, &cc, &residual) < 0) return -2;
     if (cc != 1) {
         puts("[usb] bulk ");
         puts(in_dir ? "IN" : "OUT");
@@ -2953,6 +3236,34 @@ static void usb_hotplug_release(void) {
 
 static uint64_t g_usb_heartbeat_next_ms;   /* A-3 の要約を次に出す時刻 */
 
+/* A-2 の 1 行。**較正の値を毎回添える** — 待ちの回数だけ見ても
+ * それが何秒なのか分からないため */
+static void xhci_wait_dump(const char* name, const xhci_wait_stat_t* s) {
+    puts("[usb] A-2 待ち ");
+    puts(name);
+    puts(": n=");
+    putdec(s->calls);
+    puts(" 即=");
+    putdec(s->immediate);
+    puts(" 最大=");
+    putdec(s->max_loops);
+    /* **「回転」で出す。**A-1 の前は pump を呼んだ回数で、較正した
+     * 221ns/回 を掛ければ時間になった。**いまは 1 回転が pump を
+     * 含まないので、掛け算は成り立たない。**時間は max_ms を見る */
+    puts("回転 最大ms=");
+    putdec(s->max_ms);
+    puts(" 到達=");
+    putdec(s->timeouts);
+    if (s->timeouts) {
+        puts("(");
+        putdec(s->timeout_ms);
+        puts("ms)");
+    }
+    puts(" 上限=");
+    putdec(XHCI_WAIT_MS);
+    puts("ms\r\n");
+}
+
 void usb_hotplug_poll(void) {
     uint8_t p;
     uint64_t now;
@@ -3029,6 +3340,40 @@ void usb_hotplug_poll(void) {
         putdec(g_hub_attach_count);
         puts("/");
         putdec(g_hub_detach_count);
+        puts("\r\n");
+
+        /* ---- A-2: 待ちの実測。block にするときの根拠 --------------------
+         *
+         *   n=      上限まで待つ気で入った回数
+         *   即=     置き場に既にあって 1 回も回らなかった回数
+         *   最大=   完了までに回った回数の最大 (較正で us に直したもの)
+         *   最大ms= 経過時間の最大。**回数からの換算の答え合わせ**
+         *   到達=   上限まで回って諦めた回数。0 でなければ上限が短い */
+        xhci_wait_dump("転送", &g_wait_xfer);
+        xhci_wait_dump("コマンド", &g_wait_cmd);
+
+        /* **取り分とレジスタ。**割り込みが仕事をしていない理由の切り分け。
+         * iman の bit0 (IP) が立ちっぱなしなら、こちらが落とせていない */
+        puts("[usb] A-1 取り分 irq=");
+        putdec(g_xhci_irq_events);
+        puts(" 保険=");
+        putdec(g_selfpump_events);
+        puts(" kbd=");
+        putdec(g_kbdpump_events);
+        puts(" 入口 eint=");
+        putdec(g_irq_eint);
+        puts("/なし=");
+        putdec(g_irq_noeint);
+        puts("/pcd=");
+        putdec(g_irq_pcd);
+        if (g_op_regs && g_rt_regs) {
+            puts(" usbsts=0x");
+            puthex(mmio_read32(g_op_regs, 0x04));
+            puts(" usbcmd=0x");
+            puthex(mmio_read32(g_op_regs, 0x00));
+            puts(" iman=0x");
+            puthex(mmio_read32(g_rt_regs, 0x20 + 0x00));
+        }
         puts("\r\n");
     }
 
@@ -3328,7 +3673,11 @@ void usb_init(void) {
         puts("\r\n");
     } else {
         uint8_t slot_id = 0;
-        int es = xhci_cmd_enable_slot(&slot_id);
+        int es;
+        /* **A-2: 空回りの実時間を測る。**列挙を始める前。ここなら
+         * イベントリングは走っていて、まだ誰も待っていない */
+        xhci_spin_calibrate();
+        es = xhci_cmd_enable_slot(&slot_id);
         if (es == 0) {
             g_xhci_slot_id = slot_id;
             puts("[usb] Enable Slot OK slot=");
