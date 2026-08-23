@@ -401,6 +401,14 @@ ifneq ($(AARCH64_SOUND),)
 AARCH64_CFLAGS += -DAARCH64_SOUND=1
 endif
 
+# **音の自己診断。既定では無効。**
+# 3 音 x (1 秒 + 0.5 秒) + 三角波で毎回 4 回鳴り、起動が約 5 秒延びる。
+# **PWM のクロックや FIFO の道を疑うときだけ付ける** (kernel/aarch64/boot.c)
+AARCH64_SOUND_SELFTEST ?=
+ifneq ($(AARCH64_SOUND_SELFTEST),)
+AARCH64_CFLAGS += -DAARCH64_SOUND_SELFTEST=1
+endif
+
 # **BCM2711 の PCIe を立ち上げる。既定では無効。**
 # QEMU で一切検証できないので、実機で 1 段ずつ確かめる用
 AARCH64_PCIE_BRCM_INIT ?=

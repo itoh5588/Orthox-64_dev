@@ -737,7 +737,20 @@ void aarch64_boot_continue(void) {
 #ifdef AARCH64_SOUND
     aarch64_uart_puts("--- 音: PWM -> 3.5mm ジャック ---\n");
     sound_init();
+    /* **自己診断は既定で切ってある。**
+     *
+     * 3 音 x (1 秒 + 0.5 秒) + 三角波で **毎回 4 回鳴り、起動が約 5 秒
+     * 延びる。**段階 2 を詰めていた頃は要ったが、DOOM で音が出るように
+     * なった今は、鳴ることの確認は DOOM が兼ねている。
+     *
+     * **消さずに残す。**PWM のクロックや FIFO の道を疑うときは、耳と
+     * 時計の両方で見られるこれが一番速い。戻すときは
+     *
+     *   make aarch64-pi4-netboot ... AARCH64_SOUND_SELFTEST=1
+     */
+#ifdef AARCH64_SOUND_SELFTEST
     aarch64_sound_selftest();
+#endif
 #endif
 
     if (aarch64_pci_ready() || usb_arch_xhci_mmio() != 0) {
