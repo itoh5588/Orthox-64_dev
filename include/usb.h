@@ -1,6 +1,8 @@
 #ifndef USB_H
 #define USB_H
 
+#include <stdint.h>
+
 void usb_init(void);
 void usb_dump_status(void);
 int usb_is_ready(void);
@@ -30,6 +32,12 @@ void usb_arch_irq_enable(void);
  * begin が返した値をそのまま end に渡す */
 uint64_t usb_arch_irq_window_begin(void);
 void usb_arch_irq_window_end(uint64_t token);
+/* **V-1 の計器 (aarch64)。**fork がユーザーのページを何枚写し、何 ms
+ * 使ったか。aarch64 は CoW が無く全ページをその場で写すので、CoW を
+ * 入れるかどうかを数字で決めるために測っている。
+ * 実装が無いアーキでは弱いシンボルの空実装が使われ、0 が返る */
+void aarch64_fork_stats(uint64_t* calls, uint64_t* pages, uint64_t* ms);
+
 int usb_hid_keyboard_ready(void);
 int usb_hid_keyboard_poll(uint8_t report[8]);
 

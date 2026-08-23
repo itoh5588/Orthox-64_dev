@@ -846,6 +846,66 @@ arch_address_space_t arch_vm_create_user_address_space(void) {
  * 通さないと翻訳できない (P2 で kernel/linux_syscall.c が同じ形で落ちた:
  * ESR=0x96000045 / FAR に物理アドレスがそのまま出る)。
  * aarch64_vm_table_ptr が MMU の状態に応じて変換してくれる */
+/* ---- V-1 の計器: fork の写しにどれだけ使っているか ------------------------
+ *
+ * **既定で切ってある。**戻すときは
+ *
+ *   make aarch64-pi4-netboot ... AARCH64_FORK_STATS=1
+ *
+ * **aarch64 は CoW が無く、fork でユーザーのページを全部その場で写す。**
+ * CoW を入れるかを「効くはず」ではなく数字で決めるために作った。
+ *
+ * 2026-08-23 に実機で測った答え: **fork の写しは全体の 0.067%** (8 本の
+ * ビルド 490 秒に対し 330ms)。**CoW を入れても 49 分が 2 秒縮むだけ。**
+ * このとき **「gcc は cc1 (9.7MB) を fork するたびに写す」は誤り**だと
+ * 分かった。**fork が写すのは親**で、cc1 は fork の後に exec で読まれる。
+ * 実測は 1 fork あたり 214 ページ = 856KB。
+ *
+ * **消さずに残す。**CoW を検討するときや、ページ複製のコストを疑うときに
+ * また同じものを書くことになる。副産物として **1 ページ 38.5us** という
+ * 数字も出ており (4KB のコピーとしては 1 桁遅い)、**S-3 の I-cache 同期が
+ * 支配的**かどうかを追うときの入口にもなる。
+ *
+ * 時計は CNTPCT_EL0 (Pi 4 で 54MHz = 18.5ns 分解能)。arch_time_now_ms は
+ * 1ms 分解能で、1 回の fork より粗いので使えない。
+ *
+ * **切ってあるときは aarch64_fork_stats を定義しない。**共有層 (kernel/usb.c)
+ * の弱いシンボルが 0 を返し、要約行そのものが出なくなる */
+#ifdef AARCH64_FORK_STATS
+
+static uint64_t g_fork_calls;
+static uint64_t g_fork_pages;
+static uint64_t g_fork_ticks;
+
+static inline uint64_t vm_cntpct(void) {
+    uint64_t v;
+    __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(v));
+    return v;
+}
+
+void aarch64_fork_stats(uint64_t* calls, uint64_t* pages, uint64_t* ms) {
+    if (calls) *calls = g_fork_calls;
+    if (pages) *pages = g_fork_pages;
+    /* **周波数はレジスタから読む。**AARCH64_CNTFRQ_HZ はコンパイル時に
+     * 渡らない構成もあるので当てにしない (Pi 4 は 54000000 が入る) */
+    if (ms) {
+        uint64_t hz;
+        __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+        *ms = hz ? (g_fork_ticks * 1000ULL) / hz : 0;
+    }
+}
+
+#define FORK_STAT_PAGE()      (g_fork_pages++)
+#define FORK_STAT_T0()        vm_cntpct()
+#define FORK_STAT_END(t0)     do { g_fork_ticks += vm_cntpct() - (t0); \
+                                   g_fork_calls++; } while (0)
+#else
+/* **切ってあるときは 1 命令も残らない。** */
+#define FORK_STAT_PAGE()      ((void)0)
+#define FORK_STAT_T0()        0
+#define FORK_STAT_END(t0)     ((void)(t0))
+#endif
+
 static void aarch64_vm_copy_page(uint64_t dst_pa, uint64_t src_pa) {
     uint64_t* d = aarch64_vm_table_ptr(dst_pa);
     const uint64_t* s = aarch64_vm_table_ptr(src_pa);
@@ -862,6 +922,8 @@ static void aarch64_vm_copy_page(uint64_t dst_pa, uint64_t src_pa) {
      * PTE の権限は上の段が持っており、判定を持ち込むと絡む。1 ページ 4KB の
      * 同期は fork 全体の写しに比べれば小さい */
     aarch64_sync_icache_range(d, AARCH64_PAGE_SIZE);
+
+    FORK_STAT_PAGE();   /* V-1 の計器 (既定で切ってある) */
 }
 
 /* fork 用にテーブルを 1 段ぶん写す。level は aarch64_vm_index と同じ 1..3。
@@ -927,10 +989,16 @@ arch_address_space_t arch_vm_clone_address_space(arch_address_space_t address_sp
     root_pa = (uint64_t)arch_vm_create_user_address_space();
     if (!root_pa) return 0;
 
-    /* ルートは L1 (VA 39bit / 4KB granule なので L1 が最上位) */
-    if (aarch64_vm_clone_table(root_pa, (uint64_t)address_space, 1) < 0) {
-        arch_vm_destroy_user_address_space(root_pa);
-        return 0;
+    /* ルートは L1 (VA 39bit / 4KB granule なので L1 が最上位)。
+     * **V-1: ここが写しの全部。**前後で時計を読む */
+    {
+        uint64_t t0 = FORK_STAT_T0();
+        int rc = aarch64_vm_clone_table(root_pa, (uint64_t)address_space, 1);
+        FORK_STAT_END(t0);
+        if (rc < 0) {
+            arch_vm_destroy_user_address_space(root_pa);
+            return 0;
+        }
     }
     return (arch_address_space_t)root_pa;
 }

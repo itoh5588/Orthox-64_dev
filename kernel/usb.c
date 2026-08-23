@@ -90,6 +90,15 @@ static void putdec(uint64_t v) {
 __attribute__((weak))
 uint64_t usb_arch_xhci_mmio(void) { return 0; }
 
+/* **V-1 の計器の既定 (aarch64 以外)。**測っていないので 0 を返す。
+ * n=0 のときは要約行を出さない */
+__attribute__((weak))
+void aarch64_fork_stats(uint64_t* calls, uint64_t* pages, uint64_t* ms) {
+    if (calls) *calls = 0;
+    if (pages) *pages = 0;
+    if (ms) *ms = 0;
+}
+
 /* ---- DMA の番地変換 -------------------------------------------------------
  *
  * **デバイスから見た番地と CPU の物理が一致するとは限らない。**
@@ -3409,6 +3418,25 @@ void usb_hotplug_poll(void) {
         puts("/");
         putdec(g_hub_detach_count);
         puts("\r\n");
+
+        /* ---- V-1: fork の写しにどれだけ使っているか ---------------------
+         *
+         * **aarch64 は CoW が無く、fork でユーザーのページを全部写す。**
+         * CoW を入れるかを「効くはず」ではなく数字で決めるための計器。
+         * 実装が無いアーキでは弱いシンボルの空実装が使われ、0 が出る */
+        {
+            uint64_t fk = 0, fp = 0, fms = 0;
+            aarch64_fork_stats(&fk, &fp, &fms);
+            if (fk != 0) {
+                puts("[fork] n=");
+                putdec(fk);
+                puts(" pages=");
+                putdec(fp);
+                puts(" ms=");
+                putdec(fms);
+                puts("\r\n");
+            }
+        }
 
         /* ---- A-2: 待ちの実測。block にするときの根拠 --------------------
          *

@@ -401,6 +401,16 @@ ifneq ($(AARCH64_SOUND),)
 AARCH64_CFLAGS += -DAARCH64_SOUND=1
 endif
 
+# **fork の写しの計器 (V-1)。既定では無効。**
+# 60 秒ごとの要約に [fork] n= pages= ms= を 1 行足す。
+# 2026-08-23 の実測では **fork の写しは全体の 0.067%** で、CoW を入れる
+# 価値は無いと分かった。**消さずに残してある** — CoW を検討するときや、
+# ページ複製のコストを疑うときにまた要る (kernel/aarch64/vm.c の注記)
+AARCH64_FORK_STATS ?=
+ifneq ($(AARCH64_FORK_STATS),)
+AARCH64_CFLAGS += -DAARCH64_FORK_STATS=1
+endif
+
 # **音の自己診断。既定では無効。**
 # 3 音 x (1 秒 + 0.5 秒) + 三角波で毎回 4 回鳴り、起動が約 5 秒延びる。
 # **PWM のクロックや FIFO の道を疑うときだけ付ける** (kernel/aarch64/boot.c)
