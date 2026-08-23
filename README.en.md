@@ -79,10 +79,11 @@ See [`scripts/pi4/README.md`](scripts/pi4/README.md) for the procedure and the v
 
 ## License
 
-Orthox-64 itself is released under the MIT License ([LICENSE](LICENSE)). The kernel includes filesystem code ported from xv6-riscv (MIT), and `ports/` bundles third-party components (musl, lwIP, BearSSL, Limine, CPython, zlib, BusyBox, GNU Make/Binutils/GCC). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Orthox-64 itself is released under the MIT License ([LICENSE](LICENSE)). The kernel includes filesystem code ported from **xv6-riscv (MIT)** and the SD card driver ported from **rpi-boot's `emmc.c` (MIT)**, and `ports/` bundles third-party components (musl, lwIP, BearSSL, Limine, CPython, zlib, BusyBox, GNU Make/Binutils/GCC). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Acknowledgements
 
 - **[MikanOS](https://github.com/uchan-nos/mikanos)** by [uchan-nos](https://github.com/uchan-nos): kernel architecture reference.
 - **[Limine](https://github.com/limine-bootloader/limine)**: bootloader.
 - **[xv6-riscv](https://github.com/mit-pdos/xv6-riscv)** (MIT PDOS, MIT): source of the ported root filesystem (xv6fs).
+- **[rpi-boot](https://github.com/jncronin/rpi-boot)** ([John Cronin](https://github.com/jncronin), MIT): source of the ported Raspberry Pi SD card (SDHCI) driver.

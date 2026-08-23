@@ -79,10 +79,11 @@ x86-64 に続き、**カーネルのセルフホスティングが 2 つ目の I
 
 ## ライセンス
 
-Orthox-64 本体は MIT ライセンス（[LICENSE](LICENSE)）。カーネルには xv6-riscv（MIT）由来のコードを含み、`ports/` に musl・lwIP・BearSSL・Limine・CPython・zlib・BusyBox・GNU Make/Binutils/GCC などを同梱しています。ライセンスと配布上の注意は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照。
+Orthox-64 本体は MIT ライセンス（[LICENSE](LICENSE)）。カーネルには **xv6-riscv（MIT）** と **rpi-boot の `emmc.c`（MIT）** 由来のコードを含み、`ports/` に musl・lwIP・BearSSL・Limine・CPython・zlib・BusyBox・GNU Make/Binutils/GCC などを同梱しています。ライセンスと配布上の注意は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照。
 
 ## 謝辞
 
 - **[MikanOS](https://github.com/uchan-nos/mikanos)**（[uchan-nos](https://github.com/uchan-nos) 氏）: カーネルアーキテクチャの参考。
 - **[Limine](https://github.com/limine-bootloader/limine)**: ブートローダー。
 - **[xv6-riscv](https://github.com/mit-pdos/xv6-riscv)**（MIT PDOS, MIT）: ルートファイルシステム（xv6fs）の移植元。
+- **[rpi-boot](https://github.com/jncronin/rpi-boot)**（[John Cronin](https://github.com/jncronin) 氏, MIT）: Raspberry Pi の SD カード（SDHCI）ドライバの移植元。
