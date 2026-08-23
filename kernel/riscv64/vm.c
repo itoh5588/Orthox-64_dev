@@ -224,6 +224,9 @@ static void riscv64_vm_destroy_table(uint64_t* table, const uint64_t* kernel, in
 
 void riscv64_vm_memcpy_page(uint64_t dst_phys, uint64_t src_phys) {
     riscv64_memcpy((void*)(uintptr_t)dst_phys, (const void*)(uintptr_t)src_phys, RISCV64_PAGE_SIZE);
+    /* **S-3: 写した先を命令フェッチと揃える** (aarch64 の
+     * aarch64_vm_copy_page と対。include/riscv64/vm.h の注記も参照) */
+    riscv64_sync_icache_range((void*)(uintptr_t)dst_phys, RISCV64_PAGE_SIZE);
 }
 
 uint64_t riscv64_vm_create_address_space(void) {

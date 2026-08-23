@@ -29,6 +29,23 @@ uint64_t riscv64_vm_get_phys(uint64_t root_pa, uint64_t virt_addr);
 void riscv64_vm_unmap_page(uint64_t root_pa, uint64_t virt_addr);
 void riscv64_vm_update_page_flags(uint64_t root_pa, uint64_t virt_addr, uint64_t flags);
 
+/* ---- 命令キャッシュの同期 (S-3) ------------------------------------------
+ *
+ * **aarch64 と同じ場所から呼ぶ** (exec のセグメント写しと fork のページ写し)。
+ * RISC-V はデータ側は一貫しているので、要るのは命令フェッチの同期だけ。
+ *
+ * `fence rw, rw` で書いたバイトを見えるようにしてから `fence.i` を出す。
+ *
+ * **fence.i はそのハートにしか効かない。** SMP で他ハートが同じページを
+ * 実行する場合は IPI で全ハートに出させる必要があり、それはまだ無い。
+ * いまは QEMU でしか動かしていないので症状は出ないが、**実機に載せた
+ * 時点で aarch64 と同じ形で落ちる** (2026-08-23 の Pi 4 の件) */
+static inline void riscv64_sync_icache_range(void* va, uint64_t len) {
+    (void)va; (void)len;   /* fence.i は範囲を取らない */
+    __asm__ volatile("fence rw, rw" ::: "memory");
+    __asm__ volatile("fence.i" ::: "memory");
+}
+
 arch_address_space_t arch_vm_kernel_address_space(void);
 arch_address_space_t arch_vm_create_user_address_space(void);
 arch_address_space_t arch_vm_clone_address_space(arch_address_space_t address_space);

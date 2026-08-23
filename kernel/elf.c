@@ -134,6 +134,23 @@ struct elf_info elf_load(arch_address_space_t address_space, void* elf_data, uin
                     kernel_memcpy((uint8_t*)PHYS_TO_VIRT(phys_addr) + offset_in_page, src, bytes_to_copy);
                 }
 
+                /* **S-3: 命令になるページは I-cache と揃えてから離れる。**
+                 *
+                 * ここまでは HHDM (Normal WB) への素の memcpy なので、
+                 * 書いたバイトは D-cache に居るだけかもしれず、しかも
+                 * この物理ページを前に使っていたプログラムの古い I-cache 行が
+                 * 残っている。**A72 の I-cache は PIPT で D-cache を
+                 * スヌープしない**ので、どちらも命令フェッチに漏れる。
+                 *
+                 * **ページまるごと揃える。** memset した部分 (bss) も
+                 * 実行可能セグメントなら命令として読まれうる。
+                 *
+                 * 実行しないセグメントは飛ばす。.data / .bss を毎回舐めると
+                 * 大きなバイナリで無駄が出る */
+                if (phdr[i].p_flags & PF_X) {
+                    arch_sync_icache_range((void*)PHYS_TO_VIRT(phys_addr), PAGE_SIZE);
+                }
+
                 curr_vaddr += size_in_page;
             }
         }

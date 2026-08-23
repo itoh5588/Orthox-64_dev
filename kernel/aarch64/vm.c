@@ -847,6 +847,18 @@ static void aarch64_vm_copy_page(uint64_t dst_pa, uint64_t src_pa) {
     uint64_t* d = aarch64_vm_table_ptr(dst_pa);
     const uint64_t* s = aarch64_vm_table_ptr(src_pa);
     for (uint64_t i = 0; i < AARCH64_PAGE_SIZE / sizeof(uint64_t); i++) d[i] = s[i];
+
+    /* **S-3: 写した先を I-cache と揃える。**
+     *
+     * aarch64 は CoW が無く、fork で**ユーザーのページを全部その場で写す**。
+     * text も新しい物理ページに書き直されるので、exec と同じ手当てが要る。
+     * gcc は cc1 / as / collect2 / ld と 4 回 fork するため、ここを外すと
+     * 9.7MB の cc1 の text が毎回そのまま危険にさらされる。
+     *
+     * **ここでは実行可能かどうかを見ない。** テーブルを写している最中で
+     * PTE の権限は上の段が持っており、判定を持ち込むと絡む。1 ページ 4KB の
+     * 同期は fork 全体の写しに比べれば小さい */
+    aarch64_sync_icache_range(d, AARCH64_PAGE_SIZE);
 }
 
 /* fork 用にテーブルを 1 段ぶん写す。level は aarch64_vm_index と同じ 1..3。

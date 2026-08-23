@@ -13,6 +13,10 @@ static inline uint64_t arch_vm_user_page_flags(int writable, int executable) {
     return flags;
 }
 
+static inline void arch_sync_icache_range(void* va, uint64_t len) {
+    riscv64_sync_icache_range(va, len);
+}
+
 #elif defined(__aarch64__)
 #include "aarch64/vm.h"
 
@@ -21,6 +25,10 @@ static inline uint64_t arch_vm_user_page_flags(int writable, int executable) {
  * 組み立ては aarch64_vm_user_page_attr に集めてある (PXN は常に立てる) */
 static inline uint64_t arch_vm_user_page_flags(int writable, int executable) {
     return aarch64_vm_user_page_attr(writable, executable);
+}
+
+static inline void arch_sync_icache_range(void* va, uint64_t len) {
+    aarch64_sync_icache_range(va, len);
 }
 
 #elif defined(__x86_64__)
@@ -32,6 +40,13 @@ static inline uint64_t arch_vm_user_page_flags(int writable, int executable) {
     if (writable) flags |= PTE_WRITABLE;
     (void)executable;
     return flags;
+}
+
+/* x86 の命令キャッシュはデータと一貫している (自己書き換えコードも
+ * ハードウェアが面倒を見る) ので、**ここは何もしないのが正しい。**
+ * 空にしておくことで、呼ぶ側がアーキを気にせず済む */
+static inline void arch_sync_icache_range(void* va, uint64_t len) {
+    (void)va; (void)len;
 }
 
 #else

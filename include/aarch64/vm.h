@@ -131,6 +131,54 @@ static inline uint64_t aarch64_vm_user_page_attr(int writable, int executable) {
     return attr;
 }
 
+/* ---- 命令キャッシュの同期 (S-3) ------------------------------------------
+ *
+ * **ユーザーの text を書いたら必ず通す。** exec がセグメントを写した後と、
+ * fork がページを写した後の 2 か所。
+ *
+ * Cortex-A72 の I-cache は PIPT で、**D-cache をスヌープしない。**
+ * カーネルは HHDM (Normal WB) 経由の memcpy で text を書くので、
+ *   - 書いたバイトが D-cache に残ったまま命令フェッチが走る
+ *   - そのページを前に使っていたプログラムの古い I-cache 行を拾う
+ * のどちらも起きる。**QEMU は書き込みで変換キャッシュを捨てるので出ない。**
+ *
+ * 2026-08-23 の実機で、gcc が作ったバイナリが 20 回中 17 回落ちた。
+ * ELR=0x400144 (`ldaxr w10,[x9]`、x9 は 2 命令前に確定した定数 0x420138) に
+ * 対して FAR=0x4c14f0 が出ており、**ファイルにある命令では成立しない**組。
+ * CPU がファイルと違うバイトを実行していた。
+ *
+ * 手順は ARM ARM の "Synchronization of data and instruction caches" どおり:
+ *   dc cvau (PoU まで clean) -> dsb ish -> ic ivau -> dsb ish -> isb
+ *
+ * **行の大きさは CTR_EL0 から取る。** D と I で違うことがあるので別々に見る
+ * (フィールドは「4 バイト語の数の log2」なので 4 << n)。
+ *
+ * 渡すのは HHDM の VA でよい。**キャッシュは PIPT** なので、同じ物理を指す
+ * どの VA から叩いても同じ行に当たる。
+ *
+ * `ic ivau` は inner-shareable 全体に届くので、SMP でも他コアの I-cache が
+ * 揃う (riscv64 の fence.i はハート単位なので、あちらは IPI が要る) */
+static inline void aarch64_sync_icache_range(void* va, uint64_t len) {
+    if (len == 0) return;
+
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    uint64_t dline = 4ULL << ((ctr >> 16) & 0xfULL);   /* CTR_EL0.DminLine */
+    uint64_t iline = 4ULL << (ctr & 0xfULL);           /* CTR_EL0.IminLine */
+
+    uint64_t start = (uint64_t)(uintptr_t)va;
+    uint64_t end   = start + len;
+
+    for (uint64_t p = start & ~(dline - 1); p < end; p += dline)
+        __asm__ volatile("dc cvau, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+
+    for (uint64_t p = start & ~(iline - 1); p < end; p += iline)
+        __asm__ volatile("ic ivau, %0" :: "r"(p) : "memory");
+    __asm__ volatile("dsb ish" ::: "memory");
+    __asm__ volatile("isb" ::: "memory");
+}
+
 uint64_t aarch64_vm_user_root_pa_current(void);
 
 /* ---- 共有層から見たアドレス空間 (M3c-2a) --------------------------------
