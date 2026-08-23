@@ -310,3 +310,9 @@ int64_t sys_write_serial(const char* buf, size_t count) {
     }
     return (int64_t)count;
 }
+
+/* 機械のリセット。**まだ手段を持たない。**
+ * aarch64 は BCM2711 の watchdog で実装済み (kernel/aarch64/runtime.c)。
+ * こちらは riscv64 なら SBI の SRST 拡張、x86 なら ACPI か 0xCF9 が
+ * 相当するが、いずれも未着手。-1 を返すと reboot(2) は -ENOSYS になる */
+int arch_system_reset(void) { return -1; }

@@ -1180,6 +1180,37 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                 arch_syscall_set_return(frame, current ? (uint64_t)current->pid : 0);
                 return;
             }
+        /* **機械のリセット。** 焼き直しのたびに電源を抜かなくて済むように
+         * 入れた。Linux と同じで魔法の数を 2 つ揃えないと効かない —
+         * **誤爆で機械が落ちるのが一番困る**ので、この検査は削らないこと。
+         *
+         * 手段を持たないアーキ (riscv64 / x86_64) では -ENOSYS。
+         * 成功したときはここから戻らない */
+        case LINUX_SYS_REBOOT:
+            {
+                uint32_t magic1 = (uint32_t)arch_syscall_arg0(frame);
+                uint32_t magic2 = (uint32_t)arch_syscall_arg1(frame);
+                uint32_t cmd    = (uint32_t)arch_syscall_arg2(frame);
+                if (magic1 != LINUX_REBOOT_MAGIC1 ||
+                    (magic2 != LINUX_REBOOT_MAGIC2  && magic2 != LINUX_REBOOT_MAGIC2A &&
+                     magic2 != LINUX_REBOOT_MAGIC2B && magic2 != LINUX_REBOOT_MAGIC2C)) {
+                    arch_syscall_set_return(frame, (uint64_t)(int64_t)-22);   /* -EINVAL */
+                    return;
+                }
+                if (cmd != LINUX_REBOOT_CMD_RESTART) {
+                    /* halt / poweroff は Pi 4 では作れない (電源を落とす
+                     * 経路が無い)。**出来ないことは出来ないと返す** */
+                    arch_syscall_set_return(frame, (uint64_t)(int64_t)-38);   /* -ENOSYS */
+                    return;
+                }
+                puts("\n[EL1] reboot: 機械をリセットする\r\n");
+                if (arch_system_reset() < 0) {
+                    arch_syscall_set_return(frame, (uint64_t)(int64_t)-38);   /* -ENOSYS */
+                    return;
+                }
+                /* 仕掛けたが、カウントが尽きるまでの間ここに来る */
+                for (;;) { }
+            }
         case LINUX_SYS_GETPPID:
             {
                 struct task* current = get_current_task();

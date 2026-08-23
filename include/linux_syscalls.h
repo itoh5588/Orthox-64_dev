@@ -59,6 +59,15 @@
 #define LINUX_SYS_RT_SIGACTION     134
 #define LINUX_SYS_RT_SIGPROCMASK   135
 #define LINUX_SYS_UNAME            160
+/* reboot(2)。**焼き直しのたびに電源を抜かなくて済むように入れた。**
+ * Linux と同じで、魔法の数を 2 つ揃えないと効かない (誤爆よけ) */
+#define LINUX_SYS_REBOOT           142
+#define LINUX_REBOOT_MAGIC1        0xfee1deadU
+#define LINUX_REBOOT_MAGIC2        672274793U      /* 0x28121969 */
+#define LINUX_REBOOT_MAGIC2A       85072278U       /* 0x05121996 */
+#define LINUX_REBOOT_MAGIC2B       369367448U      /* 0x16041998 */
+#define LINUX_REBOOT_MAGIC2C       537993216U      /* 0x20112000 */
+#define LINUX_REBOOT_CMD_RESTART   0x01234567U
 /* **実測で ENOSYS が出たもの (2026-08-11)。** Orthox の中で
  * gcc / ld / make を動かしたときに呼ばれた。どれも戻り値を見て続行する
  * 作りだったので致命的ではなかったが、埋めておく */

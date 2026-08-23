@@ -47,3 +47,9 @@ void arch_platform_init_ap(uint32_t cpu_id, uint64_t kernel_stack) {
 void arch_platform_send_resched_ipi(uint32_t arch_cpu_id) {
     lapic_send_ipi(arch_cpu_id, INT_VECTOR_RESCHED);
 }
+
+/* 機械のリセット。**まだ手段を持たない。**
+ * aarch64 は BCM2711 の watchdog で実装済み (kernel/aarch64/runtime.c)。
+ * こちらは riscv64 なら SBI の SRST 拡張、x86 なら ACPI か 0xCF9 が
+ * 相当するが、いずれも未着手。-1 を返すと reboot(2) は -ENOSYS になる */
+int arch_system_reset(void) { return -1; }

@@ -63,6 +63,15 @@ void arch_task_store_user_frame_hook(struct arch_task_context* ctx,
 /* もう進めないときに止まる */
 void arch_halt_forever(void) __attribute__((noreturn));
 
+/* 機械をリセットする (reboot(2) の受け皿)。
+ *
+ * 戻り値: 0 = リセットを仕掛けた (通常ここから戻らない)
+ *        -1 = この機械では出来ない → 呼び出し元は -ENOSYS を返す
+ *
+ * aarch64 は BCM2711 の watchdog (Pi 4 に PSCI は無い)。
+ * riscv64 / x86_64 はまだ手段を持たない */
+int arch_system_reset(void);
+
 /* puts は stdio.h。puthex はアーキの runtime.c が出す */
 void puthex(uint64_t value);
 

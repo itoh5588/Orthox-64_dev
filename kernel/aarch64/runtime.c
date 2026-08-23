@@ -18,6 +18,7 @@
 #include "aarch64/boot.h"
 #include "aarch64/task.h"
 #include "aarch64/vm.h"
+#include "aarch64/bcm_periph.h"
 #include "spinlock.h"
 
 /* 物理 → カーネル VA の差。**pmm_init が実際の値を入れる。**
@@ -663,4 +664,48 @@ int net_needs_poll_fallback(void) {
 }
 
 void net_poll(void) {
+}
+
+/* ---- 機械のリセット (reboot) ---------------------------------------------
+ *
+ * **Pi 4 に PSCI は無い。** DTB は spin-table で psci ノードを持たず、
+ * armstub も SMC を受けない。**BCM2711 の watchdog が唯一の手段。**
+ *
+ * 手順 (Linux の drivers/watchdog/bcm2835_wdt.c と同じ):
+ *   1. PM_WDOG  に短いカウントを書く
+ *   2. PM_RSTC の WRCFG を FULL_RESET にする
+ *   3. カウントが尽きるとチップがリセットされる
+ *
+ * **書き込みには必ず PM_PASSWORD を OR する。**付け忘れると黙って
+ * 無視され、「効かない」のか「番地が違う」のかが区別できなくなる。
+ *
+ * **電源は切れない。**xHCI / PCIe / VL805 は前回の状態を保ったまま
+ * 再初期化に入る。ここで引っかかったときに **USB の退行と取り違えない**
+ * こと — 電源断で上がるなら、それは reboot 側の話。
+ *
+ * PM が張られていない機械 (QEMU virt など) では何も起きない。
+ * 戻り値: 0 = リセットを仕掛けた、-1 = この機械では出来ない */
+int arch_system_reset(void) {
+    const aarch64_boot_info_t* b = aarch64_boot_info();
+    volatile uint32_t* pm;
+    uint32_t rstc;
+
+    /* **Pi かどうかは mailbox / EMMC2 の有無で見る。** vm.c が PM の
+     * ページを張るときと同じ条件にしておく。揃っていないと、張って
+     * いない番地を触って落ちる */
+    if (!b || (!b->mbox_base && !b->emmc2_base)) return -1;
+
+    pm = (volatile uint32_t*)(uintptr_t)aarch64_phys_to_virt(AARCH64_BCM_PM_BASE);
+
+    /* **先にカウントを入れてから WRCFG を立てる。**逆にすると、
+     * 前回の残りカウントで即座に落ちることがある */
+    pm[AARCH64_BCM_PM_WDOG / 4] = AARCH64_BCM_PM_PASSWORD | 10U;
+
+    rstc = pm[AARCH64_BCM_PM_RSTC / 4];
+    rstc &= AARCH64_BCM_PM_RSTC_WRCFG_CLR;
+    rstc |= AARCH64_BCM_PM_RSTC_WRCFG_FULL_RESET;
+    pm[AARCH64_BCM_PM_RSTC / 4] = AARCH64_BCM_PM_PASSWORD | rstc;
+
+    /* ここから戻らないはずだが、戻ったときのために待つ側は呼び出し元に任せる */
+    return 0;
 }

@@ -23,4 +23,25 @@
  *     → 0,2,4,5,6,7,8,9,10 (**1 と 3 はファームウェアが押さえている**) */
 #define AARCH64_BCM_DMA_BASE    (AARCH64_BCM_PERI_BASE + 0x7000ULL)
 
+/* ---- 電源管理 (PM) — reboot に使う ---------------------------------------
+ *
+ * **BCM2711 のデータシートに PM ブロックの記載は無い。** BCM2835 から
+ * 引き継いだ未文書の領域で、裏は Linux の drivers/watchdog/bcm2835_wdt.c。
+ * PWM の DREQ (D-3) と同じで、**出典がデータシートでないことを明記する。**
+ *
+ * **CM (0xFE101000) の 1 つ下のページ。**音のために CM は張ってあるが
+ * PM は別ページなので、vm.c で張り忘れると translation fault になる。
+ *
+ * Pi 4 には PSCI が無い (DTB は spin-table、psci ノード無し) ので、
+ * **watchdog が唯一のリセット手段。**電源は切れないため、xHCI / PCIe は
+ * 前回の状態を保ったまま再初期化に入る */
+#define AARCH64_BCM_PM_BASE     (AARCH64_BCM_PERI_BASE + 0x100000ULL)
+#define AARCH64_BCM_PM_RSTC     0x1CU
+#define AARCH64_BCM_PM_RSTS     0x20U
+#define AARCH64_BCM_PM_WDOG     0x24U
+/* 全書き込みに OR する。**付け忘れると黙って無視される** */
+#define AARCH64_BCM_PM_PASSWORD 0x5A000000U
+#define AARCH64_BCM_PM_RSTC_WRCFG_CLR       0xFFFFFFCFU
+#define AARCH64_BCM_PM_RSTC_WRCFG_FULL_RESET 0x00000020U
+
 #endif

@@ -583,12 +583,15 @@ static void aarch64_vm_build_kernel(void) {
     if (b->mbox_base || b->emmc2_base) {
         /* **DMA も要る (D-3)。**PWM の FIFO を CPU で埋めていると
          * 再生中カーネルが戻らない。DMA に任せる側に移した */
-        static const uint64_t snd_pa[4] = {
+        /* **PM も一緒に張る (reboot)。** CM (0xFE101000) の 1 つ下の
+         * ページで、**CM を張っただけでは届かない。**Pi 4 には PSCI が
+         * 無いので、watchdog が唯一のリセット手段 (bcm_periph.h の注記) */
+        static const uint64_t snd_pa[5] = {
             AARCH64_BCM_GPIO_BASE, AARCH64_BCM_CM_BASE, AARCH64_BCM_PWM1_BASE,
-            AARCH64_BCM_DMA_BASE
+            AARCH64_BCM_DMA_BASE, AARCH64_BCM_PM_BASE
         };
         int i;
-        for (i = 0; i < 4; i++) {
+        for (i = 0; i < 5; i++) {
             uint64_t pa = snd_pa[i] & ~(AARCH64_PAGE_SIZE - 1);
             aarch64_vm_map_range(aarch64_phys_to_virt(pa), pa,
                                  AARCH64_PAGE_SIZE, VM_DEVICE_RW);
