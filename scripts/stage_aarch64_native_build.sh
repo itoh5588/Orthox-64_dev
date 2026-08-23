@@ -86,12 +86,60 @@ OUTPUT ?= /kernel-aarch64.elf
 # (動くが遅く、ログも汚れる。riscv64 版で踏んだ)
 CC = /usr/bin/gcc
 LD = /usr/bin/ld
+# **mkdir と rm も絶対パスで。** busybox の applet は /bin にあり、
+# PATH の頭が /usr/bin なので、名前だけだと 1 コマンドごとに
+# /usr/bin/mkdir への exec 失敗が 1 回入る。動きはするが、カーネルが
+# 「Exec: File not found: /usr/bin/mkdir」を毎回出してログが汚れる
+# (2026-08-23、47 本のビルドで 47 回出た)
+MKDIR = /bin/mkdir
+RM    = /bin/rm
+
+# ---- どの機械向けに作るか --------------------------------------------------
+#
+# **2026-08-23 まで、ここには機械固有の指定が 1 つも無かった。**
+# その結果ヘッダの既定値 (すべて QEMU virt) が効き、実機で作った
+# カーネルは
+#   - 0x40200000 にリンクされ (ファームウェアは 0x80000 に置いて飛ぶ)
+#   - QEMU virt の UART 0x09000000 に喋る (実機の PL011 は 0xFE201000)
+# ものになった。**読み込まれて起動し、1 行も出さずに死ぬ。**
+#
+# **8/11 に QEMU virt でセルフホストが通ったのは、既定値が全部 virt に
+# 一致していたからで、この Makefile は暗黙に virt 専用だった。**
+#
+#   Raspberry Pi 4 : make                (既定。目的の機械)
+#   QEMU virt      : make MACHINE=virt
+#
+# 値はホスト側 Makefile の aarch64-pi4-boot と同じものを写している。
+# **片方だけ直すと、また「実機だけ黙る」に戻る。**
+MACHINE ?= pi4
+
+ifeq ($(MACHINE),pi4)
+LOAD_PA     ?= 0x80000
+MACHINE_DEFS = -DAARCH64_EARLY_UART=0xFE201000ULL \
+	       -DAARCH64_CNTFRQ_HZ=54000000 \
+	       -DAARCH64_EARLY_GICD=0xFF841000 \
+	       -DAARCH64_EARLY_GICC=0xFF842000 \
+	       -DAARCH64_SOUND=1 \
+	       -DAARCH64_PCIE_BRCM_INIT=1 \
+	       '-DAARCH64_INIT_PATH="/bin/ash"'
+else
+# QEMU virt はヘッダの既定でよい (8/11 まではこれで通っていた)
+LOAD_PA     ?= 0x40200000
+MACHINE_DEFS =
+endif
 
 CFLAGS = -std=gnu1x -mgeneral-regs-only -ffreestanding \
 	 -fno-stack-protector -fno-stack-check -fno-lto -fno-pie \
-	 -mcmodel=small -O2 -I$(SRCDIR)/include
+	 -mcmodel=small -O2 -I$(SRCDIR)/include $(MACHINE_DEFS)
 
-LDFLAGS = -nostdlib -static -m aarch64elf -T $(SRCDIR)/scripts/kernel-aarch64.ld
+# **リンク番地は --defsym では渡せない。**
+# GNU ld 2.42 は --defsym で定義した記号を、リンカスクリプトの
+# DEFINED() の判定に反映しない (2026-08-23 に手元で再現)。lld は
+# 反映するので、**ホストビルドだけが正しく効いていた。**
+# 代入してから INCLUDE する 2 行のラッパーを作って回避する。
+LDSCRIPT = $(BUILD)/machine.ld
+
+LDFLAGS = -nostdlib -static -m aarch64elf -L $(SRCDIR)/scripts -T $(LDSCRIPT)
 
 MAKEFILE_HEAD
 
@@ -116,15 +164,15 @@ $(OUTPUT): $(OBJS)
 	@echo "native-kernel-build-ok $@"
 
 $(BUILD)/%.o: $(SRCDIR)/%.c
-	@mkdir -p $(dir $@)
+	@$(MKDIR) -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/%_asm.o: $(SRCDIR)/%.S
-	@mkdir -p $(dir $@)
+	@$(MKDIR) -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -rf $(BUILD) $(OUTPUT)
+	$(RM) -rf $(BUILD) $(OUTPUT)
 
 .PHONY: all clean
 MAKEFILE_TAIL
