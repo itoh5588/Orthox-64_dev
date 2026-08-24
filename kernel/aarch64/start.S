@@ -56,6 +56,11 @@ _start:
     /* 起こすのは CPU 0 だけ。他は M1 まで寝かせる */
     cbnz    x20, 2f
 
+    /* **EL を降ろした後の行き先を x23 に置く (SMP の P-8)。**
+     * 降格の手順を副コアと共用するため、飛び先だけを引数にした。
+     * CPU 0 は 4: (FP を開けて .bss を 0 埋めして early_main) へ */
+    adr     x23, 4f
+
     /* ---- EL3 で起動していたら EL2 へ降りる --------------------------------
      *
      * **どの EL で来るかは機械とファームウェアで違う。決め打ちしない。**
@@ -177,7 +182,26 @@ _start:
     mrs     x0, CurrentEL
     lsr     x0, x0, #2
     cmp     x0, #2
-    b.ne    4f                  /* 既に EL1 なら何もしない */
+    b.ne    5f                  /* 既に EL1 なら降ろさず x23 へ */
+
+    /* **CPUECTLR_EL1.SMPEN を立てる (SMP の P-8)。**
+     *
+     * Cortex-A72 はこれが立っていないと**そのコアのキャッシュが
+     * コヒーレンシに参加しない**。`ic ivau` の broadcast も
+     * `tlbi ...is` も、同じ inner-shareable ドメインに居ることが前提なので、
+     * 落ちたコアが 1 つ混じると**キャッシュも TLB も静かにずれる**。
+     *
+     * **EL1 からは触れない** (ACTLR_EL2/EL3 の許可が要る) ので、EL2 に
+     * 居るいま立てる。armstub8 が既に立てている公算が高いが、
+     * **立っているかを測るより、立てるほうが安い**。冪等な操作。
+     *
+     * S3_1_C15_C2_1 = CPUECTLR_EL1、bit 6 = SMPEN */
+    mrs     x0, S3_1_C15_C2_1
+    orr     x0, x0, #(1 << 6)
+    msr     S3_1_C15_C2_1, x0
+    isb
+    mrs     x0, CurrentEL
+    lsr     x0, x0, #2
 
     /* EL1 は AArch64 (HCR_EL2.RW = 1)。ここを 0 のままにすると EL1 が
      * AArch32 扱いになり、eret した瞬間に迷子になる */
@@ -216,9 +240,12 @@ _start:
     mov     x0, sp
     msr     sp_el1, x0
 
-    adr     x0, 4f
-    msr     elr_el2, x0
+    msr     elr_el2, x23
     eret
+
+5:
+    /* EL1 で来た (降ろす必要が無かった)。x23 の行き先へ */
+    br      x23
 
 4:
     /* ---- FP / SIMD を EL0 に開ける ---------------------------------------
@@ -274,3 +301,65 @@ _start:
      * 上位側の aarch64_wait_forever を bl で呼ぶと届かない */
     wfe
     b       2b
+
+/* ==========================================================================
+ * 副コアの入口 (SMP の P-4)
+ *
+ * PSCI の CPU_ON、または spin-table の release address から飛んでくる。
+ * **`_start` とは共用しない。** 理由は 2 つ:
+ *
+ *   1. **DTB が渡ってこない。** spin-table では入口で x0-x3 が 0
+ *      (QEMU hw/arm/raspi.c の write_smpboot64 で実測)。`_start` は x0 を
+ *      DTB として x19 に退避するので、共用すると 0 を DTB として掴む
+ *   2. `_start` は .bss を 0 埋めし、EL を降ろす。**どちらも CPU 0 が
+ *      済ませてある。** もう一度やると起動済みの状態を壊す
+ *
+ * riscv64 が _start と riscv64_secondary_start を分けているのと同じ形。
+ *
+ * ここに来た時点の状態:
+ *   MMU off / キャッシュ off / スタック無し
+ *   EL は起こし方で決まる (PSCI は呼んだ側と同じ EL = EL1)
+ *
+ * **x21 (VA offset) は自分で作り直す。** CPU 0 のレジスタは見えない。
+ * ========================================================================== */
+.globl aarch64_secondary_start
+.extern aarch64_secondary_main
+
+aarch64_secondary_start:
+    ldr     x21, =AARCH64_KERNEL_VA_OFFSET
+
+    /* Aff0 = CPU 番号。**ブートスタックの割り当ては _start と同じ式**で
+     * なければならない (pmm もその範囲を使用中として予約している) */
+    mrs     x20, mpidr_el1
+    and     x20, x20, #0xff
+    cmp     x20, #8
+    b.hs    9f                  /* 枠が無いコアは寝かせる */
+
+    ldr     x1, =__kernel_end
+    sub     x1, x1, x21         /* 物理に直す */
+    mov     x2, #65536
+    add     x3, x20, #1
+    madd    x1, x3, x2, x1      /* base + (cpu + 1) * 64KB = このコアの頂点 */
+    mov     sp, x1
+
+    /* **EL を降ろす。** spin-table の副コアは主コアと同じ EL で解放される
+     * (QEMU raspi4b / 実機の armstub8 とも EL2)。CPU 0 と同じ手順を通す
+     * ため、行き先を x23 に置いて 6: へ入る。**PSCI の副コアは EL1 で
+     * 来る**ので、そのときは 6: が素通りして 5: -> x23 へ抜ける */
+    adr     x23, 8f
+    b       6b
+
+8:
+    /* MMU はまだ off なので C も物理で走る。**上位 VA でリンクされた C を
+     * 物理に直して呼ぶ** — _start が aarch64_early_main を呼ぶのと同じ。
+     *
+     * **x20 は EL 降格をまたいで保たれる** (eret はレジスタを壊さない) */
+    ldr     x2, =aarch64_secondary_main
+    sub     x2, x2, x21
+    mov     x0, x20             /* 第 1 引数 = CPU 番号 */
+    blr     x2
+
+9:
+    /* 戻ってきた = 上位 VA へ移れなかった。**ここも .boot で完結させる** */
+    wfe
+    b       9b

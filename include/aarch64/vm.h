@@ -202,6 +202,14 @@ void arch_vm_unmap_page(arch_address_space_t address_space, uint64_t vaddr);
 void arch_vm_update_page_flags(arch_address_space_t address_space, uint64_t vaddr, uint64_t flags);
 
 void aarch64_vm_activate_address_space(uint64_t root_pa);
+
+/* MMU を入れる (SMP の P-4 で公開した)。**CPU 0 が組んだテーブルを共有する**
+ * ので、副コアはこれを呼ぶだけでよい。g_ident_root_pa / g_kernel_root_pa を
+ * 読むだけの自己完結。**MMU off・物理 PC の状態で呼ぶこと。** */
+void aarch64_mmu_enable(void);
+
+/* 物理アドレスの世界から上位 VA へ移る (kernel/aarch64/entry.S)。戻らない */
+void aarch64_vm_enter_high(uint64_t new_sp, uint64_t cont);
 uint64_t aarch64_vm_kernel_root_pa(void);
 
 /* MMU が有効か (SCTLR_EL1.M)。

@@ -1107,7 +1107,7 @@ void arch_vm_update_page_flags(arch_address_space_t address_space, uint64_t vadd
  *
  * 割り込みは閉じておく。有効化の最中に例外が入っても恒等マッピングなら
  * 破綻しないが、切り分けを楽にするために閉じる */
-static void aarch64_mmu_enable(void) {
+void aarch64_mmu_enable(void) {
     __asm__ volatile("dsb ishst");   /* 組んだテーブルをテーブルウォーカに見せる */
 
     __asm__ volatile("msr mair_el1, %0" :: "r"((uint64_t)MAIR_EL1_VALUE));

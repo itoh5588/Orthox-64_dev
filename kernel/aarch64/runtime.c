@@ -117,32 +117,52 @@ void spin_unlock_irqrestore(spinlock_t* lock, uint64_t flags) {
     irq_restore(flags);
 }
 
-/* ---- BKL -----------------------------------------------------------------
+/* ---- BKL (SMP の P-2) ----------------------------------------------------
  *
- * **いまは CPU 1 本前提の深さ 1 本。** riscv64 は cpu_local に持たせて
- * いるが、そちらは共有タスク層が居て初めて成り立つ。M3c-2b で
- * cpu_local に移すこと。 */
+ * **深さは cpu_local に持つ。** ロック本体は 1 本のまま (BKL なので全 CPU で
+ * 共有する) だが、「自分が何重に取っているか」は CPU ごとの値。
+ * 単一のグローバルにすると、CPU A の enter が CPU B の depth を進めて
+ * しまい、**B の exit が 0 でないと見て解放しなくなる。**
+ *
+ * 形は x86 の kernel/spinlock.c:48 に合わせた。**割り込みの開け閉めだけは
+ * こちらに残す** — depth の増減が割り込みで割られると壊れるため
+ * (x86 版は cli 済みの前提で呼ばれる場所しかないので囲っていない)。
+ *
+ * **cpu_local がまだ無いあいだは生のスピンロックとして振る舞う。**
+ * riscv64/smp.c:103 と同じ約束で、**この状態でロックを持ったまま
+ * task_install_cpu_local を呼んではいけない** — exit 側が depth==0 を見て
+ * 解放せずに戻り、全 CPU が止まる。 */
+#include "task.h"
+
 static spinlock_t g_kernel_lock;
-static uint32_t g_kernel_lock_depth;
 
 void kernel_lock_enter(void) {
     uint64_t flags = irq_save_disable();
-    if (g_kernel_lock_depth == 0) spin_lock(&g_kernel_lock);
-    g_kernel_lock_depth++;
+    struct cpu_local* cpu = get_cpu_local();
+    if (!cpu) {
+        spin_lock(&g_kernel_lock);
+    } else if (cpu->kernel_lock_depth++ == 0) {
+        spin_lock(&g_kernel_lock);
+    }
     irq_restore(flags);
 }
 
 void kernel_lock_exit(void) {
     uint64_t flags = irq_save_disable();
-    if (g_kernel_lock_depth != 0) {
-        g_kernel_lock_depth--;
-        if (g_kernel_lock_depth == 0) spin_unlock(&g_kernel_lock);
+    struct cpu_local* cpu = get_cpu_local();
+    if (!cpu) {
+        spin_unlock(&g_kernel_lock);
+    } else if (cpu->kernel_lock_depth != 0) {
+        cpu->kernel_lock_depth--;
+        if (cpu->kernel_lock_depth == 0) spin_unlock(&g_kernel_lock);
     }
     irq_restore(flags);
 }
 
 int kernel_lock_held(void) {
-    return g_kernel_lock_depth != 0;
+    struct cpu_local* cpu = get_cpu_local();
+    if (!cpu) return g_kernel_lock.locked != 0;
+    return cpu->kernel_lock_depth != 0;
 }
 
 /* ---- コンソール ----------------------------------------------------------
@@ -319,30 +339,9 @@ done:
 #include "smp.h"
 #include "task.h"
 
-static struct smp_cpu_info g_cpus[1];
-static int g_cpus_ready;
-
-const struct smp_cpu_info* smp_get_cpu_info(uint32_t cpu_index) {
-    if (cpu_index != 0) return 0;
-    if (!g_cpus_ready) {
-        g_cpus[0].cpu_index = 0;
-        g_cpus[0].processor_id = 0;
-        g_cpus[0].lapic_id = 0;
-        g_cpus[0].is_bsp = 1;
-        g_cpus[0].started = 1;
-        g_cpus_ready = 1;
-    }
-    return &g_cpus[0];
-}
-
-uint32_t smp_get_started_cpu_count(void) { return 1; }
-
-/* **自分にしか送りようが無い。** 自 CPU への resched は
- * task_request_resched がフラグを立てるので、ここで何かする必要は無い。
- * 他 CPU が現れたら PSCI と GIC の SGI が要る */
-void smp_send_resched_ipi(uint32_t cpu_id) {
-    (void)cpu_id;
-}
+/* **smp_get_cpu_info / smp_get_started_cpu_count / smp_send_resched_ipi は
+ * kernel/aarch64/smp.c へ移した (SMP の P-5)。** ここにあったのは
+ * 「CPU は 1 本」と答えるスタブで、副コアが実在するいまは嘘になる */
 
 /* コンソールの fd は kernel/fs.c の本物を使う (C-1a)。
  * M3c-2b では -1 を返すスタブを置いていたが、fs.c を取り込んだので外した */
@@ -352,7 +351,8 @@ void smp_send_resched_ipi(uint32_t cpu_id) {
  * riscv64 と同じく、**BKL を全部手放してから schedule()、戻ったら取り直す。**
  * 持ったまま切り替えると、次のタスクが同じロックを待って進めなくなる */
 void kernel_yield(void) {
-    uint32_t depth = g_kernel_lock_depth;
+    struct cpu_local* cpu = get_cpu_local();
+    uint32_t depth = cpu ? cpu->kernel_lock_depth : 0;
     for (uint32_t i = 0; i < depth; i++) kernel_lock_exit();
     schedule();
     for (uint32_t i = 0; i < depth; i++) kernel_lock_enter();

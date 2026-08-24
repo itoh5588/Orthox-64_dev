@@ -27,6 +27,21 @@ aarch64_link_va_offset:
     ldr     x0, =KERNEL_VA_OFFSET
     ret
 
+/* uint64_t aarch64_secondary_entry_pa(void)
+ *
+ * 副コアの入口 (start.S の aarch64_secondary_start) の**物理アドレス**を返す。
+ * あちらは .boot に居て VA = PA なので、シンボルの値がそのまま物理になる。
+ *
+ * **C から & を取れない。** 上位 VA (この .text) から .boot までは
+ * リンク上 2^40 離れていて adrp が届かず、リロケーションが範囲外になる。
+ * aarch64_link_va_offset と同じ理由で、リテラルプール経由なら取れる。
+ *
+ * PSCI にも spin-table にも、渡すのはこの物理アドレス */
+.globl aarch64_secondary_entry_pa
+aarch64_secondary_entry_pa:
+    ldr     x0, =aarch64_secondary_start
+    ret
+
 /* void aarch64_vm_enter_high(uint64_t new_sp, uint64_t cont)
  *
  * MMU を入れた直後に、**物理アドレスの世界から上位 VA の世界へ移る**。

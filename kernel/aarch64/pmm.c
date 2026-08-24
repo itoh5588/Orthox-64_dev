@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include "aarch64/boot.h"
 #include "aarch64/vm.h"
+#include "spinlock.h"
 
 #define AARCH64_PAGE_SIZE   0x1000ULL
 #define AARCH64_BOOT_CPUS   8
@@ -214,10 +215,27 @@ void aarch64_pmm_init(void) {
     }
 }
 
-/* 連続した pages 枚を確保して**物理アドレス**を返す。0 なら失敗。
- * 中身は 0 で埋める (ページテーブルに使うので、ごみが残っていると
- * 有効ビットが立ったままの descriptor を掴むことになる) */
-uint64_t aarch64_pmm_alloc(uint64_t pages) {
+/* ---- 排他 (SMP の P-3) ---------------------------------------------------
+ *
+ * **ビットマップと refcount を 1 本のロックで守る。** 別々にすると
+ * 「refcount を 0 にした CPU」と「そのページを配ろうとする CPU」の間で
+ * 順序を決めなければならなくなる。pmm は経路が短いので分ける利がない。
+ *
+ * 守らないと何が起きるか — **探索と確保が離れている**のが要点で、
+ * 2 つの CPU が同じ空きページを見つけて**両方に配ってしまう**。
+ * これは「後から別の場所が壊れる」形で出るので、いちばん見つけにくい。
+ *
+ * **再入に注意。** 共有層の pmm_free は refcount を減らしてから
+ * aarch64_pmm_free を呼ぶ。素直に両方でロックを取ると自分を待って止まる。
+ * そこで**ロックを持った状態で呼ぶ内部関数 (_locked) を分けてある。**
+ *
+ * **0 埋めはロックの外でやる。** ページを使用中にした時点で他の CPU には
+ * 配られないので、長い memset をロックの中に入れる理由がない。 */
+static spinlock_t g_pmm_lock;
+
+/* ロックを持った状態で呼ぶこと。ビットを立てて g_used を進めるだけで、
+ * **0 埋めはしない**。失敗は 0。 */
+static uint64_t pmm_claim_locked(uint64_t pages) {
     uint64_t run = 0, start = 0;
 
     if (pages == 0 || g_pages == 0) return 0;
@@ -226,25 +244,47 @@ uint64_t aarch64_pmm_alloc(uint64_t pages) {
         if (pmm_test(page)) { run = 0; continue; }
         if (run == 0) start = page;
         if (++run == pages) {
-            uint64_t pa = g_base_pa + start * AARCH64_PAGE_SIZE;
-            uint8_t* p = (uint8_t*)(uintptr_t)(aarch64_vm_running_high()
-                                               ? aarch64_phys_to_virt(pa) : pa);
             for (uint64_t i = 0; i < pages; i++) pmm_set(start + i);
             g_used += pages;
-            for (uint64_t i = 0; i < pages * AARCH64_PAGE_SIZE; i++) p[i] = 0;
-            return pa;
+            return g_base_pa + start * AARCH64_PAGE_SIZE;
         }
     }
     return 0;
 }
 
-void aarch64_pmm_free(uint64_t pa, uint64_t pages) {
+/* ロックを持った状態で呼ぶこと。 */
+static void pmm_release_locked(uint64_t pa, uint64_t pages) {
     if (!pa || pa < g_base_pa) return;
     uint64_t start = (pa - g_base_pa) / AARCH64_PAGE_SIZE;
     for (uint64_t i = 0; i < pages && start + i < g_pages; i++) {
         if (pmm_test(start + i)) g_used--;
         pmm_clear(start + i);
     }
+}
+
+/* ロックの外で呼ぶ。**MMU の前後どちらでも触れるように経路を選ぶ** */
+static void pmm_zero_pages(uint64_t pa, uint64_t pages) {
+    uint8_t* p = (uint8_t*)(uintptr_t)(aarch64_vm_running_high()
+                                       ? aarch64_phys_to_virt(pa) : pa);
+    for (uint64_t i = 0; i < pages * AARCH64_PAGE_SIZE; i++) p[i] = 0;
+}
+
+/* 連続した pages 枚を確保して**物理アドレス**を返す。0 なら失敗。
+ * 中身は 0 で埋める (ページテーブルに使うので、ごみが残っていると
+ * 有効ビットが立ったままの descriptor を掴むことになる) */
+uint64_t aarch64_pmm_alloc(uint64_t pages) {
+    uint64_t pa;
+    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+    pa = pmm_claim_locked(pages);
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
+    if (pa) pmm_zero_pages(pa, pages);
+    return pa;
+}
+
+void aarch64_pmm_free(uint64_t pa, uint64_t pages) {
+    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+    pmm_release_locked(pa, pages);
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
 
 uint64_t aarch64_pmm_base(void)  { return g_base_pa; }
@@ -300,14 +340,23 @@ void pmm_init(void) {
     aarch64_pmm_init();
 }
 
+/* **確保と refcount の初期化を 1 つのロックの中で済ませる。**
+ * 分けると、refcount が 1 になる前のページを別の CPU の pmm_free が
+ * 見に来る余地が残る。0 埋めだけロックの外 (§ 排他 の注記) */
 void* pmm_alloc(size_t pages) {
-    uint64_t pa = aarch64_pmm_alloc((uint64_t)pages);
-    if (!pa) return 0;
-    for (size_t i = 0; i < pages; i++) {
-        int ok;
-        uint64_t page = pmm_page_index(pa + (uint64_t)i * AARCH64_PAGE_SIZE, &ok);
-        if (ok) pmm_refcount()[page] = 1;
+    uint64_t pa;
+    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+    pa = pmm_claim_locked((uint64_t)pages);
+    if (pa) {
+        for (size_t i = 0; i < pages; i++) {
+            int ok;
+            uint64_t page = pmm_page_index(pa + (uint64_t)i * AARCH64_PAGE_SIZE, &ok);
+            if (ok) pmm_refcount()[page] = 1;
+        }
     }
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
+    if (!pa) return 0;
+    pmm_zero_pages(pa, (uint64_t)pages);
     return (void*)(uintptr_t)pa;
 }
 
@@ -316,6 +365,10 @@ void* pmm_alloc(size_t pages) {
  * まだ使われているページを配り直すことになる */
 void pmm_free(void* addr, size_t pages) {
     uint64_t base = (uint64_t)(uintptr_t)addr;
+    /* **「減らして 0 なら返す」を割らない。** 2 つの CPU が同時に最後の
+     * 参照を手放すと、両方が 0 を見て**同じページを 2 回返す**。
+     * 次の alloc がそれを 2 か所へ配る。**再入するので _locked を呼ぶ** */
+    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
     for (size_t i = 0; i < pages; i++) {
         int ok;
         uint64_t pa = base + (uint64_t)i * AARCH64_PAGE_SIZE;
@@ -324,21 +377,30 @@ void pmm_free(void* addr, size_t pages) {
         uint16_t* rc = pmm_refcount();
         if (rc[page] > 0) {
             rc[page]--;
-            if (rc[page] == 0) aarch64_pmm_free(pa, 1);
+            if (rc[page] == 0) pmm_release_locked(pa, 1);
         }
     }
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
 
 void pmm_incref(void* addr) {
     int ok;
-    uint64_t page = pmm_page_index((uint64_t)(uintptr_t)addr, &ok);
+    uint64_t page;
+    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+    page = pmm_page_index((uint64_t)(uintptr_t)addr, &ok);
     if (ok && pmm_refcount()[page] < 0xffffU) pmm_refcount()[page]++;
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
 }
 
 uint16_t pmm_get_ref(void* addr) {
     int ok;
-    uint64_t page = pmm_page_index((uint64_t)(uintptr_t)addr, &ok);
-    return ok ? pmm_refcount()[page] : 0;
+    uint64_t page;
+    uint16_t ref;
+    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
+    page = pmm_page_index((uint64_t)(uintptr_t)addr, &ok);
+    ref = ok ? pmm_refcount()[page] : 0;
+    spin_unlock_irqrestore(&g_pmm_lock, flags);
+    return ref;
 }
 
 /* ISA DMA は x86 (16MB 未満 + 64KB 境界) の話。**aarch64 では使わない。**

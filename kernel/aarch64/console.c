@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include "aarch64/boot.h"
 #include "task.h"
+#include "spinlock.h"
 
 int  aarch64_uart_getchar_nonblock(void);
 void aarch64_uart_enable_rx_irq(void);
@@ -47,18 +48,26 @@ static volatile uint8_t g_console_buf[CONSOLE_BUF_SIZE];
 static volatile uint32_t g_console_head;
 static volatile uint32_t g_console_tail;
 
-/* 割り込みを止めて臨界区間に入る。**CPU 1 本前提。**
- * SMP を入れるときはスピンロックに置き換えること (riscv64 は
- * spin_lock_irqsave を使っている) */
+/* 入力リングの臨界区間 (SMP の P-3)。
+ *
+ * **割り込みを止めるだけでは足りない。** それで守れるのは「自 CPU の
+ * 割り込みハンドラ (aarch64_console_rx_irq) と自 CPU の通常実行」の
+ * competition だけで、**別の CPU は止まらない**。riscv64 が
+ * spin_lock_irqsave を使っているのに合わせる。
+ *
+ * 割り込みを止めるのは依然として必要 —— 取ったまま同じ CPU の受信割り込みに
+ * 入ると自分自身を待って止まる。irqsave 版はその両方をやる。
+ *
+ * **ここで守るのは入力リングだけ。** 出力側の直列化は
+ * aarch64_console_begin / end (boot.c) が別に持っている。 */
+static spinlock_t g_console_lock;
+
 static uint64_t console_lock(void) {
-    uint64_t daif;
-    __asm__ volatile("mrs %0, daif" : "=r"(daif));
-    __asm__ volatile("msr daifset, #2" ::: "memory");
-    return daif;
+    return spin_lock_irqsave(&g_console_lock);
 }
 
-static void console_unlock(uint64_t daif) {
-    __asm__ volatile("msr daif, %0" :: "r"(daif) : "memory");
+static void console_unlock(uint64_t flags) {
+    spin_unlock_irqrestore(&g_console_lock, flags);
 }
 
 static int console_ring_empty(void) {

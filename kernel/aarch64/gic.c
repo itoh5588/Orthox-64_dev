@@ -23,12 +23,15 @@
 #include <stdint.h>
 #include "aarch64/boot.h"
 
+uint32_t aarch64_timer_intid(void);
+
 /* **アドレスは直書きしない。** DTB の intc から reg[0] / reg[1] を取る
  * (M2b)。QEMU virt と Pi 4 では位置が違う */
 #define GICD_CTLR_OFF        0x000
 #define GICD_ISENABLER_OFF   0x100   /* 32 本ずつ 1 レジスタ */
 #define GICD_IPRIORITYR_OFF  0x400   /* 4 本ずつ 1 レジスタ */
 #define GICD_ITARGETSR_OFF   0x800   /* 1 本 1 バイト。宛先 CPU のビットマスク */
+#define GICD_SGIR_OFF        0xF00   /* CPU 間割り込みの送信 (SMP の P-5) */
 
 #define GICC_CTLR_OFF   0x000
 #define GICC_PMR_OFF    0x004        /* 優先度マスク */
@@ -58,18 +61,72 @@ void aarch64_gic_set_base(uint64_t gicd, uint64_t gicc) {
     if (gicc) g_gicc_base = gicc;
 }
 
-void aarch64_gic_init(void) {
+/* ---- 全体 (Distributor)。CPU 0 が 1 度だけ ------------------------------- */
+void aarch64_gic_init_global(void) {
     const aarch64_boot_info_t* b = aarch64_boot_info();
     if (b->gicd_base) g_gicd_base = b->gicd_base;
     if (b->gicc_base) g_gicc_base = b->gicc_base;
 
-    /* CPU Interface: 優先度マスクを最も緩く (0xF0 = すべて通す)。
+    w32(GICD_CTLR, 1);
+}
+
+/* ---- CPU ごと (CPU Interface)。**全コアが自分で呼ぶ** (SMP の P-5) -------
+ *
+ * GICv2 では **CPU Interface と INTID 0-31 のレジスタが CPU ごとに
+ * バンクされている**。同じ番地に書いても、書いた CPU のぶんしか効かない。
+ * 副コアがこれを呼ばないと、そのコアは**割り込みを 1 本も受け取れない**。 */
+void aarch64_gic_init_cpu(void) {
+    /* 優先度マスクを最も緩く (0xF0 = すべて通す)。
      * ここを 0 のままにすると「有効にしたのに一度も上がらない」になる */
     w32(GICC_PMR, 0xF0);
     w32(GICC_CTLR, 1);
 
-    /* Distributor を有効化 */
-    w32(GICD_CTLR, 1);
+    /* **SGI (0-15) を開ける。** これが CPU 間割り込みの受け口で、
+     * resched IPI に SGI 0 を使う。0-31 はバンクされているので
+     * **コアごとに開ける必要がある** */
+    for (unsigned i = 0; i < 16; i++) {
+        volatile uint8_t* prio = (volatile uint8_t*)(GICD_IPRIORITYR + i);
+        *prio = 0;   /* PMR(0xF0) より小さくないと通らない */
+    }
+    w32(GICD_ISENABLER, 0x0000ffffU);   /* INTID 0-15 */
+
+    /* **PPI もバンクされている。** タイマ (INTID 30) は CPU 0 が
+     * aarch64_gic_enable_irq(30) で開けているが、それは**CPU 0 のぶんだけ**。
+     * 副コアがこれを開けないと、そのコアは**タイマ割り込みを 1 度も
+     * 受け取らない** — プリエンプションも時間切れの起床も効かなくなる。
+     *
+     * 実測 (P-5): 開ける前は副コアの tick が 0 回で、IPI で起きたときしか
+     * 動いていなかった */
+    {
+        unsigned t = aarch64_timer_intid();
+        if (t >= 16 && t < 32) {
+            volatile uint8_t* prio = (volatile uint8_t*)(GICD_IPRIORITYR + t);
+            *prio = 0;
+            w32(GICD_ISENABLER, 1U << t);
+        }
+    }
+}
+
+/* 既存の呼び出し (CPU 0 の起動路) はこのまま。中身が 2 つに割れただけ */
+void aarch64_gic_init(void) {
+    aarch64_gic_init_global();
+    aarch64_gic_init_cpu();
+}
+
+/* ---- CPU 間割り込みを送る (SMP の P-5) -----------------------------------
+ *
+ * riscv64 の SBI send_ipi に当たる。GICv2 は GICD_SGIR に 1 回書くだけ:
+ *
+ *   [25:24] TargetListFilter  00 = CPUTargetList のとおりに送る
+ *   [23:16] CPUTargetList     宛先 CPU のビットマスク
+ *   [3:0]   SGIINTID          割り込み番号 (0-15)
+ *
+ * **書く前に dsb が要る。** 送る側は先に共有データ (resched_pending など)
+ * を書いてから起こす。順序が入れ替わると、起きた側が古い値を見る */
+void aarch64_gic_send_sgi(uint32_t cpu_mask, unsigned intid) {
+    __asm__ volatile("dsb ishst" ::: "memory");
+    w32(g_gicd_base + GICD_SGIR_OFF,
+        ((cpu_mask & 0xffU) << 16) | (intid & 0xfU));
 }
 
 void aarch64_gic_enable_irq(unsigned intid) {

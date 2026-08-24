@@ -203,6 +203,12 @@ typedef struct dtb_node_state {
     uint32_t reg_len;
     const uint8_t* intr_data;
     uint32_t intr_len;
+    /* cpu@N の起こし方 (SMP)。**`/cpus` の親にも enable-method が在る**
+     * (Pi 4 は "brcm,bcm2836-smp") が、使うのは cpu@N 側のほう */
+    const char* enable_method;
+    uint32_t enable_method_len;
+    const uint8_t* release_addr_data;
+    uint32_t release_addr_len;
     /* **生の ranges。** PCI の ranges は子が 3 セルで、下の汎用の解釈
      * (子 <= 2 セル) では読めない。PCIe のときだけ自分で読み直す */
     const uint8_t* ranges_data;
@@ -228,6 +234,10 @@ static void node_state_clear(dtb_node_state_t* n) {
     n->reg_len = 0;
     n->intr_data = 0;
     n->intr_len = 0;
+    n->enable_method = 0;
+    n->enable_method_len = 0;
+    n->release_addr_data = 0;
+    n->release_addr_len = 0;
     n->range_count = 0;
     n->has_ranges = 0;
     n->ranges_data = 0;
@@ -540,7 +550,42 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                 }
             }
 
-            if (n->is_cpu) info->cpu_count++;
+            /* ---- cpu@N。**SMP の副コアの起こし方はここで決まる** --------
+             *
+             * 添字は DTB に並んでいた順。cpu_count は最後に「見つけた数」に
+             * なるので、記録は増やす前の値を添字に使う。
+             *
+             * **reg は MPIDR の Aff0 で、アドレスではない。** だから
+             * reg_entry_phys (ranges 変換つき) ではなく reg_entry を直に
+             * 呼ぶ。**このファイルで reg_entry を直接呼んでよい唯一の場所。**
+             * 変換を通すと /soc の ranges に当たって別の値になる。
+             *
+             * **cpu-release-addr は #address-cells に関係なく常に 8 バイト。**
+             * Pi 4 は /cpus が #address-cells = 1 なのにこれは 64bit で
+             * 入っている (2026-08-24 に tests/dtb の 2 本で実測)。
+             * セル数で読むと上位 32bit を落とす */
+            if (n->is_cpu) {
+                uint32_t idx = info->cpu_count;
+                if (idx < AARCH64_MAX_CPUS) {
+                    uint64_t mpidr = 0, dummy = 0;
+                    if (reg_entry(n->reg_data, n->reg_len, ac, sc, 0, &mpidr, &dummy)) {
+                        info->cpu_mpidr[idx] = mpidr;
+                    }
+                    /* **disabled なコアは起こさない。** 数には入れるが
+                     * enable_method は UNKNOWN のままにしておく */
+                    if (n->enable_method && !n->is_disabled) {
+                        if (str_eq(n->enable_method, "spin-table")) {
+                            info->cpu_enable_method[idx] = AARCH64_CPU_ENABLE_SPIN_TABLE;
+                        } else if (str_eq(n->enable_method, "psci")) {
+                            info->cpu_enable_method[idx] = AARCH64_CPU_ENABLE_PSCI;
+                        }
+                    }
+                    if (n->release_addr_data && n->release_addr_len >= 8U) {
+                        info->cpu_release_addr[idx] = aarch64_dtb_read_be64(n->release_addr_data);
+                    }
+                }
+                info->cpu_count++;
+            }
 
             depth--;
             continue;
@@ -596,6 +641,12 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
             } else if (str_eq(prop_name, "reg")) {
                 nodes[depth].reg_data = data;
                 nodes[depth].reg_len = len;
+            } else if (str_eq(prop_name, "enable-method")) {
+                nodes[depth].enable_method = (const char*)data;
+                nodes[depth].enable_method_len = len;
+            } else if (str_eq(prop_name, "cpu-release-addr")) {
+                nodes[depth].release_addr_data = data;
+                nodes[depth].release_addr_len = len;
             } else if (str_eq(prop_name, "status")) {
                 /* "okay" と "ok" だけが有効。他 (disabled / fail / reserved)
                  * は採用しない。**文字列は NUL 終端で入っている** */

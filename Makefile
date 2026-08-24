@@ -243,7 +243,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-usb-kbd-smoke aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-netboot aarch64-pi4-smoke aarch64-pi4-sd-smoke riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-usb-kbd-smoke aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-netboot aarch64-pi4-smoke aarch64-pi4-qemu-boot aarch64-pi4-sd-smoke aarch64-smp-load riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -297,6 +297,7 @@ AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer
 	kernel/aarch64/dtb.c \
 	kernel/aarch64/vm.c kernel/aarch64/usermode.c kernel/aarch64/pmm.c \
 	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/emmc2.c kernel/aarch64/runtime.c \
+	kernel/aarch64/smp.c \
 	kernel/aarch64/stubs.c kernel/aarch64/syscall.c kernel/aarch64/console.c \
 	kernel/aarch64/mailbox.c kernel/aarch64/fb.c kernel/aarch64/fbcon.c kernel/aarch64/font12x24.c \
 	kernel/aarch64/sound.c \
@@ -555,8 +556,23 @@ aarch64-pi4-netboot: aarch64-pi4-boot
 # Pi 4 の起動確認 (QEMU の raspi4b)。**実機の代わりにはならない**が、
 # 起動形式 / DTB / GIC-400 / MMU / EL0 までは実機なしで回帰を見られる。
 # raspi4b は QEMU 9.0 以降。無ければ SKIP する
-aarch64-pi4-smoke: aarch64-pi4-boot
-	bash ./tests/aarch64_pi4_smoke.sh
+# **QEMU 用は音を切って組む。** aarch64-pi4-boot は実機向けに
+# AARCH64_SOUND=1 で組むが、**QEMU の raspi4b は PWM1 (0xFE20C800) を
+# 持たない**ので触ると external abort になる (ESR=0x96000050)。
+#
+# 以前は aarch64-pi4-boot の成果物をそのまま QEMU に掛けていて、
+# **smoke が構造的に必ず落ちていた** (2026-08-24 に判明)。
+# 実機向けの out/pi4-boot/ には触らず、別の置き場に作る
+aarch64-pi4-qemu-boot:
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
+	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \
+	    AARCH64_CNTFRQ_HZ=54000000 \
+	    AARCH64_EARLY_GICD=0xFF841000 AARCH64_EARLY_GICC=0xFF842000
+	@mkdir -p out/pi4-qemu
+	cp out/kernel8.img out/pi4-qemu/
+
+aarch64-pi4-smoke: aarch64-pi4-qemu-boot
+	PI4_IMG=out/pi4-qemu/kernel8.img bash ./tests/aarch64_pi4_smoke.sh
 
 # SD カードドライバ (EMMC2) の確認。**QEMU は SD を旧 sdhci に繋いでいる**ので、
 # 検証用に番地を差し替えて組む (tests/aarch64_pi4_sd_smoke.sh の注記)。
@@ -826,6 +842,12 @@ aarch64-busybox-musl: $(AARCH64_MUSL_SYSROOT)/lib/libc.a
 aarch64-ash-smoke: aarch64-busybox-musl
 	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/ash
 	bash ./tests/aarch64_ash_smoke.sh
+
+# SMP の負荷試験 (P-7)。**複数コアでしか出ない取りこぼしを狙う。**
+# SMP_CPUS=1 と比べれば「SMP のせいか」が切り分けられる
+aarch64-smp-load: aarch64-busybox-musl
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/ash
+	bash ./tests/aarch64_smp_load.sh
 
 $(RISCV64_KERNEL_ELF): $(RISCV64_OBJS)
 	@mkdir -p $(@D)

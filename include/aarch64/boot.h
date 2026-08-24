@@ -92,6 +92,18 @@
  * QEMU virt は 1 つ。4 あれば当面足りる */
 #define AARCH64_MAX_MEM_RANGES 4
 
+/* **start.S の `cmp x20, #8` と同じ値にすること。** あちらは MPIDR の Aff0 が
+ * 8 以上のコアをブートスタックごと切り捨てており、ここを超えたぶんは
+ * 記録する場所が無い。Pi 4 は 4 コアなので当面届かないが、**超えたときに
+ * 黙って壊れる**ことは AArch64-SMP-Design.md §11 に残してある */
+#define AARCH64_MAX_CPUS 8
+
+/* /cpus/cpu@N の enable-method。**副コアの起こし方はここで決まる。**
+ * 機械名で分岐しないための唯一の根拠なので、不明 (0) のときは起こさない */
+#define AARCH64_CPU_ENABLE_UNKNOWN    0
+#define AARCH64_CPU_ENABLE_SPIN_TABLE 1   /* Raspberry Pi 4 (armstub8) */
+#define AARCH64_CPU_ENABLE_PSCI       2   /* QEMU virt */
+
 typedef struct aarch64_boot_info {
     uint64_t dtb_pa;
     /* **memory_base / memory_size は「穴を含む全体」を指す。**
@@ -122,6 +134,18 @@ typedef struct aarch64_boot_info {
      * flags の VIRTIO_IRQ_OK が立っているときだけ有効 */
     uint32_t virtio_mmio_irq_base;
     uint32_t cpu_count;
+    /* ---- /cpus/cpu@N の中身 (SMP)。添字は DTB に並んでいた順 -------------
+     *
+     * **cpu_mpidr は reg の値で、アドレスではない。** ranges 変換を
+     * 通してはいけないので、dtb.c では reg_entry_phys ではなく reg_entry を
+     * 使っている。Pi 4 は 0/1/2/3、QEMU virt も 0/1/2/3。
+     *
+     * **cpu_release_addr は常に 64bit。** /cpus は #address-cells = 1 だが
+     * このプロパティだけは 8 バイトで入っている (実測)。セル数で読まない。
+     * spin-table のときだけ意味がある。Pi 4 は 0xd8/0xe0/0xe8/0xf0 */
+    uint32_t cpu_enable_method[AARCH64_MAX_CPUS];
+    uint64_t cpu_mpidr[AARCH64_MAX_CPUS];
+    uint64_t cpu_release_addr[AARCH64_MAX_CPUS];
     /* Raspberry Pi 4 の SD カードコントローラ (EMMC2)。**QEMU virt には
      * 無い**ので 0 のまま。番地 0 が「この機械には無い」の印 (virtio と同じ) */
     uint64_t emmc2_base;

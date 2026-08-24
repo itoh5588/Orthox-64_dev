@@ -21,7 +21,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IMG=out/pi4-boot/kernel8.img
+# **QEMU 用のイメージを既定にできるよう外から差せる。** 実機向けの
+# out/pi4-boot/kernel8.img は AARCH64_SOUND=1 で組まれていて、
+# QEMU の raspi4b では PWM1 が無く落ちる (Makefile の注記)
+IMG="${PI4_IMG:-out/pi4-boot/kernel8.img}"
 DTB=tests/dtb/bcm2711-rpi-4-b.dtb
 LOG=LOGs/aarch64-pi4.log
 

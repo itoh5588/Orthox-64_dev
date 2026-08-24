@@ -4,6 +4,8 @@
 # ディスクの /bin/ash を task_execve で読んで走らせ、標準入力からコマンドを
 # 流し込んで結果を見る (riscv64 の riscv64_ash_smoke.sh に相当)。
 #
+# SMP_CPUS=4 のように指定すると複数コアで走る (SMP の P-5)。
+#
 # **riscv64 版より検査範囲が狭い。** あちらは rootfs (user/riscv64-bin,
 # /etc/motd, orthinfo) を前提にした検査まで積んでいるが、こちらはまず
 # 「ash が立ち上がって fork/exec/pipe/リダイレクトが通る」ところを固める。
@@ -141,7 +143,7 @@ rm -f "$LOG"
     -machine virt \
     -cpu cortex-a72 \
     -m 512M \
-    -smp 1 \
+    -smp "${SMP_CPUS:-1}" \
     -display none \
     -serial stdio \
     -monitor none \

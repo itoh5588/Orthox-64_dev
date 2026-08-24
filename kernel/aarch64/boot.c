@@ -19,6 +19,7 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "usb.h"          /* usb_xhci_irq (A-1) */
+#include "spinlock.h"     /* コンソール出力の直列化 (SMP の P-4) */
 
 /* PL011 UART。QEMU は初期化なしでも DR に書けば出るが、実機と手順を
  * 揃えておく (M1 以降で割り込み受信を足すときに効く)
@@ -53,11 +54,67 @@ void aarch64_uart_set_base(uint64_t base) {
     if (base) g_uart_base = base;
 }
 
-/* 出力の 1 単位。**並行に走るタスクに行の途中を割られないようにする。**
- * タスク層より前 (aarch64_task_init の前) から呼ばれるが、そのときは
- * スケジューラが止まっているので数えるだけで済む */
-void aarch64_console_begin(void) { aarch64_preempt_disable(); }
-void aarch64_console_end(void)   { aarch64_preempt_enable(); }
+/* 出力の 1 単位。**並行に走るタスクと、他の CPU に行の途中を割られない
+ * ようにする。**
+ *
+ * P-4 で副コアが印字を始めた瞬間に、予告どおり行が混ざった:
+ *
+ *   online    : 0x000000000000000[1 / 0x0000000000000001smp] cpu
+ *
+ * **preempt を止めるだけでは足りない。** それは自 CPU のタスク切り替えを
+ * 抑えるだけで、別の CPU は止まらない。
+ *
+ * ---- 素のスピンロックにできない理由 --------------------------------------
+ *
+ * **この区間は入れ子になる。** aarch64_uart_puts 自身が begin/end で
+ * 囲まれていて、その外側を usermode.c などがさらに囲む。素のロックだと
+ * 2 周目で自分を待って止まる。
+ *
+ * そこで「所有 CPU + 深さ」の再入可能ロックにする。**所有者の判定は
+ * MPIDR の Aff0** — cpu_local はまだ設置されていない時期 (起動の早い段階、
+ * 共有層に載る前の副コア) からも呼ばれるため。
+ *
+ * ---- 割り込みを閉じるのは取得と解放の記帳のあいだだけ --------------------
+ *
+ * 区間そのものは長い (usermode.c は 50 行ほど囲む)。**そこを丸ごと
+ * 割り込み禁止にすると tick が落ちて el0 ticks の判定が変わる。**
+ *
+ * 閉じるのは「所有者を見て、ロックを取り、深さを進める」までで足りる。
+ * その後に割り込みが入っても、ハンドラは所有者が自分だと分かるので
+ * 深さを進めるだけで通り抜ける (再入可能にした本来の目的)。 */
+static spinlock_t g_console_out_lock;
+static volatile int g_console_out_owner = -1;   /* MPIDR Aff0。-1 = 空き */
+static uint32_t g_console_out_depth;
+
+static inline int aarch64_console_self(void) {
+    uint64_t mpidr;
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    return (int)(mpidr & 0xffULL);
+}
+
+void aarch64_console_begin(void) {
+    int me = aarch64_console_self();
+    uint64_t flags = irq_save_disable();
+    aarch64_preempt_disable();
+    /* **他の CPU の値と自分の番号は決して一致しない**ので、
+     * ロック外でこれを読んでよい。書くのは所有者だけ */
+    if (g_console_out_owner != me) {
+        spin_lock(&g_console_out_lock);
+        g_console_out_owner = me;
+    }
+    g_console_out_depth++;
+    irq_restore(flags);
+}
+
+void aarch64_console_end(void) {
+    uint64_t flags = irq_save_disable();
+    if (g_console_out_depth > 0 && --g_console_out_depth == 0) {
+        g_console_out_owner = -1;
+        spin_unlock(&g_console_out_lock);
+    }
+    aarch64_preempt_enable();
+    irq_restore(flags);
+}
 
 /* 1 文字は MMIO の書き込み 1 回なので、これ自体は割れようがない。
  *
@@ -165,6 +222,8 @@ uint64_t aarch64_pmm_meta_pages(void);
 int aarch64_pmm_meta_fault(void);
 uint64_t aarch64_vm_translate(uint64_t va);
 void aarch64_vm_fault_probe(void);
+void aarch64_smp_start_secondaries(void);   /* kernel/aarch64/smp.c */
+void aarch64_smp_on_ipi(void);              /* 同上 */
 void aarch64_vm_drop_identity(void);
 uint64_t aarch64_read_sctlr(void);
 uint64_t aarch64_vm_kernel_root_pa(void);
@@ -208,7 +267,10 @@ int aarch64_kbd_get_event(struct key_event* ev);
 extern volatile int g_aarch64_vm_expect_fault;
 extern volatile uint64_t g_aarch64_vm_fault_esr;
 
-static void aarch64_vectors_init(void) {
+/* **VBAR_EL1 は CPU ごとのレジスタ。** 副コアも自分で張らないと、
+ * 例外が起きても何も出さずに沈黙する。SMP の P-4 で外に出した
+ * (kernel/aarch64/smp.c が呼ぶ) */
+void aarch64_vectors_init(void) {
     __asm__ volatile("msr vbar_el1, %0" :: "r"((uint64_t)aarch64_vectors));
     __asm__ volatile("isb");
 }
@@ -410,6 +472,37 @@ static void aarch64_boot_info_dump(void) {
     aarch64_uart_puts("  cpus      : ");
     put_hex64(b->cpu_count);
     aarch64_uart_puts("\n");
+
+    /* ---- 副コアの起こし方 (SMP の P-1) ------------------------------------
+     *
+     * **機械名で分岐しないための唯一の根拠。** 期待値 (2026-08-24 に
+     * tests/dtb と QEMU の DTB で確認):
+     *
+     *   Pi 4 (実機 / 配布 DTB)  spin-table  release 0xd8/0xe0/0xe8/0xf0
+     *   QEMU virt               psci        release 無し
+     *
+     * 不明 (`?`) のまま残ったコアは起こさない */
+    {
+        uint32_t n = b->cpu_count;
+        if (n > AARCH64_MAX_CPUS) n = AARCH64_MAX_CPUS;
+        for (uint32_t i = 0; i < n; i++) {
+            aarch64_uart_puts("    mpidr ");
+            put_hex64(b->cpu_mpidr[i]);
+            switch (b->cpu_enable_method[i]) {
+            case AARCH64_CPU_ENABLE_SPIN_TABLE:
+                aarch64_uart_puts(" : spin-table  release=");
+                put_hex64(b->cpu_release_addr[i]);
+                break;
+            case AARCH64_CPU_ENABLE_PSCI:
+                aarch64_uart_puts(" : psci");
+                break;
+            default:
+                aarch64_uart_puts(" : ? (起こさない)");
+                break;
+            }
+            aarch64_uart_puts("\n");
+        }
+    }
 
     if (b->flags & AARCH64_BOOT_FLAG_DTB_VALID) {
         aarch64_uart_puts("aarch64-dtb-ok\n");
@@ -862,6 +955,15 @@ void aarch64_boot_continue(void) {
      * aarch64_task_* の器は止まる */
     aarch64_shared_task_selftest();
 
+    /* ---- 副コア (SMP の P-5) ----------------------------------------------
+     *
+     * **共有スケジューラが立ってから。** 副コアは自分の idle タスクを作って
+     * cpu_local を設置するので、task_init より前では成立しない。
+     *
+     * **selftest の後に置く理由:** あちらは「50ms 寝て起こされる」を測る。
+     * 途中で副コアが上がると、その計測に余計な要素が混ざる */
+    aarch64_smp_start_secondaries();
+
     /* ---- M4-3: xv6fs ---------------------------------------------------
      * **task_init の後。** xv6fs は sleeplock を使うので、待てるタスクが
      * 居ないと成立しない */
@@ -917,7 +1019,13 @@ void aarch64_irq_handler(void) {
     uint32_t iar = aarch64_gic_claim();
     uint32_t intid = iar & 0x3ffU;
 
-    if (intid == aarch64_timer_intid()) {
+    if (intid < 16U) {
+        /* SGI = CPU 間割り込み (SMP の P-5)。**ここでは数えるだけ。**
+         * 切り替えは IRQ の出口 (aarch64_task_resched_if_needed) と
+         * task_idle_loop が resched の印を見て行う。目的は
+         * 「wfi で寝ている CPU を起こす」ことそのもの */
+        aarch64_smp_on_ipi();
+    } else if (intid == aarch64_timer_intid()) {
         aarch64_timer_on_tick();
     } else if (intid && intid == aarch64_virtio_blk_intid()) {
         aarch64_virtio_blk_irq();

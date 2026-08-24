@@ -52,13 +52,29 @@ static int g_sched_on;
  *
  * CPU 1 本を前提にしている。**SMP に進んだら CPU ごとに持ったうえで、
  * 出力そのものにロックが要る** (別の CPU は止まらない)。 */
-static int g_preempt_off;
+/* **CPU ごとに持つ (SMP の P-4)。** 1 本のグローバルにすると、
+ * 副コアが 1 行出しているあいだ **CPU 0 のプリエンプションまで止まる**。
+ * 逆に、CPU 0 が区間に入っている最中に副コアが勝手に切り替わる。
+ *
+ * **添字は MPIDR の Aff0。** cpu_local ではなく MPIDR を使うのは、
+ * ここが cpu_local の設置より前 (起動の早い段階や、共有層に載る前の
+ * 副コア) からも呼ばれるため。読むのはタイマ割り込みだけなので、
+ * 自 CPU の値しか触らない限り保護は要らない。 */
+#define AARCH64_PREEMPT_SLOTS 8
+static int g_preempt_off[AARCH64_PREEMPT_SLOTS];
 
-/* タイマ割り込みは g_preempt_off を読むだけなので、単一 CPU では
- * この読み書きに保護は要らない */
-void aarch64_preempt_disable(void) { g_preempt_off++; }
-void aarch64_preempt_enable(void)  { if (g_preempt_off > 0) g_preempt_off--; }
-int  aarch64_preempt_disabled(void) { return g_preempt_off != 0; }
+static inline unsigned aarch64_preempt_slot(void) {
+    uint64_t mpidr;
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    return (unsigned)(mpidr & 0xffULL) % AARCH64_PREEMPT_SLOTS;
+}
+
+void aarch64_preempt_disable(void) { g_preempt_off[aarch64_preempt_slot()]++; }
+void aarch64_preempt_enable(void)  {
+    unsigned s = aarch64_preempt_slot();
+    if (g_preempt_off[s] > 0) g_preempt_off[s]--;
+}
+int  aarch64_preempt_disabled(void) { return g_preempt_off[aarch64_preempt_slot()] != 0; }
 
 aarch64_task_t* aarch64_task_current(void) { return &g_tasks[g_current]; }
 uint64_t aarch64_task_switch_count(void)   { return g_switches; }
@@ -166,7 +182,7 @@ void aarch64_task_yield(void) {
 
     /* **区間の中では明示的に譲っても切り替わらない。** 譲ったつもりで
      * 行が割れるより、区間を出るまで待たせるほうがよい */
-    if (!g_sched_on || g_preempt_off) return;
+    if (!g_sched_on || aarch64_preempt_disabled()) return;
 
     /* 選んでから切り替えるまでのあいだに割り込みが入ると、
      * 同じタスクを 2 か所から動かすことになる */
@@ -184,21 +200,48 @@ void aarch64_task_exit(void) {
     for (;;) aarch64_task_yield();
 }
 
-/* ---- 共有タスク層の受け口 (M3c-2a) --------------------------------------
+/* ---- 共有タスク層の受け口 (M3c-2a / SMP の P-2) --------------------------
  *
- * まだ共有層は載せていないが、arch_task_* の inline がこの 2 つを呼ぶので
- * 実体を置いておく。M3c-2b で共有層を繋ぐときにそのまま使える。 */
-static struct cpu_local* g_cpu_local;
-static uint64_t g_kernel_sp;
+ * **自 CPU の cpu_local は TPIDR_EL1 に置く。** x86 は GS_BASE、riscv64 は
+ * tp (= cpu index) を使っており、aarch64 の同等品がこれ。
+ *
+ * **TPIDR_EL0 と間違えないこと。** あちらはユーザーの TLS で、
+ * arch_task_apply_user_tls / aarch64_task_context の tpidr が使っている。
+ * 混ぜると、タスクを切り替えた瞬間に「自分がどの CPU か」を見失う。
+ *
+ * **タスク切り替えで保存も復元もしない。** これは CPU に紐づく値であって
+ * タスクに紐づく値ではない。文脈に混ぜると、別 CPU で再開したタスクが
+ * 前の CPU の cpu_local を掴む。
+ *
+ * リセット直後は 0 なので、設置前は NULL が返る (以前のグローバルと同じ
+ * 挙動)。共有層はどこも NULL を許す作りになっている。 */
+struct cpu_local* aarch64_task_get_cpu_local_impl(void) {
+    uint64_t v;
+    __asm__ volatile("mrs %0, tpidr_el1" : "=r"(v));
+    return (struct cpu_local*)(uintptr_t)v;
+}
 
-struct cpu_local* aarch64_task_get_cpu_local_impl(void) { return g_cpu_local; }
-void aarch64_task_set_cpu_local_impl(struct cpu_local* cpu) { g_cpu_local = cpu; }
+void aarch64_task_set_cpu_local_impl(struct cpu_local* cpu) {
+    __asm__ volatile("msr tpidr_el1, %0" :: "r"((uint64_t)(uintptr_t)cpu));
+}
 
 /* **AArch64 では例外で自動的に SP_EL1 に切り替わる**ので、riscv64 が
  * sscratch を手で入れ替えていたところは覚えておくだけでよい。
- * 実際に使うのは、EL0 へ降りる前に SP_EL1 をこの値にする所 (M3c-2b) */
-void aarch64_trap_set_kernel_stack(uint64_t kernel_sp) { g_kernel_sp = kernel_sp; }
-uint64_t aarch64_trap_kernel_stack(void) { return g_kernel_sp; }
+ * 実際に使うのは、EL0 へ降りる前に SP_EL1 をこの値にする所 (M3c-2b)
+ *
+ * **置き場を cpu_local に移した (P-2)。** 単一のグローバルのままだと、
+ * 別 CPU が切り替えるたびに上書きし合う。
+ * cpu_local がまだ無いあいだ (task_init より前) は行き先が無いので
+ * 捨てる — その時期に EL0 へ降りることは無い。 */
+void aarch64_trap_set_kernel_stack(uint64_t kernel_sp) {
+    struct cpu_local* cpu = aarch64_task_get_cpu_local_impl();
+    if (cpu) cpu->kernel_stack = kernel_sp;
+}
+
+uint64_t aarch64_trap_kernel_stack(void) {
+    struct cpu_local* cpu = aarch64_task_get_cpu_local_impl();
+    return cpu ? cpu->kernel_stack : 0;
+}
 
 /* ---- 共有スケジューラへの乗り換え (M3c-2b) -------------------------------
  *
@@ -348,7 +391,7 @@ void aarch64_task_resched_if_needed(uint64_t* frame) {
      * **区間の中では保留する**のは M3c-1 と同じ。印は task_request_resched
      * が cpu_local に持っているので、消さずに戻れば次の出口で切り替わる */
     if (g_shared_sched) {
-        if (g_preempt_off) return;
+        if (aarch64_preempt_disabled()) return;
         if (task_consume_resched()) schedule();
         return;
     }
@@ -356,7 +399,7 @@ void aarch64_task_resched_if_needed(uint64_t* frame) {
     if (!g_sched_on || !g_resched) return;
     /* **印は消さずに戻る。** 消すと、区間の中で入った tick のぶんの
      * 切り替えが 1 回まるごと消える */
-    if (g_preempt_off) return;
+    if (aarch64_preempt_disabled()) return;
     g_resched = 0;
     next_id = aarch64_task_pick_next();
     if (next_id >= 0) aarch64_task_switch_to(next_id);
