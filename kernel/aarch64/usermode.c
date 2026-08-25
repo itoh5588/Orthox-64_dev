@@ -208,6 +208,89 @@ static void aarch64_svc(uint64_t* frame) {
      * ように自分で 4 を足してはいけない。足すと命令を 1 つ飛ばす */
 }
 
+/* ---- M-1 の探針: 落ちた EL0 フレームを丸ごと出す -------------------------
+ *
+ * 日報2026-08-24 §13 の間欠障害 (4 コアで 8 回中 2 回、fork の子で
+ * `ELR = FAR = 0x3fffffefea` の命令アボート) を絞り込むためのもの。
+ * **ELR だけでは分岐が決まらない。** 一度の再現で次を全部取る:
+ *
+ *   CPU     どのコアで落ちたか。CPU 0 でも出るなら分散とは無関係
+ *   pid/comm exec の前か後か。`comm` が親と同じなら exec 前 (fork 直後)
+ *   SPSR    eret 列の問題なら EL/DAIF がおかしい
+ *   SP_EL0  ELR がスタック領域を指しているので、SP との位置関係が要る
+ *   x30     「戻り先」が壊れているなら x30 も同じ値のはず
+ *   x0-x29  fork の戻り値 (x0) が親の値のままか等
+ *
+ * **落ちるのは間欠なので、出力が混ざらないよう console を握ったまま出す。** */
+static void aarch64_dump_bad_user_frame(const uint64_t* frame, uint64_t esr, uint64_t far) {
+    struct task* cur = get_current_task();
+    struct cpu_local* cl = get_cpu_local();
+    uint64_t mpidr = 0, sctlr = 0, ttbr0 = 0, tcr = 0;
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+    __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
+    __asm__ volatile("mrs %0, tcr_el1"   : "=r"(tcr));
+
+    aarch64_console_begin();
+    aarch64_uart_puts("\n*** aarch64 EL0 からの想定外の例外 ***\n");
+    aarch64_uart_puts("  CPU : mpidr=");
+    aarch64_uart_puthex64(mpidr);
+    aarch64_uart_puts(" cpu_id=");
+    aarch64_uart_putdec64(cl ? (uint64_t)cl->cpu_id : (uint64_t)-1);
+    aarch64_uart_puts("\n  TASK: pid=");
+    aarch64_uart_putdec64(cur ? (uint64_t)cur->pid : 0);
+    aarch64_uart_puts(" ppid=");
+    aarch64_uart_putdec64(cur ? (uint64_t)cur->ppid : 0);
+    aarch64_uart_puts(" comm=");
+    aarch64_uart_puts(cur ? cur->comm : "(none)");
+    aarch64_uart_puts("\n  ESR : ");
+    aarch64_uart_puthex64(esr);
+    aarch64_uart_puts("\n  FAR : ");
+    aarch64_uart_puthex64(far);
+    aarch64_uart_puts("\n  ELR : ");
+    aarch64_uart_puthex64(frame[FRAME_ELR]);
+    aarch64_uart_puts("\n  SPSR: ");
+    aarch64_uart_puthex64(frame[FRAME_SPSR]);
+    aarch64_uart_puts("\n  SP0 : ");
+    aarch64_uart_puthex64(frame[FRAME_SP_EL0]);
+    aarch64_uart_puts("\n  x30 : ");
+    aarch64_uart_puthex64(frame[FRAME_X30]);
+    aarch64_uart_puts("\n  TTBR0: ");
+    aarch64_uart_puthex64(ttbr0);
+    aarch64_uart_puts(" SCTLR: ");
+    aarch64_uart_puthex64(sctlr);
+    aarch64_uart_puts(" TCR: ");
+    aarch64_uart_puthex64(tcr);
+    /* **タスクが持っている「あるべき値」も並べる。** frame の中身と
+     * 突き合わせれば、壊れたのが frame かタスクかが分かる */
+    if (cur) {
+        aarch64_uart_puts("\n  want: entry=");
+        aarch64_uart_puthex64(cur->user_entry);
+        aarch64_uart_puts(" sp_top=");
+        aarch64_uart_puthex64(cur->user_stack_top);
+        aarch64_uart_puts(" sp=");
+        aarch64_uart_puthex64(cur->user_stack);
+        aarch64_uart_puts(" kstack_top=");
+        aarch64_uart_puthex64(cur->kstack_top);
+    }
+    aarch64_uart_puts("\n  frame @ ");
+    aarch64_uart_puthex64((uint64_t)(uintptr_t)frame);
+    aarch64_uart_puts("\n");
+    for (int i = 0; i < 30; i += 2) {
+        aarch64_uart_puts("  x");
+        aarch64_uart_putdec64((uint64_t)i);
+        aarch64_uart_puts(i < 10 ? "  = " : " = ");
+        aarch64_uart_puthex64(frame[i]);
+        aarch64_uart_puts("   x");
+        aarch64_uart_putdec64((uint64_t)(i + 1));
+        aarch64_uart_puts((i + 1) < 10 ? "  = " : " = ");
+        aarch64_uart_puthex64(frame[i + 1]);
+        aarch64_uart_puts("\n");
+    }
+    aarch64_uart_puts("aarch64-user-BAD\n");
+    aarch64_console_end();
+}
+
 /* 下位 EL (EL0) からの同期例外。svc と、ユーザーが起こしたアボートの両方が
  * ここに来る。ESR の EC で振り分ける */
 void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
@@ -268,16 +351,7 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
 
     /* 想定外。**黙って戻らない。** ユーザーを再開させると同じ所で
      * 落ち続けて無限ループになる */
-    aarch64_console_begin();
-    aarch64_uart_puts("\n*** aarch64 EL0 からの想定外の例外 ***\n");
-    aarch64_uart_puts("  ESR : ");
-    aarch64_uart_puthex64(esr);
-    aarch64_uart_puts("\n  FAR : ");
-    aarch64_uart_puthex64(far);
-    aarch64_uart_puts("\n  ELR : ");
-    aarch64_uart_puthex64(frame[FRAME_ELR]);
-    aarch64_uart_puts("\naarch64-user-BAD\n");
-    aarch64_console_end();
+    aarch64_dump_bad_user_frame(frame, esr, far);
     st->exited = 1;
     st->exit_code = (uint64_t)-1;
 
