@@ -297,9 +297,31 @@ int  aarch64_use_shared_syscalls(void)    { return g_shared_syscalls; }
  * カーネルは TTBR1 に居るので、**TTBR0 を差し替えても自分の足元は動かない。**
  * 切り替えの前後どちらでもよいが、切り替えてしまうと「次のタスクの文脈で
  * 前のタスクの空間」という瞬間ができるので先にやる */
+/* **判断の基準は TTBR0_EL1 そのもの。`prev->root_pa` ではない (M-1)。**
+ *
+ * 以前は `next->root_pa != prev->root_pa` で切り替えの要否を決めていたが、
+ * **`prev->root_pa` は「この CPU の TTBR0 に入っている値」ではない。**
+ * 直前にこの CPU で走ったタスクの値でしかなく、
+ *
+ *   - exec は arch_task_commit_execve の中で自分で TTBR0 を書く
+ *   - ルートページは pmm から使い回されるので、別のアドレス空間が
+ *     **同じ物理番地**を取ることがある
+ *
+ * のどちらでも食い違う。食い違ったまま「切り替え不要」と判断すると、
+ * **TTBR0 も TLB も更新されないまま別のアドレス空間で走る。**
+ *
+ * 2026-08-25 に探針を入れて実測したところ、起動時の M3c-2b 自己診断で
+ * 実際に食い違っていた:
+ *
+ *   [ttbr] cpu0 切り替え省略 next=0x40747000 prev=0x40747000 ttbr0=0x40753000
+ *
+ * **ハードウェアのレジスタが唯一の真値**なので、そちらと比べる。
+ * mrs 1 命令ぶんしか増えないうえ、記帳を持つより壊れにくい。 */
 void arch_context_switch(struct arch_task_context* next, struct arch_task_context* prev) {
+    uint64_t ttbr0;
     if (!next || !prev) return;
-    if (next->root_pa && next->root_pa != prev->root_pa) {
+    __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
+    if (next->root_pa && next->root_pa != ttbr0) {
         aarch64_vm_activate_address_space(next->root_pa);
     }
     aarch64_context_switch(&next->regs, &prev->regs);
