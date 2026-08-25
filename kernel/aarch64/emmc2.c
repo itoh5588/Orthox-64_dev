@@ -40,6 +40,7 @@
 #include <stdint.h>
 #include "aarch64/boot.h"
 #include "aarch64/vm.h"
+#include "spinlock.h"
 
 /* ---- SDHCI のレジスタ (base からのオフセット) ---------------------------- */
 #define EMMC_ARG2           0x00
@@ -131,6 +132,26 @@
 #define SD_CLOCK_NORMAL     25000000U    /* 識別が済んだら 25MHz */
 
 /* ---- 状態 ---------------------------------------------------------------- */
+
+/* **コントローラは 1 台しかない (2026-08-25, M-1)。**
+ *
+ * `issue_cmd` は EMMC_ARG1 / EMMC_CMDTM / EMMC_BLKSIZECNT を書いてから
+ * EMMC_INTERRUPT を待つ、という**線 1 本ぶんの手順**で、控えの
+ * `g_last_resp` / `g_last_interrupt` / `g_last_fail` もグローバルに 1 組ずつ。
+ * **2 つの CPU が同時に入ると、互いのコマンドとデータ転送が混ざる。**
+ *
+ * QEMU 側の virtio-blk で同じ穴を実測した (kernel/aarch64/virtio_blk_mmio.c
+ * の g_vblk_lock を参照): exec したばかりの busybox のテキストページが
+ * 別のブロックの中身になり、EL0 が「分岐命令でデータアボート」という
+ * ありえない形で落ちた。4 コアで 12 回中 4 回、1 コアでは 0 回。
+ *
+ * **実機は 4 コアなので、そのままでは必ず同じ穴を踏む。**
+ * `issue_cmd` の待ちは WAIT_UNTIL のポーリングで割り込みに依存しないので、
+ * IRQ を閉じない素の spin_lock で足りる。
+ *
+ * **未検証: 実機では試していない** (QEMU の raspi4b は SD を出さない)。 */
+static spinlock_t g_emmc2_lock;
+
 static uint64_t g_base;          /* MMIO の VA。0 なら未初期化 */
 static uint64_t g_base_pa;
 static uint32_t g_rca;           /* カードの相対アドレス */
@@ -780,29 +801,37 @@ static uint32_t lba_to_arg(uint64_t lba) {
     return g_sdhc ? (uint32_t)lba : (uint32_t)(lba * SD_BLOCK_SIZE);
 }
 
+/* **ロックは転送の丸ごとを囲む。** 1 ブロックずつでは、複数セクタの
+ * 要求が別の CPU の要求と 1 ブロックおきに混ざる余地が残る */
 int aarch64_emmc2_read(uint64_t lba, void* buf, uint32_t sectors) {
     uint8_t* p = (uint8_t*)buf;
     uint32_t i;
+    int ret = 0;
     if (!g_base || !buf) return -1;
+    spin_lock(&g_emmc2_lock);
     /* **1 ブロックずつ送る。** 複数ブロック転送は CMD12 の停止処理まで
      * 要るので、まずは確実に動く形にしておく */
     for (i = 0; i < sectors; i++) {
         if (issue_cmd(CMD_READ_SINGLE, lba_to_arg(lba + i), 1,
-                      p + (size_t)i * SD_BLOCK_SIZE, 1000000) != 0) return -1;
+                      p + (size_t)i * SD_BLOCK_SIZE, 1000000) != 0) { ret = -1; break; }
     }
-    return 0;
+    spin_unlock(&g_emmc2_lock);
+    return ret;
 }
 
 int aarch64_emmc2_write(uint64_t lba, const void* buf, uint32_t sectors) {
     const uint8_t* p = (const uint8_t*)buf;
     uint32_t i;
+    int ret = 0;
     if (!g_base || !buf) return -1;
+    spin_lock(&g_emmc2_lock);
     for (i = 0; i < sectors; i++) {
         if (issue_cmd(CMD_WRITE_SINGLE, lba_to_arg(lba + i), 1,
                       (void*)(uintptr_t)(p + (size_t)i * SD_BLOCK_SIZE),
-                      1000000) != 0) return -1;
+                      1000000) != 0) { ret = -1; break; }
     }
-    return 0;
+    spin_unlock(&g_emmc2_lock);
+    return ret;
 }
 
 /* ---- storage 層の受け口 --------------------------------------------------

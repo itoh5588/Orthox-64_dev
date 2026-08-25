@@ -12,8 +12,9 @@
  *      DTB 由来の物理アドレスを直に触れない
  *   2. **vring は aarch64_pmm_alloc から取る。** デバイスには物理アドレスを
  *      渡し、こちらは上位 VA で触る
- *   3. **spinlock / task / plic に依存しない。** SMP は 1 本、待ちは
- *      ポーリングなので要らない。割り込みでの完了通知は M4-2
+ *   3. **task / plic に依存しない。** 待ちはポーリング (または完了割り込み)
+ *      なので要らない。割り込みでの完了通知は M4-2。
+ *      **spinlock だけは要る** — 2026-08-25 に SMP で踏んだ (下の g_vblk_lock)
  *
  * ★ 実機で効く注意点:
  *
@@ -28,6 +29,7 @@
 #include <stddef.h>
 #include "virtio.h"
 #include "virtio_blk.h"
+#include "spinlock.h"
 #include "aarch64/boot.h"
 #include "aarch64/vm.h"
 
@@ -171,10 +173,38 @@ static int vblk_queue_setup(void) {
     return 0;
 }
 
-/* 1 リクエスト = ヘッダ + データ + ステータスの 3 ディスクリプタ。
- * **ディスクリプタは 1 組しか持たない**ので、1 件ずつ。SMP と割り込み
- * 完了を入れるときはロックが要る (riscv64 版の教訓) */
-static int vblk_rw(uint32_t type, uint64_t sector, void* buf, uint32_t sectors) {
+/* ---- 1 件ずつに直列化する (2026-08-25, M-1) -------------------------------
+ *
+ * **ディスクリプタは 1 組しか持たない。** `g_q.desc[0..2]` も `g_hdr` も
+ * `g_status` も `g_irq_done` もグローバルに 1 つずつで、この関数は
+ * それを毎回上書きする。**1 コア前提の作りのまま SMP に乗っていた。**
+ *
+ * 2 つの CPU が同時に入ると、こうなる (実測で踏んだ形):
+ *
+ *   CPU A: desc[1].addr = A のバッファ / avail->idx++ / notify
+ *   CPU B: **デバイスが desc を読む前に** desc[1].addr = B のバッファ
+ *   デバイス: **A のブロックを B のバッファへ DMA する**
+ *
+ * `used_idx` の控えも `*g_status` も `g_irq_done` も同じようにぶつかる。
+ *
+ * 症状は「ディスクが壊れる」ではなく **「読んだ中身が別のブロックになる」**。
+ * 2026-08-25 の実測では、exec したばかりの busybox のテキストページが
+ * 別物になり、EL0 が
+ *
+ *   ESR 0x92000006 (データアボート)  ELR 0x401c24  FAR 0x9b
+ *
+ * で落ちた。**ELR の命令は `b` (無条件分岐) でデータアボートを起こしよう
+ * がない** — そこがページの中身が違うことの証拠になった。
+ * 4 コアで 12 回中 4 回。1 コアでは 0 回。
+ *
+ * **IRQ は閉じない。** 完了待ちが `wfi` で `g_irq_done` を待つので、
+ * 閉じると完了割り込みが来ずに固まる。EL1 の途中ではプリエンプトしない
+ * (aarch64_task_resched_if_needed が SPSR を見て弾く) ので、素の
+ * spin_lock で足りる。**この関数は割り込みハンドラからは呼ばれない**
+ * (ハンドラは g_irq_done を立てるだけ) ので再入もしない。 */
+static spinlock_t g_vblk_lock;
+
+static int vblk_rw_locked(uint32_t type, uint64_t sector, void* buf, uint32_t sectors) {
     struct virtio_queue* q = &g_q;
     uint16_t used_idx;
     uint64_t spin = 0;
@@ -236,6 +266,14 @@ static int vblk_rw(uint32_t type, uint64_t sector, void* buf, uint32_t sectors) 
     return (*g_status == VIRTIO_BLK_S_OK) ? 0 : -1;
 }
 
+static int vblk_rw(uint32_t type, uint64_t sector, void* buf, uint32_t sectors) {
+    int ret;
+    spin_lock(&g_vblk_lock);
+    ret = vblk_rw_locked(type, sector, buf, sectors);
+    spin_unlock(&g_vblk_lock);
+    return ret;
+}
+
 int aarch64_virtio_blk_read(uint64_t lba, void* buf, uint32_t sectors) {
     return vblk_rw(VIRTIO_BLK_T_IN, lba, buf, sectors);
 }
@@ -250,6 +288,9 @@ int aarch64_virtio_blk_init(void) {
     const aarch64_boot_info_t* b = aarch64_boot_info();
     uint64_t hdr_pa;
     uint32_t count = b->virtio_mmio_count ? b->virtio_mmio_count : 32;
+
+    /* static は 0 なので実質不要だが、**ロックの持ち主をここで明示する** */
+    spinlock_init(&g_vblk_lock);
 
     g_base = 0;
     g_base_pa = 0;
