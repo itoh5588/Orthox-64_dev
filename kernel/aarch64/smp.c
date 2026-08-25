@@ -241,12 +241,16 @@ static void aarch64_secondary_high(void) {
     aarch64_gic_init_cpu();
     aarch64_timer_init();
 
-    /* **数に入れるのは受け皿が全部そろった後。** ここを先にすると、
-     * まだ idle も cpu_local も無い CPU にタスクが飛ぶ */
-    g_cpus[cpu_index].started = 1;
-    __atomic_add_fetch(&g_started_cpus, 1, __ATOMIC_SEQ_CST);
-    __atomic_add_fetch(&g_secondary_online, 1, __ATOMIC_SEQ_CST);
-
+    /* **名乗るのも割り込みを開けるのも、数に入る前に済ませる。**
+     *
+     * 順序を逆にすると踏む (実測): 数に入った直後に console_begin へ入ると、
+     * **そこは IRQ を閉じたまま spin_lock を回る** (kernel/aarch64/boot.c:97)。
+     * CPU 0 から見ると「online なのに SGI を受け取らない CPU」になり、
+     * IPI の自己診断が BAD になる。
+     *
+     * **不変条件: 数に入った CPU は必ず IPI を受け取れる。**
+     * そのために「印字 -> 割り込みを開ける -> 数に入る」の順にする。
+     * 受け皿 (idle / cpu_local / GIC / タイマ) はどれも上で揃えてある */
     aarch64_console_begin();
     aarch64_uart_puts("[smp] cpu");
     aarch64_uart_puthex64(cpu_index);
@@ -254,6 +258,10 @@ static void aarch64_secondary_high(void) {
     aarch64_console_end();
 
     __asm__ volatile("msr daifclr, #2");   /* 割り込みを開ける */
+
+    g_cpus[cpu_index].started = 1;
+    __atomic_add_fetch(&g_started_cpus, 1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&g_secondary_online, 1, __ATOMIC_SEQ_CST);
 
     task_idle_loop(0);
     for (;;) __asm__ volatile("wfe");
@@ -400,14 +408,27 @@ void aarch64_smp_start_secondaries(void) {
 
     if (g_secondary_online < want) return;
 
-    /* **IPI が届くことを、タスクを載せる前に確かめる** */
+    /* **IPI が届くことを、タスクを載せる前に確かめる**
+     *
+     * **自己診断を console のロックの中で回してはいけない (実測)。**
+     * aarch64_console_begin は **IRQ を閉じたまま** spin_lock を回る
+     * (kernel/aarch64/boot.c:97)。相手の CPU がその行に居ると、
+     *
+     *   CPU 0: 出力ロックを握ったまま SGI を送り 1 億回待つ
+     *   CPU i: console_begin で IRQ を閉じて同じロックを待つ
+     *          -> SGI を受け取れない
+     *
+     * となって必ず「BAD (SGI が届かない)」になる。12 回中 2 回で踏んだ。
+     * **測るのはロックの外。中でやるのは印字だけ。** */
     for (uint32_t i = 1; i < n; i++) {
+        int ok;
         if (!g_cpus[i].started) continue;
+        ok = aarch64_smp_ipi_selftest(i);
         aarch64_console_begin();
         aarch64_uart_puts("  ipi cpu   : ");
         aarch64_uart_puthex64(i);
-        aarch64_uart_puts(aarch64_smp_ipi_selftest(i) ? "  ok (SGI が届いた)\n"
-                                                      : "  BAD (SGI が届かない)\n");
+        aarch64_uart_puts(ok ? "  ok (SGI が届いた)\n"
+                             : "  BAD (SGI が届かない)\n");
         aarch64_console_end();
     }
     aarch64_uart_puts("aarch64-smp-ok\n");
