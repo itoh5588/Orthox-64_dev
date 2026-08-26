@@ -212,6 +212,33 @@ static int      g_usb_kbd_ready = 0;
  * 休むのは最長でも 500ms に 1 回の確認の間だけ */
 static volatile int g_usb_busy = 0;
 
+/* **xHCI を触るのは一度に 1 人だけ (D-5)。**
+ *
+ * 抜き差しの走査 (usb_hotplug_poll) は**各 CPU の idle ループ**から
+ * 呼ばれる (kernel/sched.c:158)。SMP では 4 コアが同時に入る。
+ * 500ms のガード (:3382) は「読んで、比べて、書く」なので**揃って
+ * 通り抜ける** — その先でコマンドリングとイベントリングを取り合う。
+ * このファイル自身が「取り合うと壊れる」と書いている形 (:2611)。
+ *
+ * g_usb_busy はこれとは別物で、**抜き差し走査からキーボードへの
+ * 一方向の合図**にすぎない。立てる前に窓があり、走査どうしは
+ * 素通しだった。
+ *
+ * **待たずに戻る (try)。** idle タスクは割り込みを閉じて走っている
+ * (:645) ので、ここでスピンすると閉じたまま相手を待つことになる。
+ * どちらも「定期的に見に行く」処理で、**1 回飛ばしても次の周回で
+ * 拾える。** */
+static volatile uint32_t g_usb_owner = 0;
+
+static int usb_owner_try_take(void) {
+    return __sync_bool_compare_and_swap(&g_usb_owner, 0U, 1U);
+}
+
+static void usb_owner_release(void) {
+    __sync_synchronize();
+    g_usb_owner = 0U;
+}
+
 static uint8_t g_usb_bulk_out_ep = 0;
 static uint8_t g_usb_bulk_in_ep = 0;
 static uint16_t g_usb_ep0_mps = 64;
@@ -2604,10 +2631,9 @@ int usb_hid_keyboard_ready(void) { return g_usb_kbd_ready; }
  * スロットとエンドポイントだけで見る */
 static int g_int_outstanding = 0;
 
-int usb_hid_keyboard_poll(uint8_t report[8]) {
+static int usb_hid_keyboard_poll_owned(uint8_t report[8]) {
     uint8_t cc = 0xFF;
     uint32_t residual = 0;
-    if (!g_usb_kbd_ready || !report) return -1;
     /* **抜き差しの確認中は触らない。**イベントリングを取り合うと壊れる */
     if (g_usb_busy) return 1;
 
@@ -2640,6 +2666,17 @@ int usb_hid_keyboard_poll(uint8_t report[8]) {
         for (int i = 0; i < 8; i++) report[i] = b[i];
     }
     return 0;
+}
+
+/* 外から呼ぶ口 (D-5)。**取れなければ「まだ来ていない」として戻る** —
+ * 呼ぶのはタイマ割り込みで、次の tick でまた来る */
+int usb_hid_keyboard_poll(uint8_t report[8]) {
+    int ret;
+    if (!g_usb_kbd_ready || !report) return -1;
+    if (!usb_owner_try_take()) return 1;
+    ret = usb_hid_keyboard_poll_owned(report);
+    usb_owner_release();
+    return ret;
 }
 
 static int usb_msc_reset_recovery(void) {
@@ -3341,7 +3378,7 @@ static void xhci_wait_dump(const char* name, const xhci_wait_stat_t* s) {
     puts("ms\r\n");
 }
 
-void usb_hotplug_poll(void) {
+static void usb_hotplug_poll_owned(void) {
     uint8_t p;
     uint64_t now;
 
@@ -3591,6 +3628,14 @@ void usb_hotplug_poll(void) {
         }
     }
     g_usb_busy = 0;
+}
+
+/* 外から呼ぶ口 (D-5)。**各 CPU の idle ループが呼ぶ** (kernel/sched.c)。
+ * 誰かが触っている間は黙って戻る — 500ms 後にまた来る */
+void usb_hotplug_poll(void) {
+    if (!usb_owner_try_take()) return;
+    usb_hotplug_poll_owned();
+    usb_owner_release();
 }
 
 void usb_init(void) {
