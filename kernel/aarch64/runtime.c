@@ -87,7 +87,35 @@ void irq_restore(uint64_t flags) {
 /* ---- スピンロック --------------------------------------------------------
  *
  * **CPU 1 本でも要る。** 割り込みハンドラと通常の実行が同じデータを
- * 触るので、irqsave の版が本体。単純な exchange のループ */
+ * 触るので、irqsave の版が本体。単純な exchange のループ
+ *
+ * ---- ★ MMU が入るまでは取らない (実機で必須) -----------------------------
+ *
+ * `__atomic_exchange_n` は ldaxr / stxr の対に落ちる。**排他アクセスは
+ * Normal メモリでしか動作が保証されない** — MMU が無効な間はすべてが
+ * Device-nGnRnE 扱いになり、アーキテクチャ上 CONSTRAINED UNPREDICTABLE。
+ *
+ * **Cortex-A72 の実機では stxr が必ず失敗し、ここが永久に回る。**
+ * QEMU は MMU の状態に関わらず排他モニタを持っているので素通りする。
+ *
+ * 実測 (2026-08-26、Pi 4): aarch64_early_main の 1 行目の puts —
+ * console_begin -> spin_lock で沈黙した。**カーネルが 1 文字も出さない。**
+ * start.S に置いた通過点の探針は最後まで出ていたので、C に入る手前まで
+ * は生きていると分かった。同じ穴が pmm_init (MMU より前) にもある。
+ *
+ * **この期間に排他は要らない。** 副コアが起きるのは
+ * aarch64_smp_start_secondaries で、MMU も pmm も済んだ後。不変条件は
+ * **「MMU が入るまでは CPU 0 しか走らない」**。
+ *
+ * **記帳ではなく SCTLR_EL1 をそのまま読む。** 自前の「MMU を入れた」印を
+ * 持つと、入れ忘れ / 早すぎる更新で静かにずれる (日報2026-08-25 §8 と
+ * 同じ理由)。ハードウェアのレジスタが唯一の真値 */
+static inline int aarch64_mmu_on(void) {
+    uint64_t sctlr;
+    __asm__ volatile("mrs %0, sctlr_el1" : "=r"(sctlr));
+    return (int)(sctlr & 1U);   /* SCTLR_EL1.M */
+}
+
 void spinlock_init(spinlock_t* lock) {
     if (!lock) return;
     lock->locked = 0;
@@ -95,6 +123,7 @@ void spinlock_init(spinlock_t* lock) {
 
 void spin_lock(spinlock_t* lock) {
     if (!lock) return;
+    if (!aarch64_mmu_on()) return;   /* ここはまだ CPU 0 しか走らない */
     while (__atomic_exchange_n(&lock->locked, 1, __ATOMIC_ACQUIRE)) {
         /* SMP に進んだら wfe / sevl で待つ形にする。1 本のうちは意味が無い */
         __asm__ volatile("yield");
@@ -103,6 +132,9 @@ void spin_lock(spinlock_t* lock) {
 
 void spin_unlock(spinlock_t* lock) {
     if (!lock) return;
+    /* **lock と同じ判定で対にする。** MMU を入れる瞬間をロックの内側で
+     * またいだ場合はここだけが走るが、locked は 0 のままなので害は無い */
+    if (!aarch64_mmu_on()) return;
     __atomic_store_n(&lock->locked, 0, __ATOMIC_RELEASE);
 }
 
