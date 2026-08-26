@@ -36,6 +36,7 @@
 #include "aarch64/vm.h"
 #include "aarch64/time.h"
 #include "aarch64/bcm_periph.h"
+#include "spinlock.h"
 
 /* 番地は include/aarch64/bcm_periph.h。**vm.c の写像と共有している** */
 #define GPIO_BASE       AARCH64_BCM_GPIO_BASE
@@ -305,6 +306,22 @@ static uint32_t g_clean_idx;
 static uint32_t g_dma_range;    /* いまの PWM 分周。無音の値がこれで決まる */
 static uint32_t g_dma_rate;
 
+/* **PWM を触る者は 3 人いて、別々の CPU で走る (D-5)。**
+ *
+ *   sound_tick             タイマ割り込み (timer.c が CPU 0 に限っている)
+ *   sound_pcm_submit_u8    syscall。**任意のコア**
+ *   sound_beep_start/stop  syscall。**任意のコア**
+ *
+ * どれも g_dma_running / g_write_idx / g_clean_idx と PWM のレジスタを
+ * 書く。**ビープと PCM は同じ PWM を取り合う** (D-3b) ので、
+ * 「先に居るほうを降ろして自分を仕掛ける」の途中に割り込まれると、
+ * DMA は回っているのに出口だけ変わった状態が残る。
+ *
+ * **irqsave で取る。** submit を握っている最中にその CPU のタイマ
+ * 割り込みが入り、sound_tick が同じロックを待つと自分で止まる。
+ * 中の待ちは delay_us = CNTPCT のポーリングで、wfi を挟まない */
+static spinlock_t g_sound_lock;
+
 static inline volatile uint32_t* dma_reg(uint32_t off) {
     return reg_ptr(DMA_BASE, DMA_CH_OFF + off);
 }
@@ -422,17 +439,25 @@ static int dma_start(uint32_t sample_rate) {
  * まだ鳴っていないブロックには触らない */
 void sound_tick(void) {
     uint32_t play, guard;
-    if (!g_ready || !g_dma_running) return;
+    uint64_t flags;
+    if (!g_ready) return;
+    flags = spin_lock_irqsave(&g_sound_lock);
+    if (!g_dma_running) {
+        spin_unlock_irqrestore(&g_sound_lock, flags);
+        return;
+    }
     play = dma_play_idx();
     for (guard = 0; guard < SND_BLOCKS && g_clean_idx != play; guard++) {
         blk_silence(g_clean_idx);
         g_clean_idx = (g_clean_idx + 1U) % SND_BLOCKS;
     }
+    spin_unlock_irqrestore(&g_sound_lock, flags);
 }
 
 /* **積むだけで戻る。**受け取ったサンプル数を返す。0 は「いまは満杯」で
  * 失敗ではない。**ここが D-3 の本体** */
-int sound_pcm_submit_u8(const uint8_t* data, uint32_t len, uint32_t sample_rate) {
+static int sound_pcm_submit_u8_locked(const uint8_t* data, uint32_t len,
+                                     uint32_t sample_rate) {
     uint32_t play, queued, i;
     uint32_t* w;
 
@@ -466,6 +491,15 @@ int sound_pcm_submit_u8(const uint8_t* data, uint32_t len, uint32_t sample_rate)
 
     g_write_idx = (g_write_idx + 1U) % SND_BLOCKS;
     return (int)len;
+}
+
+/* 外から呼ぶ口。**中身は上、ここは囲うだけ** (D-5) */
+int sound_pcm_submit_u8(const uint8_t* data, uint32_t len, uint32_t sample_rate) {
+    int ret;
+    uint64_t flags = spin_lock_irqsave(&g_sound_lock);
+    ret = sound_pcm_submit_u8_locked(data, len, sample_rate);
+    spin_unlock_irqrestore(&g_sound_lock, flags);
+    return ret;
 }
 
 /* **この機械に BCM の周辺があるか。**
@@ -613,7 +647,7 @@ static void probe_step(const char* what) {
 
 /* **duty 50% の矩形波を可聴域で出す。**
  * range = PWM クロック / 周波数、data = range / 2 */
-void sound_beep_start(uint32_t freq_hz) {
+static void sound_beep_start_locked(uint32_t freq_hz) {
     uint32_t range;
 
     if (!g_ready || freq_hz == 0) return;
@@ -646,7 +680,14 @@ void sound_beep_start(uint32_t freq_hz) {
     probe_step("ctl=on");
 }
 
-void sound_beep_stop(void) {
+/* 外から呼ぶ口 (D-5)。**PCM を降ろしてから自分を仕掛けるまでが一続き** */
+void sound_beep_start(uint32_t freq_hz) {
+    uint64_t flags = spin_lock_irqsave(&g_sound_lock);
+    sound_beep_start_locked(freq_hz);
+    spin_unlock_irqrestore(&g_sound_lock, flags);
+}
+
+static void sound_beep_stop_locked(void) {
     if (!g_ready) return;
     /* **DMA が使っている最中なら PWM を落とさない (D-3b)。**
      *
@@ -660,6 +701,14 @@ void sound_beep_stop(void) {
      * 実機で「submit=512 が通っているのに何も聞こえない」の正体 */
     if (g_dma_running) return;
     w32(PWM1_BASE, PWM_CTL, 0);
+}
+
+/* 外から呼ぶ口 (D-5)。**g_dma_running を見て決める判断ごと囲う** —
+ * 見た後に別のコアが DMA を起こすと、始まったばかりの PCM を殺す */
+void sound_beep_stop(void) {
+    uint64_t flags = spin_lock_irqsave(&g_sound_lock);
+    sound_beep_stop_locked();
+    spin_unlock_irqrestore(&g_sound_lock, flags);
 }
 
 
