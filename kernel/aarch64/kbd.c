@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include "syscall.h"
 #include "usb.h"
+#include "spinlock.h"
 
 /* ---- usage -> (scancode, ascii) ------------------------------------------
  *
@@ -97,6 +98,17 @@ static int map_usage(uint8_t usage, uint8_t* scancode, uint16_t* ascii) {
 static struct key_event g_queue[KBD_QUEUE_SIZE];
 static uint32_t g_head, g_tail;
 
+/* **リングを積む側と取る側は別の CPU で走る (D-5)。**
+ *
+ * 積むのはタイマ割り込みの kbd_tick (timer.c が CPU 0 に限っている)、
+ * 取るのは syscall の aarch64_kbd_get_event で、**こちらは任意のコア。**
+ * 排他が無いと g_head / g_tail が壊れる。
+ *
+ * **irqsave で取る。** 素の spin_lock だと、CPU 0 で get_event が
+ * 握っている最中にその CPU のタイマ割り込みが入り、kbd_push が同じ
+ * ロックを待って**自分で自分を止める。** */
+static spinlock_t g_kbd_lock;
+
 /* **シェルに文字を渡す口** (kernel/aarch64/console.c)。
  *
  * DOOM 用の生イベント列とは**別の出口**にする。同じ待ち行列から両方が
@@ -122,12 +134,14 @@ static uint16_t shift_char(uint16_t a) {
 }
 
 static void kbd_push(uint8_t pressed, uint8_t scancode, uint16_t ascii) {
+    uint64_t flags = spin_lock_irqsave(&g_kbd_lock);
     uint32_t next = (g_head + 1U) % KBD_QUEUE_SIZE;
     if (next == g_tail) g_tail = (g_tail + 1U) % KBD_QUEUE_SIZE;   /* 古いものを捨てる */
     g_queue[g_head].pressed = pressed;
     g_queue[g_head].scancode = scancode;
     g_queue[g_head].ascii = ascii;
     g_head = next;
+    spin_unlock_irqrestore(&g_kbd_lock, flags);
 }
 
 /* 前回のレポート。差分を取るために覚えておく */
@@ -199,10 +213,16 @@ static void kbd_apply_report(const uint8_t rep[8]) {
  *
  * 戻り値: 1 = 取れた / 0 = 何も無い */
 int aarch64_kbd_get_event(struct key_event* ev) {
+    uint64_t flags;
     if (!ev) return 0;
-    if (g_head == g_tail) return 0;
+    flags = spin_lock_irqsave(&g_kbd_lock);
+    if (g_head == g_tail) {
+        spin_unlock_irqrestore(&g_kbd_lock, flags);
+        return 0;
+    }
     *ev = g_queue[g_tail];
     g_tail = (g_tail + 1U) % KBD_QUEUE_SIZE;
+    spin_unlock_irqrestore(&g_kbd_lock, flags);
     return 1;
 }
 
