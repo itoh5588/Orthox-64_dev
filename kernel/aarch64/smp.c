@@ -67,6 +67,12 @@ static volatile uint32_t g_secondary_online;
  * **数えるのは共有スケジューラに載り切ったコアだけ** (idle を作り、
  * cpu_local を設置し、割り込みを開けた後)。MMU が入っただけの段階で
  * 数に入れると、まだ受け皿の無い CPU にタスクが飛ぶ。 */
+/* 起こす副コアの上限。**既定では絞らない** (DTB が見つけた数がそのまま)。
+ * ビルド時に -DAARCH64_SMP_MAX_CPUS=1 を渡すと 1 コアで起動する */
+#ifndef AARCH64_SMP_MAX_CPUS
+#define AARCH64_SMP_MAX_CPUS AARCH64_MAX_CPUS
+#endif
+
 static struct smp_cpu_info g_cpus[AARCH64_MAX_CPUS];
 static volatile uint32_t g_started_cpus = 1;   /* CPU 0 は最初から動いている */
 
@@ -305,6 +311,18 @@ void aarch64_smp_start_secondaries(void) {
     uint32_t want = 0;
 
     if (n > AARCH64_MAX_CPUS) n = AARCH64_MAX_CPUS;
+    /* **切り分けのために起こす数を絞れるようにしてある。**
+     *
+     * 実機で「落ち方が一定しない」を追うとき、**まず 1 コアで通ることを
+     * 見てから 4 コアにする** — 通らなければ SMP 以前の問題で、そこを
+     * 先に潰さないと 4 コアの症状は読めない。
+     *
+     *   make aarch64-pi4-netboot AARCH64_SMP_MAX_CPUS=1 ...
+     *
+     * **配列の大きさは変えない** (AARCH64_MAX_CPUS のまま)。ここで
+     * 絞るのは「起こす数」だけなので、g_cpus も start.S の上限も
+     * 食い違わない */
+    if (n > AARCH64_SMP_MAX_CPUS) n = AARCH64_SMP_MAX_CPUS;
 
     aarch64_console_begin();
     aarch64_uart_puts("--- SMP: 副コアを起こす ---\n  entry     : ");

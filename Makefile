@@ -359,6 +359,16 @@ AARCH64_CFLAGS += $(AARCH64_CFLAGS_EXTRA)
 AARCH64_LOAD_PA ?= 0x40200000
 # DTB を読む前の出力先。機械ごとに違う (include/aarch64/boot.h の注記)
 #   QEMU virt  0x09000000 (既定) / Pi 3  0x3F201000 / Pi 4  0xFE201000
+# start.S の通過点を UART に直接出す探針。**切り分けのための一時的な道具。**
+# boot.c の最初の puts より前で死ぬと 1 文字も出ないので、そこを測るには
+# start.S から直に PL011 を叩くしかない。
+# 番地は AARCH64_EARLY_UART と同じだが、**.S から使うので ULL の付かない
+# 生の値**を別に渡す (movz/movk の即値に ULL は書けない)
+AARCH64_START_PROBE ?=
+ifneq ($(AARCH64_START_PROBE),)
+AARCH64_CFLAGS += -DAARCH64_START_PROBE=1 -DAARCH64_START_PROBE_UART=$(AARCH64_EARLY_UART)
+endif
+
 AARCH64_EARLY_UART ?=
 ifneq ($(AARCH64_EARLY_UART),)
 AARCH64_CFLAGS += -DAARCH64_EARLY_UART=$(AARCH64_EARLY_UART)ULL
@@ -422,6 +432,13 @@ endif
 
 # **BCM2711 の PCIe を立ち上げる。既定では無効。**
 # QEMU で一切検証できないので、実機で 1 段ずつ確かめる用
+# 起こす副コアの上限。**切り分け用。**実機で「まず 1 コアで通るか」を
+# 見るときに AARCH64_SMP_MAX_CPUS=1 を渡す。既定は絞らない
+AARCH64_SMP_MAX_CPUS ?=
+ifneq ($(AARCH64_SMP_MAX_CPUS),)
+AARCH64_CFLAGS += -DAARCH64_SMP_MAX_CPUS=$(AARCH64_SMP_MAX_CPUS)
+endif
+
 AARCH64_PCIE_BRCM_INIT ?=
 ifneq ($(AARCH64_PCIE_BRCM_INIT),)
 AARCH64_CFLAGS += -DAARCH64_PCIE_BRCM_INIT=1

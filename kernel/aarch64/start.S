@@ -12,11 +12,36 @@
 
 #include "aarch64/vm.h"
 
+/* ---- 起動の通過点を UART に出す探針 (一時的な道具) ------------------------
+ *
+ * **実機が 1 文字も出さずに死ぬとき、どこまで進んだかを測る。**
+ * boot.c の最初の puts は MMU も .bss の 0 埋めも済んだ後なので、
+ * それより前で死ぬと手がかりが 1 つも残らない。ブートローダが UART を
+ * 初期化した後なので、**PL011 の DR に直に書けばそのまま出る。**
+ *
+ *   make aarch64-pi4-netboot AARCH64_START_PROBE=1 ...
+ *
+ * 既定では 1 命令も生えない。**使うのは x9 / x10 だけ** — この経路で
+ * 中身を保っておく必要があるのは x19-x23 で、そこは踏まない。
+ * FIFO の空きは見ない (数文字なので溢れない) */
+#ifdef AARCH64_START_PROBE
+.macro PROBE ch
+    movz    x9, #((AARCH64_START_PROBE_UART) & 0xffff)
+    movk    x9, #(((AARCH64_START_PROBE_UART) >> 16) & 0xffff), lsl #16
+    mov     w10, #\ch
+    str     w10, [x9]
+.endm
+#else
+.macro PROBE ch
+.endm
+#endif
+
 .section .text.start
 .globl _start
 .extern aarch64_early_main
 
 _start:
+    PROBE 0x31                  /* '1' start.S に来た */
     /* QEMU は x0 に DTB の物理アドレスを渡す。真っ先に退避すること。
      * ここを潰すと DTB を二度と拾えない (最初 mpidr を x0 に読んで壊した) */
     mov     x19, x0
@@ -165,6 +190,7 @@ _start:
     eret
 
 6:
+    PROBE 0x32                  /* '2' EL2 の判定まで来た (EL3 経路も合流) */
     /* ---- EL2 で起動していたら EL1 へ降りる --------------------------------
      *
      * QEMU virt は既定 (virtualization=off) だと EL1 から始まるが、
@@ -196,10 +222,12 @@ _start:
      * **立っているかを測るより、立てるほうが安い**。冪等な操作。
      *
      * S3_1_C15_C2_1 = CPUECTLR_EL1、bit 6 = SMPEN */
+    PROBE 0x33                  /* '3' CPUECTLR_EL1 を触る直前 */
     mrs     x0, S3_1_C15_C2_1
     orr     x0, x0, #(1 << 6)
     msr     S3_1_C15_C2_1, x0
     isb
+    PROBE 0x34                  /* '4' CPUECTLR_EL1 を触り終えた */
     mrs     x0, CurrentEL
     lsr     x0, x0, #2
 
@@ -240,6 +268,7 @@ _start:
     mov     x0, sp
     msr     sp_el1, x0
 
+    PROBE 0x35                  /* '5' EL1 へ降りる直前 */
     msr     elr_el2, x23
     eret
 
@@ -248,6 +277,7 @@ _start:
     br      x23
 
 4:
+    PROBE 0x36                  /* '6' EL1 の合流点に着いた */
     /* ---- FP / SIMD を EL0 に開ける ---------------------------------------
      *
      * **CPACR_EL1.FPEN を開かないと EL0 の FP / NEON 命令が全部トラップされる。**
@@ -294,6 +324,7 @@ _start:
     ldr     x2, =aarch64_early_main
     sub     x2, x2, x21
     mov     x0, x19             /* DTB の物理アドレスを第 1 引数で渡す */
+    PROBE 0x37                  /* '7' .bss を 0 埋めし終え、C に入る直前 */
     blr     x2
 
 2:
