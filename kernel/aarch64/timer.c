@@ -77,17 +77,56 @@ void aarch64_kbd_tick(void);
  * **音を持たない機械では何もしない** */
 void sound_tick(void);
 
+/* この CPU の番号。**記帳ではなく mpidr をそのまま読む** —
+ * cpu_local が未設置の区間でも成立する (smp.c:98 と同じ形) */
+static inline uint32_t timer_cpu_index(void) {
+    uint64_t mpidr;
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    return (uint32_t)(mpidr & 0xffULL);
+}
+
 void aarch64_timer_on_tick(void) {
-    /* **USB キーボードを拾う。**割り込みを繋いでいないので、ここが唯一の
-     * 定期的な機会。文字が来ていればコンソールのリングへ流し、寝ている
-     * シェルを起こす (kernel/aarch64/kbd.c)。
-     * **キーボードが無い機械では即座に戻る** */
-    aarch64_kbd_tick();
+    /* **周期のポーリングは CPU 0 だけが行う (D-5)。**
+     *
+     * タイマは PPI なので 4 コア全部に上がる (gic.c:100)。ここを
+     * 全コアで回すと、どちらもグローバルに 1 組しか無い状態を
+     * 書くので壊れる — kbd は xHCI のイベントリングを取り合い
+     * (usb.c:2611)、sound は g_clean_idx を同時に進める。
+     *
+     * **ロックで包むのではなく、叩く者を 1 人に戻す。** どちらも
+     * 「定期的に 1 回」が意味で、四重に叩く意味が無い。ロックだと
+     * kbd_tick の USB 転送 (ms 単位) を**割り込み文脈のまま 3 コアが
+     * 待つ**ことになる。sched.c:133 の task_poll_sleep_wakeups と同じ形。
+     *
+     * **周期も直る。** 4 コアで回していた間は「10ms に 1 回」の
+     * つもりで 4 倍叩いていた。
+     *
+     * **これで消えるのは tick 同士だけ。** tick と syscall (別のコアで
+     * 走るユーザプロセス) の競合は残るので、そちらは kbd.c / sound.c
+     * 側でロックを取る */
+    if (timer_cpu_index() == 0) {
+        /* **USB キーボードを拾う。**割り込みを繋いでいないので、ここが唯一の
+         * 定期的な機会。文字が来ていればコンソールのリングへ流し、寝ている
+         * シェルを起こす (kernel/aarch64/kbd.c)。
+         * **キーボードが無い機械では即座に戻る** */
+        aarch64_kbd_tick();
 
-    /* 音の後片付け (D-3)。**鳴っていなければ即座に戻る** */
-    sound_tick();
+        /* 音の後片付け (D-3)。**鳴っていなければ即座に戻る** */
+        sound_tick();
 
-    g_ticks++;
+        /* **数えるのも CPU 0 だけ (D-5)。**
+         *
+         * これは「割り込みが入った回数」で、time ではなく**間隔**の
+         * 物差しに使われている (virtio_blk_mmio.c:43 の
+         * 「10ms x 300 = 3 秒」)。4 コアで数えると 4 倍の速さで進み、
+         * **3 秒のつもりが 0.75 秒で時間切れになる。**
+         * 非 atomic な ++ を 4 コアで叩いて数を落とす問題も同時に消える。
+         *
+         * 時刻 (arch_time_now_ms) は CNTPCT_EL0 から出しているので
+         * ここには依存しない (runtime.c:44) */
+        g_ticks++;
+    }
+
     aarch64_task_on_tick();   /* 切り替えの印を立てる (実際の切り替えは IRQ の出口) */
     write_tval(g_interval);
     write_ctl(CNTP_CTL_ENABLE);
