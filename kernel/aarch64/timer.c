@@ -15,6 +15,7 @@
  */
 #include <stdint.h>
 #include "aarch64/boot.h"
+#include "task.h"
 
 #define TICK_HZ 100     /* 10ms 刻み。x86 / riscv64 の SCHED_TICK_MS と揃える */
 
@@ -85,6 +86,77 @@ static inline uint32_t timer_cpu_index(void) {
     return (uint32_t)(mpidr & 0xffULL);
 }
 
+/* ---- CPU ごとの稼働を数える (M-4 の切り分け) -----------------------------
+ *
+ * **「4 コアにしたのに縮まない」の原因を絞るための計器。**
+ *
+ * 実測 (2026-08-26): 実機でセルフホストのビルドを make -j4 で回したら
+ * 50 分 9 秒。1 コアだった 8/23 の 52 分とほぼ同じで、**4 コアにした
+ * 効果が出なかった。** ログからは「4 本並列で 50 分」と「逐次で 50 分」
+ * が区別できない — 起動行に時刻が無いので、どちらでも同じに見える。
+ *
+ * **区別するには「各 CPU が実際に走っていた割合」を測るしかない。**
+ *
+ *   どのコアも高い    -> CPU は使い切っている。遅いのは別の所
+ *                        (SD の I/O が本命。emmc2 は PIO のみで DMA 無し)
+ *   cpu0 だけ高い     -> タスクが分散していない。スケジューラの問題
+ *   どのコアも低い    -> 全員が何かを待っている
+ *
+ * タイマは PPI で**全 CPU に上がる**ので、自分の分は自分で数えられる。
+ * tick ごとに加算 2 回だけなので、常時入れておいても割に合う。
+ *
+ * idle タスクを走らせていた tick は「暇」、それ以外は「働いた」。 */
+static volatile uint64_t g_cpu_tick_all[AARCH64_MAX_CPUS];
+static volatile uint64_t g_cpu_tick_busy[AARCH64_MAX_CPUS];
+static volatile uint32_t g_cpu_runq_peak[AARCH64_MAX_CPUS];
+
+static void cpu_stats_count(uint32_t cpu) {
+    struct cpu_local* c;
+    if (cpu >= AARCH64_MAX_CPUS) return;
+    g_cpu_tick_all[cpu]++;
+    /* **cpu_local がまだ無い時期にも tick は来る** (副コアが数に入る前)。
+     * その間は「暇」として数える — 実際まだ何もしていない */
+    c = get_cpu_local();
+    if (!c) return;
+    if (c->current_task && c->current_task != c->idle_task) {
+        g_cpu_tick_busy[cpu]++;
+    }
+    if (c->runq_count > g_cpu_runq_peak[cpu]) g_cpu_runq_peak[cpu] = c->runq_count;
+}
+
+/* **区間ごとの割合を出す。** 累積だと平均に均されて、ビルドの山が
+ * 見えなくなる。前回からの差分で出す。
+ *
+ * 呼ぶのは CPU 0 だけ。**待ち行列の頂点は出したら 0 に戻す** —
+ * 「この 60 秒で最大いくつ積まれたか」が見たいので */
+static void cpu_stats_report(void) {
+    static uint64_t prev_all[AARCH64_MAX_CPUS];
+    static uint64_t prev_busy[AARCH64_MAX_CPUS];
+    uint32_t i;
+    uint32_t n = aarch64_boot_info()->cpu_count;
+    if (n > AARCH64_MAX_CPUS) n = AARCH64_MAX_CPUS;
+
+    aarch64_console_begin();
+    aarch64_uart_puts("[cpu] 60s");
+    for (i = 0; i < n; i++) {
+        uint64_t all  = g_cpu_tick_all[i]  - prev_all[i];
+        uint64_t busy = g_cpu_tick_busy[i] - prev_busy[i];
+        prev_all[i]  = g_cpu_tick_all[i];
+        prev_busy[i] = g_cpu_tick_busy[i];
+        aarch64_uart_puts("  cpu");
+        aarch64_uart_putdec64(i);
+        aarch64_uart_puts(" ");
+        /* tick が 0 の CPU は「上がっていない」。割り算で落ちないように */
+        aarch64_uart_putdec64(all ? (busy * 100ULL) / all : 0ULL);
+        aarch64_uart_puts("%(rq");
+        aarch64_uart_putdec64(g_cpu_runq_peak[i]);
+        aarch64_uart_puts(")");
+        g_cpu_runq_peak[i] = 0;
+    }
+    aarch64_uart_puts("\n");
+    aarch64_console_end();
+}
+
 void aarch64_timer_on_tick(void) {
     /* **周期のポーリングは CPU 0 だけが行う (D-5)。**
      *
@@ -104,7 +176,12 @@ void aarch64_timer_on_tick(void) {
      * **これで消えるのは tick 同士だけ。** tick と syscall (別のコアで
      * 走るユーザプロセス) の競合は残るので、そちらは kbd.c / sound.c
      * 側でロックを取る */
-    if (timer_cpu_index() == 0) {
+    uint32_t me = timer_cpu_index();
+
+    /* **数えるのは全 CPU。** 出すのは CPU 0 だけ (下) */
+    cpu_stats_count(me);
+
+    if (me == 0) {
         /* **USB キーボードを拾う。**割り込みを繋いでいないので、ここが唯一の
          * 定期的な機会。文字が来ていればコンソールのリングへ流し、寝ている
          * シェルを起こす (kernel/aarch64/kbd.c)。
@@ -125,6 +202,9 @@ void aarch64_timer_on_tick(void) {
          * 時刻 (arch_time_now_ms) は CNTPCT_EL0 から出しているので
          * ここには依存しない (runtime.c:44) */
         g_ticks++;
+
+        /* 60 秒ごとに 1 行。100Hz なので 6000 tick */
+        if ((g_ticks % 6000ULL) == 0ULL) cpu_stats_report();
     }
 
     aarch64_task_on_tick();   /* 切り替えの印を立てる (実際の切り替えは IRQ の出口) */
