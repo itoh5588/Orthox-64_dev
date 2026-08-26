@@ -132,23 +132,43 @@ static void cpu_stats_count(uint32_t cpu) {
 static void cpu_stats_report(void) {
     static uint64_t prev_all[AARCH64_MAX_CPUS];
     static uint64_t prev_busy[AARCH64_MAX_CPUS];
+    static uint64_t prev_wait[AARCH64_MAX_CPUS][2];
+    static uint64_t prev_pct;          /* 前回の CNTPCT。区間の長さに使う */
+    uint64_t now, span;
     uint32_t i;
     uint32_t n = aarch64_boot_info()->cpu_count;
     if (n > AARCH64_MAX_CPUS) n = AARCH64_MAX_CPUS;
+
+    /* **区間の長さは tick 数ではなく CNTPCT で測る。** 待ちの割合を
+     * 出すには「実時間で何割」が要る。tick は 10ms 刻みで粗い */
+    now  = aarch64_wait_now();
+    span = now - prev_pct;
+    prev_pct = now;
 
     aarch64_console_begin();
     aarch64_uart_puts("[cpu] 60s");
     for (i = 0; i < n; i++) {
         uint64_t all  = g_cpu_tick_all[i]  - prev_all[i];
         uint64_t busy = g_cpu_tick_busy[i] - prev_busy[i];
+        uint64_t wsp  = aarch64_wait_get(i, 0) - prev_wait[i][0];   /* spinlock */
+        uint64_t wsd  = aarch64_wait_get(i, 1) - prev_wait[i][1];   /* SD */
         prev_all[i]  = g_cpu_tick_all[i];
         prev_busy[i] = g_cpu_tick_busy[i];
+        prev_wait[i][0] = aarch64_wait_get(i, 0);
+        prev_wait[i][1] = aarch64_wait_get(i, 1);
+
         aarch64_uart_puts("  cpu");
         aarch64_uart_putdec64(i);
         aarch64_uart_puts(" ");
         /* tick が 0 の CPU は「上がっていない」。割り算で落ちないように */
         aarch64_uart_putdec64(all ? (busy * 100ULL) / all : 0ULL);
-        aarch64_uart_puts("%(rq");
+        /* **待ちの内訳。** busy のうち何割が待ちかがここで分かれる。
+         * lk = spinlock を取るまで / sd = SD の応答待ち */
+        aarch64_uart_puts("%(lk");
+        aarch64_uart_putdec64(span ? (wsp * 100ULL) / span : 0ULL);
+        aarch64_uart_puts(" sd");
+        aarch64_uart_putdec64(span ? (wsd * 100ULL) / span : 0ULL);
+        aarch64_uart_puts(" rq");
         aarch64_uart_putdec64(g_cpu_runq_peak[i]);
         aarch64_uart_puts(")");
         g_cpu_runq_peak[i] = 0;

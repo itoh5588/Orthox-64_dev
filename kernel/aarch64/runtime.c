@@ -116,18 +116,68 @@ static inline int aarch64_mmu_on(void) {
     return (int)(sctlr & 1U);   /* SCTLR_EL1.M */
 }
 
+/* ---- ★ 待ちに費やした時間を CPU ごとに積む (M-4b') ----------------------
+ *
+ * **「idle でない割合」では待ちと実行が区別できなかった。**
+ *
+ * 実測 (2026-08-26): 実機のビルド中、4 コアとも 100%(rq0) と出た。
+ * 並列も分散も効いているのに 1 コアと同じ 50 分。**あの 100% には
+ * spin_lock のスピンも SD のポーリングも含まれていた** —
+ * 「CPU が電気を使っている」であって「仕事が進んでいる」ではない。
+ *
+ * そこで**待ちそのものを数える**。100% のうち何割が待ちかが出れば、
+ * 「CPU が足りない」のか「全員が待っている」のかが分かれる。
+ *
+ * **自 CPU しか書かない**ので排他は要らない。同じ CPU で割り込みが
+ * 入ると加算が割れうるが、割合を見る用途では誤差。 */
+#define AARCH64_WAIT_KINDS 2   /* 0 = spinlock / 1 = SD (emmc2) */
+static volatile uint64_t g_wait_ticks[AARCH64_MAX_CPUS][AARCH64_WAIT_KINDS];
+
+static inline uint32_t wait_cpu_index(void) {
+    uint64_t mpidr;
+    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+    return (uint32_t)(mpidr & 0xffULL);
+}
+
+uint64_t aarch64_wait_now(void) {
+    uint64_t v;
+    __asm__ volatile("isb");
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));
+    return v;
+}
+
+void aarch64_wait_add(uint32_t kind, uint64_t start) {
+    uint32_t cpu = wait_cpu_index();
+    if (cpu >= AARCH64_MAX_CPUS || kind >= AARCH64_WAIT_KINDS) return;
+    g_wait_ticks[cpu][kind] += aarch64_wait_now() - start;
+}
+
+uint64_t aarch64_wait_get(uint32_t cpu, uint32_t kind) {
+    if (cpu >= AARCH64_MAX_CPUS || kind >= AARCH64_WAIT_KINDS) return 0;
+    return g_wait_ticks[cpu][kind];
+}
+
 void spinlock_init(spinlock_t* lock) {
     if (!lock) return;
     lock->locked = 0;
 }
 
 void spin_lock(spinlock_t* lock) {
+    uint64_t t0;
     if (!lock) return;
     if (!aarch64_mmu_on()) return;   /* ここはまだ CPU 0 しか走らない */
+
+    /* **まず 1 回だけ試す。** 競合していないときが大多数で、そこで
+     * CNTPCT を読むと計器のほうが本体より高くつく。
+     * **取れなかったときだけ計る** (M-4b') */
+    if (!__atomic_exchange_n(&lock->locked, 1, __ATOMIC_ACQUIRE)) return;
+
+    t0 = aarch64_wait_now();
     while (__atomic_exchange_n(&lock->locked, 1, __ATOMIC_ACQUIRE)) {
         /* SMP に進んだら wfe / sevl で待つ形にする。1 本のうちは意味が無い */
         __asm__ volatile("yield");
     }
+    aarch64_wait_add(0, t0);
 }
 
 void spin_unlock(spinlock_t* lock) {

@@ -199,9 +199,13 @@ static void udelay(uint64_t us) {
 
 /* 条件が立つまで待つ。**必ず上限を付ける** (日報2026-08-11 追§9)。
  * 戻り値 1 = 立った / 0 = 時間切れ */
+/* **待った時間を積む (M-4b')。** ここは SD の応答を待って回る場所で、
+ * 「4 コアが揃って 100% なのに縮まない」の容疑者。条件が即真なら
+ * counter() の 1 回ぶんしか増えない (もともと読んでいる) */
 #define WAIT_UNTIL(cond, us) ({                                   \
     uint64_t _f = aarch64_timer_freq();                           \
-    uint64_t _lim = _f ? (counter() + ((uint64_t)(us) * _f) / 1000000U) : 0; \
+    uint64_t _t0 = counter();                                     \
+    uint64_t _lim = _f ? (_t0 + ((uint64_t)(us) * _f) / 1000000U) : 0; \
     uint64_t _spin = 0;                                           \
     int _ok = 0;                                                  \
     for (;;) {                                                    \
@@ -209,6 +213,7 @@ static void udelay(uint64_t us) {
         if (_f) { if (counter() >= _lim) break; }                 \
         else if (++_spin > (uint64_t)(us) * 100U) break;          \
     }                                                             \
+    aarch64_wait_add(1, _t0);                                     \
     _ok;                                                          \
 })
 

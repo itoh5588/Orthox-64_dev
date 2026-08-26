@@ -224,6 +224,13 @@ void aarch64_uart_set_base(uint64_t base);
  * 並行に走っていても行が割れない。puts / puthex64 は自分で囲んで
  * あるので、**複数回の呼び出しで 1 行を組むときだけ**明示的に要る。
  * 入れ子にできる */
+/* ★ 待ちに費やした時間を CPU ごとに積む (M-4b'。kernel/aarch64/runtime.c)。
+ *   kind: 0 = spinlock / 1 = SD (emmc2)
+ * 使い方: t0 = aarch64_wait_now(); ...待つ...; aarch64_wait_add(kind, t0); */
+uint64_t aarch64_wait_now(void);
+void aarch64_wait_add(uint32_t kind, uint64_t start);
+uint64_t aarch64_wait_get(uint32_t cpu, uint32_t kind);
+
 void aarch64_console_begin(void);
 void aarch64_console_end(void);
 void aarch64_wait_forever(void);

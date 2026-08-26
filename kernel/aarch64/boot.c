@@ -636,7 +636,9 @@ void aarch64_early_main(uint64_t dtb_phys) {
              * 化けているときに「そもそも描けているのか」を見分けられる */
             aarch64_fb_test_pattern();
             aarch64_uart_puts("  fb pattern: 描いた\n");
+#ifndef AARCH64_NO_FBCON
             aarch64_fbcon_init();
+#endif
             aarch64_uart_puts("  fb console: ");
             if (aarch64_fbcon_ready()) {
                 put_dec(aarch64_fbcon_cols());
@@ -783,7 +785,9 @@ void aarch64_boot_continue(void) {
      * **キーボードと画面を同時に試せる唯一の機械** */
     if (aarch64_fb_info()->base == 0 && aarch64_pci_ready()) {
         if (aarch64_fb_init_pci(0, 0) == 0) {
+#ifndef AARCH64_NO_FBCON
             aarch64_fbcon_init();
+#endif
             aarch64_uart_puts("  fb console: ");
             if (aarch64_fbcon_ready()) {
                 put_dec(aarch64_fbcon_cols());

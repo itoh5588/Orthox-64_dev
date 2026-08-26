@@ -364,6 +364,13 @@ AARCH64_LOAD_PA ?= 0x40200000
 # start.S から直に PL011 を叩くしかない。
 # 番地は AARCH64_EARLY_UART と同じだが、**.S から使うので ULL の付かない
 # 生の値**を別に渡す (movz/movk の即値に ULL は書けない)
+# 画面へのコンソール出力を切る。**切り分け用。**
+# fbcon の描画で落ちるかを見るときに使う (HDMI を使わないなら実害無し)
+AARCH64_NO_FBCON ?=
+ifneq ($(AARCH64_NO_FBCON),)
+AARCH64_CFLAGS += -DAARCH64_NO_FBCON=1
+endif
+
 AARCH64_START_PROBE ?=
 ifneq ($(AARCH64_START_PROBE),)
 AARCH64_CFLAGS += -DAARCH64_START_PROBE=1 -DAARCH64_START_PROBE_UART=$(AARCH64_EARLY_UART)
