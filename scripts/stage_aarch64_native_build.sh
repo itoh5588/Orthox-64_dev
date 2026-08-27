@@ -159,9 +159,21 @@ OBJS     = $(C_OBJS) $(ASM_OBJS)
 
 all: $(OUTPUT)
 
-$(OUTPUT): $(OBJS)
+$(OUTPUT): $(OBJS) $(LDSCRIPT)
 	$(LD) $(LDFLAGS) $(OBJS) -o $@
 	@echo "native-kernel-build-ok $@"
+
+# **上の LDSCRIPT の注記で「2 行のラッパーを作る」と書いておきながら、
+# 作る規則が無かった** (2026-08-27 に実機で露見)。
+# BUILD を新しくすると必ず
+#   ld: cannot open linker script file /kbuildN/machine.ld
+# で落ちる。**実機に古い Makefile が載っている間は見えなかった。**
+#
+# INCLUDE の解決は LDFLAGS の -L $(SRCDIR)/scripts に任せる。
+$(LDSCRIPT):
+	@$(MKDIR) -p $(dir $@)
+	@echo 'AARCH64_LOAD_PA = $(LOAD_PA);' > $@
+	@echo 'INCLUDE kernel-aarch64.ld' >> $@
 
 $(BUILD)/%.o: $(SRCDIR)/%.c
 	@$(MKDIR) -p $(dir $@)
@@ -192,6 +204,24 @@ echo "  ソース $(echo $AARCH64_C_SRCS $AARCH64_SHARED_C_SRCS $AARCH64_ASM_SRC
 
 [ -f "$OUT/scripts/kernel-aarch64.ld" ] || {
   echo "★ リンカスクリプトが入っていない" >&2; exit 1; }
+
+# **ラッパーを作る規則があること。** 無いと BUILD を新しくした初回に
+# 必ずリンクで落ちる (2026-08-27 に実機で 30 分かけて露見させた)
+grep -q '^\$(LDSCRIPT):' "$OUT/Makefile" || {
+  echo "★ 生成した Makefile に \$(LDSCRIPT) を作る規則が無い" >&2; exit 1; }
+echo "  リンカスクリプトのラッパーを作る規則がある"
+
+# **実際に作らせて中身を見る。**規則が在るだけでは、中身が正しいか
+# 分からない。makefile として評価させ、2 行そろうことを確かめる
+_ldcheck="$(mktemp -d)"
+if make --no-print-directory -C "$OUT" BUILD="$_ldcheck" "$_ldcheck/machine.ld" >/dev/null 2>&1 \
+   && grep -q '^AARCH64_LOAD_PA = 0x' "$_ldcheck/machine.ld" \
+   && grep -q '^INCLUDE kernel-aarch64.ld$' "$_ldcheck/machine.ld"; then
+  echo "  ラッパーを実際に作らせて中身も確かめた"
+else
+  echo "★ ラッパーが作れないか中身が違う" >&2; rm -rf "$_ldcheck"; exit 1
+fi
+rm -rf "$_ldcheck"
 
 # **ヘッダの取りこぼしを実測で見る。** #include "..." の相対取り込みを
 # 全部辿るのは高いので、include/ 直下の .h の本数がホストと一致することを見る
