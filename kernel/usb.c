@@ -280,6 +280,38 @@ static uint32_t g_cmd_cycle = 1;
  * 一周の判定は必ず同じ値でないといけない**ので定数を 1 つにする */
 #define XHCI_EVT_RING_TRBS 256U
 static uint32_t g_evt_dequeue_idx = 0;
+
+/* ---- イベントリングと置き場の排他 (U-2) -----------------------------------
+ *
+ * **`irq_save_disable()` では 4 コアで守れない。**あれが止めるのは自分の
+ * CPU の割り込みだけで、他のコアが同時に同じ場所を触るのは止まらない。
+ * ここは 1 コアの時代に書かれたまま SMP に乗っていた
+ * (このファイル自身が「並行性は未対処」と書き残している)。
+ *
+ * 同時に入る者は 3 通り:
+ *
+ *   usb_xhci_irq()      CPU 0 の割り込み。xhci_evt_pump を呼ぶ
+ *   待ち手の保険        任意のコアのタスク文脈。同じ pump を呼ぶ
+ *   xhci_evt_stash_take 任意のコア。置き場を詰め替える
+ *
+ * 重なると **g_evt_dequeue_idx を 2 人で進めて、イベントを 1 つ飛ばす。**
+ * 実機の症状はこれ:
+ *
+ *   [usb] ep0 IN *** イベントが来ない slot=1 seq=860 ...
+ *   [recov] 完了イベントが来ない
+ *
+ * **大きい所有権 (g_usb_owner) を割り込みに取らせるのは駄目。**あちらは
+ * ミリ秒かかる制御転送の全体を囲んでいて、割り込みがそこで待つと線が
+ * 塞がる (日報2026-08-26 の U-2 が「try では足りない、設計から」と
+ * 書いていたのはこの点)。
+ *
+ * **そこで、リングと置き場だけを囲む短いロックを別に持つ。**囲むのは
+ * 「吸い出す」「取り出す」「捨てる」の 3 つだけで、制御転送は入らない。
+ * 割り込みが待たされるのは他のコアの吸い出し 1 回ぶん = マイクロ秒。
+ *
+ * **必ず irqsave 版を使う。**自分の CPU の割り込みを閉じないと、
+ * 握ったまま割り込まれて自分で自分を待つ。 */
+static spinlock_t g_evt_lock;
 static uint32_t g_evt_cycle = 1;
 static uint64_t g_input_ctx_phys = 0;
 static uint64_t g_output_ctx_phys = 0;
@@ -479,10 +511,13 @@ static void xhci_evt_stash_clear(void);   /* 定義は下の「イベントの�
 static uint32_t xhci_evt_drain(void) {
     uint32_t d[4];
     uint32_t n = 0;
+    uint64_t flags = spin_lock_irqsave(&g_evt_lock);
     while (n < XHCI_EVT_RING_TRBS && xhci_evt_dequeue(d)) n++;
     /* **置き場も一緒に空にする。**残しておくと、作り直したリングの
-     * イベントに古いものが混ざる */
+     * イベントに古いものが混ざる。**ロックの中で呼ぶ**ので
+     * xhci_evt_stash_clear は自分では取らない */
     xhci_evt_stash_clear();
+    spin_unlock_irqrestore(&g_evt_lock, flags);
     return n;
 }
 
@@ -575,9 +610,27 @@ static void xhci_evt_stash_push(const uint32_t d[4]) {
     g_evt_stash_gen++;
 }
 
-/* 条件に合うものを 1 つ取り出して詰める。見つからなければ 0 */
+/* 条件に合うものを 1 つ取り出して詰める。見つからなければ 0。
+ *
+ * **配列を後ろから詰め替える間に割り込みが押し込むと壊れる (U-2)。**
+ * 呼ばれるのはタスク文脈だけだが、押し込む側は CPU 0 の割り込みなので
+ * ロックが要る */
+static int xhci_evt_stash_take_locked(uint32_t want_type, uint8_t slot_expect,
+                                      uint8_t ep_expect, uint64_t trb_expect,
+                                      uint32_t out[4]);
+
 static int xhci_evt_stash_take(uint32_t want_type, uint8_t slot_expect, uint8_t ep_expect,
                                uint64_t trb_expect, uint32_t out[4]) {
+    int ret;
+    uint64_t flags = spin_lock_irqsave(&g_evt_lock);
+    ret = xhci_evt_stash_take_locked(want_type, slot_expect, ep_expect, trb_expect, out);
+    spin_unlock_irqrestore(&g_evt_lock, flags);
+    return ret;
+}
+
+static int xhci_evt_stash_take_locked(uint32_t want_type, uint8_t slot_expect,
+                                      uint8_t ep_expect, uint64_t trb_expect,
+                                      uint32_t out[4]) {
     uint32_t i;
     for (i = 0; i < g_evt_stash_count; i++) {
         uint32_t idx = (g_evt_stash_head + i) % XHCI_EVT_STASH_CAP;
@@ -600,6 +653,8 @@ static int xhci_evt_stash_take(uint32_t want_type, uint8_t slot_expect, uint8_t 
     return 0;
 }
 
+/* **呼び出し側が g_evt_lock を握っていること** (いまの呼び手は
+ * xhci_evt_drain だけ) */
 static void xhci_evt_stash_clear(void) {
     g_evt_stash_head = 0;
     g_evt_stash_count = 0;
@@ -624,13 +679,15 @@ static void xhci_evt_stash_clear(void) {
 static uint32_t xhci_evt_pump(void) {
     uint32_t d[4];
     uint32_t n = 0;
-    uint64_t flags = irq_save_disable();
+    /* **自 CPU の割り込みを閉じるだけでは足りない (U-2)。**
+     * 他のコアの pump と取り出しも締め出す。g_evt_lock の注記を参照 */
+    uint64_t flags = spin_lock_irqsave(&g_evt_lock);
     /* **上限を置く。**壊れたリングで永久に回らないように */
     while (n < XHCI_EVT_RING_TRBS && xhci_evt_dequeue(d)) {
         xhci_evt_stash_push(d);
         n++;
     }
-    irq_restore(flags);
+    spin_unlock_irqrestore(&g_evt_lock, flags);
     return n;
 }
 
