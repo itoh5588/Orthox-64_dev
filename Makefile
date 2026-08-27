@@ -371,6 +371,21 @@ ifneq ($(AARCH64_NO_FBCON),)
 AARCH64_CFLAGS += -DAARCH64_NO_FBCON=1
 endif
 
+# SD (EMMC2) を DMA でなく従来の PIO で動かす。**切り分け用。**
+# ADMA2 + 割り込み完了を入れた後 (M-4c)、遅い側と比べたいときに使う
+AARCH64_EMMC2_PIO ?=
+ifneq ($(AARCH64_EMMC2_PIO),)
+AARCH64_CFLAGS += -DAARCH64_EMMC2_PIO=1
+endif
+
+# caps に ADMA2 が無くても DMA を使う。**QEMU で道を確かめるための道具。**
+# raspi4b が模しているのは旧 arasan で ADMA2 を名乗らないが、QEMU の sdhci の
+# 共通部は ADMA2 を実装している。実機では要らない (EMMC2 は自分で名乗る)
+AARCH64_EMMC2_FORCE_DMA ?=
+ifneq ($(AARCH64_EMMC2_FORCE_DMA),)
+AARCH64_CFLAGS += -DAARCH64_EMMC2_FORCE_DMA=1
+endif
+
 AARCH64_START_PROBE ?=
 ifneq ($(AARCH64_START_PROBE),)
 AARCH64_CFLAGS += -DAARCH64_START_PROBE=1 -DAARCH64_START_PROBE_UART=$(AARCH64_EARLY_UART)

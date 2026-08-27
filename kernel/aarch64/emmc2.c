@@ -26,21 +26,58 @@
  *   - 番地は DTB から取る。emmc2bus の **ranges を通して初めて物理になる**
  *     (0x7e340000 -> 0xfe340000)。変換しないと繋がらない番地を叩いて沈黙する
  *
- * ---- 転送は PIO ------------------------------------------------------------
+ * ---- 転送は ADMA2 + 割り込み完了 (2026-08-27, M-4c) ------------------------
  *
- * **DMA を使わない。** DATA レジスタ経由で 4 バイトずつ運ぶ。遅いが、
- * これなら **DMA のキャッシュコヒーレンシ (洗い出しの B) が要らない**。
- * MAIR に非キャッシュ枠を作るのも dc civac のヘルパを書くのも後回しにできる。
- * 速度が要るようになったら ADMA2 を足す。そのときに B が要る。
+ * **もとは PIO だった。** DATA レジスタ経由で 4 バイトずつ、512 バイトを
+ * 128 回の MMIO で運び、しかも 1 セクタごとに CMD17 を出していた。
+ * xv6fs は BSIZE=1024 なので**読み 1 回につきコマンド 2 回**。
  *
- * 割り込みも使わない (ポーリング)。DTB から INTID 158 は取れているので、
- * 後から割り込み待ちに変えられる。
+ * 2026-08-26 の計器 (M-4b') で、これがそのまま実機の遅さだと出た:
+ * ビルド中の全 49 区間で**常に 1 本のコアが SD の応答を 70〜95% 待ち、
+ * 残り 3 本がそのコアの握る g_emmc2_lock を 15〜29% 待っていた。**
+ * 4 コアぶんの CPU 時間の 42.6% が待ちに消えている。
+ *
+ * そこで 3 つ同時に変えた:
+ *
+ *   1. **ADMA2 で運ぶ。** CPU は記述子を 1 本書くだけになる
+ *   2. **複数ブロックを 1 コマンドで。** CMD18/CMD25 + AUTO CMD12
+ *   3. **完了を割り込みで待ち、待つあいだは寝る。** 待つコアも、
+ *      待たされるコアも、その間ほかのタスクを走らせる
+ *
+ * ---- なぜバウンスバッファか ------------------------------------------------
+ *
+ * **呼び手のバッファに直接 DMA しない。** 理由が 2 つある:
+ *
+ *   - **番地が届かない。** 実機の DTB の /emmc2bus は
+ *     `dma-ranges = <0x0 0xc0000000  0x0 0x00000000  0x40000000>`。
+ *     コントローラから見た番地は**物理 + 0xC0000000** で、しかも
+ *     **窓は低位 1GB しか無い**。呼び手のバッファは 4GB の Pi なら
+ *     どこにでも来る
+ *   - **キャッシュが食い違う。** 呼び手のバッファは HHDM の Normal-WB。
+ *     直接 DMA するなら dc civac / dc ivac を対で入れることになる
+ *
+ * そこで **DMA プールの非キャッシュ枠 (Normal-NC、物理 4MB 付近) を
+ * 中継に使う。** キャッシュ維持も別名 (alias) も要らない。写す手間は
+ * 増えるが、**8 バイト単位で運べば 512 バイトあたり 64 回**で済む
+ * (PIO の 128 回の MMIO より軽い)。
+ *
+ * 使えないときは**黙って PIO に退く** — ADMA2 非対応 / プールから
+ * 取れない / 物理 1GB を超えた、のいずれか。`AARCH64_EMMC2_PIO=1` で
+ * 明示的に PIO へ固定もできる (切り分け用)。
+ *
+ * ---- 割り込みが来なくても止まらない ---------------------------------------
+ *
+ * **最初の 1 回はポーリングで完了を待つ。** そこで割り込みが上がって
+ * 初めて「寝てよい」に切り替える (g_irq_works)。GIC の設定を取り違えて
+ * INTID 158 が届かなくても、遅くなるだけで固まらない。
  */
 #include <stddef.h>
 #include <stdint.h>
 #include "aarch64/boot.h"
 #include "aarch64/vm.h"
+#include "aarch64/time.h"
 #include "spinlock.h"
+#include "task.h"
 
 /* ---- SDHCI のレジスタ (base からのオフセット) ---------------------------- */
 #define EMMC_ARG2           0x00
@@ -60,6 +97,10 @@
 #define EMMC_IRPT_EN        0x38
 #define EMMC_CONTROL2       0x3C
 #define EMMC_CAPABILITIES_0 0x40
+/* **標準 SDHCI の ADMA System Address。** BCM の資料には名前が無いが、
+ * EMMC2 は素直な SDHCI 3.0 なので 0x58 に居る (BCM 独自なのは名前だけ) */
+#define EMMC_ADMA_SA_LOW    0x58
+#define EMMC_ADMA_SA_HIGH   0x5C
 #define EMMC_SLOTISR_VER    0xFC
 
 /* CMDTM のビット */
@@ -74,7 +115,9 @@
 #define SD_CMD_RSPNS_MASK   (3U << 16)
 #define SD_CMD_MULTI_BLOCK  (1U << 5)
 #define SD_CMD_DAT_DIR_CH   (1U << 4)   /* card -> host = 読み */
+#define SD_CMD_AUTO_CMD12   (1U << 2)   /* 複数ブロックの後に CMD12 を自動で出す */
 #define SD_CMD_BLKCNT_EN    (1U << 1)
+#define SD_CMD_DMA_EN       (1U << 0)   /* データを DMA で運ぶ (M-4c) */
 
 #define SD_RESP_R1          (SD_CMD_RSPNS_48  | SD_CMD_CRCCHK_EN)
 #define SD_RESP_R1B         (SD_CMD_RSPNS_48B | SD_CMD_CRCCHK_EN)
@@ -92,6 +135,9 @@
 #define SD_INT_READ_RDY     (1U << 5)
 #define SD_INT_ERR          (1U << 15)
 #define SD_INT_ERR_MASK     0xFFFF0000U
+/* 待ち手が見るのはこの 3 つだけ。**CMD_DONE は入れない** — 応答は数マイクロ秒で
+ * 返るので、そこで寝ると切り替えのほうが高くつく */
+#define SD_INT_DATA_WAIT    (SD_INT_DATA_DONE | SD_INT_ERR | SD_INT_ERR_MASK)
 
 /* STATUS のビット */
 #define SD_STATUS_CMD_INHIBIT   (1U << 0)
@@ -113,6 +159,14 @@
 #define SD_CTRL0_BUS_POWER      (1U << 8)
 #define SD_CTRL0_VOLT_3V3       (7U << 9)
 
+/* Host Control 1 の DMA 選択 (bits 4:3)。00 = SDMA / 10 = ADMA2 (32bit)。
+ * **SDMA は 512KB の境界ごとに割り込みが上がる**ので使わない */
+#define SD_CTRL0_DMA_MASK       (3U << 3)
+#define SD_CTRL0_DMA_ADMA2      (2U << 3)
+
+/* CAPABILITIES_0 bit19 = ADMA2 対応。**立っていなければ PIO に退く** */
+#define SD_CAPS0_ADMA2          (1U << 19)
+
 /* 使うコマンドだけ。**表を丸ごと持たない** — 使わないものを持つと、
  * 合っているかどうかを確かめる手立てが無いまま増える */
 #define CMD_GO_IDLE         (SD_CMD_INDEX(0))
@@ -124,6 +178,13 @@
 #define CMD_SET_BLOCKLEN    (SD_CMD_INDEX(16) | SD_RESP_R1)
 #define CMD_READ_SINGLE     (SD_CMD_INDEX(17) | SD_RESP_R1 | SD_DATA_READ)
 #define CMD_WRITE_SINGLE    (SD_CMD_INDEX(24) | SD_RESP_R1 | SD_DATA_WRITE)
+/* 複数ブロック (M-4c)。**停止は AUTO CMD12 に任せる** — 自分で CMD12 を
+ * 出す形にすると、転送の後にもう 1 往復かかる */
+#define CMD_READ_MULTI      (SD_CMD_INDEX(18) | SD_RESP_R1 | SD_DATA_READ)
+#define CMD_WRITE_MULTI     (SD_CMD_INDEX(25) | SD_RESP_R1 | SD_DATA_WRITE)
+/* 転送の中止。**退避のときだけ使う。**カードは「データを送る」状態のまま
+ * 止まっているので、ホスト側の線を戻すだけでは次のコマンドが通らない */
+#define CMD_STOP_TRANS      (SD_CMD_INDEX(12) | SD_RESP_R1B | SD_CMD_TYPE_ABORT)
 #define CMD_APP_CMD         (SD_CMD_INDEX(55) | SD_RESP_R1)
 #define ACMD_SD_SEND_OP_COND (SD_CMD_INDEX(41) | SD_RESP_R3)
 
@@ -146,11 +207,27 @@
  * ありえない形で落ちた。4 コアで 12 回中 4 回、1 コアでは 0 回。
  *
  * **実機は 4 コアなので、そのままでは必ず同じ穴を踏む。**
- * `issue_cmd` の待ちは WAIT_UNTIL のポーリングで割り込みに依存しないので、
- * IRQ を閉じない素の spin_lock で足りる。
+ * 2026-08-26 に実機で通ることを確かめた。
  *
- * **未検証: 実機では試していない** (QEMU の raspi4b は SD を出さない)。 */
+ * ---- ただし「スピンして待つ」のをやめた (2026-08-27, M-4c) -----------------
+ *
+ * **転送のあいだ spin_lock を握り続けるのが M-4 の正体だった。**
+ * 待っているコアも、待たされているコアも、その間なにもできない。
+ *
+ * そこで**所有権と排他を分けた**:
+ *
+ *   - `g_emmc2_lock` は **g_emmc2_busy を触るあいだだけ**握る (数命令)
+ *   - 空くのを待つ側は `kernel_yield()` で**他のタスクに譲る**
+ *   - 転送の完了は割り込みで待ち、待つ側は `task_mark_io_wait_until` で寝る
+ *
+ * 作りは riscv64 の先例をそのまま踏襲した
+ * (kernel/riscv64/virtio_blk_mmio.c の vblk_mmio_acquire / wait_used)。
+ *
+ * **タスクがまだ無い文脈 (起動の初期) では譲れない**ので、そのときは
+ * 従来どおり回して待つ。そこは CPU 0 しか走っていないので競合しない。 */
 static spinlock_t g_emmc2_lock;
+static uint32_t   g_emmc2_busy;      /* 1 = 誰かがコントローラを使っている */
+static struct task* g_waiter;        /* 完了を寝て待っているタスク */
 
 static uint64_t g_base;          /* MMIO の VA。0 なら未初期化 */
 static uint64_t g_base_pa;
@@ -159,13 +236,59 @@ static int      g_sdhc;          /* 1 なら SDHC/SDXC = アドレスがブロ�
 static uint64_t g_blocks;        /* 容量 (512 バイト単位) */
 static uint32_t g_last_resp[4];
 
+/* ---- DMA (M-4c) ---------------------------------------------------------- */
+
+/* バウンスの大きさ。**32KB = 64 セクタ。**
+ *
+ * ADMA2 の記述子は長さが 16 ビットで、0 が 65536 を意味する。**32KB なら
+ * その約束に触れずに 1 本で書ける。** xv6fs が一度に求めるのは 2 セクタ
+ * なので、これで足りないことはまず無い (足りなければ分けて回す) */
+#define EMMC2_BOUNCE_SECTORS  64U
+#define EMMC2_BOUNCE_BYTES    (EMMC2_BOUNCE_SECTORS * SD_BLOCK_SIZE)
+
+/* コントローラから見た番地。**直書きしない** — /emmc2bus の dma-ranges を
+ * DTB から読む (dtb.c)。実機の Pi 4 は「物理 + 0xC0000000、低位 1GB まで」、
+ * QEMU の raspi4b (旧 sdhci) は変換なし */
+static uint64_t g_dma_offset;
+static uint64_t g_dma_limit;     /* 0 = 上限が分からない */
+
+static inline uint32_t emmc2_bus(uint64_t pa) {
+    return (uint32_t)(pa + g_dma_offset);
+}
+
+/* 寝て待つときの 1 回ぶんの上限。**割り込みが来なくても必ず起きる** */
+#define EMMC2_WAIT_SLICE_MS   10U
+
+/* ADMA2 の記述子 (32bit 版)。attr / len / addr で 8 バイト */
+typedef struct {
+    uint16_t attr;
+    uint16_t len;
+    uint32_t addr;
+} adma2_desc_t;
+
+#define ADMA2_ATTR_VALID    (1U << 0)
+#define ADMA2_ATTR_END      (1U << 1)
+#define ADMA2_ATTR_TRAN     (2U << 4)   /* act = 10b = データを運ぶ */
+
+static uint64_t g_desc_pa;           /* 記述子表の物理。0 なら DMA を使わない */
+static uint64_t g_bounce_pa;         /* バウンスの物理 */
+static uint32_t g_dma_ok;            /* 1 なら ADMA2 で運ぶ */
+static uint32_t g_dma_proven;        /* 1 = DMA で一度でも運べた */
+static uint32_t g_intid;             /* 完了割り込みの INTID。0 なら使わない */
+static volatile uint32_t g_irq_done;    /* 完了の印 */
+static volatile uint32_t g_irq_status;  /* ハンドラが拾った INTERRUPT */
+static uint32_t g_irq_works;         /* 1 = 割り込みが実際に上がった */
+static uint64_t g_irq_count;
+
 void aarch64_uart_puts(const char* s);
 void aarch64_uart_puthex64(uint64_t v);
 void aarch64_uart_putchar(char c);
 uint64_t aarch64_timer_freq(void);
+void aarch64_gic_enable_irq(unsigned intid);
 
 int aarch64_emmc2_read(uint64_t lba, void* buf, uint32_t sectors);
 static void find_xv6fs(void);
+static int emmc2_bring_up(void);
 
 static inline void w32(uint64_t off, uint32_t v) {
     *(volatile uint32_t*)(uintptr_t)(g_base + off) = v;
@@ -402,6 +525,257 @@ static int issue_cmd(uint32_t cmd, uint32_t arg, uint32_t blocks,
     return 0;
 }
 
+/* ---- 所有権 (M-4c) --------------------------------------------------------
+ *
+ * **空くまでスピンしない。**譲る。`g_emmc2_lock` を握るのは
+ * `g_emmc2_busy` を読み書きする数命令のあいだだけ */
+static void emmc2_acquire(void) {
+    for (;;) {
+        uint64_t flags = spin_lock_irqsave(&g_emmc2_lock);
+        if (!g_emmc2_busy) {
+            g_emmc2_busy = 1;
+            spin_unlock_irqrestore(&g_emmc2_lock, flags);
+            return;
+        }
+        spin_unlock_irqrestore(&g_emmc2_lock, flags);
+        /* **タスクがまだ無い文脈では譲れない。** ここは CPU 0 しか
+         * 走っていないので、そもそも塞がっていることが無い */
+        if (!get_current_task()) return;
+        kernel_yield();
+    }
+}
+
+static void emmc2_release(void) {
+    uint64_t flags = spin_lock_irqsave(&g_emmc2_lock);
+    g_emmc2_busy = 0;
+    spin_unlock_irqrestore(&g_emmc2_lock, flags);
+}
+
+/* ---- 完了割り込み (M-4c) --------------------------------------------------
+ *
+ * **INTID 158 は SPI で、GIC は SPI を全部 CPU 0 に向けている** (gic.c:150)。
+ * 待っているタスクがどのコアに居ても、起こすのは task_wake なので届く。
+ *
+ * ハンドラは**状態を落として起こすだけ**。レベル駆動なので、
+ * INTERRUPT を落とさないと上がりっぱなしになる。 */
+void aarch64_emmc2_irq(void) {
+    struct task* waiter;
+    uint64_t flags;
+    uint32_t bits;
+
+    if (!g_base) return;
+
+    bits = r32(EMMC_INTERRUPT) & SD_INT_DATA_WAIT;
+    if (bits) w32(EMMC_INTERRUPT, bits);
+
+    /* **信号を閉じてから抜ける。** 次の転送で開け直す。こうしておけば、
+     * 転送していないあいだに線が上がることが無い */
+    w32(EMMC_IRPT_EN, 0);
+
+    g_irq_status |= bits;
+    g_irq_count++;
+    g_irq_works = 1;          /* **実際に上がった。**以後は寝て待ってよい */
+    __sync_synchronize();
+    g_irq_done = 1;
+
+    flags = spin_lock_irqsave(&g_emmc2_lock);
+    waiter = g_waiter;
+    g_waiter = 0;
+    spin_unlock_irqrestore(&g_emmc2_lock, flags);
+    /* task_wake は g_task_lock を取るので、デバイスのロックの外で呼ぶ */
+    if (waiter) task_wake(waiter);
+}
+
+uint32_t aarch64_emmc2_intid(void) { return g_intid; }
+uint64_t aarch64_emmc2_irq_count(void) { return g_irq_count; }
+int aarch64_emmc2_dma_enabled(void) { return (int)g_dma_ok; }
+
+/* データ転送の完了を待つ。戻り値 1 = 完了 / 0 = 時間切れ。
+ *
+ * **最初の 1 回はポーリングで待つ** (g_irq_works が 0 のあいだ)。そこで
+ * 割り込みが上がって初めて寝る側に移る。GIC の設定を取り違えていても
+ * 「遅い」で済み、固まらない。 */
+static int emmc2_wait_data_done(uint32_t timeout_us) {
+    struct task* self = get_current_task();
+    uint64_t t0 = aarch64_wait_now();
+    uint64_t deadline_ms = arch_time_now_ms() + (uint64_t)(timeout_us / 1000U) + 1ULL;
+    int ok = 0;
+
+    for (;;) {
+        uint32_t st;
+
+        if (g_irq_done) { ok = 1; break; }
+
+        /* **毎回レジスタも見る。** IRPT_EN を立てるより先に終わっていた
+         * 場合、割り込みは二度と来ない */
+        st = r32(EMMC_INTERRUPT) & SD_INT_DATA_WAIT;
+        if (st) {
+            w32(EMMC_INTERRUPT, st);
+            g_irq_status |= st;
+            g_irq_done = 1;
+            ok = 1;
+            break;
+        }
+
+        if (arch_time_now_ms() > deadline_ms) break;
+
+        /* 寝られない (タスクが無い / まだ割り込みを見ていない) なら回す */
+        if (!self || !g_irq_works) continue;
+
+        {
+            uint64_t flags = spin_lock_irqsave(&g_emmc2_lock);
+            if (g_irq_done) {
+                spin_unlock_irqrestore(&g_emmc2_lock, flags);
+                ok = 1;
+                break;
+            }
+            /* **印を立ててから寝る。**この 2 つのあいだに割り込みが
+             * 入っても、ハンドラは g_emmc2_lock を待つので取りこぼさない */
+            g_waiter = self;
+            task_mark_io_wait_until(self, arch_time_now_ms() + EMMC2_WAIT_SLICE_MS);
+            spin_unlock_irqrestore(&g_emmc2_lock, flags);
+        }
+        kernel_yield();
+    }
+
+    {
+        uint64_t flags = spin_lock_irqsave(&g_emmc2_lock);
+        g_waiter = 0;
+        spin_unlock_irqrestore(&g_emmc2_lock, flags);
+    }
+    aarch64_wait_add(1, t0);   /* SD の待ちとして数える (M-4b' の計器) */
+    return ok;
+}
+
+/* ---- バウンスとの往復 -----------------------------------------------------
+ *
+ * **必ず幅の広いアクセスで運ぶ。** バウンスは Normal-NC で、1 アクセスが
+ * そのままバスの 1 往復になる。バイト単位で 512 バイト写すと PIO と
+ * 変わらなくなる (8 バイト単位なら 64 回で済む)。
+ *
+ * -mstrict-align で組んでいるので、**整列していない相手にはひとつ落とす。** */
+static void bounce_copy(void* dst, const void* src, uint32_t bytes) {
+    uintptr_t mix = (uintptr_t)dst | (uintptr_t)src | (uintptr_t)bytes;
+    uint32_t i;
+
+    if ((mix & 7U) == 0) {
+        uint64_t* d = (uint64_t*)dst;
+        const uint64_t* sp = (const uint64_t*)src;
+        for (i = 0; i < bytes / 8U; i++) d[i] = sp[i];
+    } else if ((mix & 3U) == 0) {
+        uint32_t* d = (uint32_t*)dst;
+        const uint32_t* sp = (const uint32_t*)src;
+        for (i = 0; i < bytes / 4U; i++) d[i] = sp[i];
+    } else {
+        uint8_t* d = (uint8_t*)dst;
+        const uint8_t* sp = (const uint8_t*)src;
+        for (i = 0; i < bytes; i++) d[i] = sp[i];
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+static void* bounce_va(void) {
+    return (void*)(uintptr_t)aarch64_phys_to_virt(g_bounce_pa);
+}
+
+/* CMD / DAT の線だけ戻す。**全体リセットではない** — 電源もクロックも
+ * カードの選択も保ったまま、詰まった転送だけ捨てる (SDHCI の作法)。
+ * DMA が失敗して PIO へ退くときに使う */
+static void emmc2_reset_lines(void) {
+    w32(EMMC_CONTROL1, r32(EMMC_CONTROL1) | (1U << 25) | (1U << 26));
+    (void)WAIT_UNTIL((r32(EMMC_CONTROL1) & ((1U << 25) | (1U << 26))) == 0, 100000);
+    w32(EMMC_INTERRUPT, 0xffffffffU);
+}
+
+/* ---- ADMA2 でデータ付きコマンドを出す (M-4c) ------------------------------
+ *
+ * 戻り値 0 = 成功。`issue_cmd` の PIO 版と同じ約束で `g_last_fail` を残す。 */
+static int issue_cmd_dma(uint32_t cmd, uint32_t arg, uint32_t blocks,
+                         uint32_t timeout_us) {
+    volatile adma2_desc_t* d;
+    uint32_t irpts;
+    uint32_t bytes = blocks * SD_BLOCK_SIZE;
+
+    g_last_fail = EMMC_FAIL_NONE;
+
+    if (!WAIT_UNTIL((r32(EMMC_STATUS) & SD_STATUS_CMD_INHIBIT) == 0, timeout_us)) {
+        g_last_fail = EMMC_FAIL_CMD_INHIBIT;
+        return -1;
+    }
+    if (!WAIT_UNTIL((r32(EMMC_STATUS) & SD_STATUS_DAT_INHIBIT) == 0, timeout_us)) {
+        g_last_fail = EMMC_FAIL_DAT_INHIBIT;
+        return -1;
+    }
+
+    /* 記述子は 1 本。**バウンスは連続した 32KB** なので分ける必要が無い */
+    d = (volatile adma2_desc_t*)(uintptr_t)aarch64_phys_to_virt(g_desc_pa);
+    d->attr = (uint16_t)(ADMA2_ATTR_TRAN | ADMA2_ATTR_END | ADMA2_ATTR_VALID);
+    d->len  = (uint16_t)bytes;
+    d->addr = emmc2_bus(g_bounce_pa);
+    __asm__ volatile("dsb sy" ::: "memory");
+
+    w32(EMMC_ADMA_SA_LOW, emmc2_bus(g_desc_pa));
+    w32(EMMC_ADMA_SA_HIGH, 0);
+    w32(EMMC_BLKSIZECNT, (blocks << 16) | SD_BLOCK_SIZE);
+
+    g_irq_status = 0;
+    g_irq_done = 0;
+    __sync_synchronize();
+
+    /* **CMDTM を書く前に信号を開ける。** 後だと、速く終わった転送の
+     * 完了を取り逃す */
+    w32(EMMC_IRPT_EN, SD_INT_DATA_WAIT);
+
+    w32(EMMC_ARG1, arg);
+    w32(EMMC_CMDTM, cmd);
+
+    /* 応答は数マイクロ秒で返る。ここは回して待つ。
+     * **g_irq_done も見る** — 転送が速く終わってハンドラが先に走ると、
+     * エラービットはもう落とされている */
+    if (!WAIT_UNTIL(g_irq_done ||
+                    (r32(EMMC_INTERRUPT) & (SD_INT_CMD_DONE | SD_INT_ERR)),
+                    timeout_us)) {
+        g_last_interrupt = r32(EMMC_INTERRUPT);
+        g_last_fail = EMMC_FAIL_CMD_TIMEOUT;
+        w32(EMMC_IRPT_EN, 0);
+        return -1;
+    }
+    irpts = r32(EMMC_INTERRUPT);
+    g_last_interrupt = irpts;
+    w32(EMMC_INTERRUPT, SD_INT_CMD_DONE);   /* **CMD_DONE だけ落とす** */
+    if (irpts & (SD_INT_ERR | SD_INT_ERR_MASK)) {
+        w32(EMMC_INTERRUPT, SD_INT_ERR_MASK | SD_INT_ERR);
+        w32(EMMC_IRPT_EN, 0);
+        g_last_fail = EMMC_FAIL_CMD_ERROR;
+        return -1;
+    }
+    if (!(irpts & SD_INT_CMD_DONE)) {
+        w32(EMMC_IRPT_EN, 0);
+        g_last_fail = EMMC_FAIL_CMD_TIMEOUT;
+        return -1;
+    }
+    g_last_resp[0] = r32(EMMC_RESP0);
+
+    if (!emmc2_wait_data_done(timeout_us)) {
+        g_last_interrupt = r32(EMMC_INTERRUPT);
+        g_last_fail = EMMC_FAIL_DATA_TIMEOUT;
+        w32(EMMC_IRPT_EN, 0);
+        return -1;
+    }
+    w32(EMMC_IRPT_EN, 0);
+
+    g_last_interrupt = g_irq_status;
+    if (g_irq_status & (SD_INT_ERR | SD_INT_ERR_MASK)) {
+        g_last_fail = EMMC_FAIL_DATA_ERROR;
+        return -1;
+    }
+
+    /* **DMA が書き終わったものを読む前に境界を置く。**バウンスは
+     * Normal-NC なので無効化は要らないが、順序は要る */
+    __asm__ volatile("dsb sy" ::: "memory");
+    return 0;
+}
+
 /* ACMD は CMD55 を前置きする。**RCA を渡すこと** — 0 のままだと
  * 識別後のカードが受け付けない */
 static int issue_acmd(uint32_t cmd, uint32_t arg, uint32_t timeout_us) {
@@ -499,7 +873,100 @@ static void dump_regs(uint32_t base_clock) {
     put("\n");
 }
 
-int aarch64_emmc2_init(void) {
+/* ---- DMA の準備 (M-4c) ----------------------------------------------------
+ *
+ * **駄目なら黙って PIO に退く。** ここで止めない — 遅くても起動するほうが
+ * 良い。何で退いたかは 1 行出す。 */
+static void emmc2_dma_setup(void) {
+#ifdef AARCH64_EMMC2_PIO
+    g_dma_ok = 0;
+    put("  emmc2 dma : PIO に固定 (AARCH64_EMMC2_PIO=1)\n");
+#else
+    const aarch64_boot_info_t* b = aarch64_boot_info();
+    uint64_t desc_pa, buf_pa;
+
+    g_dma_ok = 0;
+    g_dma_offset = b->emmc2_dma_offset;
+    g_dma_limit  = b->emmc2_dma_limit;
+
+    /* **HHDM が無いとバウンスに触れない。** DMA プールは物理で返るので、
+     * 上位 VA へ移った後でないと読み書きできない */
+    if (!aarch64_vm_mmu_enabled()) {
+        put("  emmc2 dma : MMU の前なので PIO のまま\n");
+        return;
+    }
+    if (!(r32(EMMC_CAPABILITIES_0) & SD_CAPS0_ADMA2)) {
+#ifdef AARCH64_EMMC2_FORCE_DMA
+        /* **QEMU の raspi4b は旧 arasan を模しているので caps に ADMA2 が
+         * 立たない。** それでも sdhci の共通部は ADMA2 を実装しているので、
+         * 記述子の形・複数ブロック・割り込みの道はここで確かめられる。
+         * **実機でこれを使う理由は無い** (EMMC2 は自分で名乗る) */
+        put("  emmc2 dma : caps に ADMA2 が無いが強行 (AARCH64_EMMC2_FORCE_DMA) caps0=");
+        puthex(r32(EMMC_CAPABILITIES_0));
+        put("\n");
+#else
+        put("  emmc2 dma : ADMA2 非対応 caps0=");
+        puthex(r32(EMMC_CAPABILITIES_0));
+        put("  PIO のまま\n");
+        return;
+#endif
+    }
+
+    desc_pa = aarch64_vm_dma_alloc(1);
+    buf_pa  = aarch64_vm_dma_alloc(EMMC2_BOUNCE_BYTES / 4096U);
+    if (!desc_pa || !buf_pa) {
+        put("  emmc2 dma : プールから取れない。PIO のまま\n");
+        return;
+    }
+    /* **窓に収まっているか** (/emmc2bus の dma-ranges)。
+     * 外に出たら黙って壊れるより先に言う (sound.c と同じ考え方) */
+    if (g_dma_limit && (desc_pa + 4096ULL > g_dma_limit ||
+                        buf_pa + EMMC2_BOUNCE_BYTES > g_dma_limit)) {
+        put("  emmc2 dma : DMA の窓の外 pa=");
+        puthex_short(buf_pa);
+        put(" limit=");
+        puthex_short(g_dma_limit);
+        put("  PIO のまま\n");
+        return;
+    }
+
+    g_desc_pa   = desc_pa;
+    g_bounce_pa = buf_pa;
+
+    /* Host Control 1 の DMA 選択を ADMA2 へ。**電源のビットを消さない** */
+    w32(EMMC_CONTROL0,
+        (r32(EMMC_CONTROL0) & ~SD_CTRL0_DMA_MASK) | SD_CTRL0_DMA_ADMA2);
+
+    g_dma_ok = 1;
+    put("  emmc2 dma : ADMA2  desc=");
+    puthex_short(emmc2_bus(g_desc_pa));
+    put(" buf=");
+    puthex_short(emmc2_bus(g_bounce_pa));
+    put(" (バス番地)\n");
+
+    /* 完了割り込み。**ここまで来てから開ける。**
+     * 最初の 1 回はポーリングで待ち、上がったのを見てから寝る側に移る */
+    if (b->emmc2_intid) {
+        g_intid = b->emmc2_intid;
+        aarch64_gic_enable_irq(g_intid);
+        put("  emmc2 irq : INTID ");
+        putdec(g_intid);
+        put("\n");
+    } else {
+        put("  emmc2 irq : DTB に番号が無い。ポーリングで待つ\n");
+    }
+#endif
+}
+
+/* ---- カードを立ち上げる --------------------------------------------------
+ *
+ * リセットからカードを選ぶところまで。**MBR も DMA も見ない。**
+ *
+ * 割ってあるのは、**転送が詰まったときにここだけをやり直せるようにする**
+ * ため (M-4c の退避)。線のリセットと CMD12 では DAT_INHIBIT が落ちない
+ * 場合があるのを QEMU で実測した (fail=2 で固まる)。全体リセットから
+ * 通し直せば、起動直後と同じ状態に戻る。 */
+static int emmc2_bring_up(void) {
     const aarch64_boot_info_t* b = aarch64_boot_info();
     uint32_t ver, c1, base_clock, i;
 
@@ -668,6 +1135,16 @@ int aarch64_emmc2_init(void) {
     put(" GiB)");
     put(g_sdhc ? "  (SDHC/SDXC)\n" : "  (標準容量)\n");
 
+    return 0;
+}
+
+int aarch64_emmc2_init(void) {
+    if (emmc2_bring_up() != 0) return -1;
+
+    /* **DMA は MBR を読む前に用意する。** 起動そのものが最初の試験になる
+     * (M-4c)。駄目なら PIO のまま進む */
+    emmc2_dma_setup();
+
     /* **カードが読めるようになってから MBR を見る。** ここまで来て初めて
      * aarch64_emmc2_read が使える */
     find_xv6fs();
@@ -806,37 +1283,100 @@ static uint32_t lba_to_arg(uint64_t lba) {
     return g_sdhc ? (uint32_t)lba : (uint32_t)(lba * SD_BLOCK_SIZE);
 }
 
-/* **ロックは転送の丸ごとを囲む。** 1 ブロックずつでは、複数セクタの
- * 要求が別の CPU の要求と 1 ブロックおきに混ざる余地が残る */
-int aarch64_emmc2_read(uint64_t lba, void* buf, uint32_t sectors) {
-    uint8_t* p = (uint8_t*)buf;
+/* PIO で 1 セクタずつ運ぶ従来の道。**DMA が使えないときの退避経路** */
+static int emmc2_rw_pio(uint64_t lba, uint8_t* buf, uint32_t sectors, int is_write) {
     uint32_t i;
-    int ret = 0;
-    if (!g_base || !buf) return -1;
-    spin_lock(&g_emmc2_lock);
-    /* **1 ブロックずつ送る。** 複数ブロック転送は CMD12 の停止処理まで
-     * 要るので、まずは確実に動く形にしておく */
     for (i = 0; i < sectors; i++) {
-        if (issue_cmd(CMD_READ_SINGLE, lba_to_arg(lba + i), 1,
-                      p + (size_t)i * SD_BLOCK_SIZE, 1000000) != 0) { ret = -1; break; }
+        uint32_t cmd = is_write ? CMD_WRITE_SINGLE : CMD_READ_SINGLE;
+        if (issue_cmd(cmd, lba_to_arg(lba + i), 1,
+                      buf + (size_t)i * SD_BLOCK_SIZE, 1000000) != 0) return -1;
     }
-    spin_unlock(&g_emmc2_lock);
+    return 0;
+}
+
+/* ADMA2 で運ぶ (M-4c)。**複数セクタは 1 コマンドにまとめる。**
+ *
+ * 従来は 1 セクタ 1 コマンドで、xv6fs の 1 ブロック (1024 バイト) を
+ * 読むのに CMD17 を 2 回出していた。 */
+static int emmc2_rw_dma(uint64_t lba, uint8_t* buf, uint32_t sectors, int is_write) {
+    uint8_t* bounce = (uint8_t*)bounce_va();
+
+    while (sectors) {
+        uint32_t n = (sectors > EMMC2_BOUNCE_SECTORS) ? EMMC2_BOUNCE_SECTORS : sectors;
+        uint32_t bytes = n * SD_BLOCK_SIZE;
+        uint32_t cmd;
+
+        if (is_write) bounce_copy(bounce, buf, bytes);
+
+        if (n == 1) {
+            cmd = (is_write ? CMD_WRITE_SINGLE : CMD_READ_SINGLE) | SD_CMD_DMA_EN;
+        } else {
+            cmd = (is_write ? CMD_WRITE_MULTI : CMD_READ_MULTI) |
+                  SD_CMD_MULTI_BLOCK | SD_CMD_BLKCNT_EN | SD_CMD_AUTO_CMD12 |
+                  SD_CMD_DMA_EN;
+        }
+
+        if (issue_cmd_dma(cmd, lba_to_arg(lba), n, 1000000) != 0) return -1;
+
+        if (!is_write) bounce_copy(buf, bounce, bytes);
+
+        buf += bytes;
+        lba += n;
+        sectors -= n;
+    }
+    return 0;
+}
+
+/* **転送の丸ごとを 1 人で持つ。** 1 ブロックずつ手放すと、複数セクタの
+ * 要求が別の CPU の要求と 1 ブロックおきに混ざる余地が残る。
+ * ただし**待つ側はスピンしない** (emmc2_acquire を参照) */
+static int emmc2_rw(uint64_t lba, void* buf, uint32_t sectors, int is_write) {
+    int ret;
+    if (!g_base || !buf) return -1;
+    if (sectors == 0) return 0;
+
+    emmc2_acquire();
+    if (g_dma_ok) {
+        ret = emmc2_rw_dma(lba, (uint8_t*)buf, sectors, is_write);
+        /* **最初の 1 回が通らなかったら PIO へ退く。**
+         *
+         * ADMA2 の設定を取り違えていたときに、起動そのものが止まるのを
+         * 避ける。**一度でも通った後の失敗は本物の I/O エラー**として
+         * そのまま返す (黙って遅い道に落ちると原因が見えなくなる) */
+        if (ret != 0 && !g_dma_proven) {
+            put("  emmc2 dma : 最初の転送が通らない fail=");
+            puthex(g_last_fail);
+            put(" int=");
+            puthex(g_last_interrupt);
+            put("  PIO へ退く\n");
+            g_dma_ok = 0;
+            /* **中途半端に止まった転送は線のリセットでは戻らない。**
+             * CMD12 を足しても DAT_INHIBIT が落ちないのを実測した
+             * (QEMU、fail=2)。**全体リセットから立ち上げ直す** */
+            emmc2_reset_lines();
+            (void)issue_cmd(CMD_STOP_TRANS, 0, 0, 0, 500000);
+            if (emmc2_bring_up() != 0) {
+                put("  emmc2 dma : 立ち上げ直しにも失敗した\n");
+                emmc2_release();
+                return -1;
+            }
+            ret = emmc2_rw_pio(lba, (uint8_t*)buf, sectors, is_write);
+        } else if (ret == 0) {
+            g_dma_proven = 1;
+        }
+    } else {
+        ret = emmc2_rw_pio(lba, (uint8_t*)buf, sectors, is_write);
+    }
+    emmc2_release();
     return ret;
 }
 
+int aarch64_emmc2_read(uint64_t lba, void* buf, uint32_t sectors) {
+    return emmc2_rw(lba, buf, sectors, 0);
+}
+
 int aarch64_emmc2_write(uint64_t lba, const void* buf, uint32_t sectors) {
-    const uint8_t* p = (const uint8_t*)buf;
-    uint32_t i;
-    int ret = 0;
-    if (!g_base || !buf) return -1;
-    spin_lock(&g_emmc2_lock);
-    for (i = 0; i < sectors; i++) {
-        if (issue_cmd(CMD_WRITE_SINGLE, lba_to_arg(lba + i), 1,
-                      (void*)(uintptr_t)(p + (size_t)i * SD_BLOCK_SIZE),
-                      1000000) != 0) { ret = -1; break; }
-    }
-    spin_unlock(&g_emmc2_lock);
-    return ret;
+    return emmc2_rw(lba, (void*)(uintptr_t)buf, sectors, 1);
 }
 
 /* ---- storage 層の受け口 --------------------------------------------------

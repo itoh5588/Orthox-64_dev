@@ -208,6 +208,8 @@ extern char aarch64_vectors[];
 void aarch64_gic_init(void);
 void aarch64_gic_enable_irq(unsigned intid);
 uint32_t aarch64_gic_claim(void);
+uint32_t aarch64_emmc2_intid(void);
+void aarch64_emmc2_irq(void);
 void aarch64_gic_complete(uint32_t iar);
 void aarch64_timer_init(void);
 void aarch64_timer_on_tick(void);
@@ -1036,6 +1038,9 @@ void aarch64_irq_handler(void) {
     } else if (intid && intid == aarch64_uart_intid()) {
         /* コンソール入力 (P3)。リングへ移して待ち手を起こす */
         aarch64_console_rx_irq();
+    } else if (intid && intid == aarch64_emmc2_intid()) {
+        /* SD の転送完了 (M-4c)。**ここは印を落として待ち手を起こすだけ** */
+        aarch64_emmc2_irq();
     } else if (intid == aarch64_xhci_intid()) {
         /* xHCI (A-1)。イベントリングを置き場へ吸い出す。
          * **INTx はレベル駆動**なので、発生源は usb_xhci_irq() が落とす */
