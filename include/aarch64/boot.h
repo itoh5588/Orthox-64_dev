@@ -151,6 +151,13 @@ typedef struct aarch64_boot_info {
     uint64_t emmc2_base;
     uint64_t emmc2_size;
     uint32_t emmc2_intid;
+    /* **DMA の番地変換** (M-4c)。/emmc2bus の dma-ranges から。
+     *   emmc2_dma_offset : コントローラから見た番地 = 物理 + これ
+     *   emmc2_dma_limit  : 届く物理の上限 (0 = 制限が分からない)
+     * 実機の Pi 4 は offset=0xC0000000 / limit=0x40000000。
+     * dma-ranges が無い機械 (QEMU の raspi4b) では両方 0 = 素通し */
+    uint64_t emmc2_dma_offset;
+    uint64_t emmc2_dma_limit;
     /* VideoCore の mailbox (Raspberry Pi)。**画面はこれ経由でしか取れない。**
      * DTB には HDMI の framebuffer が載っていないので、解像度もアドレスも
      * ファームウェアに聞くしかない。**QEMU virt には無い**ので 0 のまま */

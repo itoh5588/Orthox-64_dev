@@ -462,6 +462,39 @@ void aarch64_dtb_scan(uint64_t dtb_pa) {
                     aarch64_dtb_read_be32(n->intr_data) == 0U) {
                     info->emmc2_intid = aarch64_dtb_read_be32(n->intr_data + 4) + 32U;
                 }
+
+                /* **DMA で使う番地は reg とは別の変換を通る** (M-4c)。
+                 *
+                 * 実機の /emmc2bus は
+                 *   dma-ranges = <0x0 0xc0000000  0x0 0x00000000  0x40000000>
+                 * で、**コントローラから見た番地は物理 + 0xC0000000、
+                 * 届く範囲は低位 1GB だけ。** ADMA2 の記述子にそのまま
+                 * 物理を書くと、どこにも繋がらない場所を読み書きする。
+                 *
+                 * **直書きしない** — QEMU の raspi4b は旧 sdhci が /soc の
+                 * 下に在って dma-ranges を持たず、そこでは差は 0 になる。
+                 * 親 (バス) 側のプロパティなので nodes[parent] から読む */
+                if (parent != depth && nodes[parent].dma_ranges_data) {
+                    uint32_t cac = addr_cells[parent];
+                    uint32_t pac = (parent > 0) ? addr_cells[parent - 1] : addr_cells[0];
+                    uint32_t csc = size_cells[parent];
+                    uint32_t need = (cac + pac + csc) * 4U;
+                    if (cac <= 2 && pac <= 2 && csc <= 2 && cac != 0 &&
+                        need != 0 && nodes[parent].dma_ranges_len >= need) {
+                        const uint8_t* q = nodes[parent].dma_ranges_data;
+                        uint64_t child, host, span;
+                        child = (cac == 2) ? aarch64_dtb_read_be64(q)
+                                           : aarch64_dtb_read_be32(q);
+                        q += cac * 4U;
+                        host = (pac == 2) ? aarch64_dtb_read_be64(q)
+                                          : aarch64_dtb_read_be32(q);
+                        q += pac * 4U;
+                        span = (csc == 2) ? aarch64_dtb_read_be64(q)
+                                          : ((csc == 1) ? aarch64_dtb_read_be32(q) : 0U);
+                        info->emmc2_dma_offset = child - host;
+                        info->emmc2_dma_limit = span ? (host + span) : 0;
+                    }
+                }
             }
 
             /* mailbox (VideoCore との窓口)。**EMMC2 と同じく ranges 変換が要る**
