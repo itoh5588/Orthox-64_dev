@@ -116,17 +116,37 @@ void aarch64_console_end(void) {
     irq_restore(flags);
 }
 
-/* 1 文字は MMIO の書き込み 1 回なので、これ自体は割れようがない。
+/* 1 文字。**MMIO の書き込み 1 回なので、文字そのものは割れようがない。**
+ *
+ * ---- それでも囲む (M-2) ----------------------------------------------------
+ *
+ * **囲まないと、囲んでいる相手の行の真ん中に入り込む。**
+ *
+ * `aarch64_uart_puts` と 60 秒ごとの計器 (timer.c) は行の全体を
+ * console_begin/end で囲んでいる。**囲っていない書き手は、その行の
+ * 途中に割り込める。** 実機で踏んだ形 (2026-08-27):
+ *
+ *     echo h[cpu] 60s  cpu0 0%(lk0 sd0 rq0) ...
+ *     ello
+ *
+ * キーボードの反響 (EL0 の write 経由で 1 文字ずつ) が囲われておらず、
+ * 計器の行に食い込んだ。**1 文字ずつでも取りに行けば、相手が行を
+ * 出し終わるまで待つ**ので、こうはならない。
+ *
+ * ロックは**同じ CPU からの再入を許す** (owner + depth) ので、
+ * puts の中から 1 文字ずつここへ来ても止まらない。
  *
  * **画面にも同じものを流す。** シリアルの代わりではなく増設 —
  * 画面が無い機械 (QEMU virt) では aarch64_fbcon_putc が何もしないので、
  * ここに条件は書かない */
 void aarch64_uart_putchar(char c) {
+    aarch64_console_begin();
     while (mmio_read32(g_uart_base + PL011_FR_OFF) & PL011_FR_TXFF) {
         /* 送信 FIFO が空くまで待つ */
     }
     mmio_write32(g_uart_base + PL011_DR_OFF, (uint32_t)(unsigned char)c);
     aarch64_fbcon_putc(c);
+    aarch64_console_end();
 }
 
 /* 1 文字だけ取る。無ければ -1 (P3)。**待たない** —
@@ -184,9 +204,13 @@ static void put_hex64(uint64_t v) {
 void aarch64_uart_putdec64(uint64_t v) {
     char buf[24];
     int i = 0;
-    if (v == 0) { aarch64_uart_putchar('0'); return; }
+    /* **数 1 つを 1 まとまりにする (M-2)。**1 文字ずつ出すので、
+     * 囲まないと "1024" が "10" と "24" に割れて別の行が挟まる */
+    aarch64_console_begin();
+    if (v == 0) { aarch64_uart_putchar('0'); aarch64_console_end(); return; }
     while (v > 0 && i < (int)sizeof(buf)) { buf[i++] = (char)('0' + (int)(v % 10U)); v /= 10U; }
     while (i > 0) aarch64_uart_putchar(buf[--i]);
+    aarch64_console_end();
 }
 
 static void put_dec(uint64_t v) { aarch64_uart_putdec64(v); }

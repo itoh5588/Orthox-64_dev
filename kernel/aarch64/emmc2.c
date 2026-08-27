@@ -938,11 +938,13 @@ static void emmc2_dma_setup(void) {
         (r32(EMMC_CONTROL0) & ~SD_CTRL0_DMA_MASK) | SD_CTRL0_DMA_ADMA2);
 
     g_dma_ok = 1;
+    aarch64_console_begin();
     put("  emmc2 dma : ADMA2  desc=");
     puthex_short(emmc2_bus(g_desc_pa));
     put(" buf=");
     puthex_short(emmc2_bus(g_bounce_pa));
     put(" (バス番地)\n");
+    aarch64_console_end();
 
     /* 完了割り込み。**ここまで来てから開ける。**
      * 最初の 1 回はポーリングで待ち、上がったのを見てから寝る側に移る */
@@ -1126,6 +1128,7 @@ static int emmc2_bring_up(void) {
         return -1;
     }
 
+    aarch64_console_begin();
     put("  emmc2     : 初期化 ok  base=");
     puthex_short(g_base_pa);
     put("  ");
@@ -1134,6 +1137,7 @@ static int emmc2_bring_up(void) {
     putdec(g_blocks / 2097152ULL);    /* 512B ブロック -> GiB */
     put(" GiB)");
     put(g_sdhc ? "  (SDHC/SDXC)\n" : "  (標準容量)\n");
+    aarch64_console_end();
 
     return 0;
 }
@@ -1232,6 +1236,10 @@ static void find_xv6fs(void) {
         /* **見つからなかったときのために、あるものを全部出す。**
          * 「無い」とだけ言われても、パーティションが幾つあってどこから
          * 始まっているのかが分からないと次の手が打てない */
+        /* **1 行を 8 回に分けて組み立てている (M-2)。**囲まないと、
+         * 別のコアの [ep0] の行と混ざって「part 39 type=」のような
+         * 実在しない行になる (2026-08-26 に実測) */
+        aarch64_console_begin();
         put("  part ");
         putdec(i + 1U);
         put("    : type=");
@@ -1241,6 +1249,7 @@ static void find_xv6fs(void) {
         put(" sectors=");
         puthex_short(sectors);
         put("\n");
+        aarch64_console_end();
 
         /* **MBR を退避してから中身を見に行く。** looks_like_xv6fs が
          * g_sector を踏むので、残りのエントリを読めなくなる */
@@ -1249,6 +1258,7 @@ static void find_xv6fs(void) {
         if (looks_like_xv6fs(lba)) {
             g_part_lba = lba;
             g_part_blocks = sectors;
+            aarch64_console_begin();
             put("  xv6fs     : パーティション ");
             putdec(i + 1U);
             put("  lba=");
@@ -1256,6 +1266,7 @@ static void find_xv6fs(void) {
             put(" blocks=");
             putdec(g_part_blocks);
             put("\n");
+            aarch64_console_end();
             return;
         }
 

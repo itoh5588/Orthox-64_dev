@@ -90,6 +90,21 @@ static void putdec(uint64_t v) {
 __attribute__((weak))
 uint64_t usb_arch_xhci_mmio(void) { return 0; }
 
+/* ---- 1 行を割らせない囲い (M-2) -------------------------------------------
+ *
+ * **このファイルは 1 行を puts / putdec の何十回かに分けて組み立てる。**
+ * その隙間に別のコアの出力が入ると、実機のログはこうなる:
+ *
+ *     [ep0] seq=13 slot=1 IN  bReq=0x00 wIndex=1 idx0=  part 39    : type=
+ *
+ * 「part 39」も「type=」も実在しない。**2 本の行が混ざっているだけ**だが、
+ * これを数えて誤読したことが実際にある (日報2026-08-26 の反省)。
+ *
+ * アーキ側が行の囲いを持っていれば使う。**既定は何もしない** —
+ * x86 は大きいカーネルロックの下で出しているので、まずはそのまま */
+__attribute__((weak)) void usb_arch_console_begin(void) {}
+__attribute__((weak)) void usb_arch_console_end(void) {}
+
 /* **V-1 の計器の既定 (aarch64 以外)。**測っていないので 0 を返す。
  * n=0 のときは要約行を出さない */
 __attribute__((weak))
@@ -1537,6 +1552,7 @@ static uint32_t xhci_ring_push(uint64_t ring_phys, uint32_t* idx, uint32_t* cycl
             static uint32_t told;
             if (told < 4U) {
                 told++;
+                usb_arch_console_begin();
                 puts("[ring] 枠 255 で Link を書いた ring=0x");
                 puthex(ring_phys);
                 puts(" cycle ");
@@ -1544,6 +1560,7 @@ static uint32_t xhci_ring_push(uint64_t ring_phys, uint32_t* idx, uint32_t* cycl
                 puts(" -> ");
                 putdec((*cycle) ^ 1U);
                 puts(told == 4U ? "  (以降は出さない)\r\n" : "\r\n");
+                usb_arch_console_end();
             }
         }
 
@@ -1667,6 +1684,9 @@ static void xhci_freeze_snapshot(const char* tag, uint8_t slot_id, uint32_t idx0
 static void ep0_trace(uint8_t slot_id, const char* kind, uint64_t setup, uint32_t idx0) {
     g_ep0_seq++;
     if (g_ep0_seq > 60U) return;
+    /* **1 行を 14 回に分けて組み立てている (M-2)。**囲まないと、途中に
+     * 別のコアの行が挟まる。実機で emmc2 の part 行と混ざった */
+    usb_arch_console_begin();
     puts("[ep0] seq="); putdec(g_ep0_seq);
     puts(" slot="); putdec(slot_id);
     puts(" "); puts(kind);
@@ -1675,6 +1695,7 @@ static void ep0_trace(uint8_t slot_id, const char* kind, uint64_t setup, uint32_
     puts(" idx0="); putdec(idx0);
     puts(" cy="); putdec(g_ep0_slot[slot_id].cycle);
     puts("\r\n");
+    usb_arch_console_end();
 }
 
 static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_phys, uint32_t len) {
@@ -2088,11 +2109,13 @@ static int xhci_ep0_recover_stall(uint8_t slot_id) {
     {
         uint32_t st = xhci_ep0_state(slot_id);
         uint32_t type;
+        usb_arch_console_begin();
         puts("[recov] slot="); putdec(slot_id);
         puts(" epstate="); putdec(st);
         puts(st == 1U ? " (Running → Stop Endpoint)\r\n" :
              st == 2U ? " (Halted → Reset Endpoint)\r\n" :
                         " (Stopped/Error → そのまま Set TR Dequeue)\r\n");
+        usb_arch_console_end();
 
         if (st == 1U || st == 2U) {
             /* 15 = Stop Endpoint / 14 = Reset Endpoint */
@@ -2252,11 +2275,13 @@ static int usb_hub_find_device(uint8_t slot_id, uint8_t nbr_ports,
         usb_delay_ms(100);
 
         if (usb_hub_get_port_status(slot_id, p, &st) < 0) continue;
+        usb_arch_console_begin();
         puts("[usb] hub port ");
         putdec(p);
         puts(" status=0x");
         puthex(st);
         puts((st & HUB_PORT_CONNECTION) ? "  接続あり\r\n" : "\r\n");
+        usb_arch_console_end();
         if (!(st & HUB_PORT_CONNECTION)) continue;
 
         (void)usb_hub_port_feature(slot_id, p, HUB_FEAT_C_CONNECTION, 0);
@@ -2265,11 +2290,13 @@ static int usb_hub_find_device(uint8_t slot_id, uint8_t nbr_ports,
          * Address Device は通らない** */
         (void)usb_hub_reset_port(slot_id, p, &st);
 
+        usb_arch_console_begin();
         puts("[usb] hub port ");
         putdec(p);
         puts(" reset -> status=0x");
         puthex(st);
         puts((st & HUB_PORT_ENABLE) ? "  有効になった\r\n" : "  *** 有効にならなかった\r\n");
+        usb_arch_console_end();
         if (!(st & HUB_PORT_ENABLE)) continue;
 
         if (out_port) *out_port = p;
@@ -3227,6 +3254,7 @@ static int xhci_port_reset(volatile uint8_t* op, uint8_t port) {
     USB_MB();
 
     portsc = mmio_read32(op, o);
+    usb_arch_console_begin();
     puts("[usb] port ");
     putdec(port);
     puts(" (USB");
@@ -3234,6 +3262,7 @@ static int xhci_port_reset(volatile uint8_t* op, uint8_t port) {
     puts(") reset -> portsc=0x");
     puthex(portsc);
     puts((portsc & PORTSC_PED) ? "  有効になった\r\n" : "  *** 有効にならなかった\r\n");
+    usb_arch_console_end();
 
     return (portsc & PORTSC_PED) ? 0 : -1;
 }
@@ -3491,6 +3520,9 @@ static void usb_hotplug_poll_owned(void) {
      *   wrap=  リングの一周。止まっていれば制御転送が流れていない */
     if (now >= g_usb_heartbeat_next_ms) {
         g_usb_heartbeat_next_ms = now + 60000ULL;
+        /* **要約は数行まとめて 1 単位にする (M-2)。**中は出力だけで、
+         * 待ちも return も無いので長く握らない */
+        usb_arch_console_begin();
         puts("[usb] 経過 poll=");
         putdec(g_hub_poll_count);
         puts(" irq=");
@@ -3565,6 +3597,7 @@ static void usb_hotplug_poll_owned(void) {
             puthex(mmio_read32(g_rt_regs, 0x20 + 0x00));
         }
         puts("\r\n");
+        usb_arch_console_end();
     }
 
     g_usb_busy = 1;
@@ -3578,6 +3611,7 @@ static void usb_hotplug_poll_owned(void) {
          * 失敗を continue で流していたので、GET_STATUS が通っているのか
          * どうかすら分からなかった */
         if (!g_hub_scan_told) {
+            usb_arch_console_begin();
             puts("[usb] hotplug: scan port ");
             putdec(p);
             puts(" rc=");
@@ -3585,6 +3619,7 @@ static void usb_hotplug_poll_owned(void) {
             puts(" st=0x");
             puthex(st);
             puts("\r\n");
+            usb_arch_console_end();
             if (p >= g_hub_nbr_ports || p >= HUB_MAX_PORTS) g_hub_scan_told = 1;
         }
 

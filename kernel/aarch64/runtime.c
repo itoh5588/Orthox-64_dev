@@ -259,6 +259,11 @@ void puts(const char* s) {
  * `kernel/init.c` の puthex がそうなっている。ここだけ prefix を付けていたので
  * 共有層 (usb.c など) のログが `0x0x0000000000000009` になっていた
  * (2026-08-19)。**"0x" 付きが欲しいときは aarch64_uart_puthex64 を直に呼ぶ** */
+/* 共有層 (usb.c) が行を 1 単位にするための囲い (M-2)。
+ * **aarch64 は既に行の排他を持っている**ので、そこへ繋ぐだけ */
+void usb_arch_console_begin(void) { aarch64_console_begin(); }
+void usb_arch_console_end(void) { aarch64_console_end(); }
+
 void puthex(uint64_t value) {
     static const char digits[] = "0123456789abcdef";
     char buf[17];
