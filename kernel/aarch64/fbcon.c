@@ -25,6 +25,7 @@
  */
 #include <stdint.h>
 #include "aarch64/fb.h"
+#include "aarch64/boot.h"
 #include "aarch64/vm.h"
 
 /* 96 個目は「表に無い文字」の升目 (scripts/gen_font12x24.py) */
@@ -93,6 +94,18 @@ static void fbcon_draw_glyph(uint32_t cx, uint32_t cy, char ch) {
     uint32_t py0 = cy * g_cell_h;
     unsigned char c = (unsigned char)ch;
 
+    /* **升目の外には決して書かない (F-1)。**
+     *
+     * 2026-08-26 と 08-27 の実機で、ここが画面の 1 行下 (y=768) に書いて
+     * 落ちた。**1024x768 の画面は 0x300000 バイトで、FAR は 0x300030** —
+     * ちょうど 1 行ぶん外の、左から 2 升目。
+     *
+     * 本当の原因は下の 2 つ (newline の作り直しと putc の排他) で潰したが、
+     * **状態がどう壊れても画面の外に書かない**ことは、ここで独立に
+     * 保証しておく価値がある。表示が欠けるのは我慢できるが、
+     * カーネルが落ちるのは我慢できない。 */
+    if (cx >= g_cols || cy >= g_rows) return;
+
     /* **表に無い文字は空白にしない。** 「字が無い」と「空白」を混ぜると
      * 化けに気づけない。専用の升目を出す。
      *
@@ -141,11 +154,23 @@ static void fbcon_scroll(void) {
     fbcon_clear_rows(move_px, g_cell_h);
 }
 
+/* **g_row が範囲外の値を一瞬でも持たないようにする (F-1)。**
+ *
+ * もとは `if (++g_row >= g_rows) { fbcon_scroll(); g_row = g_rows - 1; }`
+ * だった。これは **g_row = 32 (= g_rows) のまま fbcon_scroll() を呼ぶ。**
+ * スクロールは画面 1 枚を非キャッシュのメモリで写すのでミリ秒かかり、
+ * **その間ずっと「画面の 1 行下」を指した状態が見えていた。**
+ *
+ * 1 コアなら誰も見ないので問題にならない。**4 コアだと、その窓の間に
+ * 別のコアが同じ g_row を読んで描く。** 下の排他で塞いだが、
+ * そもそも壊れた値を持たない形にしておく。 */
 static void fbcon_newline(void) {
     g_col = 0;
-    if (++g_row >= g_rows) {
+    if (g_row + 1U >= g_rows) {
         fbcon_scroll();
         g_row = g_rows - 1U;
+    } else {
+        g_row++;
     }
 }
 
@@ -165,14 +190,47 @@ static void fbcon_newline(void) {
  * 残る。**読めないことに変わりはないが、読める部分が読めるようになる。
  *
  * **空白にはしない。**「字が無い」と「空白」を混ぜると化けに気づけない */
+/* ---- 排他 (F-1) -----------------------------------------------------------
+ *
+ * **g_row / g_col / 画面そのものを、複数のコアが同時に触っていた。**
+ *
+ * `aarch64_uart_puts` は aarch64_console_begin/end で囲んであるが、
+ * **`aarch64_uart_putchar` と `aarch64_uart_putdec64` は囲んでいない**
+ * (boot.c)。この 2 つもここへ落ちてくるので、囲まれた書き手と囲まれて
+ * いない書き手が同時に走る。実機のログに
+ *
+ *     [ep0] seq=13 slot=1 IN  bReq=0x00 wIndex=1 idx0=  part 39    : type=
+ *
+ * と 2 人ぶんが混ざっていたのが、その場に居た証拠。
+ *
+ * **新しいロックを足さず、コンソールのものを使う。**理由が 2 つある:
+ *
+ *   - **同じ CPU からの再入を許す作りになっている** (owner + depth)。
+ *     puts の途中から putchar 経由でここへ来るし、'\t' はこの関数自身を
+ *     呼び戻す。素の spinlock だと自分で自分を待って止まる
+ *   - **IRQ を止めっぱなしにしない。** スクロールはミリ秒かかるので、
+ *     その間 IRQ を閉じると SD の完了もタイマも取り逃す
+ *
+ * **try 方式にはしない。**取れなかったときに落とす手もあるが、画面から
+ * 文字が虫食いで消えると「壊れている」のか「出していない」のか
+ * 区別できなくなる。画面は遅くてよい。 */
+static void fbcon_putc_locked(char c);
+
 void aarch64_fbcon_putc(char c) {
-    unsigned char u = (unsigned char)c;
     if (!g_ready) return;
+
+    aarch64_console_begin();
+    fbcon_putc_locked(c);
+    aarch64_console_end();
+}
+
+static void fbcon_putc_locked(char c) {
+    unsigned char u = (unsigned char)c;
 
     if (c == '\n') { fbcon_newline(); return; }
     if (c == '\r') { g_col = 0; return; }
     if (c == '\t') {
-        do { aarch64_fbcon_putc(' '); } while (g_col & 7U);
+        do { fbcon_putc_locked(' '); } while (g_col & 7U);
         return;
     }
     if (c == '\b') { if (g_col > 0) g_col--; return; }
