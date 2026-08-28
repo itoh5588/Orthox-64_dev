@@ -21,6 +21,7 @@
 
 #include "xv6fs.h"
 #include "fs.h"
+#include "arch_time.h"   /* arch_time_now_ms。3 アーキテクチャに振り分ける */
 #include "string.h"
 #include "kassert.h"
 #include <stdarg.h>
@@ -110,6 +111,31 @@ static void xv6fs_set_mode(struct xv6fs_inode *ip, uint32_t mode) {
 static struct xv6fs_superblock g_sb;
 static uint32_t g_xv6fs_dev;   /* マウント済みデバイス番号 */
 
+/* ------------------------------------------------------------------ */
+/* mtime の時計                                                        */
+/*                                                                     */
+/* **この機械に RTC は無い。**取れるのは起動からの経過ミリ秒だけで、        */
+/* それをそのまま mtime にすると再起動のたびに 0 へ巻き戻る。            */
+/* 巻き戻ると make は「ソースより出力が新しい」と誤って判断し、           */
+/* 直したソースを作り直さなくなる —— 2026-08-28 に踏んだ穴そのもの。      */
+/*                                                                     */
+/* そこでスーパーブロックに土台 (mtime_base) を持たせ、mount のたびに     */
+/* **前もって進めて書き戻す**。書き戻しをファイル書き込みより先に済ませる  */
+/* ので、途中で電源が落ちても時刻が後戻りすることはない。                 */
+/*                                                                     */
+/* **これは壁時計ではない。**単調に増える通し番号を秒の形で持っているだけ */
+/* で、実際の日時とは対応しない。make が要るのは前後関係だけなので足りる。*/
+/* ------------------------------------------------------------------ */
+/* mount のたびに土台をこれだけ進める。1 回の起動がこれを超えて続くと
+ * 次の起動と重なりうるが、重なっても「同じ秒」になるだけで逆転はしない */
+#define XV6FS_MOUNT_ADVANCE_SEC  86400U
+
+static uint32_t g_mtime_base;
+
+uint32_t xv6fs_now_sec(void) {
+    return g_mtime_base + (uint32_t)(arch_time_now_ms() / 1000ULL);
+}
+
 struct {
     spinlock_t        lock;
     struct xv6fs_inode inode[XV6FS_NINODE];
@@ -125,6 +151,16 @@ void xv6fs_itrunc(struct xv6fs_inode *ip);
 static void readsb(uint32_t dev, struct xv6fs_superblock *sb) {
     struct xv6buf *bp = xv6bread(dev, 1);
     memcpy(sb, bp->data, sizeof(*sb));
+    xv6brelse(bp);
+}
+
+/* **ログを通さずに直に書く。**スーパーブロックはログ自身の位置を書いて
+ * いるので、ログの中に入れると復旧の順序が循環する。書くのは mount 時の
+ * mtime_base だけで、1 ブロックの上書きで済む */
+static void writesb(uint32_t dev, const struct xv6fs_superblock *sb) {
+    struct xv6buf *bp = xv6bread(dev, 1);
+    memcpy(bp->data, sb, sizeof(*sb));
+    xv6bwrite(bp);
     xv6brelse(bp);
 }
 
@@ -144,7 +180,13 @@ int xv6fs_mount_storage(const char *devname) {
 
     readsb(g_xv6fs_dev, &g_sb);
     if (g_sb.magic != XV6FS_FSMAGIC) {
-        xv6fs_print("xv6fs: bad magic 0x%x on %s\n", g_sb.magic, devname);
+        if (g_sb.magic == XV6FS_FSMAGIC_V1) {
+            /* **黙って読むと inode の位置がずれて化ける。**名指しで止める */
+            xv6fs_print("xv6fs: %s は mtime 以前の旧形式 (magic 0x%x)。"
+                        "イメージを作り直すこと\n", devname, g_sb.magic);
+        } else {
+            xv6fs_print("xv6fs: bad magic 0x%x on %s\n", g_sb.magic, devname);
+        }
         g_xv6fs_devname[0] = '\0';   /* マウント失敗: is_mounted() が false を返すようにクリア */
         return -1;
     }
@@ -153,6 +195,14 @@ int xv6fs_mount_storage(const char *devname) {
 
     xv6log_init(g_xv6fs_dev, &g_sb);
     xv6fs_init(g_xv6fs_dev);
+
+    /* **ファイルを 1 つも書く前に土台を進めて書き戻す。**
+     * 順序が肝で、先に書き戻しておけば、この起動中に電源が落ちても
+     * 次の起動の時刻はここより後ろから始まる */
+    g_mtime_base = g_sb.mtime_base + XV6FS_MOUNT_ADVANCE_SEC;
+    g_sb.mtime_base = g_mtime_base;
+    writesb(g_xv6fs_dev, &g_sb);
+    xv6fs_print("xv6fs: mtime 土台 %u 秒から\n", g_mtime_base);
     return 0;
 }
 
@@ -221,7 +271,8 @@ struct xv6fs_inode *xv6fs_ialloc(uint32_t dev, int16_t type) {
             (struct xv6fs_dinode *)bp->data + inum % XV6FS_IPB;
         if (dip->type == 0) {
             memset(dip, 0, sizeof(*dip));
-            dip->type = type;
+            dip->type  = type;
+            dip->mtime = xv6fs_now_sec();
             xv6log_write(bp);
             xv6brelse(bp);
             return xv6fs_iget(dev, inum);
@@ -278,6 +329,7 @@ void xv6fs_ilock(struct xv6fs_inode *ip) {
         ip->minor = dip->minor;
         ip->nlink = dip->nlink;
         ip->size  = dip->size;
+        ip->mtime = dip->mtime;
         memcpy(ip->addrs, dip->addrs, sizeof(ip->addrs));
         xv6brelse(bp);
         ip->valid = 1;
@@ -300,6 +352,7 @@ void xv6fs_iupdate(struct xv6fs_inode *ip) {
     dip->minor = ip->minor;
     dip->nlink = ip->nlink;
     dip->size  = ip->size;
+    dip->mtime = ip->mtime;
     memcpy(dip->addrs, ip->addrs, sizeof(ip->addrs));
     xv6log_write(bp);
     xv6brelse(bp);
@@ -623,7 +676,8 @@ static void xv6fs_itrunc_to(struct xv6fs_inode *ip, uint32_t length) {
         }
     }
 
-    ip->size = length;
+    ip->size  = length;
+    ip->mtime = xv6fs_now_sec();
     xv6fs_iupdate(ip);
 }
 
@@ -699,6 +753,10 @@ int xv6fs_writei(struct xv6fs_inode *ip, const void *src,
 
     if (off > ip->size)
         ip->size = off;
+    /* **make が見ているのはこれ。**書いた瞬間に時刻を進めないと、
+     * 出力が入力より新しくならず依存解決が成り立たない */
+    if (tot > 0)
+        ip->mtime = xv6fs_now_sec();
     xv6fs_iupdate(ip);
     return (int)tot;
 }
@@ -853,7 +911,7 @@ int xv6fs_stat_path(const char *path, uint32_t *out_mode,
     xv6fs_ilock(ip);
     if (out_mode)  *out_mode  = xv6fs_type_mode(ip);
     if (out_size)  *out_size  = ip->size;
-    if (out_mtime) *out_mtime = 0;
+    if (out_mtime) *out_mtime = (int64_t)ip->mtime;
     if (out_rdev) {
         *out_rdev = (ip->type == XV6FS_T_DEVICE)
             ? ((((uint32_t)ip->major & 0xFFU) << 8) | ((uint32_t)ip->minor & 0xFFU))
@@ -1079,7 +1137,8 @@ int xv6fs_truncate_file(const char *path, uint64_t length) {
     if (length < ip->size) {
         xv6fs_itrunc_to(ip, (uint32_t)length);
     } else {
-        ip->size = (uint32_t)length;
+        ip->size  = (uint32_t)length;
+        ip->mtime = xv6fs_now_sec();
         xv6fs_iupdate(ip);
     }
     xv6fs_iunlock(ip);

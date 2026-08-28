@@ -11,6 +11,7 @@
 #include "syscall.h"
 #include "sys_internal.h"
 #include "task.h"
+#include "xv6fs.h"   /* xv6fs_now_sec。CLOCK_REALTIME をファイルの時計と揃える */
 
 static task_context_t* g_linux_fallback_current_context;
 extern int task_fork(arch_task_exec_frame_t* frame);
@@ -649,13 +650,29 @@ static int linux_bootstrap_sys_futex(volatile int* uaddr, int op, int val) {
     }
 }
 
+/* CLOCK_REALTIME (0) と CLOCK_MONOTONIC (1)。
+ *
+ * **REALTIME は xv6fs の時計と同じものを返すこと。**別々にすると、
+ * ファイルの mtime だけが未来にある状態になり、make が
+ *
+ *   File 'Makefile' has modification time NNNN s in the future
+ *   Clock skew detected.  Your build may be incomplete.
+ *
+ * を全ファイルについて出す (2026-08-28 に実機で確認)。この機械に RTC は
+ * 無いので、**唯一の「壁時計らしきもの」は xv6fs が持つ土台**である。
+ * それを唯一の出どころにして、時計が 2 つある状態を作らない。
+ *
+ * MONOTONIC のほうは起動からの経過でよい。むしろ土台を混ぜてはいけない
+ * (mount のたびに飛ぶので単調でなくなる)。 */
 static int linux_bootstrap_sys_clock_gettime(int clock_id, struct linux_timespec* ts) {
     uint64_t ms;
     if (!ts) return -LINUX_EFAULT;
-    ms = arch_time_now_ms();
     if (clock_id != 0 && clock_id != 1) return -LINUX_EINVAL;
-    ts->tv_sec = (int64_t)(ms / 1000ULL);
+    ms = arch_time_now_ms();
     ts->tv_nsec = (int64_t)((ms % 1000ULL) * 1000000ULL);
+    /* xv6fs が未マウントなら土台は 0 で、経過秒そのものに退く */
+    ts->tv_sec = (clock_id == 0) ? (int64_t)xv6fs_now_sec()
+                                 : (int64_t)(ms / 1000ULL);
     return 0;
 }
 

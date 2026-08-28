@@ -1369,11 +1369,16 @@ static int fs_try_active_root_stat(const char* path, struct kstat* st) {
         uint32_t mode = 0;
         uint64_t size = 0;
         uint32_t rdev = 0;
-        if (xv6fs_stat_path(path, &mode, &size, 0, &rdev) < 0) return -1;
+        int64_t  mtime = 0;
+        if (xv6fs_stat_path(path, &mode, &size, &mtime, &rdev) < 0) return -1;
         kstat_set_defaults(st, mode, (int64_t)size);
         st->dev = FS_DEV_ROOT_ARCHIVE;
         st->ino = fs_hash_name(path);
         st->rdev = rdev;
+        /* **kstat_set_defaults が 0 を入れた後で上書きする。**
+         * ここが 0 のままだと make の依存解決が働かない (2026-08-28) */
+        st->mtime_sec = mtime;
+        st->ctime_sec = mtime;
         return 0;
     }
     return -1;

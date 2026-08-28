@@ -813,10 +813,15 @@ int sys_stat(const char* path, struct kstat* st) {
         uint32_t xv6_mode = 0;
         uint64_t xv6_size = 0;
         uint32_t xv6_rdev = 0;
-        if (xv6fs_stat_path(resolved, &xv6_mode, &xv6_size, 0, &xv6_rdev) == 0) {
+        int64_t  xv6_mtime = 0;
+        if (xv6fs_stat_path(resolved, &xv6_mode, &xv6_size, &xv6_mtime, &xv6_rdev) == 0) {
             uint64_t xv6_ino = 0;
             riscv64_fs_kstat_defaults(st, xv6_mode, (int64_t)xv6_size);
             st->rdev = xv6_rdev;
+            /* **既定は 0。**ここで上書きしないと make の依存解決が働かない
+             * (aarch64 側と同じ穴。2026-08-28) */
+            st->mtime_sec = xv6_mtime;
+            st->ctime_sec = xv6_mtime;
             /* **本物の inode 番号を返すこと。** ここを定数 2 にしていたため
              * すべてのディレクトリが同じ ino になり、Orthox 上の gcc が
              * インクルードパスの重複判定 (dev+ino で比較する) で /include を

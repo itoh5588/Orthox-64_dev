@@ -28,7 +28,12 @@ void xv6_sleep_unlock(struct xv6_sleeplock *s);
 /* FS定数 (Orthox-64拡張版)                                           */
 /* ------------------------------------------------------------------ */
 #define XV6FS_BSIZE       1024
-#define XV6FS_FSMAGIC     0x10203040U
+/* **2026-08-28 に 0x10203040 から上げた。**inode に mtime を足して
+ * dinode が 60 → 64 バイトになり、IPB が 17 → 16 に変わったため、
+ * 旧イメージを新カーネルで読むと inode の位置がずれて**黙って化ける**。
+ * マジックを変えて、旧イメージは mount の時点で撥ねる */
+#define XV6FS_FSMAGIC     0x10203041U
+#define XV6FS_FSMAGIC_V1  0x10203040U   /* mtime 以前。読めないが名指しで報せる */
 #define XV6FS_ROOTINO     1
 
 #define XV6FS_NDIRECT     9
@@ -88,24 +93,39 @@ struct xv6fs_superblock {
     uint32_t logstart;
     uint32_t inodestart;
     uint32_t bmapstart;
+    /* **この機械には RTC が無い。**時計は起動からの経過秒しか取れないので、
+     * そのまま mtime にすると再起動のたびに時刻が巻き戻り、make が
+     * 「出力のほうが古い」と誤判定する。**単調増加を跨いで保つための土台**を
+     * ここに置き、mount のたびに前へ進めて書き戻す (xv6fs_now_sec) */
+    uint32_t mtime_base;
 };
 
-/* on-disk inode: 60 bytes
+/* on-disk inode: 64 bytes  (2026-08-28 に 60 から拡張)
  *   short type(2) + short major(2) + short minor(2) + short nlink(2)
- *   + uint size(4) + uint addrs[12](48)
+ *   + uint size(4) + uint mtime(4) + uint addrs[12](48)
  *   addrs[0..8]=direct(9), [9]=indirect, [10]=dindirect, [11]=tindirect
- */
+ *
+ * **60 バイトのままでは mtime を置く隙間が無かった** (1024/60 = 17 個で
+ * 端数 4 バイト、1 個あたりでは 0)。64 にすると IPB が 17 → 16 になり、
+ * inode 領域が 483 → 513 ブロックに伸びる。**イメージの配置が変わる**ので
+ * XV6FS_FSMAGIC も一緒に上げてある */
 struct xv6fs_dinode {
     int16_t  type;
     int16_t  major;
     int16_t  minor;
     int16_t  nlink;
     uint32_t size;
+    uint32_t mtime;                     /* 秒。0 = 不明 */
     uint32_t addrs[XV6FS_NDIRECT + 3];  /* 9直接 + 1間接 + 1二重間接 + 1三重間接 */
 };
 
 /* inodes per block */
-#define XV6FS_IPB  (XV6FS_BSIZE / sizeof(struct xv6fs_dinode))      /* 17 */
+#define XV6FS_IPB  (XV6FS_BSIZE / sizeof(struct xv6fs_dinode))      /* 16 */
+
+/* **配置は mkfs (scripts/build_rootfs_xv6fs.py) と 1 バイトも違ってはいけない。**
+ * 詰め物が入った瞬間に inode の位置がずれるので、ここで組み立てを止める */
+typedef char xv6fs_dinode_size_check[(sizeof(struct xv6fs_dinode) == 64) ? 1 : -1];
+typedef char xv6fs_ipb_check[(XV6FS_IPB == 16) ? 1 : -1];
 
 /* block containing inode i */
 #define XV6FS_IBLOCK(i, sb)  ((i) / XV6FS_IPB + (sb).inodestart)
@@ -157,6 +177,7 @@ struct xv6fs_inode {
     int16_t  minor;
     int16_t  nlink;
     uint32_t size;
+    uint32_t mtime;
     uint32_t addrs[XV6FS_NDIRECT + 3];
 };
 
@@ -251,5 +272,8 @@ int xv6fs_rmdir_path(const char *path);
 int xv6fs_mkdir_path(const char *path, int mode);
 int xv6fs_chmod_path(const char *path, uint32_t mode);
 int xv6fs_sync(void);
+/* mtime に入れる「いまの秒」。壁時計ではなく、再起動を跨いで単調に増える
+ * 通し番号 (スーパーブロックの mtime_base + 起動からの経過秒) */
+uint32_t xv6fs_now_sec(void);
 
 #endif /* XV6FS_H */

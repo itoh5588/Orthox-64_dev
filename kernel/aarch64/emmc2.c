@@ -78,6 +78,7 @@
 #include "aarch64/time.h"
 #include "spinlock.h"
 #include "task.h"
+#include "xv6fs.h"   /* XV6FS_FSMAGIC。MBR 走査でパーティションを見分けるため */
 
 /* ---- SDHCI のレジスタ (base からのオフセット) ---------------------------- */
 #define EMMC_ARG2           0x00
@@ -1178,7 +1179,11 @@ int aarch64_emmc2_init(void) {
 #define MBR_PART_LBA      8U
 #define MBR_PART_SECTORS  12U
 
-#define XV6FS_MAGIC       0x10203040U
+/* **xv6fs.h の XV6FS_FSMAGIC と一致していること。**
+ * ここは MBR を走査して xv6fs のパーティションを見つけるためだけに使う。
+ * 2026-08-28 に mtime 拡張でマジックを上げたとき、ここの直書きを
+ * 直し忘れると「パーティションが見つからない」形で出る */
+#define XV6FS_MAGIC       XV6FS_FSMAGIC
 #define XV6FS_SB_SECTOR   2U      /* BSIZE=1024 のブロック 1 = 512B の 2 番目 */
 
 static uint64_t g_part_lba;       /* xv6fs の先頭 LBA。0 = カードの先頭から */

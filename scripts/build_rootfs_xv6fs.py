@@ -29,7 +29,11 @@ NDINDIRECT = NINDIRECT * NINDIRECT              # 2 段間接: 65536
 NTINDIRECT = NINDIRECT * NINDIRECT * NINDIRECT  # 3 段間接: 16777216
 MAXFILE    = NDIRECT + NINDIRECT + NDINDIRECT + NTINDIRECT
 
-FSMAGIC  = 0x10203040
+# 2026-08-28: dinode に mtime を足して 60 → 64 バイトになり、IPB が 17 → 16。
+# 配置が変わるのでマジックを上げた。**読み取りだけは旧形式も受ける** —
+# 受けないと現行 rootfs から中身を取り出せず、移行できない
+FSMAGIC     = 0x10203041
+FSMAGIC_V1  = 0x10203040   # mtime 以前
 ROOTINO  = 1
 
 T_DIR    = 1
@@ -39,15 +43,43 @@ T_FIFO   = 4
 MODE_MAGIC = 0x4f4d
 DIRSIZ   = 62   # dirent = inum(2) + name(62) = 64 bytes; BSIZE/64 = 16 entries/block
 
-# dinode on-disk layout:
+# dinode on-disk layout (v2, 2026-08-28〜):
 #   short type(2) + short major(2) + short minor(2) + short nlink(2)
-#   + uint size(4) + uint addrs[NDIRECT+3](4×12) = 60 bytes
+#   + uint size(4) + uint mtime(4) + uint addrs[NDIRECT+3](4×12) = 64 bytes
 #   addrs[0..8]=direct(9), [9]=indirect, [10]=dindirect, [11]=tindirect
+# v1 は mtime が無く 60 バイト、IPB=17 だった。
+#
+# **kernel/xv6fs.c の struct xv6fs_dinode と 1 バイトも違ってはいけない。**
+# あちらには sizeof を見る静的表明を入れてある
 DINODE_ADDRS = NDIRECT + 3            # 12 (9+3)
-DINODE_SIZE  = 2 + 2 + 2 + 2 + 4 + 4 * DINODE_ADDRS  # 60
-DINODE_FMT   = f"<hhhhI{DINODE_ADDRS}I"
 
-IPB = BSIZE // DINODE_SIZE            # 17 inodes per block
+DINODE_SIZE  = 2 + 2 + 2 + 2 + 4 + 4 + 4 * DINODE_ADDRS  # 64
+DINODE_FMT   = f"<hhhhII{DINODE_ADDRS}I"
+IPB          = BSIZE // DINODE_SIZE   # 16 inodes per block
+
+_V1_DINODE_SIZE = 2 + 2 + 2 + 2 + 4 + 4 * DINODE_ADDRS   # 60
+_V1_DINODE_FMT  = f"<hhhhI{DINODE_ADDRS}I"
+_V1_IPB         = BSIZE // _V1_DINODE_SIZE               # 17
+
+
+def use_format(version: int) -> None:
+    """読み書きする dinode の形式を切り替える。**イメージを開いた直後に、
+    スーパーブロックのマジックを見て必ず呼ぶこと。**間違った形式で読むと
+    inode の位置がずれて、エラーにならずに化けたものが出てくる。"""
+    global DINODE_SIZE, DINODE_FMT, IPB
+    if version == 1:
+        DINODE_SIZE, DINODE_FMT, IPB = _V1_DINODE_SIZE, _V1_DINODE_FMT, _V1_IPB
+    else:
+        DINODE_SIZE = 2 + 2 + 2 + 2 + 4 + 4 + 4 * DINODE_ADDRS
+        DINODE_FMT  = f"<hhhhII{DINODE_ADDRS}I"
+        IPB         = BSIZE // DINODE_SIZE
+
+
+def format_from_magic(magic: int) -> int:
+    """マジックから形式の版を返す。知らないマジックなら 0"""
+    if magic == FSMAGIC:    return 2
+    if magic == FSMAGIC_V1: return 1
+    return 0
 
 # dirent on-disk layout: ushort inum(2) + char name[62] = 64 bytes
 DIRSIZ_BYTES = DIRSIZ
@@ -71,6 +103,10 @@ bmapstart    = 2 + nlog + ninodeblocks
 # ──────────────────────────────────────────────
 freeinode: int      = 1
 freeblock: int      = nmeta
+# 取り込んだファイルの中でいちばん新しい時刻。スーパーブロックの
+# mtime_base をこれより後ろに置くことで、**起動後に実機が書いたものは
+# 必ずイメージの中身より新しくなる**。逆転すると make が壊れる
+max_mtime: int      = 0
 image: bytearray    = bytearray(FSSIZE * BSIZE)
 
 
@@ -101,12 +137,20 @@ def winode(inum: int, din: dict) -> None:
     bn  = _iblock(inum)
     buf = rsect(bn)
     off = (inum % IPB) * DINODE_SIZE
-    packed = struct.pack(
-        DINODE_FMT,
-        din['type'], din['major'], din['minor'], din['nlink'],
-        din['size'],
-        *din['addrs'],
-    )
+    if IPB == _V1_IPB:
+        packed = struct.pack(
+            DINODE_FMT,
+            din['type'], din['major'], din['minor'], din['nlink'],
+            din['size'],
+            *din['addrs'],
+        )
+    else:
+        packed = struct.pack(
+            DINODE_FMT,
+            din['type'], din['major'], din['minor'], din['nlink'],
+            din['size'], din.get('mtime', 0),
+            *din['addrs'],
+        )
     buf[off:off + DINODE_SIZE] = packed
     wsect(bn, bytes(buf))
 
@@ -116,25 +160,31 @@ def rinode(inum: int) -> dict:
     buf  = rsect(bn)
     off  = (inum % IPB) * DINODE_SIZE
     flds = struct.unpack(DINODE_FMT, buf[off:off + DINODE_SIZE])
+    # v1 は mtime が無いので 0 を補う。addrs の開始位置もずれる
+    _mt   = 0 if IPB == _V1_IPB else flds[5]
+    _adr0 = 5 if IPB == _V1_IPB else 6
     return {
         'type':  flds[0],
         'major': flds[1],
         'minor': flds[2],
         'nlink': flds[3],
         'size':  flds[4],
-        'addrs': list(flds[5:]),
+        'mtime': _mt,
+        'addrs': list(flds[_adr0:]),
     }
 
 
-def ialloc(ftype: int, mode: int | None = None) -> int:
-    global freeinode
+def ialloc(ftype: int, mode: int | None = None, mtime: int = 0) -> int:
+    global freeinode, max_mtime
     inum = freeinode
     freeinode += 1
     assert inum < NINODES, f"out of inodes: {inum} (max {NINODES})"
     if mode is None:
         mode = 0o755 if ftype == T_DIR else 0o644
+    if mtime > max_mtime:
+        max_mtime = mtime
     din = {'type': ftype, 'major': 0, 'minor': 0, 'nlink': 1,
-           'size': 0, 'addrs': [0] * DINODE_ADDRS}
+           'size': 0, 'mtime': mtime, 'addrs': [0] * DINODE_ADDRS}
     if ftype in (T_DIR, T_FILE):
         din['major'] = MODE_MAGIC
         din['minor'] = mode & 0o7777
@@ -272,8 +322,9 @@ def add_dirent(parent: int, name: str, child: int) -> None:
     iappend(parent, _dirent(child, name))
 
 
-def mkdirnode(parent: int | None, name: str | None, mode: int | None = None) -> int:
-    inum = ialloc(T_DIR, mode)
+def mkdirnode(parent: int | None, name: str | None, mode: int | None = None,
+              mtime: int = 0) -> int:
+    inum = ialloc(T_DIR, mode, mtime)
     iappend(inum, _dirent(inum, "."))
     iappend(inum, _dirent(parent if parent is not None else inum, ".."))
     if parent is not None and name is not None:
@@ -281,10 +332,11 @@ def mkdirnode(parent: int | None, name: str | None, mode: int | None = None) -> 
     return inum
 
 
-def mkdevnode(parent: int, name: str, major: int, minor: int) -> int:
+def mkdevnode(parent: int, name: str, major: int, minor: int,
+              mtime: int = 0) -> int:
     """T_DEVICE inode を作成する。major/minor は実デバイス番号として
     そのまま格納する (T_FILE/T_DIR の MODE_MAGIC スキームは適用しない)。"""
-    inum = ialloc(T_DEVICE)
+    inum = ialloc(T_DEVICE, None, mtime)
     din = rinode(inum)
     din['major'] = major
     din['minor'] = minor
@@ -351,14 +403,16 @@ def populate(host_path: Path, dir_inum: int, depth: int = 0) -> None:
         if entry.is_symlink():
             try:
                 target = os.readlink(entry).encode()
-                child  = ialloc(T_FILE, entry.lstat().st_mode & 0o7777)
+                child  = ialloc(T_FILE, entry.lstat().st_mode & 0o7777,
+                                    int(entry.lstat().st_mtime))
                 add_dirent(dir_inum, name, child)
                 iappend(child, target)
             except OSError as e:
                 print(f"\nSKIP symlink {entry}: {e}", file=sys.stderr)
 
         elif entry.is_dir():
-            child = mkdirnode(dir_inum, name, entry.stat().st_mode & 0o7777)
+            child = mkdirnode(dir_inum, name, entry.stat().st_mode & 0o7777,
+                              int(entry.stat().st_mtime))
             populate(entry, child, depth + 1)
 
         else:
@@ -375,7 +429,7 @@ def populate(host_path: Path, dir_inum: int, depth: int = 0) -> None:
                             print(f"\r  [{done:4d}/{total}] {pct:3d}%  {name[:32]:<32}",
                                   end='', flush=True)
                         continue
-                child = ialloc(T_FILE, st.st_mode & 0o7777)
+                child = ialloc(T_FILE, st.st_mode & 0o7777, int(st.st_mtime))
                 add_dirent(dir_inum, name, child)
                 if st.st_nlink > 1:
                     hardlink_map[(st.st_dev, st.st_ino)] = child
@@ -613,9 +667,15 @@ def extract_file_from_image(img_path: str, fs_path: str, out_path: str) -> int:
 
     sb_fields = struct.unpack("<IIIIIIII", bytes(image[BSIZE:BSIZE + 32]))
     magic, _, _, _, _, logstart_sb, inodestart_sb, bmapstart_sb = sb_fields
-    if magic != FSMAGIC:
+    ver = format_from_magic(magic)
+    if ver == 0:
         print(f"ERROR: bad magic 0x{magic:08x} (expected 0x{FSMAGIC:08x})", file=sys.stderr)
         return 1
+    # **読むだけなら旧形式も受ける。**移行のときに現行 rootfs から
+    # 中身を取り出せないと詰むため
+    use_format(ver)
+    if ver == 1:
+        print(f"  (mtime 以前の旧形式 0x{magic:08x} を読んでいる)", file=sys.stderr)
 
     inodestart = inodestart_sb
     bmapstart  = bmapstart_sb
@@ -655,9 +715,15 @@ def _load_image(img_path: str) -> int:
 
     sb_fields = struct.unpack("<IIIIIIII", bytes(image[BSIZE:BSIZE + 32]))
     magic, _, _, _, _, logstart_sb, inodestart_sb, bmapstart_sb = sb_fields
-    if magic != FSMAGIC:
+    ver = format_from_magic(magic)
+    if ver == 0:
         print(f"ERROR: bad magic 0x{magic:08x} (expected 0x{FSMAGIC:08x})", file=sys.stderr)
         return 1
+    # **読むだけなら旧形式も受ける。**移行のときに現行 rootfs から
+    # 中身を取り出せないと詰むため
+    use_format(ver)
+    if ver == 1:
+        print(f"  (mtime 以前の旧形式 0x{magic:08x} を読んでいる)", file=sys.stderr)
 
     inodestart = logstart_sb + (inodestart_sb - logstart_sb)
     bmapstart  = bmapstart_sb
@@ -691,6 +757,22 @@ def _allocated_file_blocks(din: dict) -> list[int]:
             break
         blocks.append(blk)
     return blocks
+
+
+def _max_mtime_in_image() -> int:
+    """イメージ内の全 inode の mtime の最大値。--replace が「いちばん新しい」
+    時刻を付けるために使う。v1 では常に 0 が返る"""
+    hi = 0
+    for inum in range(1, NINODES):
+        try:
+            d = rinode(inum)
+        except Exception:
+            break
+        if d['type'] == 0:
+            continue
+        if d.get('mtime', 0) > hi:
+            hi = d['mtime']
+    return hi
 
 
 def replace_file_in_image(img_path: str, fs_path: str, host_path: str) -> int:
@@ -737,9 +819,16 @@ def replace_file_in_image(img_path: str, fs_path: str, host_path: str) -> int:
             break
 
     din['size'] = len(data)
+    # **中身を替えたら時刻も進める。**据え置くと、差し替えたのに make が
+    # 作り直さない —— 元の穴と同じことが起きる。イメージ内のどのファイル
+    # よりも新しくしておく (ホスト側の時刻はイメージと無関係でありうる)
+    if din.get('mtime', 0) or IPB != _V1_IPB:
+        din['mtime'] = max(_max_mtime_in_image() + 1,
+                           int(Path(host_path).stat().st_mtime))
     winode(inum, din)
     Path(img_path).write_bytes(image)
-    print(f"Replaced {len(data):,} bytes: {host_path} -> {fs_path} in {img_path}")
+    print(f"Replaced {len(data):,} bytes: {host_path} -> {fs_path} in {img_path}"
+          f"  (mtime={din.get('mtime', 0)})")
     return 0
 
 
@@ -839,6 +928,7 @@ def stat_path_in_image(img_path: str, fs_path: str) -> int:
     print(f"  inum:  {inum}")
     print(f"  type:  {_type_name(din['type'])} ({din['type']})")
     print(f"  nlink: {din['nlink']}")
+    print(f"  mtime: {din.get('mtime', 0)}")
     print(f"  size:  {din['size']} bytes")
     print(f"  data blocks:     {len(data_refs)}")
     print(f"  sparse holes:    {max(0, holes)}")
@@ -867,6 +957,7 @@ def dump_inode_in_image(img_path: str, inum_text: str) -> int:
     print(f"  major: {din['major']}")
     print(f"  minor: {din['minor']}")
     print(f"  nlink: {din['nlink']}")
+    print(f"  mtime: {din.get('mtime', 0)}")
     print(f"  size:  {din['size']} bytes")
     print(f"  addrs: {' '.join(str(a) for a in din['addrs'])}")
     if meta_refs:
@@ -904,13 +995,20 @@ def check_image(img_path: str) -> int:
 
     raw_sb = struct.unpack("<IIIIIIII", bytes(image[BSIZE:BSIZE + 32]))
     magic, sb_size, sb_nblocks, sb_ninodes, sb_nlog, sb_logstart, sb_inodestart, sb_bmapstart = raw_sb
-    if magic != FSMAGIC:
+    _ver = format_from_magic(magic)
+    if _ver == 0:
         errors.append(f"bad magic 0x{magic:08x}")
-    if sb_size != FSSIZE:
+    elif _ver == 1:
+        # **旧形式は配置そのものが違う。**道具側の定数と突き合わせても
+        # 意味が無いので、そこだけ飛ばして中身の検査に進む
+        warnings.append(f"mtime 以前の旧形式 (magic 0x{magic:08x})。"
+                        f"新カーネルでは mount できない — 作り直しが要る")
+    if _ver == 2 and sb_size != FSSIZE:
         warnings.append(f"superblock size differs from tool constant: sb={sb_size} tool={FSSIZE}")
-    if sb_ninodes != NINODES:
+    if _ver == 2 and sb_ninodes != NINODES:
         warnings.append(f"superblock ninodes differs from tool constant: sb={sb_ninodes} tool={NINODES}")
-    if sb_logstart != logstart or sb_inodestart != inodestart or sb_bmapstart != bmapstart:
+    if _ver == 2 and (sb_logstart != logstart or sb_inodestart != inodestart
+                      or sb_bmapstart != bmapstart):
         errors.append("superblock layout was not loaded consistently")
     if sb_nblocks != nblocks:
         warnings.append(f"superblock nblocks differs from tool constant: sb={sb_nblocks} tool={nblocks}")
@@ -1062,14 +1160,18 @@ def main() -> int:
         print(f"not a directory: {root_dir}", file=sys.stderr)
         return 1
 
-    # superblock (block 1)
-    sb_buf = bytearray(BSIZE)
-    sb_buf[:32] = struct.pack(
-        "<IIIIIIII",
-        FSMAGIC, FSSIZE, nblocks, NINODES,
-        nlog, logstart, inodestart, bmapstart,
-    )
-    wsect(1, bytes(sb_buf))
+    # superblock (block 1)。mtime_base は中身を入れ終えてから書き直す
+    def write_superblock(mtime_base: int) -> None:
+        sb_buf = bytearray(BSIZE)
+        sb_buf[:36] = struct.pack(
+            "<IIIIIIIII",
+            FSMAGIC, FSSIZE, nblocks, NINODES,
+            nlog, logstart, inodestart, bmapstart,
+            mtime_base,
+        )
+        wsect(1, bytes(sb_buf))
+
+    write_superblock(0)
 
     print("xv6fs image parameters:")
     print(f"  FSSIZE={FSSIZE} blocks = {FSSIZE * BSIZE // 1024 // 1024} MB")
@@ -1077,8 +1179,8 @@ def main() -> int:
     print(f"  nblocks={nblocks}  NINODES={NINODES}  IPB={IPB}  DINODE_SIZE={DINODE_SIZE}")
     print(f"  MAXFILE={MAXFILE} blocks = {MAXFILE * BSIZE // 1024 // 1024} MB/file")
 
-    # ルートディレクトリ (inum=1=ROOTINO)
-    rootino = ialloc(T_DIR)
+    # ルートディレクトリ (inum=1=ROOTINO)。時刻はホストの根と揃える
+    rootino = ialloc(T_DIR, None, int(root_dir.stat().st_mtime))
     assert rootino == ROOTINO, f"rootino={rootino} expected {ROOTINO}"
     iappend(rootino, _dirent(rootino, "."))
     iappend(rootino, _dirent(rootino, ".."))
@@ -1090,12 +1192,15 @@ def main() -> int:
     # /dev とデバイスノード生成 (ホストツリー由来の /dev があれば流用)
     root_din = rinode(rootino)
     dev_inum = _find_dirent(rootino, root_din, "dev")
+    # **デバイスノードにも時刻を入れる。**0 のまま残すと、そこだけ
+    # 「起源不明の最古のファイル」になって前後関係の説明がつかなくなる
+    dev_mtime = max_mtime
     if dev_inum is None:
-        dev_inum = mkdirnode(rootino, "dev")
+        dev_inum = mkdirnode(rootino, "dev", None, dev_mtime)
     for dev_name, dev_major, dev_minor in DEV_NODES:
         dev_din = rinode(dev_inum)
         if _find_dirent(dev_inum, dev_din, dev_name) is None:
-            mkdevnode(dev_inum, dev_name, dev_major, dev_minor)
+            mkdevnode(dev_inum, dev_name, dev_major, dev_minor, dev_mtime)
     print(f"  /dev: {len(DEV_NODES)} device nodes")
 
     # ルートディレクトリサイズを BSIZE に align (xv6 mkfs 互換)
@@ -1105,12 +1210,22 @@ def main() -> int:
 
     write_bitmap()
 
+    # **中身のいちばん新しい時刻を土台にする。**カーネルは mount のたびに
+    # ここから必ず前へ進める (XV6FS_MOUNT_ADVANCE_SEC) ので、実機が書いた
+    # ものは自動的にイメージの中身より新しくなる。ここで足すと二重になり、
+    # 日付が余計に未来へずれるだけなので足さない。
+    # **書き出しより前でやること** — 後ろに置くと image の上だけ直って
+    # ファイルには古い値が残る (2026-08-28 に一度やった)
+    mtime_base = max_mtime
+    write_superblock(mtime_base)
+
     out_img.write_bytes(image)
 
     used_mb = freeblock * BSIZE // 1024 // 1024
     print(f"\nimage written: {out_img}  ({FSSIZE * BSIZE // 1024 // 1024} MB total)")
     print(f"  inodes used : {freeinode - 1} / {NINODES}")
     print(f"  blocks used : {freeblock} / {FSSIZE}  ({used_mb} MB)")
+    print(f"  mtime      : 最新 {max_mtime} / 土台 {mtime_base}")
 
     magic = struct.unpack("<I", bytes(image[BSIZE:BSIZE + 4]))[0]
     if magic == FSMAGIC:

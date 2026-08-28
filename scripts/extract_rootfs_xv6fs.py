@@ -21,16 +21,23 @@ FSSIZE = 327680
 NDIRECT = 9
 NINDIRECT = BSIZE // 4
 
-FSMAGIC = 0x10203040
+# 2026-08-28: dinode に mtime が入って 60 → 64 バイト、IPB が 17 → 16 になった。
+# **取り出す側は両方読めないと移行できない**ので、マジックで見分ける
+FSMAGIC = 0x10203041
+FSMAGIC_V1 = 0x10203040
 ROOTINO = 1
 T_DIR = 1
 T_FILE = 2
 
 DIRSIZ = 62
 DINODE_ADDRS = NDIRECT + 3
-DINODE_SIZE = 2 + 2 + 2 + 2 + 4 + 4 * DINODE_ADDRS
-DINODE_FMT = "<hhhhI%dI" % DINODE_ADDRS
+# v2 (mtime あり) / v1 (mtime なし)
+DINODE_SIZE = 2 + 2 + 2 + 2 + 4 + 4 + 4 * DINODE_ADDRS
+DINODE_FMT = "<hhhhII%dI" % DINODE_ADDRS
 IPB = BSIZE // DINODE_SIZE
+V1_DINODE_SIZE = 2 + 2 + 2 + 2 + 4 + 4 * DINODE_ADDRS
+V1_DINODE_FMT = "<hhhhI%dI" % DINODE_ADDRS
+V1_IPB = BSIZE // V1_DINODE_SIZE
 DIRENT_FMT = "<H%ds" % DIRSIZ
 
 nlog = LOGBLOCKS + 1
@@ -44,17 +51,26 @@ class Image(object):
         with open(path, "rb") as f:
             self.data = f.read()
         magic = struct.unpack("<I", self.sect(1)[0:4])[0]
-        if magic != FSMAGIC:
+        if magic == FSMAGIC:
+            self.ipb, self.dsize, self.dfmt = IPB, DINODE_SIZE, DINODE_FMT
+            self.has_mtime = True
+        elif magic == FSMAGIC_V1:
+            self.ipb, self.dsize, self.dfmt = V1_IPB, V1_DINODE_SIZE, V1_DINODE_FMT
+            self.has_mtime = False
+            sys.stderr.write("  (mtime 以前の旧形式 0x%08x を読んでいる)\n" % magic)
+        else:
             raise SystemExit("superblock magic 不一致: 0x%08x" % magic)
 
     def sect(self, n):
         return self.data[n * BSIZE:(n + 1) * BSIZE]
 
     def inode(self, inum):
-        bn = inum // IPB + inodestart
-        off = (inum % IPB) * DINODE_SIZE
-        f = struct.unpack(DINODE_FMT, self.sect(bn)[off:off + DINODE_SIZE])
-        return {"type": f[0], "size": f[4], "addrs": list(f[5:])}
+        bn = inum // self.ipb + inodestart
+        off = (inum % self.ipb) * self.dsize
+        f = struct.unpack(self.dfmt, self.sect(bn)[off:off + self.dsize])
+        if self.has_mtime:
+            return {"type": f[0], "size": f[4], "mtime": f[5], "addrs": list(f[6:])}
+        return {"type": f[0], "size": f[4], "mtime": 0, "addrs": list(f[5:])}
 
     def _bmap(self, ino, bn):
         """ファイル内ブロック番号 bn → ディスク上のブロック番号"""

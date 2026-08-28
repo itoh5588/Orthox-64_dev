@@ -130,8 +130,10 @@ echo "  サイズ $((got_bytes / 1024 / 1024)) MB  ok"
 
 # xv6fs のスーパーブロック magic (block 1 の先頭 4 バイト、リトルエンディアン)
 magic="$(od -An -tx4 -j1024 -N4 "$IMG" | tr -d ' \n')"
-[ "$magic" = "10203040" ] || {
-  echo "★ superblock magic が 0x$magic (0x10203040 でない)" >&2; exit 1; }
+# 2026-08-28 に mtime 拡張で 0x10203040 -> 0x10203041 に上げた。
+# **include/xv6fs.h の XV6FS_FSMAGIC と揃っていること**
+[ "$magic" = "10203041" ] || {
+  echo "★ superblock magic が 0x$magic (0x10203041 でない)" >&2; exit 1; }
 echo "  superblock magic 0x$magic  ok"
 
 # **中身が入っていること。** 空のイメージでも上の 2 つは通るので効く
