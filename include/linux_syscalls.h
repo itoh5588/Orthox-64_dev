@@ -87,6 +87,7 @@
 #define LINUX_SYS_CLONE            220
 #define LINUX_SYS_EXECVE           221
 #define LINUX_SYS_MMAP             222
+#define LINUX_SYS_MPROTECT         226
 #define LINUX_SYS_WAIT4            260
 #define LINUX_SYS_PRLIMIT64        261
 #define LINUX_SYS_RENAMEAT2        276

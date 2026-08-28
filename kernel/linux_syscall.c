@@ -7,6 +7,8 @@
 #include "spinlock.h"
 #include "linux_syscalls.h"
 #include "arch_syscall.h"
+#include "arch_vm.h"   /* mprotect が権限ビットを組み立てる */
+#include "string.h"
 #include "linux_syscall.h"
 #include "syscall.h"
 #include "sys_internal.h"
@@ -1033,57 +1035,170 @@ static void* linux_mmap_err(int err) {
     return (void*)(intptr_t)(-err);
 }
 
+/* **riscv64 は kernel/sys_fs.c を繋いでいない** (自前の kernel/riscv64/fs.c を
+ * 使っており、sys_pread64 を持たない)。共有の mmap が file-backed を扱うのに
+ * 要るので、既定を弱いシンボルで置いておく。riscv64 ではここが選ばれ、
+ * ファイルを貼る mmap は ENOSYS で断られる。**riscv64 には共有 musl も
+ * まだ無いので、いま困る利用者はいない。**そちらを繋ぐときに一緒に外す。
+ * (sched.c の usb_hotplug_poll と同じ手) */
+__attribute__((weak)) int64_t sys_pread64(int fd, void* buf, size_t count, int64_t offset) {
+    (void)fd; (void)buf; (void)count; (void)offset;
+    return -1;
+}
+
+/* ページ 1 枚をファイルから読んで埋める。**private マップなので写しでよい** —
+ * 書き戻しは要らないし、他のプロセスと共有もしない (x86 の
+ * copy_mmap_file_page と同じ作り)。
+ * **pread を使うので fd の現在位置は動かない。**musl は同じ fd で
+ * ヘッダを読みながらセグメントを貼るので、位置を動かすと壊れる */
+static int linux_mmap_fill_from_file(uint8_t* dest, int fd, uint64_t file_off) {
+    if (!dest || fd < 0) return -1;
+    return (sys_pread64(fd, dest, PAGE_SIZE, (int64_t)file_off) < 0) ? -1 : 0;
+}
+
+/* mmap(2)。
+ *
+ * **2026-08-29 に file-backed / MAP_FIXED / PROT_EXEC を足した。**
+ * それまでは無名 private だけで、共有ライブラリを 1 つも開けなかった。
+ * musl の動的リンカ (ldso/dynlink.c:map_library) は
+ *
+ *   1. まず PROT_NONE で全体を予約する (無名)
+ *   2. その中へ MAP_FIXED でセグメントをファイルから貼る
+ *
+ * という順で使うので、**3 つとも無いと "Invalid argument" で止まる**
+ * (aarch64 で実測)。とくに PROT_EXEC は、無いとテキストが実行不可の
+ * まま貼られて、開けても呼んだ瞬間に落ちる。
+ *
+ * x86 は kernel/sys_vm.c の sys_mmap が別に持っている (そちらが本家)。 */
+/* この機械でファイルを貼る mmap が使えるか。弱い既定が選ばれていれば使えない */
+static int linux_mmap_can_map_file(void) {
+    /* pread が -1 を返すだけの既定かどうかは呼んでみないと分からないので、
+     * 明らかに不正な fd で 1 回試す。本物は EBADF を返し、既定も -1 を
+     * 返すため区別できない —— そこで **アーキで直に分ける** */
+#if defined(__riscv)
+    return 0;
+#else
+    return 1;
+#endif
+}
+
 static void* linux_bootstrap_sys_mmap(void* addr, size_t length, int prot, int flags, int fd, int64_t offset) {
     struct task* current = get_current_task();
     arch_address_space_t address_space;
     uint64_t base;
-    // Sv39 のユーザー VA 上限 (2^38)。スタック領域 (0x3FFFFxxxxx) 手前まで
+    /* Sv39 のユーザー VA 上限 (2^38)。スタック領域 (0x3FFFFxxxxx) 手前まで */
     uint64_t limit = 0x0000003F00000000ULL;
     uint64_t size;
     uint64_t map_flags;
-
-    (void)addr;
-    (void)offset;
+    int is_anonymous;
 
     if (!current) return linux_mmap_err(LINUX_ESRCH);
     if (length == 0) return linux_mmap_err(LINUX_EINVAL);
-    /* 無名 private マップ以外は未対応。ファイルマップは ENODEV ではなく、
-     * musl が「この組み合わせは使えない」と判断できる EINVAL で返す */
-    if ((flags & MAP_ANONYMOUS) == 0 || (flags & MAP_PRIVATE) == 0) return linux_mmap_err(LINUX_EINVAL);
-    if (fd != -1) return linux_mmap_err(LINUX_EINVAL);
+    if ((flags & MAP_PRIVATE) == 0) return linux_mmap_err(LINUX_EINVAL);
+    if (offset < 0 || (offset & (PAGE_SIZE - 1)) != 0) return linux_mmap_err(LINUX_EINVAL);
+
+    is_anonymous = (flags & MAP_ANONYMOUS) != 0;
+    if (is_anonymous) {
+        if (fd != -1 && fd != 0) return linux_mmap_err(LINUX_EINVAL);
+    } else {
+        if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return linux_mmap_err(LINUX_EBADF);
+        /* **貼れないなら先に断る。**途中まで貼ってから諦めると後始末が要る */
+        /* **ENOSYS で返す。**「この機械では実装が無い」の意味そのもので、
+         * musl は静的な道へ退くか、意味の分かる文言を出せる */
+        if (linux_mmap_can_map_file() == 0) return linux_mmap_err(LINUX_ENOSYS);
+    }
 
     size = linux_align_up_page((uint64_t)length);
     if (!size) return linux_mmap_err(LINUX_EINVAL);
 
-    base = current->mmap_end;
-    if (base < LINUX_USER_MMAP_BASE_VADDR) base = LINUX_USER_MMAP_BASE_VADDR;
-    base = linux_align_up_page(base);
     address_space = arch_task_context_get_address_space(&current->ctx);
-    while (base + size <= limit) {
-        uint64_t off = 0;
-        int occupied = 0;
-        while (off < size) {
-            if (arch_vm_get_phys(address_space, base + off) != 0) {
-                occupied = 1;
-                break;
-            }
-            off += PAGE_SIZE;
-        }
-        if (!occupied) break;
-        base += PAGE_SIZE;
-    }
-    /* ユーザー VA を使い切った */
-    if (base + size > limit) return linux_mmap_err(LINUX_ENOMEM);
 
-    map_flags = arch_vm_user_page_flags((prot & PROT_WRITE) != 0, 0);
+    if (flags & MAP_FIXED) {
+        /* **要求された番地にそのまま貼る。**musl は 1 の予約で得た範囲の
+         * 中を指してくるので、既に張られていれば置き換える */
+        base = (uint64_t)(uintptr_t)addr;
+        if (base & (PAGE_SIZE - 1)) return linux_mmap_err(LINUX_EINVAL);
+        if (base == 0 || base + size < base) return linux_mmap_err(LINUX_EINVAL);
+    } else {
+        base = current->mmap_end;
+        if (base < LINUX_USER_MMAP_BASE_VADDR) base = LINUX_USER_MMAP_BASE_VADDR;
+        base = linux_align_up_page(base);
+        while (base + size <= limit) {
+            uint64_t off = 0;
+            int occupied = 0;
+            while (off < size) {
+                if (arch_vm_get_phys(address_space, base + off) != 0) {
+                    occupied = 1;
+                    break;
+                }
+                off += PAGE_SIZE;
+            }
+            if (!occupied) break;
+            base += PAGE_SIZE;
+        }
+        /* ユーザー VA を使い切った */
+        if (base + size > limit) return linux_mmap_err(LINUX_ENOMEM);
+    }
+
+    map_flags = arch_vm_user_page_flags((prot & PROT_WRITE) != 0,
+                                        (prot & PROT_EXEC) != 0);
     for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        uint64_t phys = linux_alloc_zeroed_user_page();
-        if (!phys) return linux_mmap_err(LINUX_ENOMEM);
+        uint64_t phys;
+        /* MAP_FIXED で既に張られている枠は、いったん剥がさず上書きする。
+         * 元の物理ページは予約 (無名) のものなので使い回してよい */
+        phys = (flags & MAP_FIXED) ? arch_vm_get_phys(address_space, base + off) : 0;
+        if (!phys) {
+            phys = linux_alloc_zeroed_user_page();
+            if (!phys) return linux_mmap_err(LINUX_ENOMEM);
+        } else {
+            memset((void*)(uintptr_t)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
+        }
+        if (!is_anonymous) {
+            (void)linux_mmap_fill_from_file((uint8_t*)(uintptr_t)PHYS_TO_VIRT(phys),
+                                            fd, (uint64_t)offset + off);
+        }
         arch_vm_map_page(address_space, base + off, phys, map_flags);
     }
-    current->mmap_end = base + size;
+    if (base + size > current->mmap_end) current->mmap_end = base + size;
     arch_syscall_flush_tlb();
+    /* **貼ったばかりのテキストを実行させる前に命令キャッシュを揃える。**
+     * aarch64 は I/D が一貫していないので、揃えないと古い中身を実行しうる */
+    if (prot & PROT_EXEC) arch_sync_icache_range((void*)(uintptr_t)base, size);
     return (void*)(uintptr_t)base;
+}
+
+static int linux_bootstrap_sys_mprotect(void* addr, size_t length, int prot) {
+    struct task* current = get_current_task();
+    arch_address_space_t address_space;
+    uint64_t base = (uint64_t)(uintptr_t)addr;
+    uint64_t size;
+    uint64_t flags;
+
+    if (!current) return -LINUX_ESRCH;
+    /* Linux は addr がページ境界でないと EINVAL。length 0 は成功 */
+    if (base & (PAGE_SIZE - 1)) return -LINUX_EINVAL;
+    if (length == 0) return 0;
+
+    size = linux_align_up_page((uint64_t)length);
+    if (!size || base + size < base) return -LINUX_EINVAL;
+
+    address_space = arch_task_context_get_address_space(&current->ctx);
+    flags = arch_vm_user_page_flags((prot & PROT_WRITE) != 0,
+                                    (prot & PROT_EXEC) != 0);
+
+    /* **先に全域が張られていることを確かめる。**途中まで書き換えてから
+     * 穴に当たると、成功した分が戻せない。Linux も穴があれば ENOMEM */
+    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
+        if (arch_vm_get_phys(address_space, base + off) == 0) return -LINUX_ENOMEM;
+    }
+    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
+        uint64_t phys = arch_vm_get_phys(address_space, base + off);
+        arch_vm_map_page(address_space, base + off, phys, flags);
+    }
+    arch_syscall_flush_tlb();
+    /* 実行可にしたなら、命令キャッシュを揃えないと古い中身を実行しうる */
+    if (prot & PROT_EXEC) arch_sync_icache_range((void*)(uintptr_t)base, size);
+    return 0;
 }
 
 static int64_t linux_bootstrap_sys_wait4(int pid, int* wstatus, int options) {
@@ -1322,6 +1437,12 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_BRK:
             arch_syscall_set_return(frame, linux_bootstrap_sys_brk(arch_syscall_arg0(frame)));
+            return;
+        case LINUX_SYS_MPROTECT:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)linux_bootstrap_sys_mprotect((void*)(uintptr_t)arch_syscall_arg0(frame),
+                                                                                       (size_t)arch_syscall_arg1(frame),
+                                                                                       (int)arch_syscall_arg2(frame)));
             return;
         case LINUX_SYS_WAIT4:
             arch_syscall_set_return(frame,

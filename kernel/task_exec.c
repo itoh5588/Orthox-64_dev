@@ -15,7 +15,23 @@
 #define E2BIG 7
 #define EXEC_MAX_VEC_STR_LEN 4096
 #define EXEC_ET_DYN_LOAD_BASE 0x400000ULL
+
+/* 動的リンカ (ld-musl) を置く番地。
+ *
+ * **アーキテクチャで使える VA の幅が違う。**x86_64 は 48bit あるので
+ * 0x7fc000000000 に置けるが、**aarch64 (T0SZ=25) と riscv64 (Sv39) は
+ * 39bit しか無く、使えるのは 0x7fffffffff まで**。39bit の機械で
+ * 0x7fc000000000 を指すと、その番地を表すページテーブルの段が存在しない
+ * ため、飛んだ瞬間に level 0 の translation fault になる
+ * (2026-08-29 に aarch64 で実測: ESR=0x82000004 / FAR=ELR=入口の番地)。
+ *
+ * 39bit 側は 0x6000000000 に置く。ユーザスタックの天井 (約 0x4000000000)
+ * より上で、39bit の上限にはまだ 128GB の余裕がある。 */
+#if defined(__x86_64__)
 #define EXEC_INTERP_LOAD_BASE 0x7fc000000000ULL
+#else
+#define EXEC_INTERP_LOAD_BASE 0x6000000000ULL
+#endif
 
 #ifndef ORTHOX_MEM_TRACE
 #define ORTHOX_MEM_TRACE 0
