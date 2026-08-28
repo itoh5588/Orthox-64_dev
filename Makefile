@@ -723,6 +723,10 @@ aarch64-user-bin: $(AARCH64_USER_HELLO)
 #
 # riscv64 と違って -march / -mabi は要らない (aarch64 は 1 つしか無い)。
 AARCH64_MUSL_SYSROOT = ports/musl-install-aarch64
+# libc.so を作るのに要るコンパイラランタイム (__lttf2 等の binary128 ヘルパ)。
+# clang は compiler-rt の名前を答えるが aarch64 版が入っていないので、
+# 手持ちのクロス GCC のものを使う
+AARCH64_LIBGCC = ports/cross-aarch64/lib/gcc/aarch64-linux-musl/4.7.4/libgcc.a
 AARCH64_MUSL_CFLAGS = --target=aarch64-linux-musl -ffreestanding \
 	-fno-PIE -O2 -I$(AARCH64_MUSL_SYSROOT)/include -MMD -MP
 # **リンカスクリプトは使わない。** user-aarch64.ld は hello 専用で
@@ -730,9 +734,19 @@ AARCH64_MUSL_CFLAGS = --target=aarch64-linux-musl -ffreestanding \
 AARCH64_MUSL_LDFLAGS = -nostdlib -static -m aarch64elf --entry=_start -Ttext 0x400000
 AARCH64_MUSL_PROBE_ELF = out/aarch64-musl-probe.elf
 
+# **--enable-shared にしてある** (2026-08-28)。それまでは riscv64 の
+# レシピをそのまま写して --disable-shared だったが、これは 2026-08-10 に
+# 「riscv64 のレシピをそのまま使える」で持ち込まれた既定で、判断した記録が
+# 無い。x86 は最初から共有あり (ports/musl-install/lib/libc.so) で、
+# aarch64 だけが静的に取り残されていた。
+#
+# 共有にすると libc.a に加えて次が出る:
+#   lib/libc.so                  本体 (動的リンカを兼ねる。musl の作り)
+#   lib/ld-musl-aarch64.so.1     libc.so への symlink
 $(AARCH64_MUSL_SYSROOT)/lib/libc.a:
 	MUSL_CC="$(AARCH64_CC)" MUSL_AR="$(RISCV64_LLVM_AR)" MUSL_RANLIB="$(RISCV64_LLVM_RANLIB)" \
-	MUSL_CONFIGURE_EXTRA="--disable-shared" \
+	MUSL_CONFIGURE_EXTRA="--enable-shared" \
+	MUSL_LIBCC="$(abspath $(AARCH64_LIBGCC))" \
 	./ports/build_musl.sh $(abspath ports/musl) $(abspath $(AARCH64_MUSL_SYSROOT)) aarch64-linux-musl $(abspath $(BUILD_DIR)/musl-aarch64-build)
 
 aarch64-musl-sysroot: $(AARCH64_MUSL_SYSROOT)/lib/libc.a
@@ -878,6 +892,11 @@ aarch64-busybox-musl: $(AARCH64_MUSL_SYSROOT)/lib/libc.a
 
 # 最初のユーザープロセスとして ash を exec する。
 # **fork / waitpid / pipe が要る** (P3-1 が通っていること)
+# 動的リンクの一式 (共有 musl / .so 間参照 / TLS / dlopen)。
+# **共有 musl が要る** ($(AARCH64_MUSL_SYSROOT)/lib/libc.so)
+aarch64-dynlink-smoke: $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	bash ./tests/aarch64_dynlink_smoke.sh
+
 aarch64-ash-smoke: aarch64-busybox-musl
 	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/ash
 	bash ./tests/aarch64_ash_smoke.sh
