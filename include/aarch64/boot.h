@@ -238,6 +238,17 @@ uint64_t aarch64_wait_now(void);
 void aarch64_wait_add(uint32_t kind, uint64_t start);
 uint64_t aarch64_wait_get(uint32_t cpu, uint32_t kind);
 
+/* ★ SD への入出力を回数とブロック数で数える (P-1、2026-08-29)。
+ *
+ * **転送量では説明がつかないことが分かっている。**30 分のビルドが SD に
+ * 残した正味の変化は 0.90 MB しかないのに、SD 待ちは約 1600 秒あった
+ * (日報2026-08-29 §11〜§14)。**量ではなく回数か、1 回あたりの待ち方に
+ * 答えがある**ので、回数・ブロック数・待ち時間・1 回の最大待ちを数える。
+ *
+ * timer.c の 60 秒ごとの報告から呼ぶ。**区間ごとの差分で出す** —
+ * 累積だとビルドの山が平均に均されて見えない ([cpu] の行と同じ理由)。 */
+void aarch64_emmc2_io_report(void);
+
 void aarch64_console_begin(void);
 void aarch64_console_end(void);
 void aarch64_wait_forever(void);

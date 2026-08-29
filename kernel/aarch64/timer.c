@@ -175,6 +175,11 @@ static void cpu_stats_report(void) {
     }
     aarch64_uart_puts("\n");
     aarch64_console_end();
+
+    /* **SD への入出力を回数で出す (P-1)。**[cpu] の行と同じ 60 秒の区間で
+     * 並べて読めるように、続けて出す。**量では説明がつかないと分かって
+     * いる**ので、見たいのは回数と 1 回あたりの待ち (日報2026-08-29 §14) */
+    aarch64_emmc2_io_report();
 }
 
 void aarch64_timer_on_tick(void) {

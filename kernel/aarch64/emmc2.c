@@ -1402,12 +1402,115 @@ int aarch64_emmc2_write(uint64_t lba, const void* buf, uint32_t sectors) {
 /* **オフセットを足すのはここだけ。** aarch64_emmc2_read/write は生の LBA を
  * 扱う (MBR 自体を読むのに要る)。上の層はパーティションの先頭を 0 として
  * 数えるので、その差をこの 2 つで吸収する */
+/* ---- P-1: 入出力の回数を数える計器 (2026-08-29) --------------------------
+ *
+ * **量では説明がつかないことが先に分かっている。**30 分のビルドが SD に
+ * 残した正味の変化は 922 ブロック = 0.90 MB。読みも 6 MB 程度。ところが
+ * SD 待ちは約 1600 秒あった。単独・完全に温まった 1 本のコンパイル
+ * (250 KB しか触らない) でも SD 待ちが 57 コア秒出ている —— 実測の読み速度
+ * なら 0.24 秒で終わる量で、**238 倍**の食い違い (日報2026-08-29 §14)。
+ *
+ * **だから数えるのは「バイト数」ではなく「回数」と「1 回あたりの待ち」。**
+ *
+ *   - 呼び出し回数と総セクタ数 → 1 回が何セクタ運んでいるか
+ *   - 1 回あたりの待ちの合計と最大 → 固定費があるならここに出る
+ *   - セクタ数の分布 → xv6fs は BSIZE 1024 なので既定では 2 セクタのはず。
+ *     **1 に偏っていたら、1 回の転送が 512 バイトずつになっている**
+ *
+ * **排他は取らない。**複数コアから加算が割れうるが、割合と桁を見る用途
+ * では誤差 (runtime.c の g_wait_ticks と同じ扱い)。**計器のために
+ * ロックを増やして、測りたい対象を歪めるほうが悪い。** */
+struct emmc2_io_stat {
+    uint64_t calls;      /* 呼び出し回数 */
+    uint64_t sectors;    /* 運んだ総セクタ数 (512 バイト単位) */
+    uint64_t ticks;      /* 中で費やした時間の合計 (CNTPCT) */
+    uint64_t max_ticks;  /* 1 回の最大 */
+    uint64_t b1, b2, b8, b9;  /* セクタ数の分布: 1 / 2 / 3-8 / 9 以上 */
+};
+static volatile struct emmc2_io_stat g_io_rd, g_io_wr;
+
+static void io_stat_add(volatile struct emmc2_io_stat* st, size_t count, uint64_t t0) {
+    uint64_t d = aarch64_wait_now() - t0;
+    st->calls++;
+    st->sectors += (uint64_t)count;
+    st->ticks += d;
+    if (d > st->max_ticks) st->max_ticks = d;
+    if (count == 1)      st->b1++;
+    else if (count == 2) st->b2++;
+    else if (count <= 8) st->b8++;
+    else                 st->b9++;
+}
+
+/* **オフセットを足すのはここだけ。** aarch64_emmc2_read/write は生の LBA を
+ * 扱う (MBR 自体を読むのに要る)。上の層はパーティションの先頭を 0 として
+ * 数えるので、その差をこの 2 つで吸収する */
 int aarch64_emmc2_storage_read(void* ctx, uint64_t lba, void* buf, size_t count) {
+    uint64_t t0 = aarch64_wait_now();
+    int rc;
     (void)ctx;
-    return aarch64_emmc2_read(g_part_lba + lba, buf, (uint32_t)count);
+    rc = aarch64_emmc2_read(g_part_lba + lba, buf, (uint32_t)count);
+    io_stat_add(&g_io_rd, count, t0);
+    return rc;
 }
 
 int aarch64_emmc2_storage_write(void* ctx, uint64_t lba, const void* buf, size_t count) {
+    uint64_t t0 = aarch64_wait_now();
+    int rc;
     (void)ctx;
-    return aarch64_emmc2_write(g_part_lba + lba, buf, (uint32_t)count);
+    rc = aarch64_emmc2_write(g_part_lba + lba, buf, (uint32_t)count);
+    io_stat_add(&g_io_wr, count, t0);
+    return rc;
+}
+
+/* 1 行にまとめて出す。**区間ごとの差分**で出す ([cpu] の行と同じ理由で、
+ * 累積だとビルドの山が平均に均されて見えない)。max だけは区間ごとに 0 に
+ * 戻す —— 「この 60 秒で最も長かった 1 回」が見たい。 */
+static void io_stat_emit(const char* tag, volatile struct emmc2_io_stat* st,
+                         struct emmc2_io_stat* prev, uint64_t freq) {
+    uint64_t calls = st->calls   - prev->calls;
+    uint64_t sect  = st->sectors - prev->sectors;
+    uint64_t tk    = st->ticks   - prev->ticks;
+    uint64_t mx    = st->max_ticks;
+    prev->calls = st->calls; prev->sectors = st->sectors; prev->ticks = st->ticks;
+    st->max_ticks = 0;
+
+    aarch64_uart_puts(tag);
+    aarch64_uart_putdec64(calls);
+    aarch64_uart_puts("回 ");
+    aarch64_uart_putdec64(sect);
+    aarch64_uart_puts("sec 計");
+    aarch64_uart_putdec64(freq ? (tk * 1000ULL) / freq : 0ULL);
+    aarch64_uart_puts("ms 最大");
+    /* 1 回の最大は us で見たい。ms だと 0 に潰れる */
+    aarch64_uart_putdec64(freq ? (mx * 1000000ULL) / freq : 0ULL);
+    aarch64_uart_puts("us 平均");
+    aarch64_uart_putdec64((calls && freq) ? (tk * 1000000ULL) / freq / calls : 0ULL);
+    aarch64_uart_puts("us");
+}
+
+void aarch64_emmc2_io_report(void) {
+    static struct emmc2_io_stat prev_rd, prev_wr;
+    static uint64_t prev_b[8];
+    uint64_t freq = aarch64_timer_freq();
+    uint64_t b[8];
+    int i;
+
+    if (!g_io_rd.calls && !g_io_wr.calls) return;   /* まだ何も通っていない */
+
+    b[0] = g_io_rd.b1; b[1] = g_io_rd.b2; b[2] = g_io_rd.b8; b[3] = g_io_rd.b9;
+    b[4] = g_io_wr.b1; b[5] = g_io_wr.b2; b[6] = g_io_wr.b8; b[7] = g_io_wr.b9;
+
+    aarch64_console_begin();
+    aarch64_uart_puts("[sd] 60s");
+    io_stat_emit("  読 ", &g_io_rd, &prev_rd, freq);
+    io_stat_emit("  書 ", &g_io_wr, &prev_wr, freq);
+    /* **セクタ数の分布。**1 に偏っていたら 512 バイトずつ運んでいる */
+    aarch64_uart_puts("  分布(読 1/2/3-8/9+ 書 1/2/3-8/9+)");
+    for (i = 0; i < 8; i++) {
+        aarch64_uart_puts(i == 4 ? " | " : " ");
+        aarch64_uart_putdec64(b[i] - prev_b[i]);
+        prev_b[i] = b[i];
+    }
+    aarch64_uart_puts("\n");
+    aarch64_console_end();
 }
