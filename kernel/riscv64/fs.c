@@ -1104,7 +1104,7 @@ void fs_release_fd(file_descriptor_t* desc) {
             riscv64_fs_wake_list(readers_to_wake, n_readers);
             riscv64_fs_wake_list(writers_to_wake, n_writers);
             if (free_pipe) {
-                pmm_free((void*)VIRT_TO_PHYS((uint64_t)pipe), 1);
+                pmm_free((void*)VIRT_TO_PHYS((uint64_t)pipe), PIPE_PAGES);
             }
         }
     } else if (desc->file) {
@@ -1154,7 +1154,7 @@ int sys_pipe2(int* pipefd, int flags) {
     }
     if (fd1 == -1 || fd2 == -1) return -LINUX_EMFILE;
 
-    phys = pmm_alloc(1);
+    phys = pmm_alloc(PIPE_PAGES);
     if (!phys) return -LINUX_EMFILE;
     pipe = (pipe_t*)PHYS_TO_VIRT(phys);
     pipe->read_pos = 0;

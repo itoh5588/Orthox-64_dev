@@ -71,7 +71,17 @@ typedef struct fs_file {
 #define O_DIRECTORY_ARM  0x04000    /* aarch64 / arm */
 #define FD_CLOEXEC  1
 
-#define PIPE_BUF_SIZE 4000
+/* **POSIX の PIPE_BUF (4096) を下回ってはいけない。**
+ *
+ * PIPE_BUF 以下の write は「詰まらない」ことが保証されているので、
+ * busybox ash はヒアドキュメントがそれ以下なら**読み手を用意する前に
+ * 親プロセスで書き込む** (openhere)。ここが 4000 だったころは
+ * 4001〜4096 バイトのヒアドキュメントが恒久デッドロックした。
+ *
+ * 実機で刻んで確認 (2026-08-29):
+ *   本体 3900 B ok / 4000 B ok / **4050 B 死 (60 秒後も 0 バイト、CPU 0%)**
+ *   / 4100 B ok (PIPE_BUF 超なので ash が書き手を fork する) / 20000 B ok */
+#define PIPE_BUF_SIZE 4096
 
 /*
  * 待ち行列。以前は待ち手を 1 つしか覚えられず、後から待った側が前を上書きして
@@ -157,9 +167,15 @@ typedef struct {
     fs_waitq_t write_wq;
 } pipe_t;
 
-/* pipe_t は 1 ページ丸ごとで確保している (kernel/fs.c と kernel/riscv64/fs.c の
- * pmm_alloc(1))。溢れると隣のページを踏み潰し、パイプを使った瞬間に固まる */
-_Static_assert(sizeof(pipe_t) <= 4096, "pipe_t が 1 ページに収まらない");
+/* pipe_t は PIPE_PAGES ページ丸ごとで確保する (kernel/fs.c と
+ * kernel/riscv64/fs.c の pmm_alloc(PIPE_PAGES))。溢れると隣のページを
+ * 踏み潰し、パイプを使った瞬間に固まる。
+ *
+ * **1 ページに収めようとして buffer を 4000 にしていたのが元の不具合。**
+ * POSIX の PIPE_BUF (4096) を下回れないので、枠のほうを 2 ページにした */
+#define PIPE_PAGES 2
+_Static_assert(sizeof(pipe_t) <= PIPE_PAGES * 4096,
+               "pipe_t が PIPE_PAGES ページに収まらない");
 
 typedef struct {
     file_type_t type;

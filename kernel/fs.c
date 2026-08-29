@@ -218,7 +218,7 @@ static void fs_release_pipe_file(fs_file_t* file) {
     pipe_wake_list(readers_to_wake, n_readers);
     pipe_wake_list(writers_to_wake, n_writers);
     if (free_pipe) {
-        pmm_free((void*)VIRT_TO_PHYS((uint64_t)pipe), 1);
+        pmm_free((void*)VIRT_TO_PHYS((uint64_t)pipe), PIPE_PAGES);
     }
 }
 
@@ -1488,7 +1488,7 @@ retry:
         g_fifo_table[idx].opens = 0;
         spin_unlock_irqrestore(&g_fifo_lock, irqf);
         {
-            void* phys = pmm_alloc(1);
+            void* phys = pmm_alloc(PIPE_PAGES);
             if (!phys) {
                 irqf = spin_lock_irqsave(&g_fifo_lock);
                 g_fifo_table[idx].in_use = 0;
@@ -2635,7 +2635,7 @@ int fs_pipe(int pipefd[2]) {
     }
     if (fd1 == -1 || fd2 == -1) return -EMFILE;
 
-    void* phys = pmm_alloc(1);
+    void* phys = pmm_alloc(PIPE_PAGES);
     if (!phys) return -ENOMEM;
     pipe_t* pipe = (pipe_t*)PHYS_TO_VIRT(phys);
     pipe->read_pos = 0;
@@ -2653,7 +2653,7 @@ int fs_pipe(int pipefd[2]) {
     if (!read_file || !write_file) {
         if (read_file) fs_file_put(read_file);
         if (write_file) fs_file_put(write_file);
-        pmm_free((void*)VIRT_TO_PHYS((uint64_t)pipe), 1);
+        pmm_free((void*)VIRT_TO_PHYS((uint64_t)pipe), PIPE_PAGES);
         return -ENOMEM;
     }
     read_file->type = FT_PIPE;
@@ -3280,6 +3280,14 @@ int fs_mkdir(const char* path, int mode) {
     if (*norm == '\0') return -EEXIST;
 
     if (find_ramfs(norm)) return -EEXIST;
+    /* **`/tmp` の下は SD へ作らない (P-4)。**fs_open には同じ分岐が
+     * 入っていたが、こちらに無かったので `/tmp` でも xv6fs へ行き、
+     * あちらに /tmp が無いため nameiparent が失敗して ENOENT になっていた。
+     * **ファイルは作れるのにディレクトリだけ作れない**という形で出る
+     * (ramfs は名前がフルパスの平らな表なので親を見ない) */
+    if (path_is_under_tmp(norm)) {
+        return create_ramfs_dir(norm, (uint32_t)mode) ? 0 : -ENOENT;
+    }
     if (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
         if (fs_try_active_root_stat(norm, &st) == 0) {
             if ((st.mode & 0170000U) == KSTAT_MODE_DIR) return -EEXIST;
