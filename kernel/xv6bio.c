@@ -54,12 +54,60 @@ static void xv6fs_disk_rw(struct xv6buf *b, int write) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 連続ブロックを 1 コマンドで運ぶ (P-5、2026-08-29)                    */
+/*                                                                     */
+/* xv6fs_disk_rw は 1 ブロックずつしか運ばない。1 回あたりの固定費      */
+/* (読み 0.94 ms / 書き 2.27 ms) がブロック数だけ掛かるので、連続して   */
+/* いる区間はまとめて 1 コマンドにする。**キャッシュは通さない。**      */
+/* ------------------------------------------------------------------ */
+
+int xv6bio_rw_run(uint32_t dev, uint32_t blockno, uint32_t nblocks,
+                  void *buf, int write) {
+    uint64_t lba = (uint64_t)blockno * SECTORS_PER_BLOCK;
+    size_t   cnt = (size_t)nblocks * SECTORS_PER_BLOCK;
+    int ret;
+    (void)dev;
+    if (nblocks == 0 || !buf) return -1;
+    if (write) {
+        ret = storage_write_blocks(g_xv6fs_devname, lba, buf, cnt);
+    } else {
+        ret = storage_read_blocks(g_xv6fs_devname, lba, buf, cnt);
+    }
+    if (ret != 0) {
+        xv6bio_log("xv6bio: run %s error: block=%u n=%u ret=%d\n",
+                   write ? "write" : "read", blockno, nblocks, ret);
+        return -1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 
 struct {
     spinlock_t     lock;
     struct xv6buf  buf[XV6FS_NBUF];
     struct xv6buf  head;
 } bcache;
+
+/* **区間にキャッシュ済みのブロックが 1 つでもあれば 1。**
+ *
+ * 迂回して読むと、キャッシュ側に新しい中身がある場合に古いものを
+ * 掴む。**1 つでも当たったら区間ごと従来経路に退く** —— 分割して
+ * 部分的に束ねる手もあるが、判定が増えるわりに得が小さい。 */
+int xv6bio_range_cached(uint32_t dev, uint32_t blockno, uint32_t nblocks) {
+    struct xv6buf *b;
+    int hit = 0;
+    spin_lock(&bcache.lock);
+    for (b = bcache.buf; b < bcache.buf + XV6FS_NBUF; b++) {
+        if (b->valid && b->dev == dev &&
+            b->blockno >= blockno && b->blockno < blockno + nblocks) {
+            hit = 1;
+            break;
+        }
+    }
+    spin_unlock(&bcache.lock);
+    return hit;
+}
 
 void xv6bio_init(void) {
     struct xv6buf *b;

@@ -722,6 +722,30 @@ int xv6fs_readi(struct xv6fs_inode *ip, void *dst, uint32_t off, uint32_t n) {
             memset(dst, 0, m);
             continue;
         }
+
+        /* **連続している区間はまとめて 1 コマンドで運ぶ (P-5)。**
+         *
+         * 条件は 3 つ。ブロックの境目に揃っていること、丸ごと 1 ブロック
+         * 以上読むこと、そして先の物理ブロックが連番であること。
+         * bmap は逐次確保するので、素直に書かれたファイルはたいてい連番。
+         *
+         * **キャッシュを迂回するので、区間に 1 つでも載っていたら退く。**
+         * 載っている側が新しい可能性があり、古いものを掴む。 */
+        if ((off % XV6FS_BSIZE) == 0 && (n - tot) >= XV6FS_BSIZE) {
+            uint32_t run = 1;
+            uint32_t maxrun = (n - tot) / XV6FS_BSIZE;
+            while (run < maxrun) {
+                uint32_t a2 = bmap_lookup(ip, off / XV6FS_BSIZE + run, 0);
+                if (a2 != addr + run) break;
+                run++;
+            }
+            if (run > 1 && !xv6bio_range_cached(ip->dev, addr, run) &&
+                xv6bio_rw_run(ip->dev, addr, run, dst, 0) == 0) {
+                m = run * XV6FS_BSIZE;
+                continue;
+            }
+        }
+
         bp = xv6bread(ip->dev, addr);
         memcpy(dst, bp->data + (off % XV6FS_BSIZE), m);
         xv6brelse(bp);
