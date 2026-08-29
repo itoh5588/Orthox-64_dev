@@ -1205,6 +1205,19 @@ static int build_usb_dirents(const char* path, struct orth_dirent* dirents, size
 }
 
 static struct ramfs_file* find_ramfs(const char* name);
+static struct ramfs_file* create_ramfs_dir(const char* name, uint32_t mode);
+
+/* ---- /tmp を RAM に置く (P-4、2026-08-29) --------------------------------
+ *
+ * gcc の一時アセンブリが xv6fs (SD) の上にあると、.s を 1 行書くごとに
+ * ジャーナルのコミットが 1 回走る。linux_syscall.c 1 本 (.s は約 4,000 行)
+ * で 98 秒 / 書き 33,976 回。ramfs の /tmp に逃がすと 9 秒 / 書き 256 回
+ * (日報2026-08-29 §21)。 */
+static int path_is_under_tmp(const char* p) {
+    if (!p) return 0;
+    if (p[0] == '/') p++;
+    return p[0] == 't' && p[1] == 'm' && p[2] == 'p' && p[3] == '/' && p[4] != '\0';
+}
 
 static int build_active_root_dirents(const char* path, struct orth_dirent* dirents, size_t max_entries, size_t* out_count) {
     const char* norm = normalize_fs_path(path);
@@ -1265,6 +1278,11 @@ void fs_init(void) {
     }
     vfs_init();
     vfs_register_mountpoint("usb", VFS_MOUNT_USB_FAT, 0);
+
+    /* /tmp を RAM の上に用意する (P-4)。0777 でないと libiberty の
+     * try_dir が access(W_OK) で弾き、カレントディレクトリに退避する */
+    if (!find_ramfs("/tmp")) create_ramfs_dir("/tmp", 0777U);
+
 }
 
 static int ramfs_grow(struct ramfs_file* rf, size_t needed) {
@@ -1918,7 +1936,9 @@ int fs_open(const char* path, int flags, int mode) {
     }
 
     if (want_creat) {
-        if (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
+        /* /tmp の下は SD へ作らない (P-4)。下の create_ramfs に落ちる */
+        if (!path_is_under_tmp(path) &&
+            g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
             struct xv6fs_inode* ip = 0;
             if (xv6fs_create_file(path, mode, &ip) == 0 && ip) {
                 fs_file_t* file;

@@ -493,9 +493,27 @@ static int64_t linux_bootstrap_sys_lseek(int fd, int64_t offset, int whence) {
 
     next = base + offset;
     if (next < 0) return -LINUX_EINVAL;
-    /* 書き込み用に開いた xv6fs ファイルは EOF 越えのシークを許す (穴あき書き込み) */
+    /* **書き込み用に開いたファイルは EOF 越えのシークを許す (穴あき書き込み)。**
+     *
+     * **ramfs を外していて壊れた (P-9、2026-08-29)。** /tmp を ramfs に置いた
+     * 途端に `gcc -static` が落ちた:
+     *
+     *   as: can't write 56 bytes to section .text of /tmp/ccYYYY.o:
+     *       'file truncated'   (BFD assertion fail bfd/elf.c:3663)
+     *
+     * as はセクションを置くために EOF より先へ seek してから書く。ここで
+     * EINVAL を返すと **offset が動かないまま write が通る**ので、中身が
+     * 別の場所に落ちて、呼び出し側からは「短いファイル」に見える。
+     * **失敗の形が seek ではなく write 側に出るので分かりにくい。**
+     *
+     * 最小再現 (日報2026-08-29 §24):
+     *   lseek(fd,3000,SEEK_SET) が /tmp では -1、xv6fs 上では 3000
+     *
+     * ramfs の書き込みは ramfs_grow(off + count) で伸ばし、**新しい領域を
+     * 0 で埋める**ので、穴は正しく 0 として読める。 */
     if ((uint64_t)next > fs_fd_size(f) &&
-        !(f->type == FT_XV6FS && ((f->flags & 3) == O_WRONLY || (f->flags & 3) == O_RDWR))) {
+        !((f->type == FT_XV6FS || f->type == FT_RAMFS) &&
+          ((f->flags & 3) == O_WRONLY || (f->flags & 3) == O_RDWR))) {
         return -LINUX_EINVAL;
     }
     fs_fd_set_offset(f, (size_t)next);

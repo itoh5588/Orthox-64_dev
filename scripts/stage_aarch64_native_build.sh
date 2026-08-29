@@ -128,7 +128,16 @@ LOAD_PA     ?= 0x40200000
 MACHINE_DEFS =
 endif
 
-CFLAGS = -std=gnu1x -mgeneral-regs-only -ffreestanding \
+# **-pipe は飾りではない (2026-08-29、実測)。**
+# これが無いと gcc は cc1 と as の間を一時ファイルで繋ぐ。その一時ファイルは
+# xv6fs (SD) の上に落ち、**.s を 1 行書くごとにジャーナルのコミットが 1 回**
+# 走る。linux_syscall.c 1 本 (.s は約 4,000 行) で実測:
+#
+#   通常     98 秒   読 13,897 回 / 書 33,976 回 (34 MB)
+#   -pipe     8 秒   読    345 回 / 書    246 回
+#
+# **12 倍。**出力の .o は md5 まで一致する。**外さないこと。**
+CFLAGS = -pipe -std=gnu1x -mgeneral-regs-only -ffreestanding \
 	 -fno-stack-protector -fno-stack-check -fno-lto -fno-pie \
 	 -mcmodel=small -O2 -I$(SRCDIR)/include $(MACHINE_DEFS)
 
