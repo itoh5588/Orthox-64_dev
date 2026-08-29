@@ -843,6 +843,11 @@ $(AARCH64_RENAME_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
 
 aarch64-rename-probe: $(AARCH64_RENAME_PROBE_ELF)
 
+# G-1 の台本の完了検出を実機なしで確かめる。**日報2026-08-29 の誤検出 3 件を
+# そのまま入力に混ぜて、当たらないことを見る**
+pi4-g1-marker-test:
+	bash ./tests/pi4_g1_marker_test.sh
+
 aarch64-rename-smoke: $(AARCH64_RENAME_PROBE_ELF)
 	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/rename-probe
 	bash ./tests/aarch64_rename_smoke.sh
