@@ -14,6 +14,7 @@
 #include "sys_internal.h"
 #include "task.h"
 #include "xv6fs.h"   /* xv6fs_now_sec。CLOCK_REALTIME をファイルの時計と揃える */
+#include "wait.h"    /* wait4 を焼かずに寝かせる */
 
 static task_context_t* g_linux_fallback_current_context;
 extern int task_fork(arch_task_exec_frame_t* frame);
@@ -34,6 +35,44 @@ static struct task* linux_find_task_by_pid(int pid) {
     return 0;
 }
 
+/* wait4 で待つ親を寝かせる待ち行列。
+ *
+ * **以前は kernel_yield() で回し続けていた。**待っている親はコアを 1 本
+ * 100% 焼く。ash と configure の sh が同時に待つと、4 コアのうち 2 本が
+ * 待つためだけに消える —— 日報2026-08-29 の G-2「configure はほぼ逐次の
+ * はずなのに 2 コアが 100%」の正体がこれだった (2026-08-30、実機の
+ * [pc] 計器が 2 本とも linux_bootstrap_sys_wait4 を指した)。
+ *
+ * **時間切れつきで寝る。**task_mark_zombie は 5 か所から呼ばれるのに、
+ * 親を起こす linux_notify_parent_exit は exit の経路にしか無い
+ * (Ctrl-C / SIGSEGV / kill は通らない)。素直に寝かせると、それらの経路で
+ * 親が永久に起きず、**空回りより悪くなる。**上限を置けば、起こし損ねても
+ * 「その回だけ遅い」で済む。普段は wake_up_all で即座に起きる。
+ *
+ * wait_queue は spinlock_init と head=0 しかしないので、静的変数は
+ * ゼロ初期化のまま使える (kernel/wait.c の wait_queue_init 参照)。 */
+#define LINUX_WAIT4_POLL_MS 50
+static struct wait_queue g_child_exit_wq;
+
+/* WNOHANG。**以前は options を捨てていた**ので、子がまだ終わっていない
+ * ときに 0 を返さず待ち続けていた */
+#define LINUX_WNOHANG 1
+
+struct linux_child_wait { int ppid; int want; };
+
+static int linux_child_zombie_ready(void* arg) {
+    struct linux_child_wait* w = (struct linux_child_wait*)arg;
+    struct task* t = task_list;
+    while (t) {
+        if (t->ppid == w->ppid && (w->want == -1 || t->pid == w->want) &&
+            t->state == TASK_ZOMBIE) {
+            return 1;
+        }
+        t = t->next;
+    }
+    return 0;
+}
+
 /*
  * 子の終了は、zombie 化だけでは待機中の親へ伝わらない。特に BusyBox ash の
  * $(cmd | cmd) はブロッキング waitpid に入り得るため、親を起こさないと
@@ -43,6 +82,9 @@ static struct task* linux_find_task_by_pid(int pid) {
 static void linux_notify_parent_exit(struct task* child) {
     struct task* parent;
     if (!child || child->ppid <= 0) return;
+    /* **待ち行列は親を特定せずに全部起こす。**起こされた側は述語で
+     * 「自分の子か」を見るので、無関係な親は寝直すだけ */
+    wake_up_all(&g_child_exit_wq);
     parent = linux_find_task_by_pid(child->ppid);
     if (!parent) return;
     parent->sig_pending |= (1ULL << LINUX_SIGCHLD);
@@ -1222,9 +1264,11 @@ static int linux_bootstrap_sys_mprotect(void* addr, size_t length, int prot) {
 
 static int64_t linux_bootstrap_sys_wait4(int pid, int* wstatus, int options) {
     struct task* current = get_current_task();
-    (void)options;
+    struct linux_child_wait w;
 
     if (!current) return -LINUX_ESRCH;
+    w.ppid = current->pid;
+    w.want = pid;
 
     while (1) {
         int found_child = 0;
@@ -1244,7 +1288,12 @@ static int64_t linux_bootstrap_sys_wait4(int pid, int* wstatus, int options) {
         /* 待つべき子がいない。ash のジョブ回収は wait4 が ECHILD を返すまで
          * 回すので、ここを EPERM にすると回収ループが止まらない */
         if (!found_child) return -LINUX_ECHILD;
-        kernel_yield();
+        /* 子は居るがまだ終わっていない。WNOHANG なら 0 を返すのが POSIX */
+        if (options & LINUX_WNOHANG) return 0;
+        /* **焼かずに寝る。**子の exit で起こされるか、遅くとも
+         * LINUX_WAIT4_POLL_MS で自力で起きる */
+        (void)wait_event_timeout(&g_child_exit_wq, linux_child_zombie_ready,
+                                 &w, LINUX_WAIT4_POLL_MS);
     }
 }
 
