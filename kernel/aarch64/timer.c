@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include "aarch64/boot.h"
 #include "task.h"
+#include "aarch64/trap.h"
 
 #define TICK_HZ 100     /* 10ms 刻み。x86 / riscv64 の SCHED_TICK_MS と揃える */
 
@@ -110,7 +111,158 @@ static volatile uint64_t g_cpu_tick_all[AARCH64_MAX_CPUS];
 static volatile uint64_t g_cpu_tick_busy[AARCH64_MAX_CPUS];
 static volatile uint32_t g_cpu_runq_peak[AARCH64_MAX_CPUS];
 
-static void cpu_stats_count(uint32_t cpu) {
+/* ---- 誰が、どこを回っているか (G-1 / G-2 / P-2) --------------------------
+ *
+ * **`[cpu]` は「焼けている」ことしか言わない。**日報2026-08-29 §26 で
+ * 2 コアが 100%、SD I/O ゼロのまま 74 分止まったとき、分かったのはそこまで
+ * だった。**誰がどこを回っているかが分からないと、次に何を直すか決まらない。**
+ *
+ * タイマ割り込みは 10ms ごとに全コアへ上がる。そのときの `ELR_EL1` には
+ * **中断した地点の PC がそのまま入っている** (vectors.S の SAVE_ALL は
+ * 積むだけで書き替えない)。これを毎 tick 拾って多い順に数えれば、
+ * 追加の割り込みも入力の口も要らない、ただの標本化プロファイラになる。
+ *
+ * 1 標本だけだと「たまたまそこ」を掴むので、**64 バイト単位に丸めて
+ * 4 枠の多数決**を取る。区間で最も多かった枠と、その割合を出す。
+ *
+ * PC の上位が 0xffffff8000... ならカーネル、低ければ EL0 (ユーザー)。
+ * out/kernel-aarch64.elf か走っているプログラムの符号表で引ける */
+void aarch64_uart_puthex64(uint64_t v);
+
+#define PC_SLOTS 4
+/* **64 では粗すぎた。**spin_lock_irqsave の末尾・spin_unlock_irqrestore・
+ * kernel_lock_enter の 3 つが 1 つの桶に入り、どこを指しているのか
+ * 分からなくなった (2026-08-29 に読み違えた)。関数が混ざらない粒度にする */
+#define PC_GRAIN 16ULL
+
+struct pc_slot { uint64_t pc; uint32_t hits; };
+static struct pc_slot g_pc[AARCH64_MAX_CPUS][PC_SLOTS];
+static volatile uint32_t g_pc_total[AARCH64_MAX_CPUS];
+static volatile int      g_cpu_pid[AARCH64_MAX_CPUS];
+/* **呼び出し元。**IRQ を落としている区間は割り込みが入らないので、
+ * 溜まった tick は「IRQ を開け直す場所」(spin_unlock_irqrestore) に
+ * 集中する。PC だけでは区間の中身が見えないので、x30 で誰が開けたかを見る */
+static volatile uint64_t g_cpu_lr[AARCH64_MAX_CPUS];
+static char              g_cpu_comm[AARCH64_MAX_CPUS][16];
+
+/* 自分のコアの枠だけを触るのでロックは要らない */
+static void pc_sample(uint32_t cpu, const struct task *t,
+                      const struct aarch64_trap_frame *f) {
+    uint64_t pc;
+    uint32_t i, worst = 0;
+    int j;
+
+    /* **フレームから採る。**mrs elr_el1 でも同じだが、同じフレームから
+     * 呼び出し元 (x30) も採りたいので揃える */
+    pc = f ? f->elr : 0;
+    g_cpu_lr[cpu] = f ? f->x[30] : 0;
+    pc &= ~(PC_GRAIN - 1ULL);
+
+    /* **誰かは毎回書き換える。**枠に当たったときだけ書いていたころは、
+     * 最初にその番地を踏んだタスクの名前が残り続けた (comm がまだ
+     * 空の時期に掴むと "?" のまま貼り付く) */
+    g_cpu_pid[cpu] = t ? t->pid : -1;
+    for (j = 0; j < 15; j++) {
+        char c = (t && t->comm[j]) ? t->comm[j] : '\0';
+        g_cpu_comm[cpu][j] = c;
+        if (!c) break;
+    }
+    g_cpu_comm[cpu][15] = '\0';
+
+    g_pc_total[cpu]++;
+    for (i = 0; i < PC_SLOTS; i++) {
+        if (g_pc[cpu][i].hits && g_pc[cpu][i].pc == pc) { g_pc[cpu][i].hits++; return; }
+        if (g_pc[cpu][i].hits < g_pc[cpu][worst].hits) worst = i;
+    }
+    /* 空きか、いちばん少ない枠を置き換える */
+    g_pc[cpu][worst].pc = pc;
+    g_pc[cpu][worst].hits = 1;
+}
+
+/* ---- タスク一覧 (G-1) ---------------------------------------------------
+ *
+ * **[pc] は走っているタスクしか映さない。**2026-08-30 のハングでは、
+ * 親 2 人が wait4 で空回りしている一方、肝心の「終わらない子」は
+ * 眠っていて 1 度も標本に出なかった。**眠っている者を見る手段が要る。**
+ *
+ * 60 秒ごとに task_list を舐めて pid / ppid / 状態 / 名前を出す。
+ * 走査は BKL 下ではないので、**繋ぎ替えの最中に踏まないよう上限を置く**
+ * (壊れたリストで無限に回るより、途中で切るほうがまし)。 */
+extern struct task* task_list;   /* kernel/task.c。他所と同じ形で引く */
+
+#define TASKS_MAX_SHOWN 24
+
+static const char *task_state_name(task_state_t s) {
+    switch (s) {
+        case TASK_RUNNING:  return "run";
+        case TASK_READY:    return "rdy";
+        case TASK_SLEEPING: return "slp";
+        case TASK_IO_WAIT:  return "io";
+        case TASK_ZOMBIE:   return "zmb";
+        case TASK_DEAD:     return "dead";
+        default:            return "?";
+    }
+}
+
+static void tasks_report(void) {
+    struct task *t = task_list;
+    int n = 0;
+
+    if (!t) return;
+    aarch64_uart_puts("[tasks]");
+    while (t && n < TASKS_MAX_SHOWN) {
+        aarch64_uart_puts("  ");
+        aarch64_uart_putdec64((uint64_t)(int64_t)t->pid);
+        aarch64_uart_puts("<");
+        aarch64_uart_putdec64((uint64_t)(int64_t)t->ppid);
+        aarch64_uart_puts(" ");
+        aarch64_uart_puts(task_state_name(t->state));
+        aarch64_uart_puts(" ");
+        aarch64_uart_puts(t->comm[0] ? t->comm : "?");
+        t = t->next;
+        n++;
+    }
+    if (t) aarch64_uart_puts("  ...");
+    aarch64_uart_puts("\n");
+}
+
+/* **[cpu] とは別の行にする。**既存の台本が [cpu] の形を見ているので、
+ * そちらは変えない。暇なコアは出さない */
+static void pc_report(uint32_t n) {
+    uint32_t i, k, best;
+    int any = 0;
+
+    for (i = 0; i < n; i++) {
+        if (g_pc_total[i] == 0) continue;
+        best = 0;
+        for (k = 1; k < PC_SLOTS; k++)
+            if (g_pc[i][k].hits > g_pc[i][best].hits) best = k;
+        if (g_pc[i][best].hits == 0) continue;
+
+        if (!any) { aarch64_uart_puts("[pc] 60s"); any = 1; }
+        aarch64_uart_puts("  cpu");
+        aarch64_uart_putdec64(i);
+        aarch64_uart_puts(" pid");
+        aarch64_uart_putdec64((uint64_t)(int64_t)g_cpu_pid[i]);
+        aarch64_uart_puts(" ");
+        aarch64_uart_puts(g_cpu_comm[i][0] ? g_cpu_comm[i] : "?");
+        aarch64_uart_puts(" ");
+        aarch64_uart_puthex64(g_pc[i][best].pc);
+        aarch64_uart_puts(" lr=");
+        aarch64_uart_puthex64(g_cpu_lr[i]);
+        aarch64_uart_puts(" ");
+        aarch64_uart_putdec64((uint64_t)g_pc[i][best].hits * 100ULL / g_pc_total[i]);
+        aarch64_uart_puts("%");
+    }
+    if (any) aarch64_uart_puts("\n");
+
+    for (i = 0; i < n; i++) {
+        g_pc_total[i] = 0;
+        for (k = 0; k < PC_SLOTS; k++) { g_pc[i][k].pc = 0; g_pc[i][k].hits = 0; }
+    }
+}
+
+static void cpu_stats_count(uint32_t cpu, const struct aarch64_trap_frame *frame) {
     struct cpu_local* c;
     if (cpu >= AARCH64_MAX_CPUS) return;
     g_cpu_tick_all[cpu]++;
@@ -120,6 +272,8 @@ static void cpu_stats_count(uint32_t cpu) {
     if (!c) return;
     if (c->current_task && c->current_task != c->idle_task) {
         g_cpu_tick_busy[cpu]++;
+        /* **働いている tick だけ標本を取る。**idle の wfi を数えても意味が無い */
+        pc_sample(cpu, c->current_task, frame);
     }
     if (c->runq_count > g_cpu_runq_peak[cpu]) g_cpu_runq_peak[cpu] = c->runq_count;
 }
@@ -174,6 +328,12 @@ static void cpu_stats_report(void) {
         g_cpu_runq_peak[i] = 0;
     }
     aarch64_uart_puts("\n");
+    /* **誰がどこを回っているか。**[cpu] が「焼けている」と言った直後に、
+     * その中身を名指しする */
+    pc_report(n);
+    /* **眠っている者も含めて全部出す。**wait4 で待たれている子が
+     * どの状態で止まっているかは、ここにしか出ない */
+    tasks_report();
     aarch64_console_end();
 
     /* **SD への入出力を回数で出す (P-1)。**[cpu] の行と同じ 60 秒の区間で
@@ -182,7 +342,7 @@ static void cpu_stats_report(void) {
     aarch64_emmc2_io_report();
 }
 
-void aarch64_timer_on_tick(void) {
+void aarch64_timer_on_tick(struct aarch64_trap_frame* frame) {
     /* **周期のポーリングは CPU 0 だけが行う (D-5)。**
      *
      * タイマは PPI なので 4 コア全部に上がる (gic.c:100)。ここを
@@ -204,7 +364,7 @@ void aarch64_timer_on_tick(void) {
     uint32_t me = timer_cpu_index();
 
     /* **数えるのは全 CPU。** 出すのは CPU 0 だけ (下) */
-    cpu_stats_count(me);
+    cpu_stats_count(me, frame);
 
     if (me == 0) {
         /* **USB キーボードを拾う。**割り込みを繋いでいないので、ここが唯一の

@@ -236,7 +236,8 @@ uint32_t aarch64_emmc2_intid(void);
 void aarch64_emmc2_irq(void);
 void aarch64_gic_complete(uint32_t iar);
 void aarch64_timer_init(void);
-void aarch64_timer_on_tick(void);
+#include "aarch64/trap.h"
+void aarch64_timer_on_tick(struct aarch64_trap_frame* frame);
 uint64_t aarch64_timer_freq(void);
 uint64_t aarch64_timer_ticks(void);
 uint32_t aarch64_timer_intid(void);
@@ -1045,7 +1046,7 @@ void usb_arch_irq_window_end(uint64_t token) {
     if (token & (1ULL << 7)) __asm__ volatile("msr daifset, #2");
 }
 
-void aarch64_irq_handler(void) {
+void aarch64_irq_handler(struct aarch64_trap_frame* frame) {
     uint32_t iar = aarch64_gic_claim();
     uint32_t intid = iar & 0x3ffU;
 
@@ -1056,7 +1057,7 @@ void aarch64_irq_handler(void) {
          * 「wfi で寝ている CPU を起こす」ことそのもの */
         aarch64_smp_on_ipi();
     } else if (intid == aarch64_timer_intid()) {
-        aarch64_timer_on_tick();
+        aarch64_timer_on_tick(frame);
     } else if (intid && intid == aarch64_virtio_blk_intid()) {
         aarch64_virtio_blk_irq();
     } else if (intid && intid == aarch64_uart_intid()) {

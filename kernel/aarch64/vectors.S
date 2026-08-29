@@ -166,6 +166,8 @@ vec_el1_sync:
  * 再開できる */
 vec_el1_irq:
     SAVE_ALL
+    mov     x0, sp              /* フレームを渡す。標本化プロファイラが
+                                 * 保存済みの x30 (呼び出し元) を読む */
     bl      aarch64_irq_handler
     mov     x0, sp              /* フレームを渡す。SPSR で「どこを割り込んだか」を見る (P3-4) */
     bl      aarch64_task_resched_if_needed
@@ -191,6 +193,7 @@ vec_el0_sync:
  * ここを実装しないと、EL0 に降りた瞬間にタイマが取りこぼされる */
 vec_el0_irq:
     SAVE_ALL
+    mov     x0, sp              /* 同上 */
     bl      aarch64_irq_handler
     mov     x0, sp              /* 同上 (P3-4) */
     bl      aarch64_task_resched_if_needed
