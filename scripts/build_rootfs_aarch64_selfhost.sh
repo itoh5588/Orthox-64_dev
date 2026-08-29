@@ -106,10 +106,43 @@ if [ -d "$EXTRA" ]; then
     mkdir -p "$FSDIR/include" "$FSDIR/lib"
     cp -a "$ROOT/ports/musl-install-aarch64/include"/. "$FSDIR/include/"
     cp -a "$ROOT/ports/musl-install-aarch64/lib"/.     "$FSDIR/lib/"
+
+    # **xv6fs に symlink 型は無い (S-11、2026-08-29)。**
+    # build_rootfs_xv6fs.py:403 は symlink を「リンク先の文字列を中身に持つ
+    # 普通のファイル」に変換する。musl の ld-musl-aarch64.so.1 は libc.so を
+    # 指す symlink なので、そのまま焼くと **71 バイトのテキストファイル**が
+    # /lib/ld-musl-aarch64.so.1 になり、**動的リンクが黙って壊れる**
+    # (ELF として読めず、exec が意味の分からない失敗をする)。
+    # tests/aarch64_dynlink_smoke.sh は最初から実体で置いている。**揃える。**
+    for l in "$FSDIR/lib"/*; do
+      [ -L "$l" ] || continue
+      t="$(readlink -f "$l")"
+      rm -f "$l"
+      if [ -f "$t" ]; then
+        cp "$t" "$l"
+        echo "  symlink を実体化: $(basename "$l") <- $(basename "$t")"
+      else
+        echo "★ $l の実体が無い ($t)" >&2; exit 1
+      fi
+    done
   fi
   du -sh "$FSDIR" | sed 's/^/  重ねた後: /'
 else
   echo "--- ツールチェーンは無い ($EXTRA)。ソースだけのイメージになる"
+fi
+
+# ---- 動的リンクの検証用 (S-11 / DL-6) --------------------------------------
+# **libc.so を置くだけでは「置いた」ことしか言えない。**実機で動くことを
+# 確かめられるように、QEMU で PASS している一式 (日報2026-08-28 §15) を
+# 同じ経路で載せる。make aarch64-dynlink-smoke が out/aarch64-dyn に作る。
+DYN="${DYN:-$ROOT/out/aarch64-dyn}"
+if [ -d "$DYN" ] && ls "$DYN"/*.elf >/dev/null 2>&1; then
+  echo "--- 動的リンクの検証用を入れる: $DYN"
+  cp "$DYN"/*.elf "$FSDIR/bin/"
+  cp "$DYN"/*.so  "$FSDIR/lib/"
+  echo "  elf $(ls "$DYN"/*.elf | wc -l) 本 / so $(ls "$DYN"/*.so | wc -l) 本"
+else
+  echo "--- 動的リンクの検証用は無い ($DYN)。make aarch64-dynlink-smoke で作れる"
 fi
 
 # ---- イメージを焼く -------------------------------------------------------
@@ -142,6 +175,29 @@ n_src="$(find "$FSDIR/src/kernel-build" -type f \( -name '*.c' -o -name '*.h' -o
 [ -f "$FSDIR/src/kernel-build/Makefile" ] || {
   echo "★ ネイティブ Makefile が入っていない" >&2; exit 1; }
 echo "  カーネルソース $n_src 本 + Makefile  ok"
+
+# **S-11: 動的リンクの土台が「実体で」入っていること。**
+# symlink のまま焼くと 71 バイトのテキストになるが、イメージの大きさも
+# superblock magic も通ってしまう。**焼いた後のイメージから取り出して
+# 中身を見る** — 規則が在るだけでは中身の正しさは分からない
+# (日報2026-08-27 §18 と同じ方針)。
+if [ -f "$FSDIR/lib/libc.so" ]; then
+  tmpd="$(mktemp -d)"
+  for f in libc.so ld-musl-aarch64.so.1; do
+    python3 scripts/extract_rootfs_xv6fs.py "$IMG" "/lib/$f" "$tmpd/$f" >/dev/null || {
+      echo "★ イメージから /lib/$f を取り出せない" >&2; rm -rf "$tmpd"; exit 1; }
+    m="$(od -An -tx1 -N4 "$tmpd/$f" | tr -d ' \n')"
+    [ "$m" = "7f454c46" ] || {
+      echo "★ /lib/$f が ELF でない (先頭 $m)。symlink が実体化されていない" >&2
+      rm -rf "$tmpd"; exit 1; }
+  done
+  sa="$(stat -c %s "$tmpd/libc.so")"; sb="$(stat -c %s "$tmpd/ld-musl-aarch64.so.1")"
+  [ "$sa" = "$sb" ] || {
+    echo "★ libc.so ($sa) と ld-musl-aarch64.so.1 ($sb) の大きさが違う" >&2
+    rm -rf "$tmpd"; exit 1; }
+  rm -rf "$tmpd"
+  echo "  共有 musl /lib/libc.so と /lib/ld-musl-aarch64.so.1 (実体 $sa バイト)  ok"
+fi
 
 echo
 echo "=== 完了: $IMG ==="
