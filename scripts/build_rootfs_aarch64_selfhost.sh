@@ -121,6 +121,21 @@ if [ -d "$EXTRA" ]; then
     # /lib/ld-musl-aarch64.so.1 になり、**動的リンクが黙って壊れる**
     # (ELF として読めず、exec が意味の分からない失敗をする)。
     # tests/aarch64_dynlink_smoke.sh は最初から実体で置いている。**揃える。**
+    # **実機の gcc は glibc の名前でインタプリタを書く (2026-08-29)。**
+    #
+    #   Exec: Interpreter not found: /lib/ld-linux-aarch64.so.1
+    #
+    # ports/orthox-native-aarch64 の GCC は既定の dynamic-linker のまま
+    # 組んであるので、PT_INTERP が /lib/ld-linux-aarch64.so.1 になる。
+    # **musl のローダは名前が違うだけで中身は正しく動く**ので、その名前でも
+    # 置いておく。これが無いと、libc.so を置いた途端 (= 既定が動的リンクに
+    # 変わった途端) **実機で作ったバイナリが軒並み起動しなくなる。**
+    # GCC の configure が「cannot run C compiled programs」で止まって露見した。
+    if [ -f "$FSDIR/lib/libc.so" ]; then
+      cp "$FSDIR/lib/libc.so" "$FSDIR/lib/ld-linux-aarch64.so.1"
+      echo "  glibc 名のローダも置いた: ld-linux-aarch64.so.1"
+    fi
+
     for l in "$FSDIR/lib"/*; do
       [ -L "$l" ] || continue
       t="$(readlink -f "$l")"
@@ -231,7 +246,7 @@ fi
 # (日報2026-08-27 §18 と同じ方針)。
 if [ -f "$FSDIR/lib/libc.so" ]; then
   tmpd="$(mktemp -d)"
-  for f in libc.so ld-musl-aarch64.so.1; do
+  for f in libc.so ld-musl-aarch64.so.1 ld-linux-aarch64.so.1; do
     python3 scripts/extract_rootfs_xv6fs.py "$IMG" "/lib/$f" "$tmpd/$f" >/dev/null || {
       echo "★ イメージから /lib/$f を取り出せない" >&2; rm -rf "$tmpd"; exit 1; }
     m="$(od -An -tx1 -N4 "$tmpd/$f" | tr -d ' \n')"

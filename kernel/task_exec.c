@@ -13,6 +13,7 @@
 /* 引数が多すぎるときに返す errno。共有カーネルには errno ヘッダが無いので
  * kernel/fs.c と同じくファイル内で定義する (Linux asm-generic の値) */
 #define E2BIG 7
+#define ELOOP 40   /* #! の入れ子が深すぎる (Linux と同じ番号) */
 #define EXEC_MAX_VEC_STR_LEN 4096
 #define EXEC_ET_DYN_LOAD_BASE 0x400000ULL
 
@@ -380,10 +381,123 @@ int task_execve(arch_syscall_frame_t* frame, const char* path, char* const argv[
             return vec_rc;
         }
     }
-    if (fs_get_file_data(exec_copy->path, &file_addr, &file_size) < 0) {
-        puts("Exec: File not found: "); puts(exec_copy->path); puts("\r\n");
-        pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
-        return -1;
+    /* ---- #! (shebang) の解決 (2026-08-29) ---------------------------------
+     *
+     * **これが無いとシェルスクリプトを直接 exec できない。**elf.c が
+     * 「ELF: Invalid magic」で弾き、呼び出し側には 127 が返る。
+     * GCC を実機で組もうとして露見した —— configure も libtool も
+     * move-if-change も、**ビルドの過程で何千回もスクリプトを exec する。**
+     *
+     * Linux と同じ組み替えをする:
+     *   execve("/p/script", ["script", "a"])  かつ  #!/bin/sh -x
+     *     -> execve("/bin/sh", ["/bin/sh", "-x", "/p/script", "a"])
+     *
+     * **引数は 1 つまで。**Linux もそうで、"#!/bin/sh -e -x" は
+     * 「-e -x」という 1 つの引数になる。
+     *
+     * 入れ子は 4 段までにする。スクリプトが自分を指すと無限に回る。 */
+    for (int shebang_depth = 0; ; shebang_depth++) {
+        const char* head;
+        /* **カーネルスタックに 4KB を 2 本置かない。**インタプリタの経路は
+         * 短い (Linux も 1 行 128 バイトに制限していた時期がある) */
+        char interp[256];
+        char sharg[256];
+        int has_arg = 0, k, argc_now, i, n;
+
+        if (fs_get_file_data(exec_copy->path, &file_addr, &file_size) < 0) {
+            puts("Exec: File not found: "); puts(exec_copy->path); puts("\r\n");
+            pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+            return -1;
+        }
+        head = (const char*)file_addr;
+        if (file_size < 2 || head[0] != '#' || head[1] != '!') break;   /* ELF のはず */
+
+        if (shebang_depth >= 4) {
+            fs_free_exec_buffer(exec_copy->path, file_addr, file_size);
+            pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+            return -ELOOP;
+        }
+
+        /* 1 行目を読む。**改行までしか見ない** */
+        {
+            size_t pos = 2, lim = file_size;
+            if (lim > 1024) lim = 1024;             /* Linux も 1 行を制限する */
+            while (pos < lim && (head[pos] == ' ' || head[pos] == '\t')) pos++;
+            n = 0;
+            while (pos < lim && head[pos] != '\n' && head[pos] != ' ' &&
+                   head[pos] != '\t' && head[pos] != '\r' &&
+                   n + 1 < (int)sizeof(interp)) {
+                interp[n++] = head[pos++];
+            }
+            interp[n] = '\0';
+            if (n == 0) {                            /* "#!" だけ。ELF でもない */
+                fs_free_exec_buffer(exec_copy->path, file_addr, file_size);
+                pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+                return -1;
+            }
+            while (pos < lim && (head[pos] == ' ' || head[pos] == '\t')) pos++;
+            n = 0;
+            while (pos < lim && head[pos] != '\n' && head[pos] != '\r' &&
+                   n + 1 < (int)sizeof(sharg)) {
+                sharg[n++] = head[pos++];
+            }
+            /* 末尾の空白を落とす */
+            while (n > 0 && (sharg[n - 1] == ' ' || sharg[n - 1] == '\t')) n--;
+            sharg[n] = '\0';
+            has_arg = (n > 0);
+        }
+        fs_free_exec_buffer(exec_copy->path, file_addr, file_size);
+        file_addr = NULL;
+
+        /* argv を組み替える。**元の argv[0] は捨て、経路そのものを渡す** */
+        k = 1 + (has_arg ? 1 : 0);
+        argc_now = 0;
+        while (exec_copy->argv[argc_now]) argc_now++;
+        if (argc_now == 0) argc_now = 1;             /* argv[0] が無い呼び方に備える */
+        if (argc_now + k > EXEC_MAX_VEC_STRINGS) {
+            pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+            return -E2BIG;
+        }
+        for (i = argc_now - 1; i >= 1; i--) {
+            const char* from = exec_copy->argv_storage[i];
+            char* to = exec_copy->argv_storage[i + k];
+            int j = 0;
+            while (from[j] && j + 1 < EXEC_MAX_VEC_STR_LEN) { to[j] = from[j]; j++; }
+            to[j] = '\0';
+        }
+        {
+            int j = 0;
+            while (interp[j] && j + 1 < EXEC_MAX_VEC_STR_LEN) {
+                exec_copy->argv_storage[0][j] = interp[j]; j++;
+            }
+            exec_copy->argv_storage[0][j] = '\0';
+        }
+        if (has_arg) {
+            int j = 0;
+            while (sharg[j] && j + 1 < EXEC_MAX_VEC_STR_LEN) {
+                exec_copy->argv_storage[1][j] = sharg[j]; j++;
+            }
+            exec_copy->argv_storage[1][j] = '\0';
+        }
+        {
+            const char* sp = exec_copy->path;
+            char* to = exec_copy->argv_storage[k];
+            int j = 0;
+            while (sp[j] && j + 1 < EXEC_MAX_VEC_STR_LEN) { to[j] = sp[j]; j++; }
+            to[j] = '\0';
+        }
+        argc_now += k;
+        for (i = 0; i < argc_now; i++) exec_copy->argv[i] = exec_copy->argv_storage[i];
+        exec_copy->argv[argc_now] = 0;
+
+        /* 次はインタプリタを開く */
+        {
+            int j = 0;
+            while (interp[j] && j + 1 < EXEC_MAX_PATH_LEN) {
+                exec_copy->path[j] = interp[j]; j++;
+            }
+            exec_copy->path[j] = '\0';
+        }
     }
     arch_address_space_t address_space = arch_vm_create_user_address_space();
     if (!address_space) {
