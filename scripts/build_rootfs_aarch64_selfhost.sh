@@ -69,8 +69,15 @@ cp -a "$SRCTREE" "$FSDIR/src/kernel-build"
 # (xv6fs に symlink 型が無い。riscv64 の RISCV64_ROOTFS_APPLETS と同じ形)。
 # applet を増やしてもイメージは busybox 1 本分しか太らない。
 BUSYBOX="${BUSYBOX:-$ROOT/out/busybox-aarch64-musl.elf}"
+# **/bin に張っていない applet は「無い」のと同じ。**busybox に入って
+# いても PATH から呼べない (2026-08-29 に GCC の configure 準備で気づいた
+# —— sed / grep / awk はビルド済みなのに /bin に無かった)。
 APPLETS="ash sh cat chmod cp echo env false head ln ls mkdir mv printf pwd rm \
-         rmdir sleep stat tail test touch true wc which"
+         rmdir sleep stat tail test touch true wc which \
+         awk sed grep egrep fgrep sort uniq cut tr tee comm diff \
+         find xargs expr seq basename dirname readlink realpath \
+         date uname du df dd sync mktemp install cmp md5sum od hexdump \
+         rev yes tar gzip gunzip"
 if [ -f "$BUSYBOX" ]; then
   echo "--- busybox ash を入れる"
   cp "$BUSYBOX" "$FSDIR/bin/busybox"
@@ -145,6 +152,37 @@ else
   echo "--- 動的リンクの検証用は無い ($DYN)。make aarch64-dynlink-smoke で作れる"
 fi
 
+# ---- GCC のソース (実機でセルフホストするため、任意) ----------------------
+#
+# **既定では入れない。**185 MB あり、普段のイメージ (320 MB) には入らない。
+# 入れるときは大きさと inode 数も一緒に上げること:
+#
+#   GCCSRC=out/gcc-src-c-only FSSIZE=1572864 NINODES=32768 \
+#     bash scripts/build_rootfs_aarch64_selfhost.sh
+#
+# out/gcc-src-c-only は ports/gcc-4.7.4-aarch64 から build-* / 他言語 /
+# testsuite を落としたもの (929 MB -> 185 MB、5,051 ファイル)。
+#
+# gmp / mpfr / mpc は ports/gcc-prereq-aarch64 に aarch64 版が既にあるので、
+# それを /usr の下に重ねて --with-gmp=/usr で見せる。
+GCCSRC="${GCCSRC:-}"
+if [ -n "$GCCSRC" ]; then
+  [ -d "$GCCSRC" ] || { echo "★ GCCSRC が無い: $GCCSRC" >&2; exit 1; }
+  echo "--- GCC のソースを入れる: $GCCSRC"
+  mkdir -p "$FSDIR/src"
+  cp -a "$GCCSRC" "$FSDIR/src/gcc-4.7.4"
+  PREREQ_A="${PREREQ_A:-$ROOT/ports/gcc-prereq-aarch64}"
+  if [ -d "$PREREQ_A" ]; then
+    echo "--- gmp/mpfr/mpc (aarch64) を重ねる: $PREREQ_A"
+    mkdir -p "$FSDIR/usr"
+    cp -a "$PREREQ_A"/. "$FSDIR/usr/"
+  else
+    echo "★ $PREREQ_A が無い。GCC の configure は gmp を要求する" >&2; exit 1
+  fi
+  echo "  ソース $(find "$FSDIR/src/gcc-4.7.4" -type f | wc -l) ファイル"
+  du -sh "$FSDIR" | sed 's/^/  ここまでの合計: /'
+fi
+
 # ---- イメージを焼く -------------------------------------------------------
 echo "--- イメージを焼く (FSSIZE=$FSSIZE blocks / NINODES=$NINODES)"
 rm -f "$IMG"
@@ -175,6 +213,16 @@ n_src="$(find "$FSDIR/src/kernel-build" -type f \( -name '*.c' -o -name '*.h' -o
 [ -f "$FSDIR/src/kernel-build/Makefile" ] || {
   echo "★ ネイティブ Makefile が入っていない" >&2; exit 1; }
 echo "  カーネルソース $n_src 本 + Makefile  ok"
+
+# GCC を載せたときは、configure が最初に触るものが在ることを見る
+if [ -n "$GCCSRC" ]; then
+  for f in src/gcc-4.7.4/configure src/gcc-4.7.4/gcc/Makefile.in \
+           usr/lib/libgmp.a usr/lib/libmpfr.a usr/lib/libmpc.a \
+           usr/include/gmp.h bin/awk bin/sed bin/grep; do
+    [ -e "$FSDIR/$f" ] || { echo "★ /$f がイメージに無い" >&2; exit 1; }
+  done
+  echo "  GCC のソースと gmp/mpfr/mpc と awk/sed/grep  ok"
+fi
 
 # **S-11: 動的リンクの土台が「実体で」入っていること。**
 # symlink のまま焼くと 71 バイトのテキストになるが、イメージの大きさも
