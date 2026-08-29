@@ -98,6 +98,7 @@ static int linux_syscall_trace_wanted(uint64_t number) {
         case 66:  /* writev */
         case 68:  /* pwrite64 */
         case 82:  /* fsync */
+        case 38:  /* renameat */
         case 276: /* renameat2 */
             return 1;
         default:
@@ -1678,12 +1679,24 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             /* xv6fs はタイムスタンプを持たないため touch を成功扱いにする */
             arch_syscall_set_return(frame, 0);
             return;
-        /* riscv64 に renameat(38) は無い (asm-generic の __ARCH_WANT_RENAMEAT を
-         * 立てていないため未割り当て)。musl は renameat2 を出す */
+        /* rename(2)。**番号がアーキで違うので両方受ける。**aarch64 の musl は
+         * renameat(38)、riscv64 の musl は renameat2(276) を出す。
+         * 38 を落としていたころは aarch64 で rename が丸ごと ENOSYS だった */
+        case LINUX_SYS_RENAMEAT:
+            arch_syscall_set_return(frame,
+                (uint64_t)(int64_t)sys_renameat((int)arch_syscall_arg0(frame),
+                                                (const char*)(uintptr_t)arch_syscall_arg1(frame),
+                                                (int)arch_syscall_arg2(frame),
+                                                (const char*)(uintptr_t)arch_syscall_arg3(frame),
+                                                0U));
+            return;
         case LINUX_SYS_RENAMEAT2:
-            /* xv6fs に rename API が無い。EXDEV を返して mv の copy+unlink
-             * フォールバックに乗せる */
-            arch_syscall_set_return(frame, (uint64_t)(int64_t)-18);
+            arch_syscall_set_return(frame,
+                (uint64_t)(int64_t)sys_renameat((int)arch_syscall_arg0(frame),
+                                                (const char*)(uintptr_t)arch_syscall_arg1(frame),
+                                                (int)arch_syscall_arg2(frame),
+                                                (const char*)(uintptr_t)arch_syscall_arg3(frame),
+                                                (unsigned int)arch_syscall_arg4(frame)));
             return;
         case LINUX_SYS_FACCESSAT:
             {

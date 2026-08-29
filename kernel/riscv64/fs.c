@@ -982,6 +982,44 @@ int sys_linkat(int olddirfd, const char* oldpath, int newdirfd, const char* newp
     return sys_link(old_resolved, new_resolved);
 }
 
+/* child が parent の下にあるか。正規化済みの絶対パスどうしで見る。
+ * ディレクトリのハードリンクが無いので実体とパスが 1 対 1 になり、
+ * 文字列だけで「自分の子孫の下へ入ろうとしている」を判定できる */
+static int riscv64_fs_path_is_under(const char* parent, const char* child) {
+    size_t i = 0;
+    while (parent[i] && parent[i] == child[i]) i++;
+    if (parent[i] != '\0') return 0;
+    return child[i] == '/';
+}
+
+/* rename(2)。riscv64 の musl は renameat2(276) を出す。
+ * **以前はここで EXDEV を返し、mv の copy+unlink に退かせていた。**
+ * xv6fs に rename が入ったので本来の意味で付け替える */
+int sys_renameat(int olddirfd, const char* oldpath,
+                 int newdirfd, const char* newpath, unsigned int flags) {
+    char old_resolved[256];
+    char new_resolved[256];
+    size_t i;
+    /* RENAME_NOREPLACE(1) / RENAME_EXCHANGE(2) / RENAME_WHITEOUT(4) は未対応。
+     * 黙って普通の rename にすると上書き事故になるので断る */
+    if (flags != 0) return -LINUX_EINVAL;
+    if (!oldpath || !newpath || oldpath[0] == '\0' || newpath[0] == '\0')
+        return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    if (riscv64_fs_resolve_dirfd_path(olddirfd, oldpath,
+                                      old_resolved, sizeof(old_resolved)) < 0)
+        return -LINUX_ENOENT;
+    if (riscv64_fs_resolve_dirfd_path(newdirfd, newpath,
+                                      new_resolved, sizeof(new_resolved)) < 0)
+        return -LINUX_ENOENT;
+    /* 同じ名前どうしなら何もせずに成功 (POSIX) */
+    for (i = 0; old_resolved[i] && old_resolved[i] == new_resolved[i]; i++) { }
+    if (old_resolved[i] == '\0' && new_resolved[i] == '\0') return 0;
+    if (riscv64_fs_path_is_under(old_resolved, new_resolved))
+        return -LINUX_EINVAL;
+    return xv6fs_rename_path(old_resolved, new_resolved);
+}
+
 int sys_mkdir(const char* path, int mode) {
     char resolved[256];
     struct kstat st;

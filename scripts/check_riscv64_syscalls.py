@@ -24,7 +24,15 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HDR = os.path.join(REPO, "include/linux_syscalls.h")
 MUSL = os.path.join(REPO, "ports/musl-install-riscv64/include/bits/syscall.h")
+MUSL_AARCH64 = os.path.join(REPO, "ports/musl-install-aarch64/include/bits/syscall.h")
 SRC_DIR = os.path.join(REPO, "kernel/riscv64")
+
+# **asm-generic には無く、aarch64 にだけある番号。**asm-generic は
+# __ARCH_WANT_* で番号の一部を選べるようになっていて、aarch64 は
+# __ARCH_WANT_RENAMEAT を立てている。riscv64 の表と突き合わせるだけだと
+# 「知らない番号」に見えるので、こちらは aarch64 の musl と照合する。
+# **番号の重複検査 (2.) からは外さない。**衝突の見落としが本来の敵
+AARCH64_ONLY = {"renameat"}
 
 
 def fail(msg):
@@ -47,8 +55,25 @@ def main():
     for m in re.finditer(r"#define\s+LINUX_SYS_(\w+)\s+(\d+)", open(HDR).read()):
         ours[m.group(1).lower()] = int(m.group(2))
 
+    musl_a64 = {}
+    if os.path.exists(MUSL_AARCH64):
+        for m in re.finditer(r"#define\s+__NR_(\w+)\s+(\d+)",
+                             open(MUSL_AARCH64).read()):
+            musl_a64[m.group(1)] = int(m.group(2))
+
     # 1. musl の表と一致するか
     for name, val in sorted(ours.items()):
+        if name in AARCH64_ONLY:
+            if not musl_a64:
+                continue    # aarch64 の sysroot がまだ無い
+            if name not in musl_a64:
+                errors += fail("%s=%d は aarch64 にも無い番号" % (name, val))
+            elif musl_a64[name] != val:
+                errors += fail("%s: ours=%d aarch64=%d" % (name, val, musl_a64[name]))
+            elif name in musl:
+                errors += fail("%s は asm-generic にもある。AARCH64_ONLY から外すこと"
+                               % name)
+            continue
         if name not in musl:
             errors += fail("%s=%d は asm-generic に無い番号" % (name, val))
         elif musl[name] != val:

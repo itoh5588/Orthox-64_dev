@@ -240,6 +240,8 @@ int fs_sync(void);
 int fs_unlink(const char* path);
 int fs_unlinkat(int dirfd, const char* path, int flags);
 int fs_rename(const char* oldpath, const char* newpath);
+int fs_renameat(int olddirfd, const char* oldpath,
+                int newdirfd, const char* newpath, unsigned int flags);
 int fs_chmod(const char* path, uint32_t mode);
 int fs_mkdir(const char* path, int mode);
 int fs_mknod(const char* path, uint32_t mode, uint64_t dev);

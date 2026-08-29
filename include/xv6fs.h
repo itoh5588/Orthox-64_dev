@@ -288,6 +288,9 @@ int xv6fs_truncate_file(const char *path, uint64_t length);
 int xv6fs_unlink_path(const char *path);
 int xv6fs_link_path(const char *oldpath, const char *newpath);
 int xv6fs_rmdir_path(const char *path);
+/* rename(2)。0 か負の errno を返す。呼ぶ前に絶対パスへ正規化し、
+ * 自分の子孫への移動を弾いておくこと (詳細は kernel/xv6fs.c) */
+int xv6fs_rename_path(const char *oldpath, const char *newpath);
 int xv6fs_mkdir_path(const char *path, int mode);
 int xv6fs_chmod_path(const char *path, uint32_t mode);
 int xv6fs_sync(void);

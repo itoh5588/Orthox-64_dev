@@ -210,9 +210,16 @@ int xv6fs_mount_storage(const char *devname) {
 /* inode テーブル初期化                                               */
 /* ------------------------------------------------------------------ */
 
+/* **rename どうしを直列にする錠。**rename は inode を 3〜4 個まとめて
+ * 掴む唯一の操作で、しかも「親を掴んでから子」の順序が守れない場合がある
+ * (ディレクトリを動かすとき、相手の親が自分の子でありうる)。
+ * rename は滅多に走らないので、まとめて 1 本ずつ通すのがいちばん安い */
+static struct xv6_sleeplock g_rename_lock;
+
 void xv6fs_init(uint32_t dev) {
     (void)dev;
     spinlock_init(&itable.lock);
+    xv6_sleeplock_init(&g_rename_lock);
     for (int i = 0; i < XV6FS_NINODE; i++) {
         xv6_sleeplock_init(&itable.inode[i].lock);
         itable.inode[i].ref   = 0;
@@ -1267,6 +1274,178 @@ bad:
     xv6log_end_op();
     xv6fs_iput(ip);
     return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* rename                                                             */
+/* ------------------------------------------------------------------ */
+
+/* "." と ".." のほかに何も入っていないか */
+static int dir_is_empty(struct xv6fs_inode *dp) {
+    struct xv6fs_dirent de;
+
+    for (uint32_t off = 0; off < dp->size; off += sizeof(de)) {
+        if (xv6fs_readi(dp, &de, off, sizeof(de)) != (int)sizeof(de))
+            return 0;
+        if (de.inum == 0) continue;
+        if (namecmp(de.name, ".") == 0 || namecmp(de.name, "..") == 0) continue;
+        return 0;
+    }
+    return 1;
+}
+
+/* ディレクトリを別の親へ移したとき、中の ".." を張り替える */
+static int dir_reparent(struct xv6fs_inode *dp, uint32_t parent_inum) {
+    struct xv6fs_dirent de;
+
+    for (uint32_t off = 0; off < dp->size; off += sizeof(de)) {
+        if (xv6fs_readi(dp, &de, off, sizeof(de)) != (int)sizeof(de))
+            break;
+        if (de.inum == 0 || namecmp(de.name, "..") != 0) continue;
+        de.inum = (uint16_t)parent_inum;
+        return xv6fs_writei(dp, &de, off, sizeof(de)) == (int)sizeof(de) ? 0 : -1;
+    }
+    return -1;
+}
+
+/* rename(2)。**xv6fs には rename が無く、上の層は EXDEV を返して
+ * mv の copy+unlink に退いていた。**これがその実装。
+ *
+ * 付け替えを 1 つのログトランザクションで行うので、途中で電源が落ちても
+ * 「古い名前のまま」か「新しい名前になった」かのどちらかにしかならない。
+ *
+ * 満たすもの:
+ *   - 相手が既にあれば黙って置き換える (ディレクトリなら空のときだけ)
+ *   - 同じ実体を指す名前どうしなら何もせずに成功 (POSIX の規定)
+ *   - ディレクトリを別の親へ移したら中の ".." を張り替える
+ *   - 種別が食い違えば ENOTDIR / EISDIR で断る
+ *
+ * 呼び出し側 (fs_rename) が済ませておくこと:
+ *   - 絶対パスへの正規化
+ *   - **自分の子孫への移動を弾くこと。**このファイルシステムはディレクトリの
+ *     ハードリンクを許さないので実体とパスが 1 対 1 になり、文字列の前方一致
+ *     で判定できる
+ *
+ * 戻り値は 0 か負の errno。
+ */
+int xv6fs_rename_path(const char *oldpath, const char *newpath) {
+    char old_name[XV6FS_DIRSIZ];
+    char new_name[XV6FS_DIRSIZ];
+    struct xv6fs_inode *dp_old, *dp_new;
+    struct xv6fs_inode *ip = (struct xv6fs_inode *)0;
+    struct xv6fs_inode *ip_new = (struct xv6fs_inode *)0;
+    struct xv6fs_dirent de;
+    uint32_t off_old = 0, off_new = 0;
+    int same_dir, is_dir = 0;
+    int ip_locked = 0, ip_new_locked = 0;
+    int rc = 0;
+
+    if (!oldpath || !newpath) return -14;              /* EFAULT */
+
+    dp_old = xv6fs_nameiparent(oldpath, old_name);
+    if (!dp_old) return -2;                            /* ENOENT */
+    dp_new = xv6fs_nameiparent(newpath, new_name);
+    if (!dp_new) { xv6fs_iput(dp_old); return -2; }
+
+    /* iget は同じ inum に同じ実体を返すので、ポインタ比較でよい */
+    same_dir = (dp_old == dp_new);
+
+    xv6_sleep_lock(&g_rename_lock);
+    xv6log_begin_op();
+
+    /* **親を 2 つ掴む。**同じなら 1 回だけ (二度掛けると眠ったまま戻らない)。
+     * 違うなら inum の小さいほうから取り、rename どうしがすれ違っても
+     * 掴む順序が揃うようにする */
+    if (same_dir) {
+        xv6fs_ilock(dp_old);
+    } else if (dp_old->inum < dp_new->inum) {
+        xv6fs_ilock(dp_old);
+        xv6fs_ilock(dp_new);
+    } else {
+        xv6fs_ilock(dp_new);
+        xv6fs_ilock(dp_old);
+    }
+
+    ip = xv6fs_dirlookup(dp_old, old_name, &off_old);
+    if (!ip) { rc = -2; goto out; }                    /* ENOENT */
+    ip_new = xv6fs_dirlookup(dp_new, new_name, &off_new);
+
+    /* 同じ実体を指す名前どうし。POSIX は「何もせずに成功」 */
+    if (ip_new && ip_new->inum == ip->inum) goto out;
+    /* 自分の中へ入ろうとしている */
+    if (ip->inum == dp_new->inum) { rc = -22; goto out; }          /* EINVAL */
+    /* 移動先が移動元の親そのもの。中身が入っているので空ではない */
+    if (ip_new && (ip_new->inum == dp_old->inum ||
+                   ip_new->inum == dp_new->inum)) {
+        rc = -39; goto out;                                        /* ENOTEMPTY */
+    }
+
+    xv6fs_ilock(ip); ip_locked = 1;
+    is_dir = (ip->type == XV6FS_T_DIR);
+    if (ip_new) {
+        xv6fs_ilock(ip_new); ip_new_locked = 1;
+        if (is_dir && ip_new->type != XV6FS_T_DIR) { rc = -20; goto out; }  /* ENOTDIR */
+        if (!is_dir && ip_new->type == XV6FS_T_DIR) { rc = -21; goto out; } /* EISDIR */
+        if (ip_new->type == XV6FS_T_DIR && !dir_is_empty(ip_new)) {
+            rc = -39; goto out;                                    /* ENOTEMPTY */
+        }
+    }
+
+    /* --- ここから書く。**伸びる可能性のある操作を先に済ませる。**
+     * 置き換えのときは既にあるエントリに上書きするだけで何も足さない。
+     * 新規のときだけ dirlink がディレクトリを伸ばしうるので、
+     * 古い名前を消す前に済ませる。こうしておけば失敗しても実体は
+     * 古い名前から辿れる */
+    if (ip_new) {
+        memset(de.name, 0, XV6FS_DIRSIZ);
+        strncpy(de.name, new_name, XV6FS_DIRSIZ);
+        de.inum = (uint16_t)ip->inum;
+        if (xv6fs_writei(dp_new, &de, off_new, sizeof(de)) != (int)sizeof(de)) {
+            rc = -5; goto out;                                     /* EIO */
+        }
+    } else if (xv6fs_dirlink(dp_new, new_name, ip->inum) < 0) {
+        rc = -28; goto out;                                        /* ENOSPC */
+    }
+
+    /* 古い名前を消す */
+    memset(&de, 0, sizeof(de));
+    xv6fs_writei(dp_old, &de, off_old, sizeof(de));
+
+    /* **実体 (ip) の nlink は変わらない。**名前を 1 つ足して 1 つ消している */
+    if (ip_new) {
+        if (ip_new->type == XV6FS_T_DIR) {
+            /* 消えたディレクトリの ".." のぶん、親が 1 つ減る */
+            dp_new->nlink--;
+            ip_new->nlink = 0;
+        } else {
+            ip_new->nlink--;
+        }
+        xv6fs_iupdate(ip_new);
+    }
+    if (is_dir && !same_dir) {
+        if (dir_reparent(ip, dp_new->inum) < 0) { rc = -5; goto out; }
+        dp_old->nlink--;
+        dp_new->nlink++;
+    }
+    xv6fs_iupdate(ip);
+    xv6fs_iupdate(dp_old);
+    if (!same_dir) xv6fs_iupdate(dp_new);
+
+out:
+    /* **iput は眠るので、掛けたロックを外してから呼ぶ。**
+     * nlink が 0 になった相手はここでブロックごと解放される */
+    if (ip_new_locked) xv6fs_iunlock(ip_new);
+    if (ip_new) xv6fs_iput(ip_new);
+    if (ip_locked) xv6fs_iunlock(ip);
+    if (ip) xv6fs_iput(ip);
+    xv6fs_iunlock(dp_old);
+    if (!same_dir) xv6fs_iunlock(dp_new);
+    xv6log_end_op();
+    xv6_sleep_unlock(&g_rename_lock);
+    /* nameiparent を 2 回通しているので、同じ親でも参照は 2 つ */
+    xv6fs_iput(dp_old);
+    xv6fs_iput(dp_new);
+    return rc;
 }
 
 int xv6fs_mkdir_path(const char *path, int mode) {

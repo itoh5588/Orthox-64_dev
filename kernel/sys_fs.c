@@ -156,6 +156,11 @@ int sys_rename(const char* oldpath, const char* newpath) {
     return fs_rename(oldpath, newpath);
 }
 
+int sys_renameat(int olddirfd, const char* oldpath,
+                 int newdirfd, const char* newpath, unsigned int flags) {
+    return fs_renameat(olddirfd, oldpath, newdirfd, newpath, flags);
+}
+
 int sys_chmod(const char* path, uint32_t mode) {
     return fs_chmod(path, mode);
 }

@@ -107,6 +107,15 @@ extern void puthex(uint64_t v);
 #ifndef EPIPE
 #define EPIPE 32
 #endif
+#ifndef EXDEV
+#define EXDEV 18
+#endif
+#ifndef ENOTEMPTY
+#define ENOTEMPTY 39
+#endif
+#ifndef ENAMETOOLONG
+#define ENAMETOOLONG 36
+#endif
 
 /* pipe を指す file object がどちらの端を持つかを file->aux0 に記録する。
  * 匿名 pipe は読み端と書き端で別の file object なのでどちらか一方、
@@ -1729,6 +1738,16 @@ static int exec_cache_insert(const char* norm, void* buf, size_t size, size_t np
 
 /* raw_path のキャッシュを無効化する (ファイル書換時に呼ぶ)。使用中なら
  * stale 化して最後の利用者の free に解放を委ねる。 */
+/* child が parent の下にあるか。正規化済みの絶対パスどうしで見る。
+ * **このファイルシステムはディレクトリのハードリンクを許さない**ので
+ * 実体とパスが 1 対 1 になり、文字列だけで判定してよい */
+static int path_is_under(const char* parent, const char* child) {
+    size_t i = 0;
+    while (parent[i] && parent[i] == child[i]) i++;
+    if (parent[i] != '\0') return 0;
+    return child[i] == '/';
+}
+
 static void exec_cache_invalidate(const char* raw_path) {
     if (!raw_path || !raw_path[0]) return;
     if (g_exec_cache_bytes == 0) return;   /* 未投入なら即 return (BKL 下) */
@@ -1739,6 +1758,23 @@ static void exec_cache_invalidate(const char* raw_path) {
     for (int i = 0; i < EXEC_CACHE_MAX; i++) {
         struct exec_cache_entry* e = &g_exec_cache[i];
         if (e->valid && !e->stale && strcmp_exact(e->path, norm)) {
+            if (e->in_use == 0) exec_cache_drop_locked(e);
+            else e->stale = 1;
+        }
+    }
+    spin_unlock_irqrestore(&g_exec_cache_lock, flags);
+}
+
+/* **ディレクトリを動かしたときに要る。**キャッシュはパスで引くので、
+ * 中身が丸ごと別の名前へ移ったのに古いパスの実行像が残っていると、
+ * もう無いはずのパスへの exec がキャッシュに当たって成功してしまう */
+static void exec_cache_invalidate_tree(const char* norm_dir) {
+    if (!norm_dir || !norm_dir[0]) return;
+    if (g_exec_cache_bytes == 0) return;
+    uint64_t flags = spin_lock_irqsave(&g_exec_cache_lock);
+    for (int i = 0; i < EXEC_CACHE_MAX; i++) {
+        struct exec_cache_entry* e = &g_exec_cache[i];
+        if (e->valid && !e->stale && path_is_under(norm_dir, e->path)) {
             if (e->in_use == 0) exec_cache_drop_locked(e);
             else e->stale = 1;
         }
@@ -3027,6 +3063,26 @@ int64_t fs_lseek(int fd, int64_t offset, int whence) {
     return new_offset;
 }
 
+/* ramfs の 1 件を解放して空き枠に戻す */
+static void ramfs_free_entry(struct ramfs_file* rf) {
+    if (rf->data && rf->capacity) {
+        void* phys_addr = (void*)VIRT_TO_PHYS((uint64_t)rf->data);
+        pmm_free(phys_addr, (int)(rf->capacity / PAGE_SIZE));
+    }
+    rf->in_use = 0;
+    rf->data = NULL;
+    rf->size = 0;
+    rf->capacity = 0;
+    rf->mode = 0;
+    rf->uid = 0;
+    rf->gid = 0;
+    rf->nlink = 0;
+    rf->atime_sec = 0;
+    rf->mtime_sec = 0;
+    rf->ctime_sec = 0;
+    rf->name[0] = '\0';
+}
+
 int fs_unlink(const char* path) {
     char resolved_path[256];
     if (!path) return -EFAULT;
@@ -3042,22 +3098,7 @@ int fs_unlink(const char* path) {
     for (int i = 0; i < MAX_RAMFS_FILES; i++) {
         if (ramfs_table[i].in_use && strcmp_exact(ramfs_table[i].name, path)) {
             if ((ramfs_table[i].mode & 0170000U) == KSTAT_MODE_DIR) return -EISDIR;
-            ramfs_table[i].in_use = 0;
-            if (ramfs_table[i].data && ramfs_table[i].capacity) {
-                void* phys_addr = (void*)VIRT_TO_PHYS((uint64_t)ramfs_table[i].data);
-                pmm_free(phys_addr, (int)(ramfs_table[i].capacity / PAGE_SIZE));
-                ramfs_table[i].data = NULL;
-            }
-            ramfs_table[i].size = 0;
-            ramfs_table[i].capacity = 0;
-            ramfs_table[i].mode = 0;
-            ramfs_table[i].uid = 0;
-            ramfs_table[i].gid = 0;
-            ramfs_table[i].nlink = 0;
-            ramfs_table[i].atime_sec = 0;
-            ramfs_table[i].mtime_sec = 0;
-            ramfs_table[i].ctime_sec = 0;
-            ramfs_table[i].name[0] = '\0';
+            ramfs_free_entry(&ramfs_table[i]);
             return 0; // 成功
         }
     }
@@ -3065,31 +3106,131 @@ int fs_unlink(const char* path) {
     return -ENOENT; // ファイルが見つからないか、TAR 内など削除できないファイル
 }
 
+/* ramfs は名前がフルパスの平らな表なので、ディレクトリを動かしたら
+ * 下にあるもの全部の名前を書き換える必要がある。
+ * check_only なら長さを見るだけで何も書かない —— **書き始めてから
+ * 「入り切らない」と分かっても引き返せない**ので、先に一周見る */
+static int ramfs_rename_subtree(const char* old_dir, const char* new_dir,
+                                int check_only) {
+    size_t cap = sizeof(ramfs_table[0].name);
+    size_t old_len = 0, new_len = 0;
+    int i;
+    while (old_dir[old_len]) old_len++;
+    while (new_dir[new_len]) new_len++;
+
+    for (i = 0; i < MAX_RAMFS_FILES; i++) {
+        struct ramfs_file* rf = &ramfs_table[i];
+        size_t len = 0;
+        if (!rf->in_use || !path_is_under(old_dir, rf->name)) continue;
+        while (rf->name[len]) len++;
+        if (len - old_len + new_len + 1 > cap) return -ENAMETOOLONG;
+    }
+    if (check_only) return 0;
+
+    for (i = 0; i < MAX_RAMFS_FILES; i++) {
+        struct ramfs_file* rf = &ramfs_table[i];
+        char buf[sizeof(ramfs_table[0].name)];
+        size_t n = 0, j;
+        if (!rf->in_use || !path_is_under(old_dir, rf->name)) continue;
+        for (j = 0; j < new_len; j++) buf[n++] = new_dir[j];
+        for (j = old_len; rf->name[j]; j++) buf[n++] = rf->name[j];
+        buf[n++] = '\0';
+        for (j = 0; j < n; j++) rf->name[j] = buf[j];
+    }
+    return 0;
+}
+
+static int ramfs_dir_has_children(const char* dir) {
+    for (int i = 0; i < MAX_RAMFS_FILES; i++) {
+        if (ramfs_table[i].in_use && path_is_under(dir, ramfs_table[i].name))
+            return 1;
+    }
+    return 0;
+}
+
+/* rename(2)。**「名前を付け替える」の一語で済む操作が、置き場所によって
+ * 3 通りに分かれる。**`/tmp` は RAM、それ以外は SD で、両者は本当に別の装置な
+ * ので、またぐときだけ EXDEV を返して mv の copy+unlink に退かせる */
 int fs_rename(const char* oldpath, const char* newpath) {
     char old_resolved[256];
     char new_resolved[256];
     const char* old_norm;
     const char* new_norm;
     struct ramfs_file* rf;
+    struct ramfs_file* rf_new;
+    int old_in_ram, new_in_ram;
+    int on_xv6fs;
+    size_t i;
+
     if (!oldpath || !newpath) return -EFAULT;
-    exec_cache_invalidate(oldpath);
-    exec_cache_invalidate(newpath);
     resolve_task_path(oldpath, old_resolved, sizeof(old_resolved));
     resolve_task_path(newpath, new_resolved, sizeof(new_resolved));
     old_norm = normalize_fs_path(old_resolved);
     new_norm = normalize_fs_path(new_resolved);
     if (*old_norm == '\0' || *new_norm == '\0') return -ENOENT;
+    /* 同じ名前どうしなら何もせずに成功 (POSIX) */
     if (strcmp_exact(old_norm, new_norm)) return 0;
-    if (find_ramfs(new_norm)) return -EEXIST;
+    /* 自分の子孫の下へは入れない */
+    if (path_is_under(old_norm, new_norm)) return -EINVAL;
+
+    exec_cache_invalidate(old_norm);
+    exec_cache_invalidate(new_norm);
+    /* 中身ごと動くかもしれないので、下にあった実行像も落とす */
+    exec_cache_invalidate_tree(old_norm);
+    exec_cache_invalidate_tree(new_norm);
+
+    on_xv6fs = (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted());
     rf = find_ramfs(old_norm);
-    if (!rf) return -ENOENT;
-    int i = 0;
-    for (; new_norm[i] && i + 1 < (int)sizeof(rf->name); i++) {
-        rf->name[i] = new_norm[i];
+    old_in_ram = (rf != 0);
+    /* 移動先に**新しく作るとしたら**どちらへ行くか。これが元と違えば別の装置 */
+    new_in_ram = (!on_xv6fs || path_is_under_tmp(new_norm) ||
+                  find_ramfs(new_norm) != 0);
+    if (old_in_ram != new_in_ram) return -EXDEV;
+
+    if (!old_in_ram) {
+        if (!on_xv6fs) return -ENOENT;
+        return xv6fs_rename_path(old_norm, new_norm);
     }
+
+    /* --- ここから RAM 側。**断る条件と長さを全部見てから書き始める** --- */
+    rf_new = find_ramfs(new_norm);
+    if (rf_new && rf_new != rf) {
+        int old_is_dir = (rf->mode & 0170000U) == KSTAT_MODE_DIR;
+        int new_is_dir = (rf_new->mode & 0170000U) == KSTAT_MODE_DIR;
+        if (old_is_dir && !new_is_dir) return -ENOTDIR;
+        if (!old_is_dir && new_is_dir) return -EISDIR;
+        if (new_is_dir && ramfs_dir_has_children(new_norm)) return -ENOTEMPTY;
+    }
+    for (i = 0; new_norm[i]; i++) { }
+    if (i + 1 > sizeof(rf->name)) return -ENAMETOOLONG;
+    if ((rf->mode & 0170000U) == KSTAT_MODE_DIR) {
+        int rc = ramfs_rename_subtree(old_norm, new_norm, 1);
+        if (rc < 0) return rc;
+    }
+
+    if (rf_new && rf_new != rf) ramfs_free_entry(rf_new);
+    if ((rf->mode & 0170000U) == KSTAT_MODE_DIR) {
+        ramfs_rename_subtree(old_norm, new_norm, 0);
+    }
+    for (i = 0; new_norm[i]; i++) rf->name[i] = new_norm[i];
     rf->name[i] = '\0';
     rf->ctime_sec = fs_now_sec();
     return 0;
+}
+
+int fs_renameat(int olddirfd, const char* oldpath,
+                int newdirfd, const char* newpath, unsigned int flags) {
+    char old_resolved[256];
+    char new_resolved[256];
+    /* RENAME_NOREPLACE(1) / RENAME_EXCHANGE(2) / RENAME_WHITEOUT(4) は未対応。
+     * **黙って普通の rename にすると上書き事故になる**ので EINVAL で断る */
+    if (flags != 0) return -EINVAL;
+    if (!oldpath || !newpath) return -EFAULT;
+    if (resolve_dirfd_path(olddirfd, oldpath, old_resolved, sizeof(old_resolved)) < 0)
+        return -ENOENT;
+    if (resolve_dirfd_path(newdirfd, newpath, new_resolved, sizeof(new_resolved)) < 0)
+        return -ENOENT;
+    return fs_rename(old_resolved, new_resolved);
 }
 
 int fs_chmod(const char* path, uint32_t mode) {

@@ -25,6 +25,11 @@
 #define LINUX_SYS_MKDIRAT          34
 #define LINUX_SYS_UNLINKAT         35
 #define LINUX_SYS_LINKAT           37
+/* **rename(2) はアーキで番号が違う。**aarch64 は asm-generic の
+ * __ARCH_WANT_RENAMEAT が立っているので musl は renameat(38) を出し、
+ * riscv64 は 38 が未割り当てで renameat2(276) を出す。両方受けないと
+ * 片方のアーキで基本の rename が ENOSYS になる */
+#define LINUX_SYS_RENAMEAT         38
 #define LINUX_SYS_TRUNCATE         45
 #define LINUX_SYS_FTRUNCATE        46
 #define LINUX_SYS_FACCESSAT        48

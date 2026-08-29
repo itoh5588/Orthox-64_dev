@@ -831,6 +831,22 @@ $(AARCH64_FP_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
 
 aarch64-fp-probe: $(AARCH64_FP_PROBE_ELF)
 
+# rename(2) の検査。**番号がアーキで違うところで落ちていた** (aarch64 は
+# renameat(38)、riscv64 は renameat2(276))。mv は rename が失敗しても
+# copy+unlink に退くので、mv では検出できない
+AARCH64_RENAME_PROBE_ELF = out/aarch64-rename-probe.elf
+$(AARCH64_RENAME_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_rename_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_rename_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-rename-probe: $(AARCH64_RENAME_PROBE_ELF)
+
+aarch64-rename-smoke: $(AARCH64_RENAME_PROBE_ELF)
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/rename-probe
+	bash ./tests/aarch64_rename_smoke.sh
+
 aarch64-fp-smoke: $(AARCH64_FP_PROBE_ELF)
 	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/fp-probe
 	bash ./tests/aarch64_fp_smoke.sh
