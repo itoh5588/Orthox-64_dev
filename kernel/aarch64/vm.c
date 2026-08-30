@@ -1043,10 +1043,22 @@ void arch_vm_destroy_user_address_space(arch_address_space_t address_space) {
     aarch64_vm_destroy_table((uint64_t)address_space, 1);
 }
 
+/* **張ったら必ずバリアを置く。**
+ *
+ * aarch64_vm_map_page は descriptor を書くだけで dsb も tlbi もしない。
+ * exec の入口は張り終えたあとに TTBR0 を差し替えて vmalle1 を打つので
+ * 偶然通っていたが、**走っているタスクに後から 1 枚足す道** (スタックを
+ * 伸ばす task_grow_user_stack) では、書いたことがテーブルウォーカに
+ * 見えている保証がない。
+ *
+ * 無効な descriptor は TLB に入らない決まりなので tlbi は要らないはずだが、
+ * aarch64_vm_flush_va は dsb ishst → tlbi → dsb ish → isb をまとめて
+ * やってくれる。**ここは正しさを優先する。** */
 void arch_vm_map_page(arch_address_space_t address_space, uint64_t vaddr,
                       uint64_t paddr, uint64_t flags) {
     if (!address_space) return;
     WITH_ROOT(address_space, aarch64_vm_map_page(vaddr, paddr, flags));
+    aarch64_vm_flush_va(vaddr);
 }
 
 /* **必ず 4KB ページで張る。** 共有層が張るのはユーザーのページで、
