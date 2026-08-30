@@ -298,10 +298,16 @@ enum {
     AT_RANDOM = 25,
 };
 
-int task_prepare_initial_user_stack(arch_address_space_t address_space, struct task* t,
-                                    const struct elf_info* info,
-                                    const struct elf_info* interp_info,
-                                    char* const argv[], char* const envp[]) {
+/* **ptrs はカーネルスタックに置かないこと。**カーネルスタックは 4 ページ
+ * (16KB) しか無いのに、EXEC_MAX_VEC_STRINGS 個 x 8 バイト x 2 は 32KB ある。
+ * ここに置いて溢れさせると、ユーザのレジスタにカーネルの番地が載って
+ * EL0 から踏む —— ESR=0x9200000e (permission fault) で落ちた (2026-08-30)。
+ * 外側のラッパがヒープから渡す。 */
+static int prepare_user_stack_with_ptrs(arch_address_space_t address_space, struct task* t,
+                                        const struct elf_info* info,
+                                        const struct elf_info* interp_info,
+                                        char* const argv[], char* const envp[],
+                                        uint64_t* env_ptrs, uint64_t* arg_ptrs) {
     uint8_t* stack_pages[USER_STACK_PAGES];
     for (int i = 0; i < USER_STACK_PAGES; i++) stack_pages[i] = 0;
     if (alloc_user_stack(address_space, t, USER_STACK_PAGES, stack_pages) < 0) {
@@ -311,7 +317,6 @@ int task_prepare_initial_user_stack(arch_address_space_t address_space, struct t
 
     int argc = 0; if (argv) while (argv[argc]) argc++;
     int envc = 0; if (envp) while (envp[envc]) envc++;
-    uint64_t env_ptrs[EXEC_MAX_VEC_STRINGS]; uint64_t arg_ptrs[EXEC_MAX_VEC_STRINGS];
     /* **上限を超えたら失敗させること。** 以前はここで argc / envc を
      * EXEC_MAX_VEC_STRINGS に詰めていたが、それは「超えた分を黙って捨てて
      * 成功を返す」ことになる。呼び出し側は成功したと思って先に進むので、
@@ -410,6 +415,29 @@ int task_prepare_initial_user_stack(arch_address_space_t address_space, struct t
 
     t->user_stack = current_str_addr;
     return 0;
+}
+
+/* ポインタ表を置く場所。**カーネルスタックでは足りない** (上の注記)。
+ * 2048 個 x 8 バイト x 2 = 32KB = 8 ページ */
+#define EXEC_PTRS_PAGES ((EXEC_MAX_VEC_STRINGS * 8 * 2 + 4095) / 4096)
+
+int task_prepare_initial_user_stack(arch_address_space_t address_space, struct task* t,
+                                    const struct elf_info* info,
+                                    const struct elf_info* interp_info,
+                                    char* const argv[], char* const envp[]) {
+    void* ptrs_phys;
+    uint64_t* base;
+    int rc;
+    ptrs_phys = pmm_alloc(EXEC_PTRS_PAGES);
+    if (!ptrs_phys) {
+        puts("Exec: ポインタ表が取れない\r\n");
+        return -1;
+    }
+    base = (uint64_t*)PHYS_TO_VIRT(ptrs_phys);
+    rc = prepare_user_stack_with_ptrs(address_space, t, info, interp_info, argv, envp,
+                                      base, base + EXEC_MAX_VEC_STRINGS);
+    pmm_free(ptrs_phys, EXEC_PTRS_PAGES);
+    return rc;
 }
 
 int task_execve(arch_syscall_frame_t* frame, const char* path, char* const argv[], char* const envp[]) {
