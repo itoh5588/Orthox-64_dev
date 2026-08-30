@@ -25,9 +25,18 @@
  * Linux も 1 本ごとではなく合計 (ARG_MAX) で見る。同じ形にする。
  * 副産物として、exec 1 回あたりの確保が 1MB から 272KB に減る。 */
 #define EXEC_ARG_TOTAL       (256 * 1024)
-#define EXEC_COPY_PAGES      68
+#define EXEC_COPY_PAGES      80
 #define EXEC_MAX_PATH_LEN    1024
-#define EXEC_MAX_VEC_STRINGS 128
+/* argv + envp の本数。**128 では GCC が組めない。**
+ *
+ * make が下位ディレクトリへ降りるときに渡す環境と引数だけで 128 本を
+ * 超える (libiberty の stamp-picdir という 3 行のルールで超えた)。
+ * リンクはもっと要る —— `ar rcs libbackend.a *.o` は 344 個。
+ *
+ * Linux の MAX_ARG_STRINGS は 0x7FFFFFFF で、**実際の制限は合計サイズだけ。**
+ * ここも本数はポインタ配列の大きさでしかないので、広く取って
+ * EXEC_ARG_TOTAL で頭打ちにする。2048 本 × 平均 128 バイトで丁度 256KB。 */
+#define EXEC_MAX_VEC_STRINGS 2048
 /* 引数が多すぎるときに返す errno。共有カーネルには errno ヘッダが無いので
  * kernel/fs.c と同じくファイル内で定義する (Linux asm-generic の値) */
 #define E2BIG 7
