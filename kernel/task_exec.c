@@ -231,6 +231,49 @@ static int alloc_user_stack(arch_address_space_t address_space, struct task* t, 
     return 0;
 }
 
+/* スタックの下端へのフォルトを埋める。**呼ぶのは EL0 のフォルト処理から。**
+ *
+ * 落ちた番地が「まだ張っていないスタックの範囲」なら、そこまで 1 ページずつ
+ * 張り足して 0 を返す。呼び出し元は落ちた命令をやり直させる。範囲の外なら
+ * -1 を返し、呼び出し元がタスクを落とす。
+ *
+ * **上限を越えたときは伸ばさない。** 無限再帰を黙って 8MiB 食わせてから
+ * 落とすより、決めた所で止めた方が原因が分かる。
+ *
+ * 訳は task_internal.h の USER_STACK_MAX_PAGES に書いた。 */
+int task_grow_user_stack(struct task* t, uint64_t fault_addr) {
+    arch_address_space_t address_space;
+    uint64_t limit, page_va;
+
+    if (!t || !t->user_stack_top) return -1;
+
+    address_space = (arch_address_space_t)arch_task_context_get_address_space(&t->ctx);
+    if (!address_space) return -1;
+
+    /* 張ってある所で落ちたなら別の理由 (権限違反など)。ここでは扱わない */
+    if (fault_addr >= t->user_stack_bottom) return -1;
+    if (fault_addr >= t->user_stack_top) return -1;
+
+    limit = t->user_stack_top - (uint64_t)USER_STACK_MAX_PAGES * PAGE_SIZE;
+    if (fault_addr < limit) return -1;          /* 上限を越えた */
+
+    page_va = fault_addr & ~((uint64_t)PAGE_SIZE - 1);
+
+    /* **下端から落ちた番地まで隙間なく張る。** 大きなフレームを一度に
+     * 掘る関数だと、間のページを飛ばして下を触りに来ることがある */
+    while (t->user_stack_bottom > page_va) {
+        uint64_t va = t->user_stack_bottom - PAGE_SIZE;
+        void* phys = pmm_alloc(1);
+        if (!phys) return -1;
+        kernel_memset((uint8_t*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
+        arch_vm_map_page(address_space, va, (uint64_t)phys,
+                         arch_vm_user_page_flags(1, 0));
+        t->user_stack_bottom = va;
+    }
+    t->user_stack_guard = t->user_stack_bottom - PAGE_SIZE;
+    return 0;
+}
+
 static int stack_write_bytes(uint8_t* stack_pages[], uint64_t mapped_bottom_vaddr,
                              uint64_t stack_top_vaddr, uint64_t user_addr,
                              const void* src, int len) {

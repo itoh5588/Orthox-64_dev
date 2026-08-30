@@ -151,6 +151,10 @@ void task_on_timer_tick(void);
 /* 期限切れの sleep/IO 待ちを起こす。task_on_timer_tick から呼ばれるほか、
  * 割り込みに頼れない環境ではブロック待ちループ側からも直接呼ぶ */
 int task_poll_sleep_wakeups(void);
+/* スタックの下端へのフォルトを 1 ページずつ埋める。成功 0 / 断るなら -1。
+ * 訳は kernel/task_internal.h の USER_STACK_MAX_PAGES に書いた */
+int task_grow_user_stack(struct task* t, uint64_t fault_addr);
+
 int task_prepare_initial_user_stack(arch_address_space_t address_space, struct task* t,
                                     const struct elf_info* info,
                                     const struct elf_info* interp_info,

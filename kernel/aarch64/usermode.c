@@ -349,6 +349,19 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
         return;
     }
 
+    /* ---- スタックの下端なら伸ばして、落ちた命令をやり直させる ----------
+     *
+     * DFSC が 0b0001xx なら変換フォールト (下位 2bit が段)。張っていない
+     * ページを触ったということなので、スタックの範囲内かを task 側で見て
+     * もらう。**ELR は進めない。**同じ命令をもう一度実行させる。
+     *
+     * 2026-08-30、GCC の cc1 が insn-attrtab.c で 252KiB を使い切って
+     * ここに落ちた (ESR=0x92000047, FAR=0x3ffffbfe60)。 */
+    if (ec == ESR_EC_DABT_LOW && ((esr & 0x3fULL) >> 2) == 0x1ULL) {
+        struct task* cur = get_current_task();
+        if (cur && cur->ppid != 0 && task_grow_user_stack(cur, far) == 0) return;
+    }
+
     /* 想定外。**黙って戻らない。** ユーザーを再開させると同じ所で
      * 落ち続けて無限ループになる */
     aarch64_dump_bad_user_frame(frame, esr, far);

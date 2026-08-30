@@ -26,6 +26,20 @@
 #define USER_STACK_PAGES       64
 #define USER_STACK_GUARD_PAGES 1
 
+/* **スタックは足りなくなったら伸ばす (task_grow_user_stack)。**
+ *
+ * 2026-08-30、GCC の `make all-host` が insn-attrtab.o で落ちた。cc1 が
+ * `ESR=0x92000047` (下位 EL からのデータアボート、L3 の変換フォールト、
+ * 書き込み)、`FAR=0x3ffffbfe60`、`SP0=0x3ffffbfec0`。
+ * `sp_top - SP0 = 0x3f140` = 252KiB で、USER_STACK_PAGES 64 からガード 1 枚を
+ * 引いた 63 ページとぴったり一致した。**ガードページを踏んでいた。**
+ *
+ * **最初から 8MiB 張ってはいけない。** alloc_user_stack は全ページを即座に
+ * 張り、fork は aarch64_vm_clone_table で張ってある分を全部写す。同じ日の
+ * 標本で vm_clone_table は既に 3% (21/736) を占めており、32 倍にすると
+ * ここが支配的になる。**入口は 64 ページのまま、要るタスクだけ伸ばす。** */
+#define USER_STACK_MAX_PAGES   2048    /* 上限 8MiB。Linux の既定と同じ */
+
 #define MSR_FS_BASE        0xC0000100
 #define MSR_GS_BASE        0xC0000101
 #define MSR_KERNEL_GS_BASE 0xC0000102
