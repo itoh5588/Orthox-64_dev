@@ -53,6 +53,21 @@ static uint64_t g_used;
 static uint64_t g_bitmap_pa;    /* ビットマップの物理アドレス (管理領域の中) */
 static uint64_t g_refcount_pa;  /* refcount の物理アドレス (同上) */
 static uint64_t g_meta_pages;   /* 管理情報が占めるページ数 */
+static uint64_t g_next_page;    /* next-fit の起点。訳は pmm_claim_locked に */
+
+/* これ以上の連なりは起点を使わず 0 から探す。16 頁 = 64KiB */
+#define PMM_BIG_PAGES 16
+
+/* **走査した長さを数える (P-10 の計器)。**
+ *
+ * 2026-08-30、next-fit を入れた直後の実機で cc1 が 30 分以上 pmm_alloc に
+ * 張り付いた ([pc] の占有 100%)。残量だけでは「起点から末尾まで空きが
+ * 無くて毎回 2 周している」のか「単に確保が多い」のかが分からない。
+ * **1 回の確保で何ページ見たかを出せば一発で決まる。**
+ * next-fit が効いていれば数ページ、効いていなければ数十万になる。 */
+static uint64_t g_scan_pages;   /* 走査したページ数の累計 */
+static uint64_t g_claim_calls;  /* pmm_claim_locked を呼んだ回数 */
+static uint64_t g_claim_wrap;   /* 2 周目まで行った回数 */
 static int      g_meta_fault;   /* 管理情報を置けなかった (穴の上だった) */
 
 /* **管理情報は物理アドレスで持つ。**
@@ -100,6 +115,7 @@ void aarch64_pmm_init(void) {
     g_base_pa = 0;
     g_pages = 0;
     g_used = 0;
+    g_next_page = 0;
     g_bitmap_pa = 0;
     g_refcount_pa = 0;
     g_meta_pages = 0;
@@ -233,29 +249,98 @@ void aarch64_pmm_init(void) {
  * 配られないので、長い memset をロックの中に入れる理由がない。 */
 static spinlock_t g_pmm_lock;
 
-/* ロックを持った状態で呼ぶこと。ビットを立てて g_used を進めるだけで、
- * **0 埋めはしない**。失敗は 0。 */
-static uint64_t pmm_claim_locked(uint64_t pages) {
+/* **次に見る場所を覚える (next-fit)。** 毎回ページ 0 から走ると、使用中が
+ * 増えるほど走査が伸びる。Pi 4 の 1GiB は 262,144 ページある。
+ *
+ * 2026-08-30、GCC の `make all-host` を回しながら標本化プロファイラで
+ * 測った。直近 200 区間 736 標本のうち **399 (58%) が pmm_alloc の
+ * 割り込み禁止区間で tick を跨いでいた** (首位を取った区間の平均占有
+ * 57.5%、中央値 59%)。2 位は fbcon_newline の 66、3 位は
+ * aarch64_vm_clone_table の 21 で、桁がひとつ違う。
+ *
+ * 起点を持ち回れば、直前に取れた場所の続きから見るので普通は数ページで
+ * 当たる。
+ *
+ * **ただし解放したら起点をそこまで戻す。** 戻さない素の next-fit を
+ * 同じ日に実機へ入れて失敗した。穴を飛ばして前へ進み続けるので、
+ * 使用中が全体に薄く散らばる。使用 114,455 / 1,030,724 頁 (11%) で
+ * 平均間隔が 9 頁になり、**1024 頁 (4MiB) の連なりが 1 つも無くなった。**
+ * ramfs_grow (/tmp は RAM 上、cc1 の一時 .s が 2 倍成長で 4MiB に届く) が
+ * 毎分 6000 回失敗し、そのたびに全頁を 2 周して CPU を 100% 使い切った。
+ *
+ * 戻せば手前の穴から埋まるので前方が密に保たれ (first-fit の利点)、
+ * かつ起点が穴の位置なので走査は短いまま (next-fit の利点)。
+ *
+ * **大きな連なりは初めから前を見る。** 小さい確保が多少散らばっても、
+ * 0 から探せば手前の詰まった領域を飛ばして空きに当たる */
+
+/* [from, to) を走査して pages 個の連なりを探す。見つけたら**先頭 + 1** を
+ * 返す (0 を「なし」に使うため)。ロックを持った状態で呼ぶこと。 */
+static uint64_t pmm_scan_locked(uint64_t from, uint64_t to, uint64_t pages) {
     uint64_t run = 0, start = 0;
 
-    if (pages == 0 || g_pages == 0) return 0;
-
-    for (uint64_t page = 0; page < g_pages; page++) {
+    if (to > from) g_scan_pages += to - from;   /* 見込み。抜けた分は下で引く */
+    for (uint64_t page = from; page < to; page++) {
         if (pmm_test(page)) { run = 0; continue; }
         if (run == 0) start = page;
         if (++run == pages) {
-            for (uint64_t i = 0; i < pages; i++) pmm_set(start + i);
-            g_used += pages;
-            return g_base_pa + start * AARCH64_PAGE_SIZE;
+            g_scan_pages -= to - (page + 1);   /* 途中で見つけた分を戻す */
+            return start + 1;
         }
     }
     return 0;
+}
+
+/* ロックを持った状態で呼ぶこと。ビットを立てて g_used を進めるだけで、
+ * **0 埋めはしない**。失敗は 0。 */
+static uint64_t pmm_claim_locked(uint64_t pages) {
+    uint64_t start, tail;
+
+    if (pages == 0 || g_pages == 0) return 0;
+    if (g_next_page >= g_pages) g_next_page = 0;
+    g_claim_calls++;
+
+    /* **大きな連なりは前から探す。**起点から見ると、後ろの散らばった
+     * 領域ばかり当たって毎回 2 周することになる */
+    if (pages >= PMM_BIG_PAGES) {
+        start = pmm_scan_locked(0, g_pages, pages);
+        if (!start) return 0;
+        start--;
+        for (uint64_t i = 0; i < pages; i++) pmm_set(start + i);
+        g_used += pages;
+        return g_base_pa + start * AARCH64_PAGE_SIZE;
+    }
+
+    /* 起点から末尾まで。普通はここで当たる */
+    start = pmm_scan_locked(g_next_page, g_pages, pages);
+    if (!start) {
+        /* **一周する。**起点をまたぐ連なりも拾えるよう、終端を pages - 1
+         * だけ伸ばす (g_pages で頭打ち)。[g_next, g_pages) と
+         * [0, g_next + pages - 1) で全ページを覆う。ここに来るのは
+         * 空きが尽きかけた時だけ */
+        g_claim_wrap++;
+        tail = g_next_page + pages - 1;
+        if (tail > g_pages) tail = g_pages;
+        start = pmm_scan_locked(0, tail, pages);
+        if (!start) return 0;
+    }
+    start--;
+
+    for (uint64_t i = 0; i < pages; i++) pmm_set(start + i);
+    g_used += pages;
+    g_next_page = start + pages;
+    return g_base_pa + start * AARCH64_PAGE_SIZE;
 }
 
 /* ロックを持った状態で呼ぶこと。 */
 static void pmm_release_locked(uint64_t pa, uint64_t pages) {
     if (!pa || pa < g_base_pa) return;
     uint64_t start = (pa - g_base_pa) / AARCH64_PAGE_SIZE;
+
+    /* **起点をここまで戻す。**手前の穴から埋め直させて、前方を密に保つ
+     * (訳は pmm_claim_locked のコメント) */
+    if (start < g_next_page) g_next_page = start;
+
     for (uint64_t i = 0; i < pages && start + i < g_pages; i++) {
         if (pmm_test(start + i)) g_used--;
         pmm_clear(start + i);
@@ -263,10 +348,17 @@ static void pmm_release_locked(uint64_t pa, uint64_t pages) {
 }
 
 /* ロックの外で呼ぶ。**MMU の前後どちらでも触れるように経路を選ぶ** */
+/* **8 バイト単位で埋める。**
+ *
+ * 元は `p[i] = 0` のバイトループで、-O2 でも strb 2 本の繰り返しにしか
+ * ならなかった (4KiB あたり 2048 周)。2026-08-30 の実機プロファイルで、
+ * next-fit を入れたあとの pmm_alloc の滞在先はこの 0 埋めループだった。
+ * ページは 4KiB 境界に揃っているので 8 バイト書きで安全に埋まる。 */
 static void pmm_zero_pages(uint64_t pa, uint64_t pages) {
-    uint8_t* p = (uint8_t*)(uintptr_t)(aarch64_vm_running_high()
-                                       ? aarch64_phys_to_virt(pa) : pa);
-    for (uint64_t i = 0; i < pages * AARCH64_PAGE_SIZE; i++) p[i] = 0;
+    uint64_t* p = (uint64_t*)(uintptr_t)(aarch64_vm_running_high()
+                                         ? aarch64_phys_to_virt(pa) : pa);
+    uint64_t n = pages * (AARCH64_PAGE_SIZE / 8);
+    for (uint64_t i = 0; i < n; i++) p[i] = 0;
 }
 
 /* 連続した pages 枚を確保して**物理アドレス**を返す。0 なら失敗。
@@ -288,6 +380,30 @@ void aarch64_pmm_free(uint64_t pa, uint64_t pages) {
 }
 
 uint64_t aarch64_pmm_base(void)  { return g_base_pa; }
+/* 60 秒ごとの計器。区間ごとに見たいので、出したら 0 に戻す */
+void aarch64_pmm_scan_report(void) {
+    uint64_t calls = g_claim_calls, scan = g_scan_pages, wrap = g_claim_wrap;
+
+    g_claim_calls = 0; g_scan_pages = 0; g_claim_wrap = 0;
+    if (calls == 0) return;
+
+    aarch64_uart_puts("[pmm] 60s  確保 ");
+    aarch64_uart_putdec64(calls);
+    aarch64_uart_puts("回  走査 ");
+    aarch64_uart_putdec64(scan);
+    aarch64_uart_puts("頁  1回あたり ");
+    aarch64_uart_putdec64(scan / calls);
+    aarch64_uart_puts("頁  2周 ");
+    aarch64_uart_putdec64(wrap);
+    aarch64_uart_puts("回  使用 ");
+    aarch64_uart_putdec64(g_used);
+    aarch64_uart_puts("/");
+    aarch64_uart_putdec64(g_pages);
+    aarch64_uart_puts("頁  起点 ");
+    aarch64_uart_putdec64(g_next_page);
+    aarch64_uart_puts("\n");
+}
+
 uint64_t aarch64_pmm_total(void) { return g_pages; }
 uint64_t aarch64_pmm_used(void)  { return g_used; }
 

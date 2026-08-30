@@ -204,6 +204,9 @@ static const char *task_state_name(task_state_t s) {
     }
 }
 
+void aarch64_pmm_scan_report(void);
+void xv6log_commit_report(void);
+
 static void tasks_report(void) {
     struct task *t = task_list;
     int n = 0;
@@ -340,6 +343,16 @@ static void cpu_stats_report(void) {
      * 並べて読めるように、続けて出す。**量では説明がつかないと分かって
      * いる**ので、見たいのは回数と 1 回あたりの待ち (日報2026-08-29 §14) */
     aarch64_emmc2_io_report();
+
+    /* **物理ページの確保が何ページ走っているか (P-10 の計器)。**
+     * next-fit が効いていれば 1 回あたり数ページ、効いていなければ
+     * 数十万ページになる。原因を推し量らずに済ませるために出す */
+    aarch64_pmm_scan_report();
+
+    /* **ログのコミットがどう束ねられているか。**
+     * SD の書き込みが 1 回 15ms かかっていたので、区間長が伸びているかを
+     * 並べて読めるようにする (2026-08-30) */
+    xv6log_commit_report();
 }
 
 void aarch64_timer_on_tick(struct aarch64_trap_frame* frame) {
