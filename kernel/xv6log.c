@@ -82,6 +82,20 @@ static struct wait_queue lg_wait;
 static void commit(void);
 static void recover_from_log(void);
 
+/* ---- コミットの計器 (2026-08-30) ----------------------------------------
+ *
+ * SD の書き込みが 1 回 15ms かかっていた (素の性能は 1〜2ms)。分布は
+ * **2 セクタ = 1 ブロックが大半**で、束ね書き (P-5) が効いていない疑いが
+ * あった。推し量らずに済ませるため、コミットの回数・1 回あたりのブロック
+ * 数・書き戻しの区間長を数えて出す。
+ *
+ * **install_trans から触るので、それより前に置くこと。** */
+static uint64_t g_commits;      /* commit() を呼んだ回数 */
+static uint64_t g_log_blocks;   /* ログに載せたブロックの総数 */
+static uint64_t g_install_runs; /* install_trans が発行した区間の数 */
+
+void xv6log_commit_report(void);   /* timer から呼ぶ */
+
 /* ------------------------------------------------------------------ */
 /* 初期化                                                              */
 /* ------------------------------------------------------------------ */
@@ -164,7 +178,7 @@ static void install_trans(int recovering) {
             xv6brelse(dbuf);
         }
 
-        if (!staged) { tail++; continue; }
+        if (!staged) { g_install_runs++; tail++; continue; }
 
         /* 宛先が連番で続くあいだ伸ばす。伸ばした分もキャッシュを更新する */
         while (tail + run < lg.lh.n &&
@@ -178,6 +192,7 @@ static void install_trans(int recovering) {
             run++;
         }
 
+        g_install_runs++;
         if (xv6bio_rw_run(lg.dev, (uint32_t)lg.lh.block[tail], (uint32_t)run,
                           g_stage + (size_t)tail * XV6FS_BSIZE, 1) != 0) {
             /* 束ねて書けなかった。**同じ区間を 1 ブロックずつ出し直す** */
@@ -395,14 +410,52 @@ static void write_log(void) {
     }
 }
 
+/* **宛先のブロック番号で並べ替えてからコミットする。**
+ *
+ * lg.lh.block[] は xv6log_write が呼ばれた順、つまり「データ、間接ブロック、
+ * inode、ビットマップ」が混ざった順に並ぶ。install_trans は連番の区間だけを
+ * 1 コマンドにまとめるので、**混ざっていると区間が 1 で切れる。**
+ *
+ * 並べ替えれば write_log が g_stage に集める順も同じになり (ログ領域は
+ * どのみち連続に書く)、install_trans の区間が最大まで伸びる。
+ * **ログヘッダに載る順が変わるが、復旧は 1 ブロックずつ独立に書き戻す**
+ * ので順序に依存しない。n は最大 126 なので挿入ソートで十分。 */
+static void sort_log_blocks(void) {
+    for (int i = 1; i < lg.lh.n; i++) {
+        int v = lg.lh.block[i];
+        int j = i - 1;
+        while (j >= 0 && lg.lh.block[j] > v) {
+            lg.lh.block[j + 1] = lg.lh.block[j];
+            j--;
+        }
+        lg.lh.block[j + 1] = v;
+    }
+}
+
 static void commit(void) {
     if (lg.lh.n > 0) {
+        g_commits++;
+        g_log_blocks += (uint64_t)lg.lh.n;
+        sort_log_blocks();
         write_log();
         write_head();
         install_trans(0);
         lg.lh.n = 0;
         write_head();
     }
+}
+
+/* 60 秒ごとの計器。出したら 0 に戻す */
+void xv6log_commit_report(void) {
+    uint64_t c = g_commits, b = g_log_blocks, r = g_install_runs;
+
+    g_commits = 0; g_log_blocks = 0; g_install_runs = 0;
+    if (c == 0) return;
+
+    xv6log_print("[log] 60s  commit %u回  載せた %u頁  1回あたり %u頁  "
+                 "書き戻し %u区間  区間長 %u頁\n",
+                 (unsigned)c, (unsigned)b, (unsigned)(b / c), (unsigned)r,
+                 (unsigned)(r ? b / r : 0));
 }
 
 /* ------------------------------------------------------------------ */
