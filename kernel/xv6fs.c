@@ -238,20 +238,48 @@ static void xv6bzero(uint32_t dev, uint32_t bno) {
     xv6brelse(bp);
 }
 
+/* **次に見るビットマップブロックを覚える。**
+ *
+ * 元は毎回ブロック 0 から走っていた。xv6fs は 1,572,864 ブロックあり、
+ * ビットマップは 192 ブロックに分かれている。使用済みが増えるほど毎回の
+ * 走査が伸びるので、大きなファイルを作ると **O(n^2)** になる。
+ *
+ * 2026-08-30 の実機で、gcc の libbackend.a (40〜60MiB) を ar が書く間、
+ * [pc] の 78% が balloc に居座った。物理ページの pmm_claim_locked が
+ * 同じ形をしていて同じ日に直したばかりで、こちらも同じ手で直る。
+ *
+ * **bfree では起点をそこまで戻す。** 戻さないと穴を飛ばして進み続け、
+ * 使用中が薄く散らばる (pmm で実測して痛い目を見た。
+ * kernel/aarch64/pmm.c の pmm_claim_locked のコメントに経緯がある)。 */
+static uint32_t g_balloc_hint;   /* 次に見るブロック番号 (BPB 境界に丸めて使う) */
+
 static uint32_t balloc(uint32_t dev) {
-    for (uint32_t b = 0; b < g_sb.size; b += XV6FS_BPB) {
-        struct xv6buf *bp = xv6bread(dev, XV6FS_BBLOCK(b, g_sb));
-        for (uint32_t bi = 0; bi < XV6FS_BPB && b + bi < g_sb.size; bi++) {
-            int m = 1 << (bi % 8);
-            if ((bp->data[bi / 8] & m) == 0) {
-                bp->data[bi / 8] |= (uint8_t)m;
-                xv6log_write(bp);
-                xv6brelse(bp);
-                xv6bzero(dev, b + bi);
-                return b + bi;
+    uint32_t start = (g_balloc_hint / XV6FS_BPB) * XV6FS_BPB;
+    uint32_t pass;
+
+    if (start >= g_sb.size) start = 0;
+
+    /* 起点から末尾まで見て、駄目なら先頭から起点まで。2 周で全部を覆う */
+    for (pass = 0; pass < 2; pass++) {
+        uint32_t from = (pass == 0) ? start : 0;
+        uint32_t to   = (pass == 0) ? g_sb.size : start + XV6FS_BPB;
+        if (to > g_sb.size) to = g_sb.size;
+
+        for (uint32_t b = from; b < to; b += XV6FS_BPB) {
+            struct xv6buf *bp = xv6bread(dev, XV6FS_BBLOCK(b, g_sb));
+            for (uint32_t bi = 0; bi < XV6FS_BPB && b + bi < g_sb.size; bi++) {
+                int m = 1 << (bi % 8);
+                if ((bp->data[bi / 8] & m) == 0) {
+                    bp->data[bi / 8] |= (uint8_t)m;
+                    xv6log_write(bp);
+                    xv6brelse(bp);
+                    xv6bzero(dev, b + bi);
+                    g_balloc_hint = b + bi;
+                    return b + bi;
+                }
             }
+            xv6brelse(bp);
         }
-        xv6brelse(bp);
     }
     xv6fs_print("xv6fs balloc: out of blocks\n");
     return 0;
@@ -259,6 +287,10 @@ static uint32_t balloc(uint32_t dev) {
 
 static void bfree(uint32_t dev, uint32_t b) {
     struct xv6buf *bp = xv6bread(dev, XV6FS_BBLOCK(b, g_sb));
+
+    /* 手前の穴から埋め直させる (訳は balloc のコメント) */
+    if (b < g_balloc_hint) g_balloc_hint = b;
+
     uint32_t bi = b % XV6FS_BPB;
     int m = 1 << (bi % 8);
     KASSERT((bp->data[bi / 8] & m) != 0);
