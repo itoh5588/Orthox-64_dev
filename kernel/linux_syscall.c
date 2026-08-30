@@ -1754,8 +1754,26 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             arch_syscall_set_return(frame, (uint64_t)(int64_t)sys_sync());
             return;
         case LINUX_SYS_UTIMENSAT:
-            /* xv6fs はタイムスタンプを持たないため touch を成功扱いにする */
-            arch_syscall_set_return(frame, 0);
+            /* **無条件に 0 を返してはいけない (2026-08-30)。**
+             *
+             * busybox の touch は「まず utimensat を試し、ENOENT なら
+             * open(O_CREAT) で作る」という順で動く。ここが常に成功を返すと
+             * **touch がファイルを作らなくなる。**
+             *
+             * GCC の configure がこれで落ちていた —— 依存形式の検査が
+             * `touch sub/conftst$i.h` でヘッダを 6 つ用意するのに 1 つも
+             * 作られず、14 方式すべてが「conftst1.h が無い」で失敗して
+             * 「no usable dependency style found」になっていた。
+             *
+             * fs_utimensat は最初から**存在しなければ ENOENT を返す**
+             * 正しい実装だった。呼んでいなかっただけ。
+             * (元のコメントの「xv6fs はタイムスタンプを持たない」は、
+             *  mtime を入れた時点で古くなっていた) */
+            arch_syscall_set_return(frame,
+                (uint64_t)(int64_t)sys_utimensat((int)arch_syscall_arg0(frame),
+                                                 (const char*)(uintptr_t)arch_syscall_arg1(frame),
+                                                 (const void*)(uintptr_t)arch_syscall_arg2(frame),
+                                                 (int)arch_syscall_arg3(frame)));
             return;
         /* rename(2)。**番号がアーキで違うので両方受ける。**aarch64 の musl は
          * renameat(38)、riscv64 の musl は renameat2(276) を出す。

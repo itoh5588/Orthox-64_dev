@@ -1044,6 +1044,26 @@ int sys_fstatfs(int fd, struct orth_statfs* out) {
     return sys_statfs(0, out);
 }
 
+/* utimensat(2)。**無条件に 0 を返してはいけない。**
+ *
+ * busybox の touch は「まず utimensat、ENOENT なら open(O_CREAT)」の順で
+ * 動くので、常に成功を返すと**touch がファイルを作らなくなる**
+ * (2026-08-30、aarch64 で GCC の configure がこれで落ちた)。
+ *
+ * times は見ない —— 常に「いま」にする (UTIME_NOW 相当)。make が
+ * 「出力が入力より新しいか」で判断するので、時刻は動かす必要がある */
+int sys_utimensat(int dirfd, const char* path, const void* times, int flags) {
+    char resolved[256];
+    struct kstat st;
+    (void)times; (void)flags;
+    if (!path || path[0] == '\0') return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0)
+        return -LINUX_ENOENT;
+    if (sys_stat(resolved, &st) < 0) return -LINUX_ENOENT;
+    return xv6fs_touch_path(resolved) == 0 ? 0 : -LINUX_ENOENT;
+}
+
 int sys_mkdir(const char* path, int mode) {
     char resolved[256];
     struct kstat st;

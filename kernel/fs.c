@@ -3026,6 +3026,13 @@ int fs_utimensat(int dirfd, const char* path, const void* times, int flags) {
         rf->atime_sec = now;
         rf->mtime_sec = now;
         rf->ctime_sec = now;
+        return 0;
+    }
+    /* **SD 側も時刻を進める。**make は「出力が入力より新しいか」で判断する
+     * ので、touch が時刻を動かさないと依存の解決が狂う。
+     * times は見ていない —— 常に「いま」にする (UTIME_NOW 相当) */
+    if (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
+        (void)xv6fs_touch_path(norm);
     }
     return 0;
 }

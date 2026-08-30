@@ -1476,6 +1476,22 @@ int xv6fs_mkdir_path(const char *path, int mode) {
     return 0;
 }
 
+/* utimensat(2) の実体。**時刻を「いま」に進めるだけ。**
+ * make は「出力が入力より新しいか」で判断するので、touch が時刻を
+ * 動かさないと依存の解決が狂う */
+int xv6fs_touch_path(const char *path) {
+    struct xv6fs_inode *ip = xv6fs_namei(path);
+    if (!ip) return -1;
+    xv6log_begin_op(XV6LOG_OP_SMALL);
+    xv6fs_ilock(ip);
+    ip->mtime = xv6fs_now_sec();
+    xv6fs_iupdate(ip);
+    xv6fs_iunlock(ip);
+    xv6log_end_op(XV6LOG_OP_SMALL);
+    xv6fs_iput(ip);
+    return 0;
+}
+
 int xv6fs_chmod_path(const char *path, uint32_t mode) {
     struct xv6fs_inode *ip = xv6fs_namei(path);
     if (!ip) return -1;
