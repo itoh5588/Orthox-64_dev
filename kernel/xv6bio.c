@@ -87,7 +87,37 @@ struct {
     spinlock_t     lock;
     struct xv6buf  buf[XV6FS_NBUF];
     struct xv6buf  head;
+    /* 手さげ袋 (P-3)。**bget の当たり判定を O(NBUF) から O(1) にする。**
+     * 2026-07-05 に NBUF を 4096 にして逆効果だったのは、線形走査の costs が
+     * 全アクセスに乗ったため。ここを直したので拡大できるようになった */
+    struct xv6buf *htab[XV6FS_NBUF_HASH];
 } bcache;
+
+/* 手さげ袋から外す。**入っていないこともある** (初期化直後) */
+static void bhash_remove(struct xv6buf *b) {
+    if (!b->hprevp) return;
+    *b->hprevp = b->hnext;
+    if (b->hnext) b->hnext->hprevp = b->hprevp;
+    b->hnext  = 0;
+    b->hprevp = 0;
+}
+
+static void bhash_insert(struct xv6buf *b) {
+    struct xv6buf **head = &bcache.htab[XV6FS_BHASH(b->dev, b->blockno)];
+    b->hnext = *head;
+    if (*head) (*head)->hprevp = &b->hnext;
+    *head = b;
+    b->hprevp = head;
+}
+
+/* 在れば返す。**bcache.lock を持って呼ぶこと** */
+static struct xv6buf *bhash_find(uint32_t dev, uint32_t blockno) {
+    struct xv6buf *b;
+    for (b = bcache.htab[XV6FS_BHASH(dev, blockno)]; b; b = b->hnext) {
+        if (b->dev == dev && b->blockno == blockno) return b;
+    }
+    return 0;
+}
 
 /* **区間にキャッシュ済みのブロックが 1 つでもあれば 1。**
  *
@@ -95,15 +125,15 @@ struct {
  * 掴む。**1 つでも当たったら区間ごと従来経路に退く** —— 分割して
  * 部分的に束ねる手もあるが、判定が増えるわりに得が小さい。 */
 int xv6bio_range_cached(uint32_t dev, uint32_t blockno, uint32_t nblocks) {
-    struct xv6buf *b;
+    uint32_t i;
     int hit = 0;
     spin_lock(&bcache.lock);
-    for (b = bcache.buf; b < bcache.buf + XV6FS_NBUF; b++) {
-        if (b->valid && b->dev == dev &&
-            b->blockno >= blockno && b->blockno < blockno + nblocks) {
-            hit = 1;
-            break;
-        }
+    /* **区間の各ブロックを手さげ袋で引く (P-3)。**全バッファを舐めていた
+     * ころは NBUF に比例したが、区間は高々 112 ブロックなので、
+     * NBUF を拡大してもこちらは増えない */
+    for (i = 0; i < nblocks; i++) {
+        struct xv6buf *b = bhash_find(dev, blockno + i);
+        if (b && b->valid) { hit = 1; break; }
     }
     spin_unlock(&bcache.lock);
     return hit;
@@ -111,11 +141,14 @@ int xv6bio_range_cached(uint32_t dev, uint32_t blockno, uint32_t nblocks) {
 
 void xv6bio_init(void) {
     struct xv6buf *b;
+    uint32_t i;
 
     spinlock_init(&bcache.lock);
 
     bcache.head.prev = &bcache.head;
     bcache.head.next = &bcache.head;
+
+    for (i = 0; i < XV6FS_NBUF_HASH; i++) bcache.htab[i] = 0;
 
     for (b = bcache.buf; b < bcache.buf + XV6FS_NBUF; b++) {
         b->next = bcache.head.next;
@@ -123,6 +156,10 @@ void xv6bio_init(void) {
         xv6_sleeplock_init(&b->lock);
         b->valid  = 0;
         b->refcnt = 0;
+        b->dev    = 0xffffffffU;   /* 袋に入れない印 */
+        b->blockno = 0xffffffffU;
+        b->hnext  = 0;
+        b->hprevp = 0;
         bcache.head.next->prev = b;
         bcache.head.next = b;
     }
@@ -135,23 +172,26 @@ static struct xv6buf *bget(uint32_t dev, uint32_t blockno) {
 
     spin_lock(&bcache.lock);
 
-    /* キャッシュ済みか確認 */
-    for (b = bcache.head.next; b != &bcache.head; b = b->next) {
-        if (b->dev == dev && b->blockno == blockno) {
-            b->refcnt++;
-            spin_unlock(&bcache.lock);
-            xv6_sleep_lock(&b->lock);
-            return b;
-        }
+    /* **キャッシュ済みか確認 (P-3: 手さげ袋で O(1))。**
+     * ここは全アクセスが通るので、NBUF に比例させてはいけない */
+    b = bhash_find(dev, blockno);
+    if (b) {
+        b->refcnt++;
+        spin_unlock(&bcache.lock);
+        xv6_sleep_lock(&b->lock);
+        return b;
     }
 
-    /* LRU の末尾から未使用バッファを探して再利用 */
+    /* LRU の末尾から未使用バッファを探して再利用。
+     * **こちらは外したときだけ通る。**入れ替える相手は袋を移す */
     for (b = bcache.head.prev; b != &bcache.head; b = b->prev) {
         if (b->refcnt == 0) {
+            bhash_remove(b);
             b->dev     = dev;
             b->blockno = blockno;
             b->valid   = 0;
             b->refcnt  = 1;
+            bhash_insert(b);
             spin_unlock(&bcache.lock);
             xv6_sleep_lock(&b->lock);
             return b;

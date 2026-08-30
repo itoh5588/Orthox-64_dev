@@ -42,11 +42,58 @@ void xv6_sleep_unlock(struct xv6_sleeplock *s);
 #define XV6FS_NTINDIRECT  (XV6FS_NINDIRECT * XV6FS_NINDIRECT * XV6FS_NINDIRECT) /* 16777216 */
 #define XV6FS_MAXFILE     (XV6FS_NDIRECT + XV6FS_NINDIRECT + XV6FS_NDINDIRECT + XV6FS_NTINDIRECT)
 
-#define XV6FS_NBUF        128    /* バッファキャッシュ数 (128KB)。
-                                  * 注: 4096 (4MB) への拡大は 2026-07-05 に実測で逆効果と判明
-                                  * (cc1 13MB の exec が毎回キャッシュを洗い流す一方、
-                                  *  bget の線形走査コストが全アクセスに乗るため)。
-                                  * 拡大するなら bget のハッシュ化とセットで行うこと */
+/* バッファキャッシュ数。1 個あたり XV6FS_BSIZE (1KB) + 管理領域。
+ *
+ * **2026-07-05 に 4096 (4MB) を試して逆効果だった。**cc1 13MB の exec が
+ * 毎回キャッシュを洗い流す一方、**bget の線形走査コストが全アクセスに
+ * 乗る**ため。「拡大するなら bget のハッシュ化とセットで」と書き残した。
+ *
+ * **2026-08-30 にハッシュ化した (P-3)。**bget の当たり判定が
+ * O(NBUF) から O(1) になったので、拡大の前提が整った。
+ *
+ * 拡大の動機: P-6 で書き込みが 18 分の 1 になった結果、**律速が読みへ移った**
+ * (実機の GCC configure で読み 28,399回/分・60 秒の窓の 53%)。
+ *
+ * 変えるときは実測で確かめること。物差しは**実機のネイティブカーネル
+ * フルビルド** (46 本、P-5 後で 3 分 22 秒)。cc1 の exec を何度も踏むので
+ * ここの効きがそのまま出る。
+ *
+ * 2026-08-30 実機 (Pi 4) で掃引した。物差しは GCC の下位 configure
+ * (libiberty 相当、checking 175〜177 項目)。P-6 適用後、SD は同じ:
+ *
+ *     NBUF     .bss     checks   読み/分
+ *      128   0.26MiB  110/106s  25,000〜30,000
+ *      512   0.66MiB     70s     3,085
+ *     1024   1.21MiB     68s     2,365
+ *     2048   2.29MiB     66s     1,996
+ *     4096   4.45MiB   ★64s      2,092
+ *     8192   8.78MiB     64s     2,000
+ *    16384  17.44MiB     70s     3,283
+ *
+ * **効くのは 128→1024 の区間だけ**で、読みが 1/12 に落ちてそこで SD が
+ * 律速でなくなる。configure の作業集合が 4〜8MB に収まりきったということ。
+ * 1024 以上は 68→66→64 秒と 4 秒しか縮まない。
+ *
+ * **16384 は逆に遅い** (70 秒)。バッファを増やしたのに読みが 3,283 回/分と
+ * 増えている。手さげ袋 8192 個が CPU のキャッシュに乗らなくなったため。
+ * **大きければ速いわけではない。**
+ *
+ * 4096 を採る。8192 と同速だが .bss が半分で済む (4.7MB 対 9.2MB)。
+ *
+ * なお 日報2026-07-05 の「4096 は逆効果」は**ハッシュを入れる前の話**で、
+ * 当時は bget が O(NBUF) だったので大きくするほど探索が伸びた。P-3 で
+ * 前提が変わったので、その結論はここで置き換わる。 */
+#ifndef XV6FS_NBUF
+#define XV6FS_NBUF        4096
+#endif
+
+/* bget の当たり判定に使う手さげ袋の数。**2 の冪にすること** (剰余を
+ * & で済ませる)。NBUF より少し小さめにして、袋あたり 1〜2 個に収める */
+#ifndef XV6FS_NBUF_HASH
+#define XV6FS_NBUF_HASH   (XV6FS_NBUF / 2)
+#endif
+#define XV6FS_BHASH(dev, blockno) \
+    ((((blockno) * 2654435761U) ^ (dev)) & (XV6FS_NBUF_HASH - 1))
 #define XV6FS_NINODES     8192
 #define XV6FS_LOGBLOCKS   126
 
@@ -155,6 +202,10 @@ struct xv6buf {
     uint32_t  refcnt;
     struct xv6buf *prev;
     struct xv6buf *next;
+    /* 手さげ袋の鎖 (P-3)。**LRU の鎖とは別物。**LRU は入れ替えの順序、
+     * こちらは「この番号のブロックは在るか」を O(1) で引くためのもの */
+    struct xv6buf *hnext;
+    struct xv6buf **hprevp;
     uint8_t   data[XV6FS_BSIZE];
 };
 
@@ -314,6 +365,8 @@ int xv6fs_rmdir_path(const char *path);
 int xv6fs_rename_path(const char *oldpath, const char *newpath);
 int xv6fs_mkdir_path(const char *path, int mode);
 int xv6fs_chmod_path(const char *path, uint32_t mode);
+/* utimensat(2) の実体。mtime を「いま」に進める */
+int xv6fs_touch_path(const char *path);
 /* statfs(2) の材料。**単位はブロック** (bsize バイト) */
 struct xv6fs_statfs {
     uint64_t bsize;
