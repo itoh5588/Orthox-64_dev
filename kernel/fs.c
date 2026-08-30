@@ -181,9 +181,9 @@ static void fs_release_xv6fs_file(fs_file_t* file) {
     if (!file) return;
     struct xv6fs_inode* ip = (struct xv6fs_inode*)file->private_data;
     if (ip) {
-        xv6log_begin_op();
+        xv6log_begin_op(XV6LOG_OP_FULL);
         xv6fs_iput(ip);
-        xv6log_end_op();
+        xv6log_end_op(XV6LOG_OP_FULL);
         file->private_data = 0;
     }
 }
@@ -2260,14 +2260,17 @@ int64_t fs_write(int fd, const void* buf, size_t count) {
             size_t chunk = count - written;
             int n;
             if (chunk > XV6FS_WRITE_CHUNK_MAX) chunk = XV6FS_WRITE_CHUNK_MAX;
-            xv6log_begin_op();
+            /* **申告は「最大」ではなく「今回の chunk」で出す (P-6)。**
+             * 小さな書きが小さく申告するからこそ、溜めたまま入れる */
+            int op_blocks = XV6LOG_OP_WRITE(chunk);
+            xv6log_begin_op(op_blocks);
             xv6fs_ilock(ip);
             n = xv6fs_writei(ip, src + written,
                              (uint32_t)(offset_now + written),
                              (uint32_t)chunk);
             if (ip->size > fs_fd_size(f)) fs_fd_set_size(f, ip->size);
             xv6fs_iunlock(ip);
-            xv6log_end_op();
+            xv6log_end_op(op_blocks);
             if (n < 0) return written ? (int64_t)written : -EIO;
             if (n == 0) break;
             written += (size_t)n;

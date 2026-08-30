@@ -228,8 +228,29 @@ int  xv6bio_range_cached(uint32_t dev, uint32_t blockno, uint32_t nblocks);
 /* ------------------------------------------------------------------ */
 
 void xv6log_init(uint32_t dev, struct xv6fs_superblock *sb);
-void xv6log_begin_op(void);
-void xv6log_end_op(void);
+/* ---- xv6log_begin_op に申告する「この op が汚しうる最大ブロック数」(P-6) ----
+ *
+ * **溜めるようになったので、見込みを間違えるとログが溢れる。**
+ * 2026-08-30 に「1 op あたり 10 ブロック」という古い見込みのまま溜めて、
+ * lh.n が 116 まで育った状態に 112 ブロックの書き込みが入り、
+ * xv6log_write の KASSERT(lg.lh.n < XV6FS_LOGBLOCKS) でパニックした。
+ * あの 10 は**毎回コミットして lh.n が 0 に戻る前提**の数字だった。
+ *
+ *   XV6LOG_OP_WRITE(n)  データ n バイト + inode / ビットマップ / 間接ぶん
+ *   XV6LOG_OP_SMALL     inode 更新とディレクトリ 1 件の付け外し
+ *   XV6LOG_OP_FULL      **上限が読めないもの。**itrunc を踏みうる経路は
+ *                       すべてこれ (unlink / rmdir / rename / truncate /
+ *                       close)。xv6fs_itrunc_to は大きさに上限なく
+ *                       1 トランザクションでブロックを解放する */
+#define XV6LOG_OP_WRITE(bytes) \
+    ((int)(((bytes) + XV6FS_BSIZE - 1) / XV6FS_BSIZE) + 8)
+#define XV6LOG_OP_SMALL  16
+#define XV6LOG_OP_FULL   XV6FS_LOGBLOCKS
+
+void xv6log_begin_op(int max_blocks);
+void xv6log_end_op(int max_blocks);
+/* 溜めたログを必ず出す。sync(2) / fsync(2) の実体 (P-6) */
+void xv6log_flush(void);
 void xv6log_write(struct xv6buf *b);
 void xv6log_recover(void);
 

@@ -52,6 +52,7 @@ struct xv6log {
     spinlock_t lock;
     int        start;        /* logstart ブロック番号 */
     int        outstanding;  /* 進行中の FS システムコール数 */
+    int        reserved;     /* 進行中の op が申告したブロック数の合計 (P-6) */
     int        committing;   /* commit() 実行中フラグ */
     uint32_t   dev;
     struct logheader lh;
@@ -93,6 +94,7 @@ void xv6log_init(uint32_t dev, struct xv6fs_superblock *sb) {
     lg.start       = (int)sb->logstart;
     lg.dev         = dev;
     lg.outstanding = 0;
+    lg.reserved = 0;
     lg.committing  = 0;
     lg.lh.n        = 0;
     g_stage_valid  = 0;
@@ -234,46 +236,124 @@ static void recover_from_log(void) {
 /* ------------------------------------------------------------------ */
 
 /* begin_op が進めそうかのヒント (正確な判定は lg.lock 下で再確認する)。 */
-static int xv6log_progress_hint(void *arg) {
-    (void)arg;
-    return !lg.committing &&
-           lg.lh.n + (lg.outstanding + 1) * 10 <= XV6FS_LOGBLOCKS;
+/* ---- P-6: コミットを溜める ----------------------------------------------
+ *
+ * **以前は end_op が必ず commit していた。**1 回の write(2) が commit 1 回に
+ * なるので、小さな書きを繰り返すものは SD を叩き潰す。実機で GCC の
+ * configure を回すと、60 秒の窓で **書き 25,728 回・約 31 MB・窓の 99.7% が
+ * 転送中**、しかも**ほぼ全部 2 セクタ (1 KB) 単位**だった
+ * (日報2026-08-30 §10、[sd] の分布 0 20,628 5,028 72)。
+ *
+ * ログに余裕があるうちは溜める。**同じブロックへの繰り返しは xv6log_write の
+ * 吸収で 1 エントリに畳まれる**ので、config.log に 1 行ずつ追記するようなものは
+ * 最後のデータブロックと inode ブロックの 2 つに落ちる。
+ *
+ * ---- ★ 溜める上限を決めるのはログではなくバッファキャッシュ ----
+ *
+ * ログに載せたブロックは xv6log_write が xv6bpin で固定する。**溜めた数だけ
+ * キャッシュ (XV6FS_NBUF = 128) が減り**、使い切ると bget が
+ * KASSERT(0 && "xv6bio bget no free buffers") で落ちる。
+ * XV6FS_LOGBLOCKS (126) まで溜めると 128 本のうち 126 本が埋まる。
+ * **48 で止めて 80 本をデータ用に残す。**
+ *
+ * ---- 出すのは 3 つの機会だけ ----
+ *
+ *   - 次の op の申告ぶんが入らないとき (begin_op)
+ *   - sync(2) / fsync(2)              (xv6log_flush)
+ *   - ログが満杯で begin_op が詰まったとき
+ *
+ * ★ 代償: write(2) から戻った時点では SD に載っていない。**電源を抜けば
+ * 直近のぶんは消える。**Linux が fsync 無しで振る舞うのと同じ約束にした。
+ * 焼き直しや再起動の前には busybox sync を通すこと。 */
+#define XV6LOG_BATCH_MAX 48
+
+/* この申告ぶんが今すぐ入るか。**lg.lock は取らない** —— あくまでヒントで、
+ * 本判定は begin_op がロックの下でやり直す */
+static int xv6log_room_hint(void *arg) {
+    int need = arg ? *(int *)arg : XV6FS_LOGBLOCKS;
+    if (lg.committing) return 0;
+    /* 自分で吐き出せる状態になった */
+    if (lg.outstanding == 0 && lg.lh.n > 0) return 1;
+    if (lg.lh.n + lg.reserved + need > XV6FS_LOGBLOCKS) return 0;
+    /* 溜めるのは BATCH_MAX まで。空なら 1 op に全部使わせる */
+    return lg.lh.n == 0 || lg.lh.n + lg.reserved + need <= XV6LOG_BATCH_MAX;
 }
 
-void xv6log_begin_op(void) {
-    for (;;) {
-        spin_lock(&lg.lock);
-        if (!lg.committing &&
-            lg.lh.n + (lg.outstanding + 1) * 10 <= XV6FS_LOGBLOCKS) {
-            lg.outstanding++;
-            spin_unlock(&lg.lock);
-            return;
-        }
-        spin_unlock(&lg.lock);
-        /* ログが満杯 or commit 中: 待機列で眠る (end_op / commit 完了で wake) */
-        wait_event(&lg_wait, xv6log_progress_hint, 0);
-    }
-}
-
-void xv6log_end_op(void) {
+/* lg.lock を持たずに呼ぶ。溜まっているものがあり、誰も commit 中でなく、
+ * 進行中の op も無いときだけ吐き出す */
+static void xv6log_commit_if_idle(void) {
     int do_commit = 0;
-
     spin_lock(&lg.lock);
-    lg.outstanding--;
-    KASSERT(!lg.committing);
-    if (lg.outstanding == 0) {
+    if (!lg.committing && lg.outstanding == 0 && lg.lh.n > 0) {
         do_commit = 1;
         lg.committing = 1;
     }
     spin_unlock(&lg.lock);
+    if (!do_commit) return;
+    commit();
+    spin_lock(&lg.lock);
+    lg.committing = 0;
+    spin_unlock(&lg.lock);
+    wake_up_all(&lg_wait);
+}
 
-    if (do_commit) {
-        commit();
+/* sync(2) / fsync(2) から呼ぶ。**ここが唯一の「必ず出す」約束**になった */
+void xv6log_flush(void) {
+    xv6log_commit_if_idle();
+}
+
+/* max_blocks = この op が汚しうる最大ブロック数 (XV6LOG_OP_* を使う)。
+ * **見込みを間違えると xv6log_write の KASSERT で落ちる。** */
+void xv6log_begin_op(int max_blocks) {
+    int need = max_blocks;
+    if (need < 1) need = 1;
+    if (need > XV6FS_LOGBLOCKS) need = XV6FS_LOGBLOCKS;
+
+    for (;;) {
+        int do_commit = 0;
         spin_lock(&lg.lock);
-        lg.committing = 0;
+        if (!lg.committing &&
+            lg.lh.n + lg.reserved + need <= XV6FS_LOGBLOCKS &&
+            (lg.lh.n == 0 || lg.lh.n + lg.reserved + need <= XV6LOG_BATCH_MAX)) {
+            lg.outstanding++;
+            lg.reserved += need;
+            spin_unlock(&lg.lock);
+            return;
+        }
+        /* **入らないなら自分で吐き出す。**end_op が commit しなくなったので、
+         * ここで詰まったときに誰も出さないと止まる */
+        if (!lg.committing && lg.outstanding == 0 && lg.lh.n > 0) {
+            do_commit = 1;
+            lg.committing = 1;
+        }
         spin_unlock(&lg.lock);
+        if (do_commit) {
+            commit();
+            spin_lock(&lg.lock);
+            lg.committing = 0;
+            spin_unlock(&lg.lock);
+            wake_up_all(&lg_wait);
+            continue;
+        }
+        /* ログが満杯 or commit 中: 待機列で眠る */
+        wait_event(&lg_wait, xv6log_room_hint, &need);
     }
-    /* outstanding 減少 or commit 完了でログ空きが変化した */
+}
+
+/* max_blocks は begin_op に渡したものと同じ値を渡すこと。
+ * **ここでは commit しない** —— 出すかどうかは begin_op が決める */
+void xv6log_end_op(int max_blocks) {
+    int need = max_blocks;
+    if (need < 1) need = 1;
+    if (need > XV6FS_LOGBLOCKS) need = XV6FS_LOGBLOCKS;
+
+    spin_lock(&lg.lock);
+    lg.outstanding--;
+    lg.reserved -= need;
+    if (lg.reserved < 0) lg.reserved = 0;
+    KASSERT(!lg.committing);
+    spin_unlock(&lg.lock);
+    /* outstanding / reserved が減ってログ空きが変化した */
     wake_up_all(&lg_wait);
 }
 

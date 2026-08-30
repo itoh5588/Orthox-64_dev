@@ -1011,11 +1011,14 @@ int xv6fs_write_file(const char *path, uint64_t offset,
         int r;
         if (chunk > (size_t)XV6FS_WRITE_CHUNK_MAX) chunk = (size_t)XV6FS_WRITE_CHUNK_MAX;
 
-        xv6log_begin_op();
+        /* **申告は「最大」ではなく「今回の chunk」で出す (P-6)。**
+         * 小さな書きが小さく申告するからこそ、溜めたまま入れる */
+        int op_blocks = XV6LOG_OP_WRITE(chunk);
+        xv6log_begin_op(op_blocks);
         xv6fs_ilock(ip);
         r = xv6fs_writei(ip, src + done, (uint32_t)(offset + done), (uint32_t)chunk);
         xv6fs_iunlock(ip);
-        xv6log_end_op();
+        xv6log_end_op(op_blocks);
 
         if (r != (int)chunk) {
             xv6fs_iput(ip);
@@ -1036,10 +1039,10 @@ int xv6fs_mknod_fifo(const char *path, int mode) {
 
     if (!path || path[0] == '\0') return -1;
 
-    xv6log_begin_op();
+    xv6log_begin_op(XV6LOG_OP_SMALL);
     dp = xv6fs_nameiparent(path, name);
     if (!dp) {
-        xv6log_end_op();
+        xv6log_end_op(XV6LOG_OP_SMALL);
         return -1;
     }
 
@@ -1048,7 +1051,7 @@ int xv6fs_mknod_fifo(const char *path, int mode) {
     if (ip) {
         xv6fs_iput(ip);
         xv6fs_iunlock(dp);
-        xv6log_end_op();
+        xv6log_end_op(XV6LOG_OP_SMALL);
         xv6fs_iput(dp);
         return -17; /* EEXIST */
     }
@@ -1056,7 +1059,7 @@ int xv6fs_mknod_fifo(const char *path, int mode) {
     ip = xv6fs_ialloc(dp->dev, XV6FS_T_FIFO);
     if (!ip) {
         xv6fs_iunlock(dp);
-        xv6log_end_op();
+        xv6log_end_op(XV6LOG_OP_SMALL);
         xv6fs_iput(dp);
         return -1;
     }
@@ -1070,13 +1073,13 @@ int xv6fs_mknod_fifo(const char *path, int mode) {
         xv6fs_iunlock(ip);
         xv6fs_iput(ip);
         xv6fs_iunlock(dp);
-        xv6log_end_op();
+        xv6log_end_op(XV6LOG_OP_SMALL);
         xv6fs_iput(dp);
         return -1;
     }
     xv6fs_iunlock(ip);
     xv6fs_iunlock(dp);
-    xv6log_end_op();
+    xv6log_end_op(XV6LOG_OP_SMALL);
     xv6fs_iput(dp);
     xv6fs_iput(ip);
     return 0;
@@ -1091,10 +1094,10 @@ int xv6fs_create_file(const char *path, int mode,
     if (out_ip) *out_ip = 0;
     if (!path || path[0] == '\0') return -1;
 
-    xv6log_begin_op();
+    xv6log_begin_op(XV6LOG_OP_SMALL);
     dp = xv6fs_nameiparent(path, name);
     if (!dp) {
-        xv6log_end_op();
+        xv6log_end_op(XV6LOG_OP_SMALL);
         return -1;
     }
 
@@ -1110,13 +1113,13 @@ int xv6fs_create_file(const char *path, int mode,
             xv6fs_iunlock(ip);
             xv6fs_iput(ip);
             xv6fs_iunlock(dp);
-            xv6log_end_op();
+            xv6log_end_op(XV6LOG_OP_SMALL);
             xv6fs_iput(dp);
             return -1;
         }
         xv6fs_iunlock(ip);
         xv6fs_iunlock(dp);
-        xv6log_end_op();
+        xv6log_end_op(XV6LOG_OP_SMALL);
         xv6fs_iput(dp);
         if (out_ip) *out_ip = ip;
         else xv6fs_iput(ip);
@@ -1126,7 +1129,7 @@ int xv6fs_create_file(const char *path, int mode,
     ip = xv6fs_ialloc(dp->dev, XV6FS_T_FILE);
     if (!ip) {
         xv6fs_iunlock(dp);
-        xv6log_end_op();
+        xv6log_end_op(XV6LOG_OP_SMALL);
         xv6fs_iput(dp);
         return -1;
     }
@@ -1140,13 +1143,13 @@ int xv6fs_create_file(const char *path, int mode,
         xv6fs_iunlock(ip);
         xv6fs_iput(ip);
         xv6fs_iunlock(dp);
-        xv6log_end_op();
+        xv6log_end_op(XV6LOG_OP_SMALL);
         xv6fs_iput(dp);
         return -1;
     }
     xv6fs_iunlock(ip);
     xv6fs_iunlock(dp);
-    xv6log_end_op();
+    xv6log_end_op(XV6LOG_OP_SMALL);
     xv6fs_iput(dp);
 
     if (out_ip) *out_ip = ip;
@@ -1157,11 +1160,11 @@ int xv6fs_create_file(const char *path, int mode,
 int xv6fs_truncate_file(const char *path, uint64_t length) {
     struct xv6fs_inode *ip = xv6fs_namei(path);
     if (!ip) return -1;
-    xv6log_begin_op();
+    xv6log_begin_op(XV6LOG_OP_FULL);
     xv6fs_ilock(ip);
     if (length > (uint64_t)XV6FS_MAXFILE * XV6FS_BSIZE) {
         xv6fs_iunlock(ip);
-        xv6log_end_op();
+        xv6log_end_op(XV6LOG_OP_FULL);
         xv6fs_iput(ip);
         return -1;
     }
@@ -1173,7 +1176,7 @@ int xv6fs_truncate_file(const char *path, uint64_t length) {
         xv6fs_iupdate(ip);
     }
     xv6fs_iunlock(ip);
-    xv6log_end_op();
+    xv6log_end_op(XV6LOG_OP_FULL);
     xv6fs_iput(ip);
     return 0;
 }
@@ -1183,17 +1186,17 @@ int xv6fs_unlink_path(const char *path) {
     struct xv6fs_inode *dp = xv6fs_nameiparent(path, name);
     if (!dp) return -1;
 
-    xv6log_begin_op();
+    xv6log_begin_op(XV6LOG_OP_FULL);
     xv6fs_ilock(dp);
     uint32_t off = 0;
     struct xv6fs_inode *ip = xv6fs_dirlookup(dp, name, &off);
     if (!ip) {
-        xv6fs_iunlock(dp); xv6log_end_op(); xv6fs_iput(dp); return -1;
+        xv6fs_iunlock(dp); xv6log_end_op(XV6LOG_OP_FULL); xv6fs_iput(dp); return -1;
     }
     xv6fs_ilock(ip);
     if (ip->type == XV6FS_T_DIR) {
         xv6fs_iunlock(ip); xv6fs_iput(ip);
-        xv6fs_iunlock(dp); xv6log_end_op(); xv6fs_iput(dp); return -1;
+        xv6fs_iunlock(dp); xv6log_end_op(XV6LOG_OP_FULL); xv6fs_iput(dp); return -1;
     }
     struct xv6fs_dirent de;
     memset(&de, 0, sizeof(de));
@@ -1201,7 +1204,7 @@ int xv6fs_unlink_path(const char *path) {
     ip->nlink--;
     xv6fs_iupdate(ip);
     xv6fs_iunlock(ip); xv6fs_iput(ip);
-    xv6fs_iunlock(dp); xv6log_end_op(); xv6fs_iput(dp);
+    xv6fs_iunlock(dp); xv6log_end_op(XV6LOG_OP_FULL); xv6fs_iput(dp);
     return 0;
 }
 
@@ -1210,17 +1213,17 @@ int xv6fs_rmdir_path(const char *path) {
     struct xv6fs_inode *dp = xv6fs_nameiparent(path, name);
     if (!dp) return -1;
 
-    xv6log_begin_op();
+    xv6log_begin_op(XV6LOG_OP_FULL);
     xv6fs_ilock(dp);
     uint32_t off = 0;
     struct xv6fs_inode *ip = xv6fs_dirlookup(dp, name, &off);
     if (!ip) {
-        xv6fs_iunlock(dp); xv6log_end_op(); xv6fs_iput(dp); return -1;
+        xv6fs_iunlock(dp); xv6log_end_op(XV6LOG_OP_FULL); xv6fs_iput(dp); return -1;
     }
     xv6fs_ilock(ip);
     if (ip->type != XV6FS_T_DIR) {
         xv6fs_iunlock(ip); xv6fs_iput(ip);
-        xv6fs_iunlock(dp); xv6log_end_op(); xv6fs_iput(dp); return -1;
+        xv6fs_iunlock(dp); xv6log_end_op(XV6LOG_OP_FULL); xv6fs_iput(dp); return -1;
     }
     struct xv6fs_dirent de;
     memset(&de, 0, sizeof(de));
@@ -1230,7 +1233,7 @@ int xv6fs_rmdir_path(const char *path) {
     ip->nlink = 0;
     xv6fs_iupdate(ip);
     xv6fs_iunlock(ip); xv6fs_iput(ip);
-    xv6fs_iunlock(dp); xv6log_end_op(); xv6fs_iput(dp);
+    xv6fs_iunlock(dp); xv6log_end_op(XV6LOG_OP_FULL); xv6fs_iput(dp);
     return 0;
 }
 
@@ -1244,11 +1247,11 @@ int xv6fs_link_path(const char *oldpath, const char *newpath) {
 
     if (!ip) return -1;
 
-    xv6log_begin_op();
+    xv6log_begin_op(XV6LOG_OP_FULL);
     xv6fs_ilock(ip);
     /* ディレクトリのハードリンクはループを作るので禁止 */
     if (ip->type == XV6FS_T_DIR) {
-        xv6fs_iunlock(ip); xv6log_end_op(); xv6fs_iput(ip); return -1;
+        xv6fs_iunlock(ip); xv6log_end_op(XV6LOG_OP_FULL); xv6fs_iput(ip); return -1;
     }
     ip->nlink++;
     xv6fs_iupdate(ip);
@@ -1262,7 +1265,7 @@ int xv6fs_link_path(const char *oldpath, const char *newpath) {
         goto bad;
     }
     xv6fs_iunlock(dp); xv6fs_iput(dp);
-    xv6log_end_op();
+    xv6log_end_op(XV6LOG_OP_FULL);
     xv6fs_iput(ip);
     return 0;
 
@@ -1271,7 +1274,7 @@ bad:
     ip->nlink--;
     xv6fs_iupdate(ip);
     xv6fs_iunlock(ip);
-    xv6log_end_op();
+    xv6log_end_op(XV6LOG_OP_FULL);
     xv6fs_iput(ip);
     return -1;
 }
@@ -1351,7 +1354,7 @@ int xv6fs_rename_path(const char *oldpath, const char *newpath) {
     same_dir = (dp_old == dp_new);
 
     xv6_sleep_lock(&g_rename_lock);
-    xv6log_begin_op();
+    xv6log_begin_op(XV6LOG_OP_FULL);
 
     /* **親を 2 つ掴む。**同じなら 1 回だけ (二度掛けると眠ったまま戻らない)。
      * 違うなら inum の小さいほうから取り、rename どうしがすれ違っても
@@ -1440,7 +1443,7 @@ out:
     if (ip) xv6fs_iput(ip);
     xv6fs_iunlock(dp_old);
     if (!same_dir) xv6fs_iunlock(dp_new);
-    xv6log_end_op();
+    xv6log_end_op(XV6LOG_OP_FULL);
     xv6_sleep_unlock(&g_rename_lock);
     /* nameiparent を 2 回通しているので、同じ親でも参照は 2 つ */
     xv6fs_iput(dp_old);
@@ -1453,11 +1456,11 @@ int xv6fs_mkdir_path(const char *path, int mode) {
     struct xv6fs_inode *dp = xv6fs_nameiparent(path, name);
     if (!dp) return -1;
 
-    xv6log_begin_op();
+    xv6log_begin_op(XV6LOG_OP_SMALL);
     xv6fs_ilock(dp);
     struct xv6fs_inode *ip = xv6fs_ialloc(dp->dev, XV6FS_T_DIR);
     if (!ip) {
-        xv6fs_iunlock(dp); xv6log_end_op(); xv6fs_iput(dp); return -1;
+        xv6fs_iunlock(dp); xv6log_end_op(XV6LOG_OP_SMALL); xv6fs_iput(dp); return -1;
     }
     xv6fs_ilock(ip);
     ip->nlink = 1;
@@ -1469,29 +1472,32 @@ int xv6fs_mkdir_path(const char *path, int mode) {
     dp->nlink++;
     xv6fs_iupdate(dp);
     xv6fs_iunlock(ip); xv6fs_iput(ip);
-    xv6fs_iunlock(dp); xv6log_end_op(); xv6fs_iput(dp);
+    xv6fs_iunlock(dp); xv6log_end_op(XV6LOG_OP_SMALL); xv6fs_iput(dp);
     return 0;
 }
 
 int xv6fs_chmod_path(const char *path, uint32_t mode) {
     struct xv6fs_inode *ip = xv6fs_namei(path);
     if (!ip) return -1;
-    xv6log_begin_op();
+    xv6log_begin_op(XV6LOG_OP_SMALL);
     xv6fs_ilock(ip);
     if (ip->type != XV6FS_T_DIR && ip->type != XV6FS_T_FILE) {
         xv6fs_iunlock(ip);
-        xv6log_end_op();
+        xv6log_end_op(XV6LOG_OP_SMALL);
         xv6fs_iput(ip);
         return -1;
     }
     xv6fs_set_mode(ip, mode);
     xv6fs_iupdate(ip);
     xv6fs_iunlock(ip);
-    xv6log_end_op();
+    xv6log_end_op(XV6LOG_OP_SMALL);
     xv6fs_iput(ip);
     return 0;
 }
 
 int xv6fs_sync(void) {
-    return 0;  /* xv6log_end_op() でコミット済み */
+    /* **P-6 以前はここが空でよかった** —— end_op が毎回コミットしていたから。
+     * 溜めるようにしたので、**ここが唯一の「必ず出す」約束**になった */
+    xv6log_flush();
+    return 0;
 }
