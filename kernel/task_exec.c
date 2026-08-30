@@ -7,14 +7,31 @@
 #include "fs.h"
 #include "lapic.h"
 
-#define EXEC_COPY_PAGES      260
+/* argv と envp を写す場所。**1 本ごとの上限ではなく合計で見る。**
+ *
+ * 以前は argv_storage[128][4096] という固定の枠だったので、**1 本でも
+ * 4096 バイトを超えると exec が失敗した。**GCC の最上位 Makefile は
+ * $(HOST_EXPORTS) を展開した 9,451 バイトのレシピを /bin/sh -c に渡すので、
+ * make all-host が 1 段目 (libiberty) から進まなかった (2026-08-30)。
+ *
+ * **見つけにくい形で出る。**exec の失敗をシェルも make も一律 127 と
+ * 「not found」で報告するので、`make: /bin/sh: No such file or directory`
+ * になる。/bin/sh は在るのに無いと言われるので、最初はファイルシステムを
+ * 疑うことになる。最小再現はこれ:
+ *     A=`awk 'BEGIN{s="";for(i=0;i<5000;i++)s=s "x";print s}'`
+ *     /bin/sh -c "echo OK; : $A"     -> /bin/sh: not found
+ *   (3000 バイトなら通る)
+ *
+ * Linux も 1 本ごとではなく合計 (ARG_MAX) で見る。同じ形にする。
+ * 副産物として、exec 1 回あたりの確保が 1MB から 272KB に減る。 */
+#define EXEC_ARG_TOTAL       (256 * 1024)
+#define EXEC_COPY_PAGES      68
 #define EXEC_MAX_PATH_LEN    1024
 #define EXEC_MAX_VEC_STRINGS 128
 /* 引数が多すぎるときに返す errno。共有カーネルには errno ヘッダが無いので
  * kernel/fs.c と同じくファイル内で定義する (Linux asm-generic の値) */
 #define E2BIG 7
 #define ELOOP 40   /* #! の入れ子が深すぎる (Linux と同じ番号) */
-#define EXEC_MAX_VEC_STR_LEN 4096
 #define EXEC_ET_DYN_LOAD_BASE 0x400000ULL
 
 /* 動的リンカ (ld-musl) を置く番地。
@@ -66,12 +83,18 @@ static int task_comm_is_name(const struct task* t, const char* name) {
 #endif
 
 struct exec_copy_buf {
-    char path[EXEC_MAX_PATH_LEN];
-    char argv_storage[EXEC_MAX_VEC_STRINGS][EXEC_MAX_VEC_STR_LEN];
-    char envp_storage[EXEC_MAX_VEC_STRINGS][EXEC_MAX_VEC_STR_LEN];
+    char  path[EXEC_MAX_PATH_LEN];
     char* argv[EXEC_MAX_VEC_STRINGS + 1];
     char* envp[EXEC_MAX_VEC_STRINGS + 1];
+    char* argv2[EXEC_MAX_VEC_STRINGS + 1];  /* #! の組み換えで使う並べ替え先 */
+    int   used;                             /* storage の使用済みバイト数 */
+    char  storage[EXEC_ARG_TOTAL];          /* argv と envp を順に詰める */
 };
+
+/* **枠に収まることを組み立て時に確かめる。**pmm_alloc はページ数で頼むので、
+ * 構造体を太らせたときに気付ける場所がここしかない */
+_Static_assert(sizeof(struct exec_copy_buf) <= EXEC_COPY_PAGES * 4096,
+               "exec_copy_buf が EXEC_COPY_PAGES に収まらない");
 
 static int copy_user_cstring(const char* src, char* dst, int size) {
     if (!src || !dst || size <= 0) return -1;
@@ -86,9 +109,42 @@ static int copy_user_cstring(const char* src, char* dst, int size) {
     return -1;
 }
 
-static int copy_user_string_vector(char* const user_vec[], char** kernel_vec,
-                                   char storage[][EXEC_MAX_VEC_STR_LEN]) {
-    int count = 0;
+/* カーネル側の 1 本を storage の残りに足し、その番地を返す。溢れたら 0。
+ * **既に詰めた分は動かさない** —— 呼び出し側が持っているポインタが生き続ける */
+static char* arg_push(struct exec_copy_buf* b, const char* src) {
+    int len = 0, i;
+    char* dst;
+    if (!src) return 0;
+    while (src[len]) len++;
+    len++;
+    if (b->used + len > EXEC_ARG_TOTAL) return 0;
+    dst = b->storage + b->used;
+    for (i = 0; i < len; i++) dst[i] = src[i];
+    b->used += len;
+    return dst;
+}
+
+/* ユーザ空間の 1 本を storage の残りに写す。**残り全部を使ってよい** ——
+ * 1 本ごとの枠は設けない。収まらなければ -E2BIG */
+static int arg_push_user(struct exec_copy_buf* b, const char* src, char** out) {
+    int room, i;
+    char* dst;
+    if (!src) return -1;
+    if ((uint64_t)src < 0x1000ULL) return -1;
+    room = EXEC_ARG_TOTAL - b->used;
+    if (room <= 1) return -E2BIG;
+    dst = b->storage + b->used;
+    for (i = 0; i + 1 < room; i++) {
+        char ch = src[i];
+        dst[i] = ch;
+        if (!ch) { b->used += i + 1; *out = dst; return 0; }
+    }
+    return -E2BIG;   /* 残りに収まらなかった */
+}
+
+static int copy_user_string_vector(struct exec_copy_buf* b,
+                                   char* const user_vec[], char** kernel_vec) {
+    int count = 0, rc;
     if (!kernel_vec) return -1;
     if (!user_vec) {
         kernel_vec[0] = 0;
@@ -99,10 +155,8 @@ static int copy_user_string_vector(char* const user_vec[], char** kernel_vec,
     while (count < EXEC_MAX_VEC_STRINGS) {
         const char* src = user_vec[count];
         if (!src) break;
-        if (copy_user_cstring(src, storage[count], EXEC_MAX_VEC_STR_LEN) < 0) {
-            return -1;
-        }
-        kernel_vec[count] = storage[count];
+        rc = arg_push_user(b, src, &kernel_vec[count]);
+        if (rc < 0) return rc;
         count++;
     }
     /* **上限で打ち切ったまま成功を返さないこと。** 以前はここで黙って
@@ -371,10 +425,10 @@ int task_execve(arch_syscall_frame_t* frame, const char* path, char* const argv[
         /* argv / envp の複製は -E2BIG を返すことがある。-1 に潰さず通す */
         int vec_rc = copy_user_cstring(path, exec_copy->path, EXEC_MAX_PATH_LEN) < 0 ? -1 : 0;
         if (vec_rc >= 0) {
-            vec_rc = copy_user_string_vector(argv, exec_copy->argv, exec_copy->argv_storage);
+            vec_rc = copy_user_string_vector(exec_copy, argv, exec_copy->argv);
         }
         if (vec_rc >= 0) {
-            vec_rc = copy_user_string_vector(envp, exec_copy->envp, exec_copy->envp_storage);
+            vec_rc = copy_user_string_vector(exec_copy, envp, exec_copy->envp);
         }
         if (vec_rc < 0) {
             pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
@@ -458,37 +512,36 @@ int task_execve(arch_syscall_frame_t* frame, const char* path, char* const argv[
             pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
             return -E2BIG;
         }
-        for (i = argc_now - 1; i >= 1; i--) {
-            const char* from = exec_copy->argv_storage[i];
-            char* to = exec_copy->argv_storage[i + k];
-            int j = 0;
-            while (from[j] && j + 1 < EXEC_MAX_VEC_STR_LEN) { to[j] = from[j]; j++; }
-            to[j] = '\0';
-        }
+        /* **既にある文字列は動かさない。**連続バッファなのでスロットを
+         * ずらすことはできないが、その必要も無い —— 並べ替えるのは
+         * ポインタだけで、新しく要る interp / sharg / path の 3 本を
+         * 後ろに足せば足りる */
         {
-            int j = 0;
-            while (interp[j] && j + 1 < EXEC_MAX_VEC_STR_LEN) {
-                exec_copy->argv_storage[0][j] = interp[j]; j++;
+            int nn = 0;
+            char* p3;
+            if (!(p3 = arg_push(exec_copy, interp))) {
+                pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+                return -E2BIG;
             }
-            exec_copy->argv_storage[0][j] = '\0';
-        }
-        if (has_arg) {
-            int j = 0;
-            while (sharg[j] && j + 1 < EXEC_MAX_VEC_STR_LEN) {
-                exec_copy->argv_storage[1][j] = sharg[j]; j++;
+            exec_copy->argv2[nn++] = p3;
+            if (has_arg) {
+                if (!(p3 = arg_push(exec_copy, sharg))) {
+                    pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+                    return -E2BIG;
+                }
+                exec_copy->argv2[nn++] = p3;
             }
-            exec_copy->argv_storage[1][j] = '\0';
+            /* **path はこの後 interp で上書きするので、先に写しておく** */
+            if (!(p3 = arg_push(exec_copy, exec_copy->path))) {
+                pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+                return -E2BIG;
+            }
+            exec_copy->argv2[nn++] = p3;
+            for (i = 1; i < argc_now; i++) exec_copy->argv2[nn++] = exec_copy->argv[i];
+            exec_copy->argv2[nn] = 0;
+            for (i = 0; i <= nn; i++) exec_copy->argv[i] = exec_copy->argv2[i];
+            argc_now = nn;
         }
-        {
-            const char* sp = exec_copy->path;
-            char* to = exec_copy->argv_storage[k];
-            int j = 0;
-            while (sp[j] && j + 1 < EXEC_MAX_VEC_STR_LEN) { to[j] = sp[j]; j++; }
-            to[j] = '\0';
-        }
-        argc_now += k;
-        for (i = 0; i < argc_now; i++) exec_copy->argv[i] = exec_copy->argv_storage[i];
-        exec_copy->argv[argc_now] = 0;
 
         /* 次はインタプリタを開く */
         {
