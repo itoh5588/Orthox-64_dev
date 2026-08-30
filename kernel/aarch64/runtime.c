@@ -69,18 +69,21 @@ uint64_t arch_time_cpu_ms(uint32_t cpu_id) {
  * (F/A/D) を巻き戻すと、呼び出し元が意図して変えたものを消す */
 #define DAIF_I  (1ULL << 7)
 
+/* **"memory" を付ける。** 付けないとコンパイラが割り込み禁止区間の外へ
+ * メモリアクセスを動かせる。x86 版 (kernel/spinlock.c) には付いていて、
+ * こちらだけ抜けていた */
 uint64_t irq_save_disable(void) {
     uint64_t daif;
-    __asm__ volatile("mrs %0, daif" : "=r"(daif));
-    __asm__ volatile("msr daifset, #2");
+    __asm__ volatile("mrs %0, daif" : "=r"(daif) :: "memory");
+    __asm__ volatile("msr daifset, #2" ::: "memory");
     return daif;
 }
 
 void irq_restore(uint64_t flags) {
     if (flags & DAIF_I) {
-        __asm__ volatile("msr daifset, #2");
+        __asm__ volatile("msr daifset, #2" ::: "memory");
     } else {
-        __asm__ volatile("msr daifclr, #2");
+        __asm__ volatile("msr daifclr, #2" ::: "memory");
     }
 }
 
@@ -172,10 +175,26 @@ void spin_lock(spinlock_t* lock) {
      * **取れなかったときだけ計る** (M-4b') */
     if (!__atomic_exchange_n(&lock->locked, 1, __ATOMIC_ACQUIRE)) return;
 
+    /* ---- 取れるまで待つ。**書きに行かずに、読むだけで待つ** ------------
+     *
+     * 元は exchange をそのまま回していた。あれは待ち手が 1 周ごとに
+     * キャッシュラインを排他状態で奪うので、**離す側まで遅くなる**。
+     * ロックを持っている CPU は unlock で同じラインに書くが、その所有権を
+     * 待ち手と取り合うことになる。待ち手が増えるほど区間が伸びる。
+     *
+     * 素の load で 0 になるのを見てから 1 度だけ exchange する
+     * (test and test-and-set)。待っている間ラインは Shared のまま各 CPU の
+     * キャッシュに居座り、バスに出るのは所有者が離す 1 回だけになる。
+     *
+     * **wfe / sev は使わない。** 取りこぼすと次の割り込み (10ms) まで
+     * 寝てしまう。2026-08-30 に暴走を止められず電源断が要った件 (M-9) の
+     * あとで、止まり方が増える変更は入れない。yield はヒントなので
+     * 取りこぼしても害が無い */
     t0 = aarch64_wait_now();
-    while (__atomic_exchange_n(&lock->locked, 1, __ATOMIC_ACQUIRE)) {
-        /* SMP に進んだら wfe / sevl で待つ形にする。1 本のうちは意味が無い */
-        __asm__ volatile("yield");
+    for (;;) {
+        while (__atomic_load_n(&lock->locked, __ATOMIC_RELAXED))
+            __asm__ volatile("yield");
+        if (!__atomic_exchange_n(&lock->locked, 1, __ATOMIC_ACQUIRE)) break;
     }
     aarch64_wait_add(0, t0);
 }
