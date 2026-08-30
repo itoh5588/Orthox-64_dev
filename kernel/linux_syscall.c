@@ -423,6 +423,61 @@ static int linux_sys_getrusage(int who, struct linux_rusage* usage) {
     return 0;
 }
 
+/* times(2)。**返り値だけは本物を返す。**GCC の timevar.c は
+ *
+ *     now->wall = times (&tms) * ticks_to_msec;
+ *
+ * と返り値をそのまま壁時計に使うので、ENOSYS で -1 が返ると
+ * -ftime-report の数字が全部でたらめになる。2026-08-30 に Pi 4 実機で
+ * セルフホストした cc1 が
+ *
+ *     phase setup : -0.80 ( 0%) usr1316.20 (2632400%) sys
+ *
+ * のような表示を出した。**中身を 0 にするだけでは足りない**のがここ。
+ *
+ * 単位は CLK_TCK で、musl の aarch64 は 100 固定なので 10ms を 1 とする。
+ * プロセスごとの CPU 時間は記録していないので tms の 4 つは 0 でよい。
+ * user / sys は 0.00 と出るが、wall は正しくなる。
+ * buf が NULL でも呼べる (Linux も許す) */
+struct linux_tms {
+    int64_t tms_utime;
+    int64_t tms_stime;
+    int64_t tms_cutime;
+    int64_t tms_cstime;
+};
+
+static int64_t linux_sys_times(struct linux_tms* buf) {
+    if (buf) {
+        buf->tms_utime  = 0;
+        buf->tms_stime  = 0;
+        buf->tms_cutime = 0;
+        buf->tms_cstime = 0;
+    }
+    return (int64_t)(arch_time_now_ms() / 10ULL);
+}
+
+/* fchown(2) / fchownat(2)。**所有者を変える要求は常に成功でよい。**
+ * xv6fs の inode に uid / gid の欄が無く、Orthox は uid 0 の単一利用者で
+ * 動くので、「root のものにせよ」は既に満たされている。ENOSYS を返して
+ * いたときは GCC のビルドで cp -p が
+ *
+ *     cp: can't preserve ownership of 'include-fixed/limits.h'
+ *
+ * を出していた (2026-08-30 に実機で確認)。**黙って 0 を返すのではなく、
+ * 相手が本当に在るかだけは見る。**無いものに成功を返すと、呼び手が
+ * 「作れた」と思い込んで次で転ぶ */
+static int linux_sys_fchown(int fd) {
+    struct kstat st;
+    return sys_fstat(fd, &st);
+}
+
+static int linux_sys_fchownat(int dirfd, const char* path, int flags) {
+    struct kstat st;
+    if (path && path[0] == '\0' && (flags & LINUX_AT_EMPTY_PATH) != 0)
+        return sys_fstat(dirfd, &st);
+    return sys_fstatat(dirfd, path, &st, flags);
+}
+
 /* umask はプロセスごとの状態で fork で引き継ぐ (include/task.h)。
  * **古い値を返すのが仕様。** 返さないと、保存して戻す側が壊れる */
 static int linux_sys_umask(int mask) {
@@ -1710,6 +1765,23 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                         (int)arch_syscall_arg1(frame),
                                         (const struct linux_rlimit64*)(uintptr_t)arch_syscall_arg2(frame),
                                         (struct linux_rlimit64*)(uintptr_t)arch_syscall_arg3(frame)));
+            return;
+        case LINUX_SYS_TIMES:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)linux_sys_times(
+                                        (struct linux_tms*)(uintptr_t)arch_syscall_arg0(frame)));
+            return;
+        case LINUX_SYS_FCHOWN:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)linux_sys_fchown(
+                                        (int)arch_syscall_arg0(frame)));
+            return;
+        case LINUX_SYS_FCHOWNAT:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)linux_sys_fchownat(
+                                        (int)arch_syscall_arg0(frame),
+                                        (const char*)(uintptr_t)arch_syscall_arg1(frame),
+                                        (int)arch_syscall_arg4(frame)));
             return;
         case LINUX_SYS_GETRUSAGE:
             arch_syscall_set_return(frame,

@@ -99,6 +99,12 @@ struct linux_statfs {
 #define LINUX_REBOOT_MAGIC2B       369367448U      /* 0x16041998 */
 #define LINUX_REBOOT_MAGIC2C       537993216U      /* 0x20112000 */
 #define LINUX_REBOOT_CMD_RESTART   0x01234567U
+/* **実測で ENOSYS が出たもの (2026-08-30)。** Pi 4 実機で GCC 4.7.4 を
+ * セルフホストしたときに呼ばれた。times だけは **返り値が意味を持つ**ので
+ * 中身を 0 にするだけでは足りない (linux_syscall.c の実装を見よ) */
+#define LINUX_SYS_FCHOWNAT          54
+#define LINUX_SYS_FCHOWN            55
+#define LINUX_SYS_TIMES            153
 /* **実測で ENOSYS が出たもの (2026-08-11)。** Orthox の中で
  * gcc / ld / make を動かしたときに呼ばれた。どれも戻り値を見て続行する
  * 作りだったので致命的ではなかったが、埋めておく */
