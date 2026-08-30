@@ -843,6 +843,18 @@ $(AARCH64_RENAME_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
 
 aarch64-rename-probe: $(AARCH64_RENAME_PROBE_ELF)
 
+# /reboot —— カーネルを差し替えるたびに人へ電源の入れ直しを頼まずに済む。
+# **静的リンクで作ること** (S-11 で libc.so を置いてから、実機の gcc の
+# 既定が動的リンクに変わった。ローダが揃わないと not found になる)
+AARCH64_REBOOT_ELF = out/aarch64-reboot.elf
+$(AARCH64_REBOOT_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_reboot.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_reboot.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-reboot: $(AARCH64_REBOOT_ELF)
+
 # G-1 の台本の完了検出を実機なしで確かめる。**日報2026-08-29 の誤検出 3 件を
 # そのまま入力に混ぜて、当たらないことを見る**
 pi4-g1-marker-test:

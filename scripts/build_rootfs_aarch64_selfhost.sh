@@ -55,6 +55,22 @@ mkdir -p "$FSDIR/bin" "$FSDIR/src"
 #
 # **中身は静的。**procfs は無いので、実際にマウントしている 1 本を書いておく。
 # 空き容量そのものは statfs が本物を返す。/etc/mtab は df 以外が見る
+# **`/reboot` を必ず入れる (S-13)。**カーネルを差し替えるたびに人へ
+# 電源の入れ直しを頼まずに済む (実測 21〜27 秒で復帰)。
+#
+# **2 回消した。**2026-08-29 と 2026-08-30 に、実機の gcc で書き起こした
+# ものを rootfs に置いていたため、焼き直すたびに消えた。
+# **静的リンクであること** —— S-11 で libc.so を置いてから実機の gcc の
+# 既定が動的リンクに変わり、ローダ次第で `not found` になる。
+if [ -f out/aarch64-reboot.elf ]; then
+  cp out/aarch64-reboot.elf "$FSDIR/reboot"
+  chmod +x "$FSDIR/reboot"
+  echo "--- /reboot を入れた ($(wc -c < out/aarch64-reboot.elf) バイト)"
+else
+  echo "★ out/aarch64-reboot.elf が無い。make aarch64-reboot を先に" >&2
+  exit 1
+fi
+
 mkdir -p "$FSDIR/proc" "$FSDIR/etc"
 printf '/dev/sd0 / xv6fs rw 0 0\n' > "$FSDIR/proc/mounts"
 cp "$FSDIR/proc/mounts" "$FSDIR/etc/mtab"
@@ -238,6 +254,17 @@ n_src="$(find "$FSDIR/src/kernel-build" -type f \( -name '*.c' -o -name '*.h' -o
 [ -f "$FSDIR/src/kernel-build/Makefile" ] || {
   echo "★ ネイティブ Makefile が入っていない" >&2; exit 1; }
 echo "  カーネルソース $n_src 本 + Makefile  ok"
+
+# **/reboot が在り、静的リンクであること (S-13)。**
+# 2 回消しているうえ、動的リンクだと `not found` になって
+# 「再起動の道具が起動しない」という最悪の形になる
+[ -x "$FSDIR/reboot" ] || { echo "★ /reboot がイメージに無い" >&2; exit 1; }
+if command -v llvm-readelf >/dev/null 2>&1; then
+  if llvm-readelf -l "$FSDIR/reboot" 2>/dev/null | grep -q INTERP; then
+    echo "★ /reboot が動的リンクになっている (PT_INTERP が在る)" >&2; exit 1
+  fi
+fi
+echo "  /reboot ($(wc -c < "$FSDIR/reboot") バイト、静的リンク)  ok"
 
 # GCC を載せたときは、configure が最初に触るものが在ることを見る
 if [ -n "$GCCSRC" ]; then
