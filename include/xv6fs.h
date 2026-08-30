@@ -314,6 +314,17 @@ int xv6fs_rmdir_path(const char *path);
 int xv6fs_rename_path(const char *oldpath, const char *newpath);
 int xv6fs_mkdir_path(const char *path, int mode);
 int xv6fs_chmod_path(const char *path, uint32_t mode);
+/* statfs(2) の材料。**単位はブロック** (bsize バイト) */
+struct xv6fs_statfs {
+    uint64_t bsize;
+    uint64_t blocks;
+    uint64_t bfree;
+    uint64_t files;
+    uint64_t ffree;
+    uint64_t namelen;
+};
+int xv6fs_statfs(struct xv6fs_statfs *out);
+
 int xv6fs_sync(void);
 /* mtime に入れる「いまの秒」。壁時計ではなく、再起動を跨いで単調に増える
  * 通し番号 (スーパーブロックの mtime_base + 起動からの経過秒) */

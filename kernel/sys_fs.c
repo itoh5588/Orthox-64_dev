@@ -144,6 +144,17 @@ int sys_sync(void) {
     return fs_sync();
 }
 
+int sys_statfs(const char* path, struct orth_statfs* out) {
+    return fs_statfs(path, out);
+}
+
+int sys_fstatfs(int fd, struct orth_statfs* out) {
+    /* **どの道 1 つの xv6fs しか無い。**fd から辿るべきだが、
+     * 分ける意味が出るまではパス無しの statfs と同じにする */
+    (void)fd;
+    return fs_statfs(0, out);
+}
+
 int sys_unlink(const char* path) {
     return fs_unlink(path);
 }

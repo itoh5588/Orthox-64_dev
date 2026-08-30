@@ -30,6 +30,32 @@
  * riscv64 は 38 が未割り当てで renameat2(276) を出す。両方受けないと
  * 片方のアーキで基本の rename が ENOSYS になる */
 #define LINUX_SYS_RENAMEAT         38
+/* statfs(2) / fstatfs(2)。**空き容量が見えないまま数時間のビルドを回すのは
+ * 危ない**ので入れた (2026-08-30)。busybox df は引数つきだと statfs を、
+ * 引数なしだと /proc/mounts を読もうとする */
+#define LINUX_SYS_STATFS           43
+#define LINUX_SYS_FSTATFS          44
+
+/* Linux/asm-generic の struct statfs (LP64)。**musl の bits/statfs.h と対。**
+ * 120 バイト。f_fsid は int 2 本ぶんの 8 バイト */
+struct linux_statfs {
+    uint64_t f_type;
+    uint64_t f_bsize;
+    uint64_t f_blocks;
+    uint64_t f_bfree;
+    uint64_t f_bavail;
+    uint64_t f_files;
+    uint64_t f_ffree;
+    uint64_t f_fsid;
+    uint64_t f_namelen;
+    uint64_t f_frsize;
+    uint64_t f_flags;
+    uint64_t f_spare[4];
+};
+
+/* df が「種別」の欄に出す値。**Linux の表に無い番号を名乗る** —— 既存の
+ * ファイルシステムを騙るより、知らない値のほうが正直 ("XV6F") */
+#define LINUX_XV6FS_MAGIC 0x58563646ULL
 #define LINUX_SYS_TRUNCATE         45
 #define LINUX_SYS_FTRUNCATE        46
 #define LINUX_SYS_FACCESSAT        48

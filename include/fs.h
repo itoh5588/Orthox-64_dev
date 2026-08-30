@@ -252,6 +252,17 @@ int fs_getcwd(char* buf, size_t size);
 int fs_truncate(const char* path, uint64_t length);
 int fs_ftruncate(int fd, uint64_t length);
 int fs_utimensat(int dirfd, const char* path, const void* times, int flags);
+/* statfs(2) の結果。**単位はブロック** (bsize バイト) */
+struct orth_statfs {
+    uint64_t bsize;
+    uint64_t blocks;
+    uint64_t bfree;
+    uint64_t bavail;
+    uint64_t files;
+    uint64_t ffree;
+    uint64_t namelen;
+};
+int fs_statfs(const char* path, struct orth_statfs* out);
 int fs_sync(void);
 int fs_unlink(const char* path);
 int fs_unlinkat(int dirfd, const char* path, int flags);

@@ -49,6 +49,16 @@ echo "--- イメージの中身を並べる"
 rm -rf "$FSDIR"
 mkdir -p "$FSDIR/bin" "$FSDIR/src"
 
+# **`df` が読む表。**busybox は「パス → マウント点」を /proc/mounts から引くので、
+# statfs(2) を実装しただけでは df が手前で止まる (2026-08-30 に実機で確認:
+# 「df: /proc/mounts: No such file or directory」)。
+#
+# **中身は静的。**procfs は無いので、実際にマウントしている 1 本を書いておく。
+# 空き容量そのものは statfs が本物を返す。/etc/mtab は df 以外が見る
+mkdir -p "$FSDIR/proc" "$FSDIR/etc"
+printf '/dev/sd0 / xv6fs rw 0 0\n' > "$FSDIR/proc/mounts"
+cp "$FSDIR/proc/mounts" "$FSDIR/etc/mtab"
+
 # **カーネルが中身まで照合する既知のファイル。**
 # 「読めた」だけでは、別のブロックを返していても気づけない
 # (tests/aarch64_smoke.sh と同じ文字列。fs の自己診断がこれを見る)

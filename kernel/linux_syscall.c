@@ -1657,6 +1657,35 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                                                   (const char*)(uintptr_t)arch_syscall_arg3(frame),
                                                                   (int)arch_syscall_arg4(frame)));
             return;
+        case LINUX_SYS_STATFS:
+        case LINUX_SYS_FSTATFS:
+            {
+                struct orth_statfs st;
+                struct linux_statfs* u =
+                    (struct linux_statfs*)(uintptr_t)arch_syscall_arg1(frame);
+                int rc;
+                if (syscall_no == LINUX_SYS_STATFS) {
+                    rc = sys_statfs((const char*)(uintptr_t)arch_syscall_arg0(frame), &st);
+                } else {
+                    rc = sys_fstatfs((int)arch_syscall_arg0(frame), &st);
+                }
+                if (rc == 0 && u) {
+                    memset(u, 0, sizeof(*u));
+                    u->f_type    = LINUX_XV6FS_MAGIC;
+                    u->f_bsize   = st.bsize;
+                    u->f_blocks  = st.blocks;
+                    u->f_bfree   = st.bfree;
+                    u->f_bavail  = st.bavail;
+                    u->f_files   = st.files;
+                    u->f_ffree   = st.ffree;
+                    u->f_namelen = st.namelen;
+                    u->f_frsize  = st.bsize;
+                } else if (rc == 0 && !u) {
+                    rc = -14;   /* EFAULT */
+                }
+                arch_syscall_set_return(frame, (uint64_t)(int64_t)rc);
+            }
+            return;
         case LINUX_SYS_UNAME:
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)linux_sys_uname(

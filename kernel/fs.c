@@ -116,6 +116,9 @@ extern void puthex(uint64_t v);
 #ifndef ENAMETOOLONG
 #define ENAMETOOLONG 36
 #endif
+#ifndef ENOSYS_FS
+#define ENOSYS_FS 38
+#endif
 
 /* pipe を指す file object がどちらの端を持つかを file->aux0 に記録する。
  * 匿名 pipe は読み端と書き端で別の file object なのでどちらか一方、
@@ -3337,6 +3340,38 @@ int fs_rmdir(const char* path) {
         return 0;
     }
     return -ENOENT;
+}
+
+/* statfs(2)。**どの道 1 つの xv6fs しか無い**ので、パスは「在るか」だけ見る。
+ * /tmp (ramfs) を聞かれたら RAM の実態を返す —— あちらは伸び縮みするので
+ * 総量という概念が無く、**0 を返して「分からない」と正直に言う**より、
+ * 使用中のぶんだけでも出したほうが判断に使える */
+int fs_statfs(const char* path, struct orth_statfs* out) {
+    char resolved_path[256];
+    const char* norm;
+    struct xv6fs_statfs st;
+
+    if (!out) return -EFAULT;
+    if (path) {
+        struct kstat dummy;
+        resolve_task_path(path, resolved_path, sizeof(resolved_path));
+        norm = normalize_fs_path(resolved_path);
+        /* 在らないパスは ENOENT (df は引数ごとにこれを見る) */
+        if (*norm && !strcmp_exact(norm, "/") && fs_stat(resolved_path, &dummy) < 0) {
+            return -ENOENT;
+        }
+    }
+    if (!(g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted())) return -ENOSYS_FS;
+    if (xv6fs_statfs(&st) < 0) return -EIO;
+
+    out->bsize   = st.bsize;
+    out->blocks  = st.blocks;
+    out->bfree   = st.bfree;
+    out->bavail  = st.bfree;
+    out->files   = st.files;
+    out->ffree   = st.ffree;
+    out->namelen = st.namelen;
+    return 0;
 }
 
 int fs_sync(void) {

@@ -1020,6 +1020,30 @@ int sys_renameat(int olddirfd, const char* oldpath,
     return xv6fs_rename_path(old_resolved, new_resolved);
 }
 
+/* statfs(2) / fstatfs(2)。xv6fs が 1 つだけなのは riscv64 も同じなので、
+ * パスも fd も見ずに同じ答えを返す。**空き容量が見えないまま長いビルドを
+ * 回すのは危ない**ので入れた (2026-08-30) */
+int sys_statfs(const char* path, struct orth_statfs* out) {
+    struct xv6fs_statfs st;
+    if (!out) return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    (void)path;
+    if (xv6fs_statfs(&st) < 0) return -LINUX_EPERM;
+    out->bsize   = st.bsize;
+    out->blocks  = st.blocks;
+    out->bfree   = st.bfree;
+    out->bavail  = st.bfree;
+    out->files   = st.files;
+    out->ffree   = st.ffree;
+    out->namelen = st.namelen;
+    return 0;
+}
+
+int sys_fstatfs(int fd, struct orth_statfs* out) {
+    (void)fd;
+    return sys_statfs(0, out);
+}
+
 int sys_mkdir(const char* path, int mode) {
     char resolved[256];
     struct kstat st;

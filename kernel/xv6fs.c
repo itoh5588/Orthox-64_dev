@@ -1495,6 +1495,51 @@ int xv6fs_chmod_path(const char *path, uint32_t mode) {
     return 0;
 }
 
+/* statfs(2) の材料を集める。**空き容量が見えないまま数時間のビルドを
+ * 回すのは危ない** —— 3 時間走らせた末に容量切れで落ちるのが最悪の
+ * 失敗の仕方なので、`df` が動くようにする (2026-08-30)。
+ *
+ * **ビットマップと inode 表を舐める。**balloc / ialloc と同じ歩き方。
+ * `df` は人が打つものなので、1 秒前後かかっても構わない
+ * (1.5GB の FS でビットマップ 192 ブロック + inode 表 2048 ブロック)。
+ *
+ * ブロックは 1 つずつ数えるのではなく、**バイト単位でビットを立てて
+ * いない数を数える** —— 8 ビットまとめて見るほうが速い。 */
+int xv6fs_statfs(struct xv6fs_statfs *out) {
+    uint32_t b, i;
+    uint64_t bfree = 0, ifree = 0;
+
+    if (!out || !xv6fs_is_mounted()) return -1;
+
+    for (b = 0; b < g_sb.size; b += XV6FS_BPB) {
+        struct xv6buf *bp = xv6bread(g_xv6fs_dev, XV6FS_BBLOCK(b, g_sb));
+        for (uint32_t bi = 0; bi < XV6FS_BPB && b + bi < g_sb.size; bi++) {
+            if ((bp->data[bi / 8] & (1 << (bi % 8))) == 0) bfree++;
+        }
+        xv6brelse(bp);
+    }
+
+    /* inode 表は 1 ブロックに XV6FS_IPB 個。**ブロックごとに 1 回読む** */
+    for (i = 1; i < g_sb.ninodes; ) {
+        struct xv6buf *bp = xv6bread(g_xv6fs_dev, XV6FS_IBLOCK(i, g_sb));
+        struct xv6fs_dinode *dip = (struct xv6fs_dinode *)bp->data;
+        uint32_t upto = i + XV6FS_IPB - (i % XV6FS_IPB);
+        if (upto > g_sb.ninodes) upto = g_sb.ninodes;
+        for (; i < upto; i++) {
+            if (dip[i % XV6FS_IPB].type == 0) ifree++;
+        }
+        xv6brelse(bp);
+    }
+
+    out->bsize   = XV6FS_BSIZE;
+    out->blocks  = g_sb.size;
+    out->bfree   = bfree;
+    out->files   = g_sb.ninodes;
+    out->ffree   = ifree;
+    out->namelen = XV6FS_DIRSIZ;
+    return 0;
+}
+
 int xv6fs_sync(void) {
     /* **P-6 以前はここが空でよかった** —— end_op が毎回コミットしていたから。
      * 溜めるようにしたので、**ここが唯一の「必ず出す」約束**になった */
