@@ -115,6 +115,10 @@ void xv6_sleep_unlock(struct xv6_sleeplock *s);
 #define XV6FS_T_DEVICE 3
 #define XV6FS_T_FIFO   4   /* named pipe (mkfifo)。major/minor は T_FILE と同じ
                             * MODE_MAGIC 方式で permission を保存する */
+#define XV6FS_T_SYMLINK 5  /* symlink (2026-08-31, N-6)。リンク先の文字列を
+                            * 通常ファイルと同じ addrs[]/size に入れて持つ。
+                            * 「速いインライン格納」は無い —— NDIRECT だけで
+                            * どのみち十分な長さが入る */
 
 /*
  * Orthox-64 stores POSIX permission bits for regular files and directories
@@ -335,6 +339,9 @@ int                  xv6fs_dirlink(struct xv6fs_inode *dp,
                                    const char *name, uint32_t inum);
 
 struct xv6fs_inode*  xv6fs_namei(const char *path);
+/* lstat/readlink 用。最後の要素がシンボリックリンクでも辿らずそれ自体を
+ * 返す (途中の要素は普通に辿る) (N-6, 2026-08-31) */
+struct xv6fs_inode*  xv6fs_namei_nofollow(const char *path);
 struct xv6fs_inode*  xv6fs_nameiparent(const char *path, char *name);
 
 int                  xv6fs_stat(struct xv6fs_inode *ip, struct xv6fs_stat *st);
@@ -360,6 +367,14 @@ int xv6fs_write_file(const char *path, uint64_t offset,
                      const void *buf, size_t n);
 int xv6fs_create_file(const char *path, int mode, struct xv6fs_inode **out_ip);
 int xv6fs_mknod_fifo(const char *path, int mode);
+/* symlinkat(2) (N-6, 2026-08-31)。linkpath が既にあれば -1 (EEXIST 相当) */
+int xv6fs_symlink_path(const char *target, const char *linkpath);
+/* readlink(2)。null 終端しない。戻り値は書いたバイト数か負 */
+int xv6fs_readlink_path(const char *path, char *buf, size_t bufsiz);
+/* lstat(2) 相当。xv6fs_stat_path と違い、最後の要素がシンボリックリンク
+ * でも辿らずそれ自体を見る */
+int xv6fs_lstat_path(const char *path, uint32_t *mode, uint64_t *size,
+                     int64_t *mtime, uint32_t *rdev);
 int xv6fs_truncate_file(const char *path, uint64_t length);
 int xv6fs_unlink_path(const char *path);
 int xv6fs_link_path(const char *oldpath, const char *newpath);

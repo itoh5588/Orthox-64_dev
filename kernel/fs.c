@@ -1003,8 +1003,8 @@ static void kstat_from_ramfs(struct kstat* st, const struct ramfs_file* rf) {
 }
 
 static int fs_try_active_root_lookup(const char* path, void** data, size_t* size, uint32_t* mode);
-static int fs_try_active_root_stat(const char* path, struct kstat* st);
-static int fs_stat_normalized_path(const char* path, struct kstat* st);
+static int fs_try_active_root_stat(const char* path, struct kstat* st, int follow);
+static int fs_stat_normalized_path(const char* path, struct kstat* st, int follow);
 
 static int fs_is_mount_dir(const char* path) {
     const char* subpath = 0;
@@ -1452,13 +1452,15 @@ static int fs_try_active_root_lookup(const char* path, void** data, size_t* size
     return -1;
 }
 
-static int fs_try_active_root_stat(const char* path, struct kstat* st) {
+static int fs_try_active_root_stat(const char* path, struct kstat* st, int follow) {
     if (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
         uint32_t mode = 0;
         uint64_t size = 0;
         uint32_t rdev = 0;
         int64_t  mtime = 0;
-        if (xv6fs_stat_path(path, &mode, &size, &mtime, &rdev) < 0) return -1;
+        int rc = follow ? xv6fs_stat_path(path, &mode, &size, &mtime, &rdev)
+                        : xv6fs_lstat_path(path, &mode, &size, &mtime, &rdev);
+        if (rc < 0) return -1;
         kstat_set_defaults(st, mode, (int64_t)size);
         st->dev = FS_DEV_ROOT_ARCHIVE;
         st->ino = fs_hash_name(path);
@@ -2825,14 +2827,14 @@ int fs_fstat(int fd, struct kstat* st) {
         return 0;
     }
     if (fs_fd_type(f) == FT_DIR) {
-        if (fs_fd_name(f)[0]) return fs_stat_normalized_path(normalize_fs_path(fs_fd_name(f)), st);
+        if (fs_fd_name(f)[0]) return fs_stat_normalized_path(normalize_fs_path(fs_fd_name(f)), st, 1);
         kstat_set_defaults(st, fs_default_mode_for_type(KSTAT_MODE_DIR), (int64_t)fs_fd_size(f));
         st->dev = FS_DEV_SYNTH;
         st->ino = (uint64_t)fd + 1U;
         return 0;
     }
     if (fs_fd_type(f) == FT_USB) {
-        if (fs_fd_name(f)[0]) return fs_stat_normalized_path(normalize_fs_path(fs_fd_name(f)), st);
+        if (fs_fd_name(f)[0]) return fs_stat_normalized_path(normalize_fs_path(fs_fd_name(f)), st, 1);
         kstat_set_defaults(st,
                            fs_default_mode_for_type((fs_fd_aux1(f) & 0x10U) ? KSTAT_MODE_DIR : KSTAT_MODE_FILE),
                            (int64_t)fs_fd_size(f));
@@ -2841,7 +2843,7 @@ int fs_fstat(int fd, struct kstat* st) {
         return 0;
     }
     if ((fs_fd_type(f) == FT_RAMFS || fs_fd_type(f) == FT_MODULE || fs_fd_type(f) == FT_XV6FS) && fs_fd_name(f)[0]) {
-        if (fs_stat_normalized_path(normalize_fs_path(fs_fd_name(f)), st) == 0) return 0;
+        if (fs_stat_normalized_path(normalize_fs_path(fs_fd_name(f)), st, 1) == 0) return 0;
         /* path lookup failed (e.g. fd->name truncated to 63 chars).
            fall back to fd-local metadata so fstat does not break dlopen. */
     }
@@ -2948,7 +2950,7 @@ int fs_getdents64(int fd, void* dirp, size_t count) {
     return (int)out_used;
 }
 
-static int fs_stat_normalized_path(const char* path, struct kstat* st) {
+static int fs_stat_normalized_path(const char* path, struct kstat* st, int follow) {
     const char* mount_subpath = 0;
     const struct vfs_mountpoint* mount = 0;
     if (!st || !path) return -EINVAL;
@@ -2986,7 +2988,7 @@ static int fs_stat_normalized_path(const char* path, struct kstat* st) {
     }
 
     {
-        if (fs_try_active_root_stat(path, st) == 0) {
+        if (fs_try_active_root_stat(path, st, follow) == 0) {
             return 0;
         }
         if (fs_root_is_usb_only()) return -ENOENT;
@@ -3017,19 +3019,26 @@ int fs_stat(const char* path, struct kstat* st) {
     char resolved_path[256];
     if (!st || !path) return -EINVAL;
     resolve_task_path(path, resolved_path, sizeof(resolved_path));
-    return fs_stat_normalized_path(normalize_fs_path(resolved_path), st);
+    return fs_stat_normalized_path(normalize_fs_path(resolved_path), st, 1);
 }
+
+/* **musl (rootfs/usr/include/fcntl.h) の実際の値に合わせる。**BSD 由来の
+ * 0x0002 ではない。ここが違っていると lstat が AT_SYMLINK_NOFOLLOW を
+ * 検出できず、常に stat と同じ (辿る) 動きになる (N-6, 2026-08-31) */
+#ifndef AT_SYMLINK_NOFOLLOW
+#define AT_SYMLINK_NOFOLLOW 0x100
+#endif
 
 int fs_fstatat(int dirfd, const char* path, struct kstat* st, int flags) {
     char resolved_path[256];
-    (void)flags;
+    if (flags & ~AT_SYMLINK_NOFOLLOW) return -EINVAL;
     if (resolve_dirfd_path(dirfd, path, resolved_path, sizeof(resolved_path)) < 0) {
         return -ENOENT;
     }
-    {
-        int ret = fs_stat(resolved_path, st);
-        return ret;
-    }
+    /* N-6 (2026-08-31): lstat (AT_SYMLINK_NOFOLLOW) は最後の要素を辿らない。
+     * fs_stat 経由だと常に辿ってしまうので、正規化まで自前でやる */
+    return fs_stat_normalized_path(normalize_fs_path(resolved_path), st,
+                                   (flags & AT_SYMLINK_NOFOLLOW) ? 0 : 1);
 }
 
 #ifndef F_OK
@@ -3044,11 +3053,10 @@ int fs_fstatat(int dirfd, const char* path, struct kstat* st, int flags) {
 #ifndef R_OK
 #define R_OK 4
 #endif
+/* musl の実際の値に合わせる (N-6, 2026-08-31)。AT_REMOVEDIR と同じ 0x200
+ * だが、faccessat と unlinkat は別々の flags を受け取るので衝突しない */
 #ifndef AT_EACCESS
-#define AT_EACCESS 0x0001
-#endif
-#ifndef AT_SYMLINK_NOFOLLOW
-#define AT_SYMLINK_NOFOLLOW 0x0002
+#define AT_EACCESS 0x200
 #endif
 int fs_access(const char* path, int mode) {
     return fs_faccessat(-100, path, mode, 0);
@@ -3089,7 +3097,7 @@ int fs_utimensat(int dirfd, const char* path, const void* times, int flags) {
         if (dirfd < 0 || dirfd >= MAX_FDS || !current->fds[dirfd].in_use) return -EINVAL;
         f = &current->fds[dirfd];
         if (!fs_fd_name(f)[0]) return -EINVAL;
-        if (fs_stat_normalized_path(normalize_fs_path(fs_fd_name(f)), &st) < 0) return -ENOENT;
+        if (fs_stat_normalized_path(normalize_fs_path(fs_fd_name(f)), &st, 1) < 0) return -ENOENT;
         rf = find_ramfs(fs_fd_name(f));
         if (rf) {
             now = fs_now_sec();
@@ -3125,12 +3133,28 @@ int64_t fs_readlink(const char* path, char* buf, size_t bufsiz) {
 }
 
 int64_t fs_readlinkat(int dirfd, const char* path, char* buf, size_t bufsiz) {
-    struct kstat dummy;
-    (void)buf;
-    (void)bufsiz;
-    if (!path) return -EFAULT;
-    if (fs_fstatat(dirfd, path, &dummy, AT_SYMLINK_NOFOLLOW) < 0) return -ENOENT;
-    return -EINVAL;
+    char resolved_path[256];
+    const char* norm;
+    int n;
+    if (!path || !buf) return -EFAULT;
+    if (resolve_dirfd_path(dirfd, path, resolved_path, sizeof(resolved_path)) < 0) return -ENOENT;
+    norm = normalize_fs_path(resolved_path);
+
+    /* ramfs にシンボリックリンクは無い (N-6, 2026-08-31)。存在すれば
+     * 「シンボリックリンクではない」= EINVAL、無ければ ENOENT */
+    if (find_ramfs(norm)) return -EINVAL;
+
+    if (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
+        n = xv6fs_readlink_path(norm, buf, bufsiz);
+        if (n >= 0) return n;
+        {
+            struct kstat st;
+            if (fs_stat_normalized_path(norm, &st, 0) < 0) return -ENOENT;
+        }
+        return -EINVAL;
+    }
+
+    return -ENOENT;
 }
 
 int64_t fs_lseek(int fd, int64_t offset, int whence) {
@@ -3208,6 +3232,33 @@ int fs_unlink(const char* path) {
     }
     
     return -ENOENT; // ファイルが見つからないか、TAR 内など削除できないファイル
+}
+
+/* symlinkat(2) (N-6, 2026-08-31)。**ramfs には作れない** —— シンボリック
+ * リンクという概念自体が無く、フルパスの平らな表を作り直すのは今日の
+ * 範囲では見送った。/tmp の下を含め、ramfs 側は ENOSYS で断る。 */
+int fs_symlink(const char* target, const char* linkpath) {
+    char resolved_path[256];
+    const char* norm;
+    if (!target || !linkpath) return -EFAULT;
+    resolve_task_path(linkpath, resolved_path, sizeof(resolved_path));
+    norm = normalize_fs_path(resolved_path);
+    exec_cache_invalidate(norm);
+
+    if (path_is_under_tmp(norm) || find_ramfs(norm)) return -ENOSYS_FS;
+
+    if (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
+        if (xv6fs_symlink_path(target, norm) == 0) return 0;
+        return -EEXIST;
+    }
+    return -ENOENT;
+}
+
+int fs_symlinkat(const char* target, int dirfd, const char* linkpath) {
+    char resolved_path[256];
+    if (!target || !linkpath) return -EFAULT;
+    if (resolve_dirfd_path(dirfd, linkpath, resolved_path, sizeof(resolved_path)) < 0) return -ENOENT;
+    return fs_symlink(target, resolved_path);
 }
 
 /* ramfs は名前がフルパスの平らな表なので、ディレクトリを動かしたら
@@ -3393,7 +3444,7 @@ int fs_mkdir(const char* path, int mode) {
         return create_ramfs_dir(norm, (uint32_t)mode) ? 0 : -ENOENT;
     }
     if (g_root_source == ROOT_SOURCE_XV6FS && xv6fs_is_mounted()) {
-        if (fs_try_active_root_stat(norm, &st) == 0) {
+        if (fs_try_active_root_stat(norm, &st, 1) == 0) {
             if ((st.mode & 0170000U) == KSTAT_MODE_DIR) return -EEXIST;
             return -EEXIST;
         }
@@ -3518,7 +3569,7 @@ int fs_fchdir(int fd) {
     if (fs_fd_type(f) != FT_DIR) return -ENOTDIR;
     if (fs_fd_name(f)[0] == '\0') return -EBADF;
     norm = normalize_fs_path(fs_fd_name(f));
-    if (fs_stat_normalized_path(norm, &st) < 0) return -ENOENT;
+    if (fs_stat_normalized_path(norm, &st, 1) < 0) return -ENOENT;
     if ((st.mode & 0170000U) != KSTAT_MODE_DIR) return -ENOTDIR;
     current->cwd[i++] = '/';
     while (*norm && i + 1 < sizeof(current->cwd)) {

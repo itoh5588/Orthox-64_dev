@@ -25,6 +25,8 @@ static int64_t linux_bootstrap_sys_wait4(int pid, int* wstatus, int options);
 
 /* Linux/RISC-V の SIGCHLD。wait4 で眠った親を起こすためにも使う。 */
 #define LINUX_SIGCHLD 17
+#define LINUX_SIGINT  2
+#define LINUX_SIGQUIT 3
 
 static struct task* linux_find_task_by_pid(int pid) {
     struct task* task = task_list;
@@ -503,14 +505,13 @@ static int linux_sys_sysinfo(struct linux_sysinfo* info) {
     return 0;
 }
 
-/* xv6fs に symlink が無いので、存在するパスは「symlink ではない」= EINVAL、
- * 存在しないパスは ENOENT を返す。musl の realpath() はこの EINVAL を見て
- * 「このパス要素は symlink ではない」と判断して先へ進む。 */
-static int linux_sys_readlinkat(int dirfd, const char* path) {
-    struct kstat st;
-    if (!path) return -LINUX_EFAULT;
-    if (sys_fstatat(dirfd, path, &st, 0) < 0) return -LINUX_ENOENT;
-    return -LINUX_EINVAL; /* not a symbolic link */
+/* N-6 (2026-08-31): xv6fs に本物のシンボリックリンクを実装したので、
+ * fs_readlinkat にそのまま委ねる。戻り値は fs.c 側の errno 定数と
+ * Linux の値が同じ番号を使っているのでそのまま渡してよい (どちらも
+ * ENOENT=2 / EINVAL=22 など、fs.c 冒頭の #define がその前提で書かれている) */
+static int64_t linux_sys_readlinkat(int dirfd, const char* path, char* buf, size_t bufsiz) {
+    if (!path || !buf) return -LINUX_EFAULT;
+    return fs_readlinkat(dirfd, path, buf, bufsiz);
 }
 
 struct linux_winsize {
@@ -536,6 +537,76 @@ static struct linux_termios g_linux_console_termios = {
  * 1 文字が 2 回出る。fs.c のコンソール読み取りが参照する */
 int arch_console_echo_enabled(void) {
     return (g_linux_console_termios.c_lflag & 0x00000008u) != 0;
+}
+
+/* ---- M-9 (2026-08-31): シリアル/USB キーボードの ^C / ^\ ----------------
+ *
+ * termios は ISIG (c_lflag bit0) が立ち、VINTR=3 (^C) / VQUIT=28 (^\) も
+ * 最初から設定されていたのに、割り込み文字を見て実際に配送する経路が
+ * どこにも無かった。**リングに積む前に判定できるよう、ロックなしで
+ * 呼べる判定関数と、フォアグラウンドプロセスグループを落とす関数を
+ * 分けた。**後者は task_mark_zombie が別のロックを取るので、呼び出し側
+ * (aarch64/console.c) はコンソールの割り込みロックを持ったまま呼ばないこと
+ * (task_wake と同じ扱い)。 */
+int linux_console_is_intr_char(uint8_t ch) {
+    if ((g_linux_console_termios.c_lflag & 0x00000001u) == 0) return 0;   /* ISIG off */
+    return ch == (uint8_t)g_linux_console_termios.c_cc[0] ||   /* VINTR */
+           ch == (uint8_t)g_linux_console_termios.c_cc[1];     /* VQUIT */
+}
+
+/* M-8 (2026-08-31): pid の子を pid 1 に引き取らせる。**本来の init のような
+ * 「拾って wait する」回収ループが無いので、既に zombie な子は引き取っても
+ * 誰も reap しない。**親が消える前にここで reap してしまう。まだ走っている
+ * 子は ppid を付け替えるだけにする —— 死んだ pid を指したままにはしない。
+ *
+ * task_reap は task_list からノードを外して解放するので、**呼び出し側が
+ * 同じ巡回の中でこれを呼ぶときは、先に t->next を控えてから呼ぶこと。** */
+static void linux_reap_orphans_of(int pid) {
+    struct task* t = task_list;
+    while (t) {
+        struct task* next = t->next;
+        if (t->ppid == pid) {
+            if (t->state == TASK_ZOMBIE) {
+                (void)task_reap(t);
+            } else {
+                t->ppid = 1;
+            }
+        }
+        t = next;
+    }
+}
+
+/* x86 (kernel/keyboard.c の send_sigint_to_foreground_pgrp) と同じ、
+ * 「本物のシグナル配送ではなく即座に zombie にする」簡易実装。
+ * job control (setpgid) が無いので、フォアグラウンドの pgid は
+ * ash 自身の pid と揃っていることが多い。pid 1 (シェル自身) は
+ * 除外して、それ以外の同じ pgid のタスクだけを落とす。
+ *
+ * **2 巡に分けている。**1 巡目で zombie にする間は task_list のリンクは
+ * 変わらない (task_mark_zombie はリストを触らない) ので安全に辿れるが、
+ * 2 巡目の task_reap はノードを外すので、1 巡目の途中で呼ぶと次のノードを
+ * 見失う。落とした pid を控えておいて、1 巡目が終わってから 2 巡目で
+ * それぞれの子を片付ける。 */
+void linux_console_deliver_intr(uint8_t ch) {
+    struct task* t = task_list;
+    int fg = g_linux_tty_pgrp;
+    int sig = (ch == (uint8_t)g_linux_console_termios.c_cc[1]) ? LINUX_SIGQUIT : LINUX_SIGINT;
+    int victim_pids[64];
+    int nvictims = 0;
+    if (fg == 0) return;   /* まだ誰も TIOCSPGRP/TIOCGPGRP していない */
+
+    while (t) {
+        if (t->pgid == fg && t->pid != 1) {
+            t->sig_pending |= (1ULL << sig);
+            task_mark_zombie(t, 128 + sig);
+            if (nvictims < 64) victim_pids[nvictims++] = t->pid;
+        }
+        t = t->next;
+    }
+
+    for (int i = 0; i < nvictims; i++) {
+        linux_reap_orphans_of(victim_pids[i]);
+    }
 }
 
 /* termios の ONLCR (c_oflag bit0)。**LF だけでは実機の端末は行頭に戻らない。**
@@ -1283,6 +1354,100 @@ static void* linux_bootstrap_sys_mmap(void* addr, size_t length, int prot, int f
     return (void*)(uintptr_t)base;
 }
 
+/* N-6 (2026-08-31): mremap (216)。**未実装のままだと musl の realloc が
+ * malloc+memcpy+free に退く。**動きは正しいが、ld の起動時など大きい
+ * ヒープ塊を伸ばすたびに毎回これを踏んで遅くなっていた。
+ *
+ * kernel/sys_vm.c にも x86 ネイティブ ABI 向けの sys_mremap があるが、
+ * その関数自体は aarch64/riscv64 のビルドに入っていない (arch_vm_* 抽象を
+ * 使っていない、x86 専用の vmm_get_phys 等を直接呼ぶ実装のため)。ここでは
+ * 同じ考え方を、この ABI が既に持っている arch_vm_* / mmap / munmap の
+ * 部品で書き直した。 */
+#define LINUX_MREMAP_MAYMOVE 1
+#define LINUX_MREMAP_FIXED   2
+
+static void* linux_bootstrap_sys_mremap(void* old_addr, size_t old_len, size_t new_len,
+                                        int flags, void* new_addr) {
+    struct task* current = get_current_task();
+    arch_address_space_t address_space;
+    uint64_t old_base = (uint64_t)(uintptr_t)old_addr;
+    uint64_t old_size, new_size;
+
+    if (!current) return linux_mmap_err(LINUX_ESRCH);
+    if (!old_base || !old_len || !new_len) return linux_mmap_err(LINUX_EINVAL);
+    if ((old_base & (PAGE_SIZE - 1)) != 0) return linux_mmap_err(LINUX_EINVAL);
+    if (flags & ~(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED)) return linux_mmap_err(LINUX_EINVAL);
+    if ((flags & LINUX_MREMAP_FIXED) && !(flags & LINUX_MREMAP_MAYMOVE)) return linux_mmap_err(LINUX_EINVAL);
+
+    old_size = linux_align_up_page((uint64_t)old_len);
+    new_size = linux_align_up_page((uint64_t)new_len);
+    address_space = arch_task_context_get_address_space(&current->ctx);
+
+    if (!arch_vm_get_phys(address_space, old_base)) return linux_mmap_err(LINUX_EINVAL);
+
+    if (new_size == old_size) return old_addr;
+
+    /* 縮める: はみ出した分を外すだけ (munmap と同じ後始末) */
+    if (new_size < old_size) {
+        for (uint64_t off = new_size; off < old_size; off += PAGE_SIZE) {
+            uint64_t phys = arch_vm_get_phys(address_space, old_base + off);
+            arch_vm_unmap_page(address_space, old_base + off);
+            if (phys) pmm_free((void*)(uintptr_t)(phys & ~(PAGE_SIZE - 1ULL)), 1);
+        }
+        arch_syscall_flush_tlb();
+        return old_addr;
+    }
+
+    /* 伸ばす: 直後が空いていればその場で足す (move 不要) */
+    {
+        uint64_t end = old_base + old_size;
+        uint64_t grow = new_size - old_size;
+        uint64_t off;
+        int occupied = 0;
+        uint64_t map_flags;
+        for (off = 0; off < grow; off += PAGE_SIZE) {
+            if (arch_vm_get_phys(address_space, end + off) != 0) { occupied = 1; break; }
+        }
+        if (!occupied) {
+            /* musl の realloc はヒープにしか使わない。読み書き可・実行不可を仮定する
+             * (arch_vm_* に既存範囲の保護属性を取り直す手段が無い) */
+            map_flags = arch_vm_user_page_flags(1, 0);
+            for (off = 0; off < grow; off += PAGE_SIZE) {
+                uint64_t phys = linux_alloc_zeroed_user_page();
+                if (!phys) return linux_mmap_err(LINUX_ENOMEM);
+                arch_vm_map_page(address_space, end + off, phys, map_flags);
+            }
+            arch_syscall_flush_tlb();
+            return old_addr;
+        }
+    }
+
+    if (!(flags & LINUX_MREMAP_MAYMOVE)) return linux_mmap_err(LINUX_ENOMEM);
+
+    /* 直後に空きが無い: 新しい範囲を作り、中身を写してから古い方を外す */
+    {
+        void* mapped = linux_bootstrap_sys_mmap((flags & LINUX_MREMAP_FIXED) ? new_addr : 0,
+                                                 (size_t)new_size, PROT_READ | PROT_WRITE,
+                                                 MAP_PRIVATE | MAP_ANONYMOUS |
+                                                 ((flags & LINUX_MREMAP_FIXED) ? MAP_FIXED : 0),
+                                                 -1, 0);
+        uint64_t new_base;
+        uint64_t off;
+        if ((int64_t)(intptr_t)mapped < 0 && (int64_t)(intptr_t)mapped > -4096) return mapped;
+        new_base = (uint64_t)(uintptr_t)mapped;
+        for (off = 0; off < old_size && off < new_size; off += PAGE_SIZE) {
+            uint64_t old_phys = arch_vm_get_phys(address_space, old_base + off);
+            uint64_t new_phys = arch_vm_get_phys(address_space, new_base + off);
+            if (old_phys && new_phys) {
+                memcpy((void*)(uintptr_t)PHYS_TO_VIRT(new_phys & ~(PAGE_SIZE - 1ULL)),
+                       (void*)(uintptr_t)PHYS_TO_VIRT(old_phys & ~(PAGE_SIZE - 1ULL)), PAGE_SIZE);
+            }
+        }
+        (void)linux_bootstrap_sys_munmap(old_addr, old_len);
+        return (void*)(uintptr_t)new_base;
+    }
+}
+
 static int linux_bootstrap_sys_mprotect(void* addr, size_t length, int prot) {
     struct task* current = get_current_task();
     arch_address_space_t address_space;
@@ -1378,6 +1543,11 @@ static void linux_bootstrap_sys_exit(int status) {
             (void)sys_close(fd);
         }
     }
+
+    /* M-8 (2026-08-31): 自分の子を pid 1 に引き取らせる (孤児 zombie が
+     * 居座り続ける経緯を断つ)。詳細は linux_reap_orphans_of のコメント */
+    linux_reap_orphans_of(current->pid);
+
     (void)task_mark_zombie(current, status);
     linux_notify_parent_exit(current);
     while (1) kernel_yield();
@@ -1510,9 +1680,18 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_READLINKAT:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_sys_readlinkat(
+                                    (uint64_t)linux_sys_readlinkat(
                                         (int)arch_syscall_arg0(frame),
-                                        (const char*)(uintptr_t)arch_syscall_arg1(frame)));
+                                        (const char*)(uintptr_t)arch_syscall_arg1(frame),
+                                        (char*)(uintptr_t)arch_syscall_arg2(frame),
+                                        (size_t)arch_syscall_arg3(frame)));
+            return;
+        case LINUX_SYS_SYMLINKAT:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)fs_symlinkat(
+                                        (const char*)(uintptr_t)arch_syscall_arg0(frame),
+                                        (int)arch_syscall_arg1(frame),
+                                        (const char*)(uintptr_t)arch_syscall_arg2(frame)));
             return;
         case LINUX_SYS_FSTAT:
             arch_syscall_set_return(frame,
@@ -1557,6 +1736,14 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             arch_syscall_set_return(frame,
                                     (uint64_t)(int64_t)linux_bootstrap_sys_munmap((void*)(uintptr_t)arch_syscall_arg0(frame),
                                                                                      (size_t)arch_syscall_arg1(frame)));
+            return;
+        case LINUX_SYS_MREMAP:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(uintptr_t)linux_bootstrap_sys_mremap((void*)(uintptr_t)arch_syscall_arg0(frame),
+                                                                                     (size_t)arch_syscall_arg1(frame),
+                                                                                     (size_t)arch_syscall_arg2(frame),
+                                                                                     (int)arch_syscall_arg3(frame),
+                                                                                     (void*)(uintptr_t)arch_syscall_arg4(frame)));
             return;
         case LINUX_SYS_BRK:
             arch_syscall_set_return(frame, linux_bootstrap_sys_brk(arch_syscall_arg0(frame)));

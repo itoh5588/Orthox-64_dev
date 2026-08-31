@@ -24,6 +24,7 @@
 #define LINUX_SYS_IOCTL            29
 #define LINUX_SYS_MKDIRAT          34
 #define LINUX_SYS_UNLINKAT         35
+#define LINUX_SYS_SYMLINKAT        36
 #define LINUX_SYS_LINKAT           37
 /* **rename(2) はアーキで番号が違う。**aarch64 は asm-generic の
  * __ARCH_WANT_RENAMEAT が立っているので musl は renameat(38) を出し、
@@ -121,6 +122,7 @@ struct linux_statfs {
 #define LINUX_SYS_GETEGID          177
 #define LINUX_SYS_BRK              214
 #define LINUX_SYS_MUNMAP           215
+#define LINUX_SYS_MREMAP           216
 #define LINUX_SYS_CLONE            220
 #define LINUX_SYS_EXECVE           221
 #define LINUX_SYS_MMAP             222

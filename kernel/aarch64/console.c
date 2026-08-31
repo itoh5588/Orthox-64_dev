@@ -38,6 +38,12 @@ void aarch64_uart_enable_rx_irq(void);
 void aarch64_uart_clear_rx_irq(void);
 void aarch64_gic_enable_irq(unsigned intid);
 
+/* M-9 (2026-08-31): ^C / ^\ の判定と配送 (kernel/linux_syscall.c)。
+ * 判定はロックなしで呼べるが、配送 (task_mark_zombie を呼ぶ) は
+ * このファイルの割り込みロックを持ったまま呼ばないこと */
+int  linux_console_is_intr_char(uint8_t ch);
+void linux_console_deliver_intr(uint8_t ch);
+
 /* 待ち手は「いま読もうとしているタスク」1 本だけ。**複数を並べない。**
  * 共有 fs.c は 1 タスクずつ set/clear するので、ここで列を持つと
  * clear し損ねた古い待ち手が残る危険のほうが大きい */
@@ -78,6 +84,7 @@ static int console_ring_empty(void) {
 void aarch64_console_rx_irq(void) {
     struct task* waiter;
     int pushed = 0;
+    int intr_ch = -1;   /* M-9: ^C/^\ を見つけたらここに積む。複数来たら最後のを使う */
     uint64_t flags = console_lock();
 
     /* **確認応答は読む前。読み終わってからでは入力が永久に止まる。**
@@ -95,21 +102,31 @@ void aarch64_console_rx_irq(void) {
         ch = aarch64_uart_getchar_nonblock();
         if (ch < 0) break;                  /* クリア後に空 = ここで終わってよい */
         while (ch >= 0) {
-            uint32_t next = (g_console_head + 1U) % CONSOLE_BUF_SIZE;
             /* 端末は改行を CR で送る。**ここで LF に直す** —
              * ash は '\n' で行を区切るので、CR のままだと入力が確定しない */
             if (ch == '\r') ch = '\n';
-            if (next != g_console_tail) {
-                g_console_buf[g_console_head] = (uint8_t)ch;
-                g_console_head = next;
-                pushed = 1;
+            /* M-9: ^C/^\ はリングに積まず、消費するだけにする (本物の tty の
+             * 行制御と同じ)。配送はロックの外でまとめて行う */
+            if (linux_console_is_intr_char((uint8_t)ch)) {
+                intr_ch = ch;
+            } else {
+                uint32_t next = (g_console_head + 1U) % CONSOLE_BUF_SIZE;
+                if (next != g_console_tail) {
+                    g_console_buf[g_console_head] = (uint8_t)ch;
+                    g_console_head = next;
+                    pushed = 1;
+                }
+                /* リングが満杯なら捨てる。**待つ側は割り込み文脈なので詰まらせない** */
             }
-            /* リングが満杯なら捨てる。**待つ側は割り込み文脈なので詰まらせない** */
             ch = aarch64_uart_getchar_nonblock();
         }
     }
     waiter = g_console_waiter;
     console_unlock(flags);
+
+    /* task_mark_zombie は別のロックを取るので、コンソールの割り込み
+     * ロックを離してから呼ぶ (M-9) */
+    if (intr_ch >= 0) linux_console_deliver_intr((uint8_t)intr_ch);
 
     /* task_wake はロックの外で呼ぶ (ロック順序を作らない) */
     if (pushed && waiter && waiter->state == TASK_SLEEPING) {
@@ -130,13 +147,21 @@ void aarch64_console_rx_irq(void) {
 void aarch64_console_push_char(char c) {
     struct task* waiter;
     int pushed = 0;
-    uint64_t flags = console_lock();
-    uint32_t next = (g_console_head + 1U) % CONSOLE_BUF_SIZE;
+    uint64_t flags;
 
     /* 端末は改行を CR で送る。**USB キーボードの Enter も同じ扱いにする** —
      * ash は '\n' で行を区切るので、CR のままだと入力が確定しない */
     if (c == '\r') c = '\n';
 
+    /* M-9: ^C/^\ はリングに積まない。task_mark_zombie は別のロックを
+     * 取るので、コンソールの割り込みロックを取る前に配送する */
+    if (linux_console_is_intr_char((uint8_t)c)) {
+        linux_console_deliver_intr((uint8_t)c);
+        return;
+    }
+
+    flags = console_lock();
+    uint32_t next = (g_console_head + 1U) % CONSOLE_BUF_SIZE;
     if (next != g_console_tail) {
         g_console_buf[g_console_head] = (uint8_t)c;
         g_console_head = next;

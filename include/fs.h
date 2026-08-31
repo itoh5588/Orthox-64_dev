@@ -195,6 +195,7 @@ typedef struct {
 #define KSTAT_MODE_DIR  0040000
 #define KSTAT_MODE_CHR  0020000
 #define KSTAT_MODE_FIFO 0010000
+#define KSTAT_MODE_LNK  0120000
 
 struct kstat {
     uint64_t dev;
@@ -243,6 +244,9 @@ int fs_access(const char* path, int mode);
 int fs_faccessat(int dirfd, const char* path, int mode, int flags);
 int64_t fs_readlink(const char* path, char* buf, size_t bufsiz);
 int64_t fs_readlinkat(int dirfd, const char* path, char* buf, size_t bufsiz);
+/* symlinkat(2) (N-6, 2026-08-31)。xv6fs にのみ作れる (ramfs は未対応) */
+int fs_symlink(const char* target, const char* linkpath);
+int fs_symlinkat(const char* target, int dirfd, const char* linkpath);
 int64_t fs_lseek(int fd, int64_t offset, int whence);
 int fs_getdents(int fd, struct orth_dirent* dirp, size_t count);
 int fs_getdents64(int fd, void* dirp, size_t count);

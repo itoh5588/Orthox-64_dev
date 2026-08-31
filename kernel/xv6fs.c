@@ -89,6 +89,8 @@ static uint32_t xv6fs_type_mode(const struct xv6fs_inode *ip) {
     if (ip->type == XV6FS_T_FIFO) {
         type = KSTAT_MODE_FIFO;
         perm = 0644U;
+    } else if (ip->type == XV6FS_T_SYMLINK) {
+        return KSTAT_MODE_LNK | 0777U;   /* symlink の許可ビットは意味を持たない */
     } else {
         type = (ip->type == XV6FS_T_DIR) ? KSTAT_MODE_DIR : KSTAT_MODE_FILE;
         perm = (ip->type == XV6FS_T_DIR) ? 0555U : 0444U;
@@ -959,16 +961,58 @@ static const char *skipelem(const char *path, char *name) {
     return path;
 }
 
+/* シンボリックリンクのループを止める上限。
+ *
+ * Linux の MAXSYMLINKS は 40 だが、ここは合わせていない。namex_depth は
+ * シンボリックリンクを踏むたびに自分を再帰呼び出しする形で、1 段ごとに
+ * resolved[256]/target[256]/combined[256] (計 800 バイト弱) を積む。
+ * カーネルスタックは 4 頁 (16KB) しか無いので、40 段だと素朴には
+ * 32KB 近くまで積み、tail call 最適化が効かない版ではスタックを
+ * 溢れさせる。**実機 (aarch64, -O2) では tail call 化されて壊れなかったが、
+ * 最適化に頼らず安全な深さにしておく。**現実の symlink 連鎖は数段までしか
+ * 無いので、実用上はこれで十分すぎる。 */
+#define XV6FS_SYMLOOP_MAX 16
+
+/* シンボリックリンクの中身 (リンク先の文字列) を読む。呼び出し側は
+ * ip をロックしていないこと (ここで ilock/iunlockput する) */
+static int xv6fs_read_symlink_target(struct xv6fs_inode *ip, char *buf, int bufsiz) {
+    int n;
+    xv6fs_ilock(ip);
+    n = xv6fs_readi(ip, buf, 0, (uint32_t)(bufsiz - 1));
+    xv6fs_iunlockput(ip);
+    if (n < 0) return -1;
+    buf[n] = '\0';
+    return n;
+}
+
 /*
  * namex: 絶対パスのみ対応（myproc()->cwd 依存を除去）
+ *
+ * follow_final: パスの最後の要素がシンボリックリンクだったとき、それも
+ * 辿るか (stat/open は辿る。lstat/readlink/unlink はリンクそのものを
+ * 見るので呼び出し側が別経路で扱う)。**途中の要素は follow_final に
+ * 関わらず常に辿る** (POSIX の通り)。
+ *
+ * シンボリックリンクに当たったら、ここまでに辿った絶対パス (resolved) に
+ * リンク先をつなげた文字列を組み立てて、depth を 1 増やして丸ごと
+ * 取り直す。相対リンク先はここまでの絶対パスに、絶対リンク先はそのまま
+ * 使う。組み立てた文字列は改めて root から辿り直すので、リンク先や
+ * resolved に ".." が literal に混じっていても xv6fs_dirlookup 自身の
+ * ".." 解決に任せられる (ここで正規化する必要が無い)。
  */
-static struct xv6fs_inode *namex(const char *path, int nameiparent, char *name) {
+static struct xv6fs_inode *namex_depth(const char *path, int nameiparent,
+                                       char *name, int follow_final, int depth) {
     struct xv6fs_inode *ip, *next;
+    char resolved[256];
+    size_t resolved_len = 0;
+
+    if (depth > XV6FS_SYMLOOP_MAX) return (struct xv6fs_inode *)0;   /* ELOOP 相当 */
 
     if (*path == '/')
         ip = xv6fs_iget(g_xv6fs_dev, XV6FS_ROOTINO);
     else
         return (struct xv6fs_inode *)0;   /* 相対パス未対応 */
+    resolved[0] = '\0';
 
     while ((path = skipelem(path, name)) != (const char *)0) {
         xv6fs_ilock(ip);
@@ -984,6 +1028,65 @@ static struct xv6fs_inode *namex(const char *path, int nameiparent, char *name) 
         xv6fs_iunlockput(ip);
         if (!next)
             return (struct xv6fs_inode *)0;
+
+        /* **next->type はロックして読み込むまで信用できない。**xv6fs_iget は
+         * valid=0 のまま返すだけで、実際にディスクから読むのは xv6fs_ilock。
+         * ロックせずに読むと、そのキャッシュ枠に前に居た別 inode の古い
+         * type が見える (2026-08-31、実機で symlink が辿られず発覚) */
+        xv6fs_ilock(next);
+        int next_type = next->type;
+        xv6fs_iunlock(next);
+
+        if (next_type == XV6FS_T_SYMLINK && (*path != '\0' || follow_final)) {
+            char target[256];
+            char combined[256];
+            size_t clen, tlen, restlen;
+
+            /* ここから先のエラー経路は next を解放する。ip は既に
+             * xv6fs_iunlockput 済みなのでここで触ってはいけない */
+            if (xv6fs_read_symlink_target(next, target, sizeof(target)) < 0) {
+                return (struct xv6fs_inode *)0;
+            }
+            tlen = strlen(target);
+
+            if (target[0] == '/') {
+                if (tlen >= sizeof(combined)) return (struct xv6fs_inode *)0;
+                memcpy(combined, target, tlen);
+                clen = tlen;
+            } else {
+                /* resolved は空でなければ既に "/" から始まっている
+                 * (symlink は必ずどこかのディレクトリの中にあるので、
+                 * ここに来た時点で resolved_len == 0 にはならないはず) */
+                if (resolved_len + 1 + tlen >= sizeof(combined)) {
+                    return (struct xv6fs_inode *)0;
+                }
+                memcpy(combined, resolved, resolved_len);
+                clen = resolved_len;
+                combined[clen++] = '/';
+                memcpy(combined + clen, target, tlen);
+                clen += tlen;
+            }
+            restlen = strlen(path);
+            if (*path) {
+                if (clen + 1 + restlen >= sizeof(combined)) return (struct xv6fs_inode *)0;
+                combined[clen++] = '/';
+                memcpy(combined + clen, path, restlen);
+                clen += restlen;
+            }
+            combined[clen] = '\0';
+            /* xv6fs_read_symlink_target が既に next を iunlockput 済み */
+            return namex_depth(combined, nameiparent, name, follow_final, depth + 1);
+        }
+
+        if (resolved_len + 1 + strlen(name) < sizeof(resolved)) {
+            resolved[resolved_len++] = '/';
+            size_t nlen = strlen(name);
+            memcpy(resolved + resolved_len, name, nlen);
+            resolved_len += nlen;
+            resolved[resolved_len] = '\0';
+        }
+        /* ip はこのイテレーションの冒頭で既に xv6fs_iunlockput 済み。
+         * ここで xv6fs_iput(ip) をもう一度呼ぶと二重解放になる */
         ip = next;
     }
 
@@ -994,9 +1097,20 @@ static struct xv6fs_inode *namex(const char *path, int nameiparent, char *name) 
     return ip;
 }
 
+static struct xv6fs_inode *namex(const char *path, int nameiparent, char *name) {
+    return namex_depth(path, nameiparent, name, 1, 0);
+}
+
 struct xv6fs_inode *xv6fs_namei(const char *path) {
     char name[XV6FS_DIRSIZ];
     return namex(path, 0, name);
+}
+
+/* lstat/readlink 用。最後の要素がシンボリックリンクでもそれ自体を返す
+ * (途中の要素は普通に辿る) (N-6, 2026-08-31) */
+struct xv6fs_inode *xv6fs_namei_nofollow(const char *path) {
+    char name[XV6FS_DIRSIZ];
+    return namex_depth(path, 0, name, 0, 0);
 }
 
 struct xv6fs_inode *xv6fs_nameiparent(const char *path, char *name) {
@@ -1040,6 +1154,45 @@ int xv6fs_stat_path(const char *path, uint32_t *out_mode,
     xv6fs_iunlock(ip);
     xv6fs_iput(ip);
     return 0;
+}
+
+/* lstat(2) 相当。xv6fs_stat_path と同じだが、最後の要素がシンボリック
+ * リンクでも辿らずそれ自体を見る (N-6, 2026-08-31) */
+int xv6fs_lstat_path(const char *path, uint32_t *out_mode,
+                     uint64_t *out_size, int64_t *out_mtime,
+                     uint32_t *out_rdev) {
+    const char *lookup = (path && path[0]) ? path : "/";
+    struct xv6fs_inode *ip = xv6fs_namei_nofollow(lookup);
+    if (!ip) return -1;
+    xv6fs_ilock(ip);
+    if (out_mode)  *out_mode  = xv6fs_type_mode(ip);
+    if (out_size)  *out_size  = ip->size;
+    if (out_mtime) *out_mtime = (int64_t)ip->mtime;
+    if (out_rdev) {
+        *out_rdev = (ip->type == XV6FS_T_DEVICE)
+            ? ((((uint32_t)ip->major & 0xFFU) << 8) | ((uint32_t)ip->minor & 0xFFU))
+            : 0;
+    }
+    xv6fs_iunlock(ip);
+    xv6fs_iput(ip);
+    return 0;
+}
+
+/* readlink(2)。null 終端しない。戻り値は書いたバイト数か負 (N-6, 2026-08-31) */
+int xv6fs_readlink_path(const char *path, char *buf, size_t bufsiz) {
+    struct xv6fs_inode *ip = xv6fs_namei_nofollow(path);
+    int n;
+    if (!ip) return -1;
+    xv6fs_ilock(ip);
+    if (ip->type != XV6FS_T_SYMLINK) {
+        xv6fs_iunlock(ip);
+        xv6fs_iput(ip);
+        return -1;
+    }
+    n = xv6fs_readi(ip, buf, 0, (uint32_t)bufsiz);
+    xv6fs_iunlock(ip);
+    xv6fs_iput(ip);
+    return n;
 }
 
 int xv6fs_list_dir(const char *path, struct orth_dirent *dirents,
@@ -1243,6 +1396,75 @@ int xv6fs_create_file(const char *path, int mode,
 
     if (out_ip) *out_ip = ip;
     else xv6fs_iput(ip);
+    return 0;
+}
+
+/* symlinkat(2) (N-6, 2026-08-31)。linkpath が既にあれば -1 (EEXIST 相当)。
+ * inode の作成とディレクトリへの登録を先に済ませ、リンク先の文字列は
+ * 別のトランザクションで書く (どちらも小さいので分けても実害は無い)。 */
+int xv6fs_symlink_path(const char *target, const char *linkpath) {
+    char name[XV6FS_DIRSIZ];
+    struct xv6fs_inode *dp;
+    struct xv6fs_inode *ip;
+    int tlen;
+
+    if (!target || !linkpath || linkpath[0] == '\0') return -1;
+    tlen = (int)strlen(target);
+    if (tlen <= 0 || tlen >= (int)XV6FS_BSIZE) return -1;
+
+    xv6log_begin_op(XV6LOG_OP_SMALL);
+    dp = xv6fs_nameiparent(linkpath, name);
+    if (!dp) {
+        xv6log_end_op(XV6LOG_OP_SMALL);
+        return -1;
+    }
+
+    xv6fs_ilock(dp);
+    ip = xv6fs_dirlookup(dp, name, 0);
+    if (ip) {
+        xv6fs_iput(ip);
+        xv6fs_iunlock(dp);
+        xv6log_end_op(XV6LOG_OP_SMALL);
+        xv6fs_iput(dp);
+        return -1;   /* EEXIST 相当 */
+    }
+
+    ip = xv6fs_ialloc(dp->dev, XV6FS_T_SYMLINK);
+    if (!ip) {
+        xv6fs_iunlock(dp);
+        xv6log_end_op(XV6LOG_OP_SMALL);
+        xv6fs_iput(dp);
+        return -1;
+    }
+    xv6fs_ilock(ip);
+    ip->nlink = 1;
+    xv6fs_iupdate(ip);
+    if (xv6fs_dirlink(dp, name, ip->inum) < 0) {
+        ip->nlink = 0;
+        xv6fs_iupdate(ip);
+        xv6fs_iunlock(ip);
+        xv6fs_iput(ip);
+        xv6fs_iunlock(dp);
+        xv6log_end_op(XV6LOG_OP_SMALL);
+        xv6fs_iput(dp);
+        return -1;
+    }
+    xv6fs_iunlock(ip);
+    xv6fs_iunlock(dp);
+    xv6log_end_op(XV6LOG_OP_SMALL);
+    xv6fs_iput(dp);
+
+    xv6log_begin_op(XV6LOG_OP_WRITE((uint32_t)tlen));
+    xv6fs_ilock(ip);
+    if (xv6fs_writei(ip, target, 0, (uint32_t)tlen) != tlen) {
+        xv6fs_iunlock(ip);
+        xv6log_end_op(XV6LOG_OP_WRITE((uint32_t)tlen));
+        xv6fs_iput(ip);
+        return -1;
+    }
+    xv6fs_iunlock(ip);
+    xv6log_end_op(XV6LOG_OP_WRITE((uint32_t)tlen));
+    xv6fs_iput(ip);
     return 0;
 }
 
