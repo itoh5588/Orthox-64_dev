@@ -315,6 +315,10 @@ void                 xv6fs_init(uint32_t dev);
 struct xv6fs_inode*  xv6fs_ialloc(uint32_t dev, int16_t type);
 struct xv6fs_inode*  xv6fs_iget(uint32_t dev, uint32_t inum);
 void                 xv6fs_iput(struct xv6fs_inode *ip);
+/* begin_op から自前で呼ぶ側 (fs_release など、iput しかしない側) 用。
+ * itrunc の申告ブロック数を実測値に近づけて、必要なら安全に取り直す
+ * (P-12 手2)。**iput の前に他の書き込みがある呼び出しでは使わないこと** */
+void                 xv6fs_iput_op(struct xv6fs_inode *ip);
 void                 xv6fs_ilock(struct xv6fs_inode *ip);
 void                 xv6fs_iunlock(struct xv6fs_inode *ip);
 void                 xv6fs_iunlockput(struct xv6fs_inode *ip);

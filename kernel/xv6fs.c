@@ -144,6 +144,28 @@ struct {
 static void xv6fs_itrunc_to(struct xv6fs_inode *ip, uint32_t length);
 void xv6fs_itrunc(struct xv6fs_inode *ip);
 
+/* ---- P-12 手2 (2026-08-31): itrunc の申告ブロック数を実測値に近づける ----
+ *
+ * これまでは itrunc を踏みうる op (unlink/rmdir/rename/truncate/close) は
+ * 全部 XV6LOG_OP_FULL (= XV6FS_LOGBLOCKS 126) を申告していた。**上限が
+ * 読めないから**という理由だったが、実際に itrunc_to が xv6log_write を
+ * 呼ぶ回数は「解放するデータブロック数 (ビットマップ書き込みはこれを
+ * 超えない) + 間接テーブル自身への書き込み分の余裕」で決まる。
+ *
+ * ファイルが大きく、この見積もりが XV6FS_LOGBLOCKS を超えるなら、その
+ * ファイルはどのみち 1 トランザクションに収まらない。**その場合は今まで
+ * 通り丸めるだけ**なので、大きいファイルの扱いは変わらない。恩恵がある
+ * のは GCC のビルドで大半を占める小さな一時ファイルの方。 */
+#define XV6LOG_ITRUNC_SLACK 16   /* 間接テーブル自身 + inode の書き込み分 */
+
+static int xv6fs_itrunc_need(uint32_t size, uint32_t length) {
+    uint32_t have  = (size   + XV6FS_BSIZE - 1) / XV6FS_BSIZE;
+    uint32_t keep  = (length + XV6FS_BSIZE - 1) / XV6FS_BSIZE;
+    uint32_t freed = (have > keep) ? (have - keep) : 0;
+    int need = (int)freed + XV6LOG_ITRUNC_SLACK;
+    return (need > XV6FS_LOGBLOCKS) ? XV6FS_LOGBLOCKS : need;
+}
+
 /* ------------------------------------------------------------------ */
 /* superblock 読み込み                                                 */
 /* ------------------------------------------------------------------ */
@@ -397,11 +419,20 @@ void xv6fs_iupdate(struct xv6fs_inode *ip) {
     xv6brelse(bp);
 }
 
-void xv6fs_iput(struct xv6fs_inode *ip) {
+/* iput の本体。reserved_need が itrunc の実際の必要量に足りないときは
+ * **何も書かずに** 0 を返す (P-12 手2)。呼び出し側は need を大きくして
+ * begin_op からやり直すこと。reserved_need に XV6FS_LOGBLOCKS (= 常に
+ * 足りる上限) を渡せば従来通りの動きになる —— xv6fs_iput はその形。 */
+int xv6fs_iput_try(struct xv6fs_inode *ip, int reserved_need) {
     spin_lock(&itable.lock);
 
     if (ip->ref == 1 && ip->valid && ip->nlink == 0) {
         /* 参照が自分だけ + リンク数 0 → truncate して解放 */
+        int need = xv6fs_itrunc_need(ip->size, 0);
+        if (need > reserved_need) {
+            spin_unlock(&itable.lock);
+            return 0;
+        }
         xv6_sleep_lock(&ip->lock);
         spin_unlock(&itable.lock);
 
@@ -416,6 +447,32 @@ void xv6fs_iput(struct xv6fs_inode *ip) {
 
     ip->ref--;
     spin_unlock(&itable.lock);
+    return 1;
+}
+
+void xv6fs_iput(struct xv6fs_inode *ip) {
+    xv6fs_iput_try(ip, XV6FS_LOGBLOCKS);
+}
+
+/* close (fs_release) のように「begin_op → iput だけ → end_op」な形の
+ * 呼び出しをこれに置き換える。予約が外れても書き込み前に検知して安全に
+ * 取り直す (P-12 手2)。
+ * **unlink/rmdir/rename のように iput の前に他の書き込みがある場合はこれを
+ * 使わないこと** —— 取り直しは「まだ何も書いていない」ことが前提。 */
+void xv6fs_iput_op(struct xv6fs_inode *ip) {
+    int need = XV6LOG_OP_SMALL;
+    if (ip->ref == 1 && ip->valid && ip->nlink == 0)
+        need = xv6fs_itrunc_need(ip->size, 0);   /* ロックなしの目安。外れたら下で取り直す */
+
+    for (;;) {
+        xv6log_begin_op(need);
+        if (xv6fs_iput_try(ip, need)) {
+            xv6log_end_op(need);
+            return;
+        }
+        xv6log_end_op(need);
+        need = XV6FS_LOGBLOCKS;   /* 確実に足りる値で取り直す */
+    }
 }
 
 void xv6fs_iunlockput(struct xv6fs_inode *ip) {
@@ -1192,25 +1249,43 @@ int xv6fs_create_file(const char *path, int mode,
 int xv6fs_truncate_file(const char *path, uint64_t length) {
     struct xv6fs_inode *ip = xv6fs_namei(path);
     if (!ip) return -1;
-    xv6log_begin_op(XV6LOG_OP_FULL);
-    xv6fs_ilock(ip);
-    if (length > (uint64_t)XV6FS_MAXFILE * XV6FS_BSIZE) {
+
+    /* ロックなしの目安。外れても下の real_need チェックで安全に取り直す
+     * (P-12 手2) */
+    int need = XV6LOG_OP_SMALL;
+    if (length < ip->size)
+        need = xv6fs_itrunc_need(ip->size, (uint32_t)length);
+
+    for (;;) {
+        xv6log_begin_op(need);
+        xv6fs_ilock(ip);
+        if (length > (uint64_t)XV6FS_MAXFILE * XV6FS_BSIZE) {
+            xv6fs_iunlock(ip);
+            xv6log_end_op(need);
+            xv6fs_iput(ip);
+            return -1;
+        }
+        if (length < ip->size) {
+            /* ロックした今の ip->size で確定させる。見積もりが外れていたら
+             * まだ何も書いていないのでここで安全に取り直す */
+            int real_need = xv6fs_itrunc_need(ip->size, (uint32_t)length);
+            if (real_need > need) {
+                xv6fs_iunlock(ip);
+                xv6log_end_op(need);
+                need = real_need;
+                continue;
+            }
+            xv6fs_itrunc_to(ip, (uint32_t)length);
+        } else {
+            ip->size  = (uint32_t)length;
+            ip->mtime = xv6fs_now_sec();
+            xv6fs_iupdate(ip);
+        }
         xv6fs_iunlock(ip);
-        xv6log_end_op(XV6LOG_OP_FULL);
+        xv6log_end_op(need);
         xv6fs_iput(ip);
-        return -1;
+        return 0;
     }
-    if (length < ip->size) {
-        xv6fs_itrunc_to(ip, (uint32_t)length);
-    } else {
-        ip->size  = (uint32_t)length;
-        ip->mtime = xv6fs_now_sec();
-        xv6fs_iupdate(ip);
-    }
-    xv6fs_iunlock(ip);
-    xv6log_end_op(XV6LOG_OP_FULL);
-    xv6fs_iput(ip);
-    return 0;
 }
 
 int xv6fs_unlink_path(const char *path) {

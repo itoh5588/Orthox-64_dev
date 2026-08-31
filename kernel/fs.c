@@ -184,9 +184,11 @@ static void fs_release_xv6fs_file(fs_file_t* file) {
     if (!file) return;
     struct xv6fs_inode* ip = (struct xv6fs_inode*)file->private_data;
     if (ip) {
-        xv6log_begin_op(XV6LOG_OP_FULL);
-        xv6fs_iput(ip);
-        xv6log_end_op(XV6LOG_OP_FULL);
+        /* P-12 手2 (2026-08-31): 常に XV6LOG_OP_FULL を申告していたのを
+         * 実測値に近づけた。close のたびに itrunc の上限 126 を申告して
+         * 溜めたログを毎回吐き出させていたのが、GCC ビルド中の
+         * commit 564回/分の主因と見ていた (日報2026-08-30 §39) */
+        xv6fs_iput_op(ip);
         file->private_data = 0;
     }
 }
