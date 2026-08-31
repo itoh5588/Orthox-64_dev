@@ -1079,6 +1079,14 @@ next_entry:
         ;
     }
 
+    /* P-7 (2026-08-31): 子が無いディレクトリも "." と ".." だけは返す。
+     * 以前は子の列挙だけを頼りにしていたので、空のディレクトリは
+     * entry_count が 0 のまま open() を抜け、ls -a が何も返さなかった。 */
+    if (found_dir) {
+        if (dirent_append(dirents, max_entries, &count, ".", KSTAT_MODE_DIR, 0) < 0) return -1;
+        if (dirent_append(dirents, max_entries, &count, "..", KSTAT_MODE_DIR, 0) < 0) return -1;
+    }
+
     *out_count = count;
     return (found_dir || found_child) ? 0 : -1;
 }
