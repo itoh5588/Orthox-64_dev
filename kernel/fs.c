@@ -889,9 +889,19 @@ static int fat_resolve_path(const char* path, struct fat_dir_entry_info* out) {
 
 struct ramfs_file {
     char name[64];
-    uint8_t* data;
+    /* P-13 (2026-08-31): データ本体は 1 ページずつバラバラに確保する。
+     * 以前は data が「連続した 1 個の確保」で、ramfs_grow が 2 倍成長の
+     * たびに大きさぶん丸ごと pmm_alloc し直していた。50MB のファイルなら
+     * 12,800 頁の連続領域が要る計算で、4MB ですら断片化で取れなかった
+     * 実績がある (日報2026-08-30 §29)。
+     * pages はページ番号→データページ (kernel VA) の表。**表自体は
+     * データ本体よりずっと小さい** (4096 バイトごとにポインタ 1 個 =
+     * 0.2%) ので、表だけは今まで通り「2倍にして丸ごと確保し直す」で
+     * 構わない。データページ本体は連続していなくてよい。 */
+    void** pages;
+    size_t table_cap;    /* pages 表の枠数 (ページ単位) */
     size_t size;
-    size_t capacity;
+    size_t capacity;      /* 確保済みデータページのバイト数 (= 確保済み頁数 * PAGE_SIZE) */
     uint32_t mode;
     uint32_t uid;
     uint32_t gid;
@@ -1281,7 +1291,8 @@ void fs_init(void) {
     }
     for (int i = 0; i < MAX_RAMFS_FILES; i++) {
         ramfs_table[i].in_use = 0;
-        ramfs_table[i].data = NULL;
+        ramfs_table[i].pages = NULL;
+        ramfs_table[i].table_cap = 0;
         ramfs_table[i].mode = 0;
         ramfs_table[i].uid = 0;
         ramfs_table[i].gid = 0;
@@ -1299,21 +1310,56 @@ void fs_init(void) {
 
 }
 
+/* ページ表 (ポインタの配列) を大きくする。表そのものは小さいので、
+ * ここだけは今まで通り「2倍で丸ごと確保し直す」でよい (P-13)。 */
+static int ramfs_grow_table(struct ramfs_file* rf, size_t need_pages) {
+    if (need_pages <= rf->table_cap) return 0;
+    size_t new_table_cap = rf->table_cap ? rf->table_cap * 2 : 4;
+    while (new_table_cap < need_pages) new_table_cap *= 2;
+
+    size_t table_bytes = new_table_cap * sizeof(void*);
+    size_t table_pages = (table_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    void* phys = pmm_alloc((int)table_pages);
+    if (!phys) return -1;
+    void** new_table = (void**)PHYS_TO_VIRT(phys);
+    memset(new_table, 0, table_pages * PAGE_SIZE);
+
+    if (rf->pages) {
+        memcpy(new_table, rf->pages, rf->table_cap * sizeof(void*));
+        size_t old_bytes = rf->table_cap * sizeof(void*);
+        size_t old_pages = (old_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        pmm_free((void*)VIRT_TO_PHYS((uint64_t)rf->pages), (int)old_pages);
+    }
+    rf->pages = new_table;
+    rf->table_cap = new_table_cap;
+    return 0;
+}
+
 static int ramfs_grow(struct ramfs_file* rf, size_t needed) {
     if (needed <= rf->capacity) return 0;
-    size_t new_cap = rf->capacity ? rf->capacity * 2 : (size_t)PAGE_SIZE;
-    while (new_cap < needed) new_cap *= 2;
-    void* phys = pmm_alloc((int)(new_cap / PAGE_SIZE));
-    if (!phys) return -1;
-    uint8_t* nd = (uint8_t*)PHYS_TO_VIRT(phys);
-    for (size_t i = 0; i < new_cap; i++) nd[i] = 0;
-    if (rf->data) {
-        for (size_t i = 0; i < rf->size; i++) nd[i] = rf->data[i];
-        pmm_free((void*)VIRT_TO_PHYS((uint64_t)rf->data), (int)(rf->capacity / PAGE_SIZE));
+    size_t need_pages = (needed + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    if (ramfs_grow_table(rf, need_pages) < 0) return -1;
+
+    /* データページは 1 枚ずつ確保する。**連続していなくていい**のが
+     * この直しの本体 (P-13)。50MB のファイルでも 1 回の要求は
+     * 4KB で済むので、断片化していても確保に失敗しない。 */
+    size_t have_pages = rf->capacity / PAGE_SIZE;
+    for (size_t i = have_pages; i < need_pages; i++) {
+        if (rf->pages[i]) continue;
+        void* phys = pmm_alloc(1);
+        if (!phys) return -1;   /* 途中まで確保済みでも安全 (capacity が正直な値のまま) */
+        void* va = PHYS_TO_VIRT(phys);
+        memset(va, 0, PAGE_SIZE);
+        rf->pages[i] = va;
+        rf->capacity += PAGE_SIZE;
     }
-    rf->data = nd;
-    rf->capacity = new_cap;
     return 0;
+}
+
+/* バイトオフセットからページ内ポインタを引く */
+static inline uint8_t* ramfs_byte_ptr(struct ramfs_file* rf, size_t byte_off) {
+    return (uint8_t*)rf->pages[byte_off / PAGE_SIZE] + (byte_off % PAGE_SIZE);
 }
 
 static struct ramfs_file* find_ramfs(const char* name) {
@@ -1334,7 +1380,8 @@ static struct ramfs_file* create_ramfs(const char* name, uint32_t mode) {
                 if (name[j] == '\0') break;
             }
             ramfs_table[i].name[63] = '\0';
-            ramfs_table[i].data = NULL;
+            ramfs_table[i].pages = NULL;
+        ramfs_table[i].table_cap = 0;
             ramfs_table[i].size = 0;
             ramfs_table[i].capacity = 0;
             ramfs_table[i].mode = KSTAT_MODE_FILE | (mode & 07777U);
@@ -1359,7 +1406,8 @@ static struct ramfs_file* create_ramfs_dir(const char* name, uint32_t mode) {
                 if (name[j] == '\0') break;
             }
             ramfs_table[i].name[63] = '\0';
-            ramfs_table[i].data = NULL;
+            ramfs_table[i].pages = NULL;
+        ramfs_table[i].table_cap = 0;
             ramfs_table[i].size = 0;
             ramfs_table[i].mode = KSTAT_MODE_DIR | (mode & 07777U);
             ramfs_table[i].uid = 0;
@@ -1932,7 +1980,7 @@ int fs_open(const char* path, int flags, int mode) {
         file->size = rf->size;
         file->offset = 0;
         file->ops = &g_ramfs_file_ops;
-        file->private_data = rf->data;
+        file->private_data = rf;
         for (int j = 0; j < 63; j++) {
             file->path[j] = rf->name[j];
             if (rf->name[j] == '\0') break;
@@ -2049,7 +2097,7 @@ int fs_open(const char* path, int flags, int mode) {
             file->size = 0;
             file->offset = 0;
             file->ops = &g_ramfs_file_ops;
-            file->private_data = rf->data;
+            file->private_data = rf;
             for (int j = 0; j < 63; j++) {
                 file->path[j] = rf->name[j];
                 if (rf->name[j] == '\0') break;
@@ -2292,10 +2340,18 @@ int64_t fs_write(int fd, const void* buf, size_t count) {
         size_t off_w = fs_fd_offset(f);
         if (f->flags & O_APPEND) off_w = rf_w->size;  /* POSIX O_APPEND */
         if (ramfs_grow(rf_w, off_w + count) < 0) return -ENOSPC;
-        if (f->file) f->file->private_data = rf_w->data;
-        uint8_t* dest = rf_w->data + off_w;
+        /* P-13: データはページ単位に散らばっているので、ページ境界を
+         * またぐたびに書き先を引き直す */
         const uint8_t* src = (const uint8_t*)buf;
-        for (size_t i = 0; i < count; i++) dest[i] = src[i];
+        size_t written_w = 0;
+        while (written_w < count) {
+            size_t pos = off_w + written_w;
+            size_t in_page = pos % PAGE_SIZE;
+            size_t chunk = PAGE_SIZE - in_page;
+            if (chunk > count - written_w) chunk = count - written_w;
+            memcpy(ramfs_byte_ptr(rf_w, pos), src + written_w, chunk);
+            written_w += chunk;
+        }
         fs_fd_set_offset(f, off_w + count);
         if (off_w + count > rf_w->size) {
             rf_w->size = off_w + count;
@@ -2322,7 +2378,6 @@ int fs_ftruncate(int fd, uint64_t length) {
         if (!rf) return -ENOENT;
         if (length > rf->size) {
             if (ramfs_grow(rf, (size_t)length) < 0) return -ENOSPC;
-            if (f->file) f->file->private_data = rf->data;
         }
         rf->size = (size_t)length;
         rf->mtime_sec = fs_now_sec();
@@ -2549,6 +2604,28 @@ int64_t fs_read(int fd, void* buf, size_t count) {
         return (int64_t)n;
     }
 
+    if (fs_fd_type(f) == FT_RAMFS) {
+        /* P-13: データはページ単位に散らばっているので、ページ境界を
+         * またぐたびに読み先を引き直す */
+        struct ramfs_file* rf = (struct ramfs_file*)fs_fd_data_required(f, FT_RAMFS);
+        if (fs_fd_offset(f) >= rf->size) return 0;
+        size_t remaining = rf->size - fs_fd_offset(f);
+        size_t to_read = (count > remaining) ? remaining : count;
+        char* dest = (char*)buf;
+        size_t read_done = 0;
+        while (read_done < to_read) {
+            size_t pos = fs_fd_offset(f) + read_done;
+            size_t in_page = pos % PAGE_SIZE;
+            size_t chunk = PAGE_SIZE - in_page;
+            if (chunk > to_read - read_done) chunk = to_read - read_done;
+            memcpy(dest + read_done, ramfs_byte_ptr(rf, pos), chunk);
+            read_done += chunk;
+        }
+        fs_fd_set_offset(f, fs_fd_offset(f) + to_read);
+        rf->atime_sec = fs_now_sec();
+        return (int64_t)to_read;
+    }
+
     if (fs_fd_offset(f) >= fs_fd_size(f)) return 0;
     size_t remaining = fs_fd_size(f) - fs_fd_offset(f);
     size_t to_read = (count > remaining) ? remaining : count;
@@ -2557,10 +2634,6 @@ int64_t fs_read(int fd, void* buf, size_t count) {
     char* src = (char*)fs_fd_data(f) + fs_fd_offset(f);
     for (size_t i = 0; i < to_read; i++) dest[i] = src[i];
     fs_fd_set_offset(f, fs_fd_offset(f) + to_read);
-    if (fs_fd_type(f) == FT_RAMFS) {
-        struct ramfs_file* rf = find_ramfs(fs_fd_name(f));
-        if (rf) rf->atime_sec = fs_now_sec();
-    }
     return (int64_t)to_read;
 }
 
@@ -3080,12 +3153,20 @@ int64_t fs_lseek(int fd, int64_t offset, int whence) {
 
 /* ramfs の 1 件を解放して空き枠に戻す */
 static void ramfs_free_entry(struct ramfs_file* rf) {
-    if (rf->data && rf->capacity) {
-        void* phys_addr = (void*)VIRT_TO_PHYS((uint64_t)rf->data);
-        pmm_free(phys_addr, (int)(rf->capacity / PAGE_SIZE));
+    /* P-13: データページは 1 枚ずつ、表は 1 個としてそれぞれ返す */
+    if (rf->pages) {
+        size_t have_pages = rf->capacity / PAGE_SIZE;
+        for (size_t i = 0; i < have_pages; i++) {
+            if (!rf->pages[i]) continue;
+            pmm_free((void*)VIRT_TO_PHYS((uint64_t)rf->pages[i]), 1);
+        }
+        size_t table_bytes = rf->table_cap * sizeof(void*);
+        size_t table_pages = (table_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        pmm_free((void*)VIRT_TO_PHYS((uint64_t)rf->pages), (int)table_pages);
     }
     rf->in_use = 0;
-    rf->data = NULL;
+    rf->pages = NULL;
+    rf->table_cap = 0;
     rf->size = 0;
     rf->capacity = 0;
     rf->mode = 0;
@@ -3337,7 +3418,8 @@ int fs_rmdir(const char* path) {
         if ((ramfs_table[i].mode & 0170000U) != KSTAT_MODE_DIR) return -ENOTDIR;
         ramfs_table[i].in_use = 0;
         ramfs_table[i].size = 0;
-        ramfs_table[i].data = NULL;
+        ramfs_table[i].pages = NULL;
+        ramfs_table[i].table_cap = 0;
         ramfs_table[i].mode = 0;
         ramfs_table[i].uid = 0;
         ramfs_table[i].gid = 0;
@@ -3458,7 +3540,25 @@ int fs_get_file_data(const char* path, void** data, size_t* size) {
 
     struct ramfs_file* rf = find_ramfs(path);
     if (rf) {
-        *data = rf->data;
+        /* P-13: データはページ単位に散らばっている。exec は 1 塊の
+         * 連続メモリを要求する (elf.c がオフセットで直接読む) ので、
+         * ここでだけ組み立てて返す。**この呼び出しごとに新しく確保する
+         * ので、fs_free_exec_buffer で必ず解放すること** (以前は
+         * rf->data をそのまま返していて解放不要だった —— ここが変わった) */
+        size_t npages = (rf->size + PAGE_SIZE - 1) / PAGE_SIZE;
+        if (npages == 0) npages = 1;
+        void* phys = pmm_alloc((int)npages);
+        if (!phys) return -1;
+        uint8_t* buf = (uint8_t*)PHYS_TO_VIRT(phys);
+        size_t copied = 0;
+        while (copied < rf->size) {
+            size_t in_page = copied % PAGE_SIZE;
+            size_t chunk = PAGE_SIZE - in_page;
+            if (chunk > rf->size - copied) chunk = rf->size - copied;
+            memcpy(buf + copied, ramfs_byte_ptr(rf, copied), chunk);
+            copied += chunk;
+        }
+        *data = buf;
         *size = rf->size;
         return 0;
     }
@@ -3511,9 +3611,13 @@ try_module:
 }
 
 /* Free a buffer returned by fs_get_file_data if it was heap-allocated.
- * RAMFS and module pointers are not freed (they are not owned by the caller).
- * xv6fs content buffers (pmm-allocated by fs_get_file_data) are freed here. */
+ * Module pointers are not freed (they are not owned by the caller).
+ * xv6fs and RAMFS content buffers (pmm-allocated by fs_get_file_data) are
+ * freed here. **RAMFS 分は P-13 (2026-08-31) より前は rf->data を直接
+ * 返していて解放不要だったが、ページがバラバラになった今は exec の
+ * たびに新しく組み立てたコピーを返すので、他と同じく解放が要る。** */
 void fs_free_exec_buffer(const char* path, void* data, size_t size) {
+    (void)path;
     if (!data || size == 0) return;
     /* exec キャッシュ所有のバッファは解放しない。in_use を減らし、
      * 無効化済み (stale) かつ最後の利用者ならここで解放する。 */
@@ -3530,10 +3634,6 @@ void fs_free_exec_buffer(const char* path, void* data, size_t size) {
         }
         spin_unlock_irqrestore(&g_exec_cache_lock, cflags);
     }
-    char resolved[256];
-    resolve_task_path(path, resolved, sizeof(resolved));
-    const char* norm = normalize_fs_path(resolved);
-    if (find_ramfs(norm)) return;
     /* Module pointers are direct references to Limine memory — skip them. */
     if (module_request.response) {
         for (uint64_t i = 0; i < module_request.response->module_count; i++) {
