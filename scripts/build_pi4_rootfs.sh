@@ -64,6 +64,16 @@ printf 'hello from aarch64 xv6fs rootfs\n' > "$FSDIR/etc/motd"
 # 入れないと fs selftest が read file : BAD を出す
 printf 'ORTHOX-AARCH64-XV6FS-OK' > "$FSDIR/aarch64-m4.txt"
 
+# ---- ソース木の刻印 (S-12) -------------------------------------------------
+# 焼いた後にソースを直すと rootfs だけが古いままになる。ビルド時点の
+# git commit を刻んでおき、scripts/verify_rootfs_source.sh で dd の前に
+# リポジトリの現在地と突き合わせられるようにする。
+GIT_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+GIT_DIRTY="$([ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ] && echo 1 || echo 0)"
+printf 'commit=%s\ndirty=%s\nbuilt_at=%s\n' \
+    "$GIT_COMMIT" "$GIT_DIRTY" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    > "$FSDIR/etc/orthox-build-info"
+
 rm -f "$OUT"
 XV6FS_FSSIZE="$XV6FS_BLOCKS" XV6FS_NINODES="$XV6FS_INODES" \
     python3 scripts/build_rootfs_xv6fs.py "$FSDIR" "$OUT"

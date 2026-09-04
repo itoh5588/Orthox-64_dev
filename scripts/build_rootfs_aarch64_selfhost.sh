@@ -224,6 +224,16 @@ if [ -n "$GCCSRC" ]; then
   du -sh "$FSDIR" | sed 's/^/  ここまでの合計: /'
 fi
 
+# ---- ソース木の刻印 (S-12) -------------------------------------------------
+# **焼いた後にソースを直すと、rootfs だけが古いままになる。**
+# ビルド時点の git commit を刻んでおき、`scripts/verify_rootfs_source.sh` で
+# 焼く前にリポジトリの現在地と突き合わせられるようにする。
+GIT_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+GIT_DIRTY="$([ -n "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ] && echo 1 || echo 0)"
+printf 'commit=%s\ndirty=%s\nbuilt_at=%s\n' \
+    "$GIT_COMMIT" "$GIT_DIRTY" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    > "$FSDIR/etc/orthox-build-info"
+
 # ---- イメージを焼く -------------------------------------------------------
 echo "--- イメージを焼く (FSSIZE=$FSSIZE blocks / NINODES=$NINODES)"
 rm -f "$IMG"
