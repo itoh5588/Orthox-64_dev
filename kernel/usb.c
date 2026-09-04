@@ -3434,6 +3434,10 @@ static void usb_hotplug_release(void) {
     g_xhci_slot_id = g_hub_slot_id;
 }
 
+/* **既定では黙る。**60 秒ヘルスチェックと A-2 の較正ダンプは
+ * AARCH64_VERBOSE_DIAG が立っているときだけ組み込む (2026-09-04)。
+ * 呼び出し元 (usb_hotplug_poll_owned 内) も同じガードの中にある */
+#ifdef AARCH64_VERBOSE_DIAG
 static uint64_t g_usb_heartbeat_next_ms;   /* A-3 の要約を次に出す時刻 */
 
 /* A-2 の 1 行。**較正の値を毎回添える** — 待ちの回数だけ見ても
@@ -3463,6 +3467,7 @@ static void xhci_wait_dump(const char* name, const xhci_wait_stat_t* s) {
     putdec(XHCI_WAIT_MS);
     puts("ms\r\n");
 }
+#endif /* AARCH64_VERBOSE_DIAG */
 
 static void usb_hotplug_poll_owned(void) {
     uint8_t p;
@@ -3518,6 +3523,7 @@ static void usb_hotplug_poll_owned(void) {
      *   drop=  0 でなければイベントを取りこぼしている
      *   pscd=  増え続けるなら変化ビットを落とせていない (A-2 の失敗)
      *   wrap=  リングの一周。止まっていれば制御転送が流れていない */
+#ifdef AARCH64_VERBOSE_DIAG
     if (now >= g_usb_heartbeat_next_ms) {
         g_usb_heartbeat_next_ms = now + 60000ULL;
         /* **要約は数行まとめて 1 単位にする (M-2)。**中は出力だけで、
@@ -3599,6 +3605,7 @@ static void usb_hotplug_poll_owned(void) {
         puts("\r\n");
         usb_arch_console_end();
     }
+#endif /* AARCH64_VERBOSE_DIAG */
 
     g_usb_busy = 1;
     for (p = 1; p <= g_hub_nbr_ports && p <= HUB_MAX_PORTS; p++) {

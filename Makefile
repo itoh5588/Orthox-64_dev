@@ -391,6 +391,15 @@ ifneq ($(AARCH64_START_PROBE),)
 AARCH64_CFLAGS += -DAARCH64_START_PROBE=1 -DAARCH64_START_PROBE_UART=$(AARCH64_EARLY_UART)
 endif
 
+# **60 秒ごとの計器 ([cpu]/[pc]/[tasks]/[sd]/[pmm]/[log]、USB の heartbeat)。**
+# 性能調査 (P-1/P-10/D-5 など) のために積んだもので、既定では黙る。
+# ash で作業中に 1 分おきへ割り込み、実使用では邪魔になるため (2026-09-04)。
+# 要るときだけ付ける: make aarch64-pi4-boot AARCH64_VERBOSE_DIAG=1
+AARCH64_VERBOSE_DIAG ?=
+ifneq ($(AARCH64_VERBOSE_DIAG),)
+AARCH64_CFLAGS += -DAARCH64_VERBOSE_DIAG=1
+endif
+
 AARCH64_EARLY_UART ?=
 ifneq ($(AARCH64_EARLY_UART),)
 AARCH64_CFLAGS += -DAARCH64_EARLY_UART=$(AARCH64_EARLY_UART)ULL

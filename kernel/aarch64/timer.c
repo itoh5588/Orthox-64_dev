@@ -192,6 +192,11 @@ extern struct task* task_list;   /* kernel/task.c。他所と同じ形で引く 
 
 #define TASKS_MAX_SHOWN 24
 
+/* **既定では黙る。**60 秒ごとの計器一式は AARCH64_VERBOSE_DIAG が
+ * 立っているときだけ組み込む (2026-09-04)。呼び出し元
+ * (cpu_stats_report) も同じガードの中にあるので、既定ビルドでは
+ * ここから下の一連の static がまとめて消える */
+#ifdef AARCH64_VERBOSE_DIAG
 static const char *task_state_name(task_state_t s) {
     switch (s) {
         case TASK_RUNNING:  return "run";
@@ -264,6 +269,7 @@ static void pc_report(uint32_t n) {
         for (k = 0; k < PC_SLOTS; k++) { g_pc[i][k].pc = 0; g_pc[i][k].hits = 0; }
     }
 }
+#endif /* AARCH64_VERBOSE_DIAG */
 
 static void cpu_stats_count(uint32_t cpu, const struct aarch64_trap_frame *frame) {
     struct cpu_local* c;
@@ -286,6 +292,7 @@ static void cpu_stats_count(uint32_t cpu, const struct aarch64_trap_frame *frame
  *
  * 呼ぶのは CPU 0 だけ。**待ち行列の頂点は出したら 0 に戻す** —
  * 「この 60 秒で最大いくつ積まれたか」が見たいので */
+#ifdef AARCH64_VERBOSE_DIAG
 static void cpu_stats_report(void) {
     static uint64_t prev_all[AARCH64_MAX_CPUS];
     static uint64_t prev_busy[AARCH64_MAX_CPUS];
@@ -354,6 +361,7 @@ static void cpu_stats_report(void) {
      * 並べて読めるようにする (2026-08-30) */
     xv6log_commit_report();
 }
+#endif /* AARCH64_VERBOSE_DIAG */
 
 void aarch64_timer_on_tick(struct aarch64_trap_frame* frame) {
     /* **周期のポーリングは CPU 0 だけが行う (D-5)。**
@@ -401,8 +409,12 @@ void aarch64_timer_on_tick(struct aarch64_trap_frame* frame) {
          * ここには依存しない (runtime.c:44) */
         g_ticks++;
 
-        /* 60 秒ごとに 1 行。100Hz なので 6000 tick */
+        /* 60 秒ごとに 1 行。100Hz なので 6000 tick。
+         * **既定では黙る (AARCH64_VERBOSE_DIAG)。** ash で作業中に 1 分おき
+         * 割り込むのは実使用では邪魔 (2026-09-04)。性能調査のときだけ足す */
+#ifdef AARCH64_VERBOSE_DIAG
         if ((g_ticks % 6000ULL) == 0ULL) cpu_stats_report();
+#endif
     }
 
     aarch64_task_on_tick();   /* 切り替えの印を立てる (実際の切り替えは IRQ の出口) */
