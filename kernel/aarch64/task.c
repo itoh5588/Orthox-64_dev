@@ -15,6 +15,7 @@
 #include "aarch64/boot.h"
 #include "aarch64/task.h"
 #include "aarch64/vm.h"
+#include "spinlock.h"
 #include "task.h"
 
 uint64_t aarch64_pmm_alloc(uint64_t pages);
@@ -277,7 +278,7 @@ void aarch64_task_fork_child_return(void) {
     if (!current) {
         /* **黙って先へ進めない。** 進めると、子が親の続きをカーネル権限で
          * 走らせることになる */
-        aarch64_uart_puts("  task: fork の子に current がいない\n");
+        aarch64_uart_puts("  task: fork child has no current\n");
         aarch64_wait_forever();
     }
     aarch64_task_enter_initial_user_context(&current->ctx);
@@ -383,7 +384,16 @@ void aarch64_task_prepare_kernel_resume(struct arch_task_context* ctx,
  * 割り込みハンドラの途中で切り替えると、まだ積んでいないものが出る。
  * 印だけ立てて、出口 (aarch64_task_resched_if_needed) で切り替える */
 void aarch64_task_on_tick(void) {
-    if (g_shared_sched) { task_on_timer_tick(); return; }
+    /* riscv64 (kernel/riscv64/trap.c) と x86_64 (kernel/idt.c) は
+     * task_on_timer_tick() を BKL で囲んでいるが、ここだけ抜けていた (D-7)。
+     * kbd_tick/sound_tick はここでは囲まない — 意図して排他を持たない
+     * (aarch64/timer.c の aarch64_timer_on_tick のコメント参照)。 */
+    if (g_shared_sched) {
+        kernel_lock_enter();
+        task_on_timer_tick();
+        kernel_lock_exit();
+        return;
+    }
     if (g_sched_on) g_resched = 1;
 }
 
