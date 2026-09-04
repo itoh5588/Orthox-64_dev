@@ -103,7 +103,7 @@ struct exec_copy_buf {
 /* **枠に収まることを組み立て時に確かめる。**pmm_alloc はページ数で頼むので、
  * 構造体を太らせたときに気付ける場所がここしかない */
 _Static_assert(sizeof(struct exec_copy_buf) <= EXEC_COPY_PAGES * 4096,
-               "exec_copy_buf が EXEC_COPY_PAGES に収まらない");
+               "exec_copy_buf does not fit in EXEC_COPY_PAGES");
 
 static int copy_user_cstring(const char* src, char* dst, int size) {
     if (!src || !dst || size <= 0) return -1;
@@ -473,7 +473,7 @@ int task_prepare_initial_user_stack(arch_address_space_t address_space, struct t
     int rc;
     ptrs_phys = pmm_alloc(EXEC_PTRS_PAGES);
     if (!ptrs_phys) {
-        puts("Exec: ポインタ表が取れない\r\n");
+        puts("Exec: could not get pointer table\r\n");
         return -1;
     }
     base = (uint64_t*)PHYS_TO_VIRT(ptrs_phys);

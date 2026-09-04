@@ -391,25 +391,25 @@ void aarch64_virtio_blk_selftest(void) {
     aarch64_uart_puts("--- M4: virtio-mmio (virtio-blk) ---\n");
 
     if (aarch64_virtio_blk_init() != 0) {
-        aarch64_uart_puts("  device    : 見つからない (-drive / -device を付けずに起動した)\n");
+        aarch64_uart_puts("  device    : not found (booted without -drive / -device)\n");
         aarch64_uart_puts("aarch64-virtio-none\n");
         return;
     }
 
     aarch64_uart_puts("  device    : ");
     aarch64_uart_puthex64(aarch64_virtio_blk_base_pa());
-    aarch64_uart_puts("  (DTB 由来のスロットを走査して発見)\n  capacity  : ");
+    aarch64_uart_puts("  (found by scanning DTB-derived slots)\n  capacity  : ");
     aarch64_uart_puthex64(aarch64_virtio_blk_capacity());
-    aarch64_uart_puts(" セクタ\n  intid     : ");
+    aarch64_uart_puts(" sectors\n  intid     : ");
     aarch64_uart_puthex64(aarch64_virtio_blk_intid());
-    aarch64_uart_puts(aarch64_virtio_blk_intid() ? "  (割り込みで完了を待つ)\n"
-                                                 : "  (ポーリングに退いた)\n");
+    aarch64_uart_puts(aarch64_virtio_blk_intid() ? "  (waiting for completion via interrupt)\n"
+                                                 : "  (fell back to polling)\n");
 
     /* --- 1. LBA 0 を読む --- */
     rc = aarch64_virtio_blk_read(0, g_probe_buf, 1);
     aarch64_uart_puts("  read lba0 : ");
     if (rc != 0) {
-        aarch64_uart_puts("失敗 rc=");
+        aarch64_uart_puts("failed rc=");
         aarch64_uart_puthex64((uint64_t)(int64_t)rc);
         aarch64_uart_puts("\naarch64-virtio-BAD\n");
         return;
@@ -420,7 +420,7 @@ void aarch64_virtio_blk_selftest(void) {
     if (vblk_str_eq_n(g_probe_buf, "ORTHOX-AARCH64-M4-SEC000", 24)) {
         aarch64_uart_puts("  ok\n");
     } else {
-        aarch64_uart_puts("  BAD (期待した中身でない)\n");
+        aarch64_uart_puts("  BAD (not the expected content)\n");
         ok = 0;
     }
 
@@ -428,16 +428,16 @@ void aarch64_virtio_blk_selftest(void) {
     rc = aarch64_virtio_blk_read(1, g_probe_buf2, 1);
     aarch64_uart_puts("  read lba1 : ");
     if (rc != 0) {
-        aarch64_uart_puts("失敗\naarch64-virtio-BAD\n");
+        aarch64_uart_puts("failed\naarch64-virtio-BAD\n");
         return;
     }
     aarch64_uart_puts("\"");
     vblk_put_ascii(g_probe_buf2, 24);
     aarch64_uart_puts("\"");
     if (vblk_str_eq_n(g_probe_buf2, "ORTHOX-AARCH64-M4-SEC001", 24)) {
-        aarch64_uart_puts("  ok (LBA が効いている)\n");
+        aarch64_uart_puts("  ok (LBA is in effect)\n");
     } else {
-        aarch64_uart_puts("  BAD (LBA が効いていない)\n");
+        aarch64_uart_puts("  BAD (LBA not in effect)\n");
         ok = 0;
     }
 
@@ -459,7 +459,7 @@ void aarch64_virtio_blk_selftest(void) {
     }
     aarch64_uart_puts("  write/read: ");
     if (rc != 0) {
-        aarch64_uart_puts("失敗\naarch64-virtio-BAD\n");
+        aarch64_uart_puts("failed\naarch64-virtio-BAD\n");
         return;
     }
     {
@@ -467,8 +467,8 @@ void aarch64_virtio_blk_selftest(void) {
         for (unsigned i = 0; i < VBLK_SECTOR_SIZE; i++) {
             if (g_probe_buf[i] != g_probe_buf2[i]) { same = 0; break; }
         }
-        aarch64_uart_puts(same ? "ok (書いたものが読み戻せた)\n"
-                               : "BAD (書き戻しが一致しない)\n");
+        aarch64_uart_puts(same ? "ok (what was written reads back)\n"
+                               : "BAD (write-back mismatch)\n");
         if (!same) ok = 0;
     }
 
@@ -479,11 +479,11 @@ void aarch64_virtio_blk_selftest(void) {
     aarch64_uart_puts("  irq count : ");
     aarch64_uart_puthex64(aarch64_virtio_blk_irq_count());
     if (aarch64_virtio_blk_intid() && aarch64_virtio_blk_irq_count() >= 4) {
-        aarch64_uart_puts("  ok (割り込みで完了した)\n");
+        aarch64_uart_puts("  ok (completed via interrupt)\n");
     } else if (!aarch64_virtio_blk_intid()) {
-        aarch64_uart_puts("  (ポーリングなので 0)\n");
+        aarch64_uart_puts("  (0, since polling)\n");
     } else {
-        aarch64_uart_puts("  BAD (割り込みが上がっていない)\n");
+        aarch64_uart_puts("  BAD (interrupt not raised)\n");
         ok = 0;
     }
 

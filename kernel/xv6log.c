@@ -118,7 +118,7 @@ void xv6log_init(uint32_t dev, struct xv6fs_superblock *sb) {
         void *phys = pmm_alloc(pages);
         g_stage = phys ? (uint8_t *)PHYS_TO_VIRT(phys) : 0;
         if (!g_stage)
-            xv6log_print("xv6log: 中継バッファを取れない。1 ブロックずつに退く\n");
+            xv6log_print("xv6log: could not get relay buffer. falling back to 1 block at a time\n");
     }
 
     recover_from_log();
@@ -452,8 +452,8 @@ void xv6log_commit_report(void) {
     g_commits = 0; g_log_blocks = 0; g_install_runs = 0;
     if (c == 0) return;
 
-    xv6log_print("[log] 60s  commit %u回  載せた %u頁  1回あたり %u頁  "
-                 "書き戻し %u区間  区間長 %u頁\n",
+    xv6log_print("[log] 60s  commit %u  batched %u pages  %u pages/commit  "
+                 "writeback %u intervals  interval length %u pages\n",
                  (unsigned)c, (unsigned)b, (unsigned)(b / c), (unsigned)r,
                  (unsigned)(r ? b / r : 0));
 }

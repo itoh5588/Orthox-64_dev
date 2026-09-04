@@ -57,7 +57,7 @@ run_one() { # run_one <プログラム名> <期待する行>
   else
     printf '  %-22s ★ NG (期待: %s)\n' "$prog" "$want"
     # **落ちた理由を出す。**動的リンカの文言はここでしか見えない
-    grep -aE "Error (loading|relocating)|ENOSYS|想定外の例外|FAIL" "$log" | head -4 | sed 's/^/       /'
+    grep -aE "Error (loading|relocating)|ENOSYS|unexpected exception|FAIL" "$log" | head -4 | sed 's/^/       /'
     fail=1
   fi
   # **未対応 syscall を見逃さない。**動いてしまうので気づけない

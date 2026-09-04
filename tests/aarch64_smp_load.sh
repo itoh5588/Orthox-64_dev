@@ -135,13 +135,13 @@ must_not "aarch64-init-BAD"       "$LOG"
 if [ "$CPUS" != "1" ]; then
     grep -aq "aarch64-smp-ok" "$LOG"
     want=$((CPUS - 1))
-    got="$(grep -ac "共有スケジューラに参加" "$LOG" || true)"
+    got="$(grep -ac "joined shared scheduler" "$LOG" || true)"
     [ "$got" = "$want" ] || {
         echo "*** 副コアが $want 本のはずが $got 本しか上がっていない" >&2
         exit 1
     }
     # IPI が全部届いていること
-    [ "$(grep -ac "SGI が届いた" "$LOG")" = "$want" ]
+    [ "$(grep -ac "SGI was received" "$LOG")" = "$want" ]
 fi
 
 grep -aq "smp-load-start" "$LOG"

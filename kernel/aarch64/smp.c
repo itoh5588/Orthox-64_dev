@@ -234,7 +234,7 @@ static void aarch64_secondary_high(void) {
         aarch64_console_begin();
         aarch64_uart_puts("[smp] cpu");
         aarch64_uart_puthex64(cpu_index);
-        aarch64_uart_puts(" idle タスクを作れない\n");
+        aarch64_uart_puts(" could not create idle task\n");
         aarch64_console_end();
         for (;;) __asm__ volatile("wfe");
     }
@@ -260,7 +260,7 @@ static void aarch64_secondary_high(void) {
     aarch64_console_begin();
     aarch64_uart_puts("[smp] cpu");
     aarch64_uart_puthex64(cpu_index);
-    aarch64_uart_puts(" online (共有スケジューラに参加)\n");
+    aarch64_uart_puts(" online (joined shared scheduler)\n");
     aarch64_console_end();
 
     __asm__ volatile("msr daifclr, #2");   /* 割り込みを開ける */
@@ -325,7 +325,7 @@ void aarch64_smp_start_secondaries(void) {
     if (n > AARCH64_SMP_MAX_CPUS) n = AARCH64_SMP_MAX_CPUS;
 
     aarch64_console_begin();
-    aarch64_uart_puts("--- SMP: 副コアを起こす ---\n  entry     : ");
+    aarch64_uart_puts("--- SMP: waking secondary cores ---\n  entry     : ");
     aarch64_uart_puthex64(entry);
     aarch64_uart_puts("\n");
     aarch64_console_end();
@@ -341,7 +341,7 @@ void aarch64_smp_start_secondaries(void) {
     }
 
     if (n < 2) {
-        aarch64_uart_puts("  cpus      : 1 本しか無い。何もしない\n");
+        aarch64_uart_puts("  cpus      : only 1. doing nothing\n");
         aarch64_uart_puts("aarch64-smp-skip\n");
         return;
     }
@@ -367,7 +367,7 @@ void aarch64_smp_start_secondaries(void) {
             aarch64_uart_puthex64(b->cpu_mpidr[i]);
             aarch64_uart_puts("  release ");
             aarch64_uart_puthex64(b->cpu_release_addr[i]);
-            aarch64_uart_puts(ret == 0 ? "  ok\n" : "  BAD (release 番地が無い)\n");
+            aarch64_uart_puts(ret == 0 ? "  ok\n" : "  BAD (no release address)\n");
             aarch64_console_end();
             if (ret != 0) want--;
             continue;
@@ -378,7 +378,7 @@ void aarch64_smp_start_secondaries(void) {
             aarch64_console_begin();
             aarch64_uart_puts("  cpu       : ");
             aarch64_uart_puthex64(b->cpu_mpidr[i]);
-            aarch64_uart_puts("  起こし方が分からないので飛ばす\n");
+            aarch64_uart_puts("  do not know how to wake it, skipping\n");
             aarch64_console_end();
             continue;
         }
@@ -398,7 +398,7 @@ void aarch64_smp_start_secondaries(void) {
     }
 
     if (want == 0) {
-        aarch64_uart_puts("aarch64-smp-skip (起こせる副コアが無い)\n");
+        aarch64_uart_puts("aarch64-smp-skip (no secondary cores to wake)\n");
         return;
     }
 
@@ -445,8 +445,8 @@ void aarch64_smp_start_secondaries(void) {
         aarch64_console_begin();
         aarch64_uart_puts("  ipi cpu   : ");
         aarch64_uart_puthex64(i);
-        aarch64_uart_puts(ok ? "  ok (SGI が届いた)\n"
-                             : "  BAD (SGI が届かない)\n");
+        aarch64_uart_puts(ok ? "  ok (SGI was received)\n"
+                             : "  BAD (SGI not received)\n");
         aarch64_console_end();
     }
     aarch64_uart_puts("aarch64-smp-ok\n");

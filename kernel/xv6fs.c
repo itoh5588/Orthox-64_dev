@@ -206,8 +206,8 @@ int xv6fs_mount_storage(const char *devname) {
     if (g_sb.magic != XV6FS_FSMAGIC) {
         if (g_sb.magic == XV6FS_FSMAGIC_V1) {
             /* **黙って読むと inode の位置がずれて化ける。**名指しで止める */
-            xv6fs_print("xv6fs: %s は mtime 以前の旧形式 (magic 0x%x)。"
-                        "イメージを作り直すこと\n", devname, g_sb.magic);
+            xv6fs_print("xv6fs: %s is an old pre-mtime format (magic 0x%x). "
+                        "rebuild the image\n", devname, g_sb.magic);
         } else {
             xv6fs_print("xv6fs: bad magic 0x%x on %s\n", g_sb.magic, devname);
         }
@@ -226,7 +226,7 @@ int xv6fs_mount_storage(const char *devname) {
     g_mtime_base = g_sb.mtime_base + XV6FS_MOUNT_ADVANCE_SEC;
     g_sb.mtime_base = g_mtime_base;
     writesb(g_xv6fs_dev, &g_sb);
-    xv6fs_print("xv6fs: mtime 土台 %u 秒から\n", g_mtime_base);
+    xv6fs_print("xv6fs: mtime epoch from %u sec\n", g_mtime_base);
     return 0;
 }
 

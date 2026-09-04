@@ -881,7 +881,7 @@ static void dump_regs(uint32_t base_clock) {
 static void emmc2_dma_setup(void) {
 #ifdef AARCH64_EMMC2_PIO
     g_dma_ok = 0;
-    put("  emmc2 dma : PIO に固定 (AARCH64_EMMC2_PIO=1)\n");
+    put("  emmc2 dma : forced PIO (AARCH64_EMMC2_PIO=1)\n");
 #else
     const aarch64_boot_info_t* b = aarch64_boot_info();
     uint64_t desc_pa, buf_pa;
@@ -893,7 +893,7 @@ static void emmc2_dma_setup(void) {
     /* **HHDM が無いとバウンスに触れない。** DMA プールは物理で返るので、
      * 上位 VA へ移った後でないと読み書きできない */
     if (!aarch64_vm_mmu_enabled()) {
-        put("  emmc2 dma : MMU の前なので PIO のまま\n");
+        put("  emmc2 dma : staying in PIO (before MMU)\n");
         return;
     }
     if (!(r32(EMMC_CAPABILITIES_0) & SD_CAPS0_ADMA2)) {
@@ -902,13 +902,13 @@ static void emmc2_dma_setup(void) {
          * 立たない。** それでも sdhci の共通部は ADMA2 を実装しているので、
          * 記述子の形・複数ブロック・割り込みの道はここで確かめられる。
          * **実機でこれを使う理由は無い** (EMMC2 は自分で名乗る) */
-        put("  emmc2 dma : caps に ADMA2 が無いが強行 (AARCH64_EMMC2_FORCE_DMA) caps0=");
+        put("  emmc2 dma : caps lacks ADMA2, forcing anyway (AARCH64_EMMC2_FORCE_DMA) caps0=");
         puthex(r32(EMMC_CAPABILITIES_0));
         put("\n");
 #else
-        put("  emmc2 dma : ADMA2 非対応 caps0=");
+        put("  emmc2 dma : ADMA2 unsupported caps0=");
         puthex(r32(EMMC_CAPABILITIES_0));
-        put("  PIO のまま\n");
+        put("  staying in PIO\n");
         return;
 #endif
     }
@@ -916,18 +916,18 @@ static void emmc2_dma_setup(void) {
     desc_pa = aarch64_vm_dma_alloc(1);
     buf_pa  = aarch64_vm_dma_alloc(EMMC2_BOUNCE_BYTES / 4096U);
     if (!desc_pa || !buf_pa) {
-        put("  emmc2 dma : プールから取れない。PIO のまま\n");
+        put("  emmc2 dma : could not get from pool. staying in PIO\n");
         return;
     }
     /* **窓に収まっているか** (/emmc2bus の dma-ranges)。
      * 外に出たら黙って壊れるより先に言う (sound.c と同じ考え方) */
     if (g_dma_limit && (desc_pa + 4096ULL > g_dma_limit ||
                         buf_pa + EMMC2_BOUNCE_BYTES > g_dma_limit)) {
-        put("  emmc2 dma : DMA の窓の外 pa=");
+        put("  emmc2 dma : outside DMA window pa=");
         puthex_short(buf_pa);
         put(" limit=");
         puthex_short(g_dma_limit);
-        put("  PIO のまま\n");
+        put("  staying in PIO\n");
         return;
     }
 
@@ -944,7 +944,7 @@ static void emmc2_dma_setup(void) {
     puthex_short(emmc2_bus(g_desc_pa));
     put(" buf=");
     puthex_short(emmc2_bus(g_bounce_pa));
-    put(" (バス番地)\n");
+    put(" (bus address)\n");
     aarch64_console_end();
 
     /* 完了割り込み。**ここまで来てから開ける。**
@@ -956,7 +956,7 @@ static void emmc2_dma_setup(void) {
         putdec(g_intid);
         put("\n");
     } else {
-        put("  emmc2 irq : DTB に番号が無い。ポーリングで待つ\n");
+        put("  emmc2 irq : no number in DTB. waiting via polling\n");
     }
 #endif
 }
@@ -987,7 +987,7 @@ static int emmc2_bring_up(void) {
     /* コントローラの版。**3.0 未満は 10 ビット分周が無い**ので相手にしない */
     ver = r32(EMMC_SLOTISR_VER);
     if (((ver >> 16) & 0xffU) < 2U) {
-        put("  emmc2     : SDHCI の版が古い ver=");
+        put("  emmc2     : SDHCI version too old ver=");
         puthex(ver);
         put("\n");
         return -1;
@@ -1000,13 +1000,13 @@ static int emmc2_bring_up(void) {
     c1 &= ~(1U << 0);
     w32(EMMC_CONTROL1, c1);
     if (!WAIT_UNTIL((r32(EMMC_CONTROL1) & (0x7U << 24)) == 0, 1000000)) {
-        put("  emmc2     : リセットが終わらない\n");
+        put("  emmc2     : reset did not finish\n");
         return -1;
     }
 
     /* カードが刺さっているか。**「無い」と「壊れた」を混ぜない** */
     if (!WAIT_UNTIL(r32(EMMC_STATUS) & SD_STATUS_CARD_INSERTED, 500000)) {
-        put("  emmc2     : カードが無い\n");
+        put("  emmc2     : no card\n");
         return -1;
     }
 
@@ -1029,7 +1029,7 @@ static int emmc2_bring_up(void) {
     if (base_clock == 0) base_clock = 100000000U;
 
     if (set_clock(base_clock, SD_CLOCK_ID) != 0) {
-        put("  emmc2     : クロックが安定しない\n");
+        put("  emmc2     : clock did not stabilize\n");
         return -1;
     }
 
@@ -1042,7 +1042,7 @@ static int emmc2_bring_up(void) {
 
     /* CMD0: アイドルへ */
     if (issue_cmd(CMD_GO_IDLE, 0, 0, 0, 500000) != 0) {
-        put("  emmc2     : CMD0 に応答しない\n");
+        put("  emmc2     : no response to CMD0\n");
         dump_regs(base_clock);
         return -1;
     }
@@ -1053,7 +1053,7 @@ static int emmc2_bring_up(void) {
         int v2 = 0;
         if (issue_cmd(CMD_SEND_IF_COND, 0x1aa, 0, 0, 500000) == 0) {
             if ((g_last_resp[0] & 0xfffU) != 0x1aaU) {
-                put("  emmc2     : CMD8 の反響が合わない\n");
+                put("  emmc2     : CMD8 echo mismatch\n");
                 return -1;
             }
             v2 = 1;
@@ -1067,7 +1067,7 @@ static int emmc2_bring_up(void) {
         for (i = 0; i < 1000U; i++) {
             uint32_t arg = 0x00ff8000U | (v2 ? (1U << 30) : 0U);
             if (issue_acmd(ACMD_SD_SEND_OP_COND, arg, 500000) != 0) {
-                put("  emmc2     : ACMD41 が通らない (i=");
+                put("  emmc2     : ACMD41 did not pass (i=");
                 puthex(i);
                 put(")\n");
                 dump_regs(base_clock);
@@ -1080,19 +1080,19 @@ static int emmc2_bring_up(void) {
             udelay(10000);
         }
         if (i >= 1000U) {
-            put("  emmc2     : カードの初期化が終わらない\n");
+            put("  emmc2     : card init did not finish\n");
             return -1;
         }
     }
 
     /* CMD2 -> CMD3: CID を読み、相対アドレスをもらう */
     if (issue_cmd(CMD_ALL_SEND_CID, 0, 0, 0, 500000) != 0) {
-        put("  emmc2     : CMD2 が通らない\n");
+        put("  emmc2     : CMD2 did not pass\n");
         dump_regs(base_clock);
         return -1;
     }
     if (issue_cmd(CMD_SEND_REL_ADDR, 0, 0, 0, 500000) != 0) {
-        put("  emmc2     : CMD3 が通らない\n");
+        put("  emmc2     : CMD3 did not pass\n");
         return -1;
     }
     g_rca = (g_last_resp[0] >> 16) & 0xffffU;
@@ -1101,43 +1101,43 @@ static int emmc2_bring_up(void) {
      * CMD9 は stand-by 状態のカードに対するコマンドで、CMD7 で選んだ後
      * (transfer 状態) では受け付けない */
     if (issue_cmd(CMD_SEND_CSD, g_rca << 16, 0, 0, 500000) != 0) {
-        put("  emmc2     : CMD9 が通らない\n");
+        put("  emmc2     : CMD9 did not pass\n");
         return -1;
     }
     g_blocks = csd_to_blocks();
     if (g_blocks == 0) {
-        put("  emmc2     : 容量が 0 と出た\n");
+        put("  emmc2     : capacity reported as 0\n");
         return -1;
     }
 
     /* 識別が済んだので速いクロックへ */
     if (set_clock(base_clock, SD_CLOCK_NORMAL) != 0) {
-        put("  emmc2     : 通常クロックへ移れない\n");
+        put("  emmc2     : cannot move to normal clock\n");
         return -1;
     }
 
     /* CMD7: このカードを選ぶ */
     if (issue_cmd(CMD_SELECT_CARD, g_rca << 16, 0, 0, 500000) != 0) {
-        put("  emmc2     : CMD7 が通らない\n");
+        put("  emmc2     : CMD7 did not pass\n");
         return -1;
     }
 
     /* **SDHC でもブロック長は 512 に揃えておく。** 標準容量のカードでは
      * これを送らないと 512 バイト単位で読めない */
     if (issue_cmd(CMD_SET_BLOCKLEN, SD_BLOCK_SIZE, 0, 0, 500000) != 0) {
-        put("  emmc2     : CMD16 が通らない\n");
+        put("  emmc2     : CMD16 did not pass\n");
         return -1;
     }
 
     aarch64_console_begin();
-    put("  emmc2     : 初期化 ok  base=");
+    put("  emmc2     : init ok  base=");
     puthex_short(g_base_pa);
     put("  ");
     putdec(g_blocks);
-    put(" ブロック (");
+    put(" blocks (");
     putdec(g_blocks / 2097152ULL);    /* 512B ブロック -> GiB */
     put(" GiB)");
-    put(g_sdhc ? "  (SDHC/SDXC)\n" : "  (標準容量)\n");
+    put(g_sdhc ? "  (SDHC/SDXC)\n" : "  (standard capacity)\n");
     aarch64_console_end();
 
     return 0;
@@ -1215,16 +1215,16 @@ static void find_xv6fs(void) {
     /* **カードの先頭がいきなり xv6fs の場合を先に見る。** QEMU に渡している
      * ような「まるごと 1 個の fs」のイメージを、そのまま焼いたカード */
     if (looks_like_xv6fs(0)) {
-        put("  xv6fs     : カードの先頭から (パーティションなし)\n");
+        put("  xv6fs     : from start of card (no partition)\n");
         return;
     }
 
     if (aarch64_emmc2_read(0, g_sector, 1) != 0) {
-        put("  xv6fs     : MBR が読めない\n");
+        put("  xv6fs     : cannot read MBR\n");
         return;
     }
     if (mbr[MBR_SIG_OFF] != 0x55U || mbr[MBR_SIG_OFF + 1U] != 0xAAU) {
-        put("  xv6fs     : MBR の印が無い\n");
+        put("  xv6fs     : no MBR signature\n");
         return;
     }
 
@@ -1264,7 +1264,7 @@ static void find_xv6fs(void) {
             g_part_lba = lba;
             g_part_blocks = sectors;
             aarch64_console_begin();
-            put("  xv6fs     : パーティション ");
+            put("  xv6fs     : partition ");
             putdec(i + 1U);
             put("  lba=");
             puthex_short(g_part_lba);
@@ -1278,7 +1278,7 @@ static void find_xv6fs(void) {
         for (k = 0; k < SD_BLOCK_SIZE / 4U; k++) g_sector[k] = saved[k];
     }
 
-    put("  xv6fs     : MBR に xv6fs が無い\n");
+    put("  xv6fs     : no xv6fs in MBR\n");
 }
 
 int aarch64_emmc2_present(void) { return g_base != 0; }
@@ -1360,11 +1360,11 @@ static int emmc2_rw(uint64_t lba, void* buf, uint32_t sectors, int is_write) {
          * 避ける。**一度でも通った後の失敗は本物の I/O エラー**として
          * そのまま返す (黙って遅い道に落ちると原因が見えなくなる) */
         if (ret != 0 && !g_dma_proven) {
-            put("  emmc2 dma : 最初の転送が通らない fail=");
+            put("  emmc2 dma : first transfer did not pass fail=");
             puthex(g_last_fail);
             put(" int=");
             puthex(g_last_interrupt);
-            put("  PIO へ退く\n");
+            put("  falling back to PIO\n");
             g_dma_ok = 0;
             /* **中途半端に止まった転送は線のリセットでは戻らない。**
              * CMD12 を足しても DAT_INHIBIT が落ちないのを実測した
@@ -1372,7 +1372,7 @@ static int emmc2_rw(uint64_t lba, void* buf, uint32_t sectors, int is_write) {
             emmc2_reset_lines();
             (void)issue_cmd(CMD_STOP_TRANS, 0, 0, 0, 500000);
             if (emmc2_bring_up() != 0) {
-                put("  emmc2 dma : 立ち上げ直しにも失敗した\n");
+                put("  emmc2 dma : re-init also failed\n");
                 emmc2_release();
                 return -1;
             }
@@ -1476,14 +1476,14 @@ static void io_stat_emit(const char* tag, volatile struct emmc2_io_stat* st,
 
     aarch64_uart_puts(tag);
     aarch64_uart_putdec64(calls);
-    aarch64_uart_puts("回 ");
+    aarch64_uart_puts(" times ");
     aarch64_uart_putdec64(sect);
-    aarch64_uart_puts("sec 計");
+    aarch64_uart_puts("sec total");
     aarch64_uart_putdec64(freq ? (tk * 1000ULL) / freq : 0ULL);
-    aarch64_uart_puts("ms 最大");
+    aarch64_uart_puts("ms max");
     /* 1 回の最大は us で見たい。ms だと 0 に潰れる */
     aarch64_uart_putdec64(freq ? (mx * 1000000ULL) / freq : 0ULL);
-    aarch64_uart_puts("us 平均");
+    aarch64_uart_puts("us avg");
     aarch64_uart_putdec64((calls && freq) ? (tk * 1000000ULL) / freq / calls : 0ULL);
     aarch64_uart_puts("us");
 }
@@ -1502,10 +1502,10 @@ void aarch64_emmc2_io_report(void) {
 
     aarch64_console_begin();
     aarch64_uart_puts("[sd] 60s");
-    io_stat_emit("  読 ", &g_io_rd, &prev_rd, freq);
-    io_stat_emit("  書 ", &g_io_wr, &prev_wr, freq);
+    io_stat_emit("  rd ", &g_io_rd, &prev_rd, freq);
+    io_stat_emit("  wr ", &g_io_wr, &prev_wr, freq);
     /* **セクタ数の分布。**1 に偏っていたら 512 バイトずつ運んでいる */
-    aarch64_uart_puts("  分布(読 1/2/3-8/9+ 書 1/2/3-8/9+)");
+    aarch64_uart_puts("  distribution(read 1/2/3-8/9+ write 1/2/3-8/9+)");
     for (i = 0; i < 8; i++) {
         aarch64_uart_puts(i == 4 ? " | " : " ");
         aarch64_uart_putdec64(b[i] - prev_b[i]);

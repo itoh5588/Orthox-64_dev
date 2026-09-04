@@ -168,7 +168,7 @@ static void gpio_to_pwm(void) {
         aarch64_uart_putdec64((pud >> 16) & 0x3U);
         aarch64_uart_puts(" p41=");
         aarch64_uart_putdec64((pud >> 18) & 0x3U);
-        aarch64_uart_puts(" (0=プル無し)\n");
+        aarch64_uart_puts(" (0=no pull)\n");
     }
 }
 
@@ -516,7 +516,7 @@ static int machine_has_pwm(void) {
 
 void sound_init(void) {
     if (!machine_has_pwm()) {
-        aarch64_uart_puts("  sound     : 無し (PWM が無い機械)\n");
+        aarch64_uart_puts("  sound     : none (no PWM on this machine)\n");
         return;
     }
     /* **クロックが先。**PWM はクロックが止まった状態で書くとバスエラーに
@@ -554,12 +554,12 @@ void sound_init(void) {
         if (!g_cb_pa || !g_buf_pa) {
             g_cb_pa = 0;
             g_buf_pa = 0;
-            aarch64_uart_puts("*** プールから取れない (CPU 直書きに退く)\n");
+            aarch64_uart_puts("*** could not get from pool (falling back to direct CPU write)\n");
         } else if ((g_cb_pa >> 32) || (g_buf_pa >> 32)) {
             /* **32bit を超えたら使えない。**黙って壊れるより先に言う */
             g_cb_pa = 0;
             g_buf_pa = 0;
-            aarch64_uart_puts("*** 1GB より上に取れた。legacy DMA から見えない\n");
+            aarch64_uart_puts("*** allocated above 1GB. invisible to legacy DMA\n");
         } else {
             aarch64_uart_puts("cb=0x");
             aarch64_uart_puthex64(g_cb_pa);
@@ -567,9 +567,9 @@ void sound_init(void) {
             aarch64_uart_puthex64(g_buf_pa);
             aarch64_uart_puts("  ");
             aarch64_uart_putdec64(SND_BLOCKS);
-            aarch64_uart_puts(" ブロック x ");
+            aarch64_uart_puts(" blocks x ");
             aarch64_uart_putdec64(SND_BLOCK_SAMPLES);
-            aarch64_uart_puts(" サンプル  ch");
+            aarch64_uart_puts(" samples  ch");
             aarch64_uart_putdec64(DMA_CH);
             aarch64_uart_puts(" dreq");
             aarch64_uart_putdec64(DREQ_PWM1);
@@ -598,7 +598,7 @@ void sound_init(void) {
             aarch64_uart_puthex64(sta);
             aarch64_uart_puts("  berr=");
             aarch64_uart_putdec64((sta & PWM_STA_BERR) ? 1U : 0U);
-            aarch64_uart_puts("  ← クリア後。1 なら初期化中の書き込みで出ている");
+            aarch64_uart_puts("  <- after clear. 1 means it appeared from a write during init");
         }
         aarch64_uart_puts("\n  cm pwmdiv : ");
         aarch64_uart_puthex64(div);
@@ -612,7 +612,7 @@ void sound_init(void) {
         __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
         aarch64_uart_puts("  cntfrq    : ");
         aarch64_uart_putdec64(f);
-        aarch64_uart_puts(" Hz (armstub が入れた値。触っていない)\n");
+        aarch64_uart_puts(" Hz (value set by armstub. untouched)\n");
     }
 
     aarch64_uart_puts("  pwm clk   : ");
@@ -812,9 +812,9 @@ static void pcm_selftest(void) {
 
     aarch64_uart_puts("  pcm       : ");
     aarch64_uart_putdec64(PCM_LEN);
-    aarch64_uart_puts(" サンプル @");
+    aarch64_uart_puts(" samples @");
     aarch64_uart_putdec64(PCM_RATE);
-    aarch64_uart_puts("Hz 三角波 440Hz  range=");
+    aarch64_uart_puts("Hz triangle wave 440Hz  range=");
     aarch64_uart_putdec64(PWM_CLK_HZ / PCM_RATE);
     aarch64_uart_puts("\n");
 
@@ -822,21 +822,21 @@ static void pcm_selftest(void) {
     n  = sound_pcm_play_u8(g_pcm_buf, PCM_LEN, PCM_RATE);
     ms = arch_time_now_ms() - t0;
 
-    aarch64_uart_puts("            返り値=");
+    aarch64_uart_puts("            ret=");
     aarch64_uart_putdec64((uint64_t)(n < 0 ? 0 : n));
-    if (n < 0) aarch64_uart_puts(" (失敗)");
-    aarch64_uart_puts("  期待 ");
+    if (n < 0) aarch64_uart_puts(" (failed)");
+    aarch64_uart_puts("  expected ");
     aarch64_uart_putdec64((uint64_t)PCM_LEN * 1000ULL / PCM_RATE);
-    aarch64_uart_puts(" ms  実測 ");
+    aarch64_uart_puts(" ms  measured ");
     aarch64_uart_putdec64(ms);
     aarch64_uart_puts(" ms\n            ");
     /* **ここで OSC_HZ の当否が出る** */
     if (ms >= 400ULL && ms <= 620ULL) {
-        aarch64_uart_puts("→ 一致。OSC_HZ=54MHz の仮定は正しい");
+        aarch64_uart_puts("-> matches. OSC_HZ=54MHz assumption is correct");
     } else if (ms >= 1200ULL && ms <= 1650ULL) {
-        aarch64_uart_puts("→ 約 2.8 倍長い。**OSC は 54MHz ではなく 19.2MHz**");
+        aarch64_uart_puts("-> about 2.8x longer. **OSC is 19.2MHz, not 54MHz**");
     } else {
-        aarch64_uart_puts("→ どちらでもない。FIFO の待ちかクロックを見直す");
+        aarch64_uart_puts("-> neither. re-check FIFO wait or clock");
     }
     aarch64_uart_puts("\n");
 }
@@ -856,9 +856,9 @@ void aarch64_sound_selftest(void) {
     {
         uint64_t t0 = arch_time_now_ms();
         delay_ms(400);
-        aarch64_uart_puts("  delay     : 400ms 頼んで ");
+        aarch64_uart_puts("  delay     : requested 400ms, got ");
         aarch64_uart_putdec64(arch_time_now_ms() - t0);
-        aarch64_uart_puts(" ms 経った\n");
+        aarch64_uart_puts(" ms elapsed\n");
     }
 
     for (i = 0; i < 3; i++) {
@@ -896,7 +896,7 @@ void aarch64_sound_selftest(void) {
         sound_beep_stop();
         delay_ms(500);
     }
-    aarch64_uart_puts("  beep      : 3 音おわり\n");
+    aarch64_uart_puts("  beep      : 3 tones done\n");
 
     pcm_selftest();
 }

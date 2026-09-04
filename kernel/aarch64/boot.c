@@ -399,7 +399,7 @@ void aarch64_boot_capture(uint64_t dtb_hint) {
 /* 1 行 1 項目で出す。**どこから来た値かを添える。** 「DTB を読んだ」と
  * 「DTB の値を使っている」は別のことなので、区別できる形にしておく */
 static void put_src(uint32_t flag) {
-    aarch64_uart_puts((g_boot_info.flags & flag) ? "  (dtb)\n" : "  (既定値)\n");
+    aarch64_uart_puts((g_boot_info.flags & flag) ? "  (dtb)\n" : "  (default)\n");
 }
 
 static void aarch64_boot_info_dump(void) {
@@ -413,9 +413,9 @@ static void aarch64_boot_info_dump(void) {
         aarch64_uart_puts(" size ");
         put_hex64(b->dtb_size);
         aarch64_uart_puts((b->flags & AARCH64_BOOT_FLAG_DTB_FROM_X0)
-                          ? "  (x0)\n" : "  (走査)\n");
+                          ? "  (x0)\n" : "  (scanning)\n");
     } else {
-        aarch64_uart_puts("見つからない。直書きの既定値で進む\n");
+        aarch64_uart_puts("not found. proceeding with direct-write defaults\n");
     }
 
     aarch64_uart_puts("  memory    : ");
@@ -468,7 +468,7 @@ static void aarch64_boot_info_dump(void) {
      * 退き先が無い) し、スモークの「全部 DTB 由来か」の判定にも当たる */
     aarch64_uart_puts("  emmc2     : ");
     if (b->emmc2_base == 0) {
-        aarch64_uart_puts("この機械には無い\n");
+        aarch64_uart_puts("not present on this machine\n");
     } else {
         put_hex64(b->emmc2_base);
         aarch64_uart_puts(" size ");
@@ -493,8 +493,8 @@ static void aarch64_boot_info_dump(void) {
     aarch64_uart_puts("  virtio irq: ");
     put_hex64(b->virtio_mmio_irq_base);
     aarch64_uart_puts((b->flags & AARCH64_BOOT_FLAG_VIRTIO_IRQ_OK)
-                      ? "  (dtb、base + スロット番号で確認済み)\n"
-                      : "  (確かめられない。ポーリングに退く)\n");
+                      ? "  (dtb, verified via base + slot number)\n"
+                      : "  (cannot verify. falling back to polling)\n");
 
     aarch64_uart_puts("  cpus      : ");
     put_hex64(b->cpu_count);
@@ -524,7 +524,7 @@ static void aarch64_boot_info_dump(void) {
                 aarch64_uart_puts(" : psci");
                 break;
             default:
-                aarch64_uart_puts(" : ? (起こさない)");
+                aarch64_uart_puts(" : ? (not waking)");
                 break;
             }
             aarch64_uart_puts("\n");
@@ -534,7 +534,7 @@ static void aarch64_boot_info_dump(void) {
     if (b->flags & AARCH64_BOOT_FLAG_DTB_VALID) {
         aarch64_uart_puts("aarch64-dtb-ok\n");
     } else {
-        aarch64_uart_puts("aarch64-dtb-BAD (DTB が見つからない)\n");
+        aarch64_uart_puts("aarch64-dtb-BAD (DTB not found)\n");
     }
 }
 
@@ -550,7 +550,7 @@ void aarch64_early_main(uint64_t dtb_phys) {
      * 入口の EL は start.S が降ろす前に控えたもの */
     aarch64_uart_puts("  CurrentEL : EL");
     aarch64_uart_putchar((char)('0' + (int)(read_current_el() & 3U)));
-    aarch64_uart_puts("  (入口 EL");
+    aarch64_uart_puts("  (entry EL");
     aarch64_uart_putchar((char)('0' + (int)(aarch64_entry_el & 3U)));
     aarch64_uart_puts(")\n");
 
@@ -589,7 +589,7 @@ void aarch64_early_main(uint64_t dtb_phys) {
     pmm_init();
     aarch64_uart_puts("  pmm       : ");
     put_hex64(aarch64_pmm_total());
-    aarch64_uart_puts(" ページ (使用 ");
+    aarch64_uart_puts(" pages (used ");
     put_hex64(aarch64_pmm_used());
     aarch64_uart_puts(")\n");
 
@@ -598,13 +598,13 @@ void aarch64_early_main(uint64_t dtb_phys) {
      * 確かめようがない。0 ページなら切り出しに失敗している */
     aarch64_uart_puts("  pmm meta  : ");
     put_hex64(aarch64_pmm_meta_pages());
-    aarch64_uart_puts(" ページ");
+    aarch64_uart_puts(" pages");
     if (aarch64_pmm_meta_fault()) {
-        aarch64_uart_puts("  BAD (実在しない RAM の上に置こうとした)");
+        aarch64_uart_puts("  BAD (tried to place on nonexistent RAM)");
     } else if (aarch64_pmm_meta_pages() == 0) {
-        aarch64_uart_puts("  BAD (切り出せていない)");
+        aarch64_uart_puts("  BAD (not carved out)");
     } else {
-        aarch64_uart_puts("  ok (RAM から切り出した)");
+        aarch64_uart_puts("  ok (carved out from RAM)");
     }
     aarch64_uart_puts("\n");
 
@@ -623,10 +623,10 @@ void aarch64_early_main(uint64_t dtb_phys) {
             put_hex64(b2->pcie_mmio_base);
             aarch64_uart_puts(" size ");
             put_hex64(b2->pcie_mmio_size);
-            aarch64_uart_puts(b2->pcie_mmio_base ? "  (BAR の置き場)\n"
-                                                 : "  BAD (32bit 窓が無い)\n");
+            aarch64_uart_puts(b2->pcie_mmio_base ? "  (BAR location)\n"
+                                                 : "  BAD (no 32-bit window)\n");
         } else {
-            aarch64_uart_puts("無し (この機械には ECAM の PCIe が無い)\n");
+            aarch64_uart_puts("none (this machine has no ECAM PCIe)\n");
         }
     }
 
@@ -662,25 +662,25 @@ void aarch64_early_main(uint64_t dtb_phys) {
              * **絵が出るかどうかと、字が出るかどうかは別の話** — 文字が
              * 化けているときに「そもそも描けているのか」を見分けられる */
             aarch64_fb_test_pattern();
-            aarch64_uart_puts("  fb pattern: 描いた\n");
+            aarch64_uart_puts("  fb pattern: drawn\n");
 #ifndef AARCH64_NO_FBCON
             aarch64_fbcon_init();
 #endif
             aarch64_uart_puts("  fb console: ");
             if (aarch64_fbcon_ready()) {
                 put_dec(aarch64_fbcon_cols());
-                aarch64_uart_puts("桁 x ");
+                aarch64_uart_puts(" cols x ");
                 put_dec(aarch64_fbcon_rows());
-                aarch64_uart_puts("行  ok (ここから先は HDMI にも出る)\n");
+                aarch64_uart_puts(" rows  ok (from here on also appears on HDMI)\n");
             } else {
-                aarch64_uart_puts("BAD (立ち上げられない)\n");
+                aarch64_uart_puts("BAD (could not bring up)\n");
             }
         } else if (fb->fail == AARCH64_FB_FAIL_NO_MBOX) {
-            aarch64_uart_puts("無し (mailbox が無い機械)\n");
+            aarch64_uart_puts("none (no mailbox on this machine)\n");
         } else {
             aarch64_uart_puts("BAD (fail=");
             put_dec(fb->fail);
-            aarch64_uart_puts(" 1=mbox無 2=時間切れ 3=VC拒否 4=返事が変)\n");
+            aarch64_uart_puts(" 1=no mbox 2=timeout 3=VC refused 4=bad reply)\n");
         }
     }
 
@@ -690,7 +690,7 @@ void aarch64_early_main(uint64_t dtb_phys) {
     aarch64_uart_puts("  hhdm      : ");
     put_hex64(g_hhdm_offset);
     aarch64_uart_puts(g_hhdm_offset == AARCH64_KERNEL_VA_OFFSET
-                      ? "  ok\n" : "  BAD (共有層の物理→VA が壊れる)\n");
+                      ? "  ok\n" : "  BAD (shared-layer phys->VA is broken)\n");
 
     /* ---- M1: 例外ベクタ + GIC + generic timer -------------------------- */
     aarch64_vectors_init();
@@ -721,7 +721,7 @@ void aarch64_early_main(uint64_t dtb_phys) {
         if (aarch64_timer_ticks() >= want) {
             aarch64_uart_puts("aarch64-timer-ok\n");
         } else {
-            aarch64_uart_puts("aarch64-timer-BAD (tick が入らない)\n");
+            aarch64_uart_puts("aarch64-timer-BAD (tick not delivered)\n");
         }
     }
 
@@ -732,7 +732,7 @@ void aarch64_early_main(uint64_t dtb_phys) {
     aarch64_vm_init();
 
     /* 失敗したときだけここに来る */
-    aarch64_uart_puts("aarch64-mmu-BAD (上位 VA へ移れなかった)\n");
+    aarch64_uart_puts("aarch64-mmu-BAD (could not move to high VA)\n");
     aarch64_wait_forever();
 }
 
@@ -769,7 +769,7 @@ void aarch64_boot_continue(void) {
     aarch64_vm_drop_identity();
     aarch64_uart_puts("  ttbr0     : ");
     put_hex64(aarch64_vm_user_root_pa());
-    aarch64_uart_puts("  (恒等を外した。カーネルは TTBR1 だけで走っている)\n");
+    aarch64_uart_puts("  (identity map removed. kernel runs on TTBR1 only)\n");
 
     aarch64_uart_puts("  SCTLR_EL1 : ");
     put_hex64(aarch64_read_sctlr());
@@ -796,7 +796,7 @@ void aarch64_boot_continue(void) {
         if (aarch64_timer_ticks() >= want) {
             aarch64_uart_puts("aarch64-mmu-ok\n");
         } else {
-            aarch64_uart_puts("aarch64-mmu-BAD (MMU on で tick が止まった)\n");
+            aarch64_uart_puts("aarch64-mmu-BAD (tick stopped with MMU on)\n");
         }
     }
 
@@ -818,9 +818,9 @@ void aarch64_boot_continue(void) {
             aarch64_uart_puts("  fb console: ");
             if (aarch64_fbcon_ready()) {
                 put_dec(aarch64_fbcon_cols());
-                aarch64_uart_puts("桁 x ");
+                aarch64_uart_puts(" cols x ");
                 put_dec(aarch64_fbcon_rows());
-                aarch64_uart_puts("行  ok (PCI の画面)\n");
+                aarch64_uart_puts(" rows  ok (PCI display)\n");
             } else {
                 aarch64_uart_puts("BAD\n");
             }
@@ -835,7 +835,7 @@ void aarch64_boot_continue(void) {
      * 立ち上げが成功したら、その先に VL805 (xHCI) がいるので、
      * **PCI の走査をやり直す**必要がある */
     if (aarch64_pcie_brcm_init() == 0) {
-        aarch64_uart_puts("  pcie brcm : 立ち上がった。下流を探す\n");
+        aarch64_uart_puts("  pcie brcm : came up. probing downstream\n");
         aarch64_pcie_brcm_scan();
     }
     aarch64_pcie_brcm_probe();
@@ -859,7 +859,7 @@ void aarch64_boot_continue(void) {
      * QEMU にあるのは PWM0 の 0x20C000 だけ。したがって
      * **AARCH64_SOUND=1 は aarch64-pi4-boot でしか付けない** */
 #ifdef AARCH64_SOUND
-    aarch64_uart_puts("--- 音: PWM -> 3.5mm ジャック ---\n");
+    aarch64_uart_puts("--- sound: PWM -> 3.5mm jack ---\n");
     sound_init();
     /* **自己診断は既定で切ってある。**
      *
@@ -885,11 +885,11 @@ void aarch64_boot_continue(void) {
         aarch64_uart_puthex64(aarch64_vm_dma_pool_base());
         aarch64_uart_puts(" size ");
         aarch64_uart_puthex64(aarch64_vm_dma_pool_bytes());
-        aarch64_uart_puts(aarch64_vm_dma_pool_base() ? "  非キャッシュ (Normal-NC)\n"
-                                                     : "  *** 取れていない\n");
+        aarch64_uart_puts(aarch64_vm_dma_pool_base() ? "  non-cached (Normal-NC)\n"
+                                                     : "  *** not obtained\n");
         usb_init();
         aarch64_uart_puts("  usb       : ");
-        aarch64_uart_puts(usb_is_ready() ? "ok\n" : "見つからない / 初期化できない\n");
+        aarch64_uart_puts(usb_is_ready() ? "ok\n" : "not found / cannot initialize\n");
         if (usb_is_ready()) {
             int hk = usb_hid_keyboard_init();
             aarch64_uart_puts("  usb kbd   : ");
@@ -902,13 +902,13 @@ void aarch64_boot_continue(void) {
                     int r = usb_hid_keyboard_poll(rep);
                     aarch64_uart_puts("  usb kbd rd: ");
                     if (r == 0) {
-                        aarch64_uart_puts("レポートが取れた mod=");
+                        aarch64_uart_puts("got report mod=");
                         put_dec(rep[0]);
                         aarch64_uart_puts(" key=");
                         put_dec(rep[2]);
                         aarch64_uart_puts("\n");
                     } else if (r == 1) {
-                        aarch64_uart_puts("まだ何も来ていない (押されていない)\n");
+                        aarch64_uart_puts("nothing received yet (not pressed)\n");
                     } else {
                         aarch64_uart_puts("BAD\n");
                     }
@@ -944,7 +944,7 @@ void aarch64_boot_continue(void) {
                 }
 #endif
             } else {
-                aarch64_uart_puts("無し / 初期化できない\n");
+                aarch64_uart_puts("none / cannot initialize\n");
             }
         }
     }
@@ -963,11 +963,11 @@ void aarch64_boot_continue(void) {
             aarch64_uart_puts("  fb va     : ");
             put_hex64(AARCH64_FB_VA_BASE);
             if (aarch64_vm_translate(AARCH64_FB_VA_BASE) == fb->base) {
-                aarch64_uart_puts("  ok (物理と一致)\n");
+                aarch64_uart_puts("  ok (matches physical)\n");
                 aarch64_fb_mark_top(0x00ff00U);
-                aarch64_uart_puts("  fb post   : 上位 VA から描いた (画面の上端が緑)\n");
+                aarch64_uart_puts("  fb post   : drawn from high VA (top of screen is green)\n");
             } else {
-                aarch64_uart_puts("  BAD (張れていない)\n");
+                aarch64_uart_puts("  BAD (failed to map)\n");
             }
         }
     }

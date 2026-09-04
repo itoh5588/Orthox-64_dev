@@ -157,7 +157,7 @@ static void assign_bars(uint8_t b, uint8_t d, uint8_t f) {
         {
             uint64_t base = (g_mmio_next + size - 1U) & ~((uint64_t)size - 1U);
             if (base + size > g_mmio_end) {
-                aarch64_uart_puts("  pci: BAR を配る空きが尽きた\n");
+                aarch64_uart_puts("  pci: ran out of space to assign BARs\n");
                 break;
             }
             cfg_w32(b, d, f, off, (uint32_t)base | (orig & 0xfU));
@@ -347,7 +347,7 @@ void pci_enable_intx(const struct pci_device_info* dev) {
  * ので、「見つけたのに 0 のまま」を見逃さない */
 void aarch64_pci_dump(void) {
     if (!g_ready) {
-        aarch64_uart_puts("  pci       : 無し (ECAM が取れていない)\n");
+        aarch64_uart_puts("  pci       : none (ECAM not obtained)\n");
         return;
     }
     for (uint32_t i = 0; i < g_dev_count; i++) {
@@ -373,7 +373,7 @@ void aarch64_pci_dump(void) {
      * 何段辿ったかはバス番号の最大で分かる */
     aarch64_uart_puts("  pci       : ");
     puthex_n(g_dev_count, 2);
-    aarch64_uart_puts(" 台 (バス 0..");
+    aarch64_uart_puts(" devices (bus 0..");
     puthex_n(g_bus_max, 2);
     aarch64_uart_puts(")\n");
 }

@@ -196,7 +196,7 @@ static uint64_t aarch64_vm_ptr_pa(const void* p) {
 static uint64_t aarch64_vm_alloc_table(void) {
     uint64_t pa = aarch64_pmm_alloc(1);
     if (!pa) {
-        aarch64_uart_puts("  vm: テーブル用のページを確保できない\n");
+        aarch64_uart_puts("  vm: could not allocate page for table\n");
         g_vm_failed = 1;
         return 0;
     }
@@ -950,7 +950,7 @@ static int aarch64_vm_clone_table(uint64_t dst_pa, uint64_t src_pa, int level) {
              * ブロックは張っていないので、**黙って共有せず失敗させる** —
              * 共有すると親子で同じ物理ページを書き合う */
             if ((entry & AARCH64_PTE_TABLE) == 0) {
-                aarch64_uart_puts("  vm: clone: 想定外のブロック写像\n");
+                aarch64_uart_puts("  vm: clone: unexpected block mapping\n");
                 return -1;
             }
             child = aarch64_vm_alloc_table();
@@ -1027,7 +1027,7 @@ static void aarch64_vm_destroy_table(uint64_t table_pa, int level) {
             if (entry & AARCH64_PTE_TABLE) {
                 aarch64_vm_destroy_table(entry & AARCH64_PTE_ADDR_MASK, level + 1);
             } else {
-                aarch64_uart_puts("  vm: destroy: 想定外のブロック写像\n");
+                aarch64_uart_puts("  vm: destroy: unexpected block mapping\n");
             }
         } else {
             pmm_free((void*)(uintptr_t)(entry & AARCH64_PTE_ADDR_MASK), 1);
@@ -1196,7 +1196,7 @@ void aarch64_vm_fault_probe(void) {
     uint64_t esr, ec, dfsc;
 
     if (probe_va == 0) {
-        aarch64_uart_puts("  mmu probe : SKIP (未マップの VA が見つからない)\n");
+        aarch64_uart_puts("  mmu probe : SKIP (no unmapped VA found)\n");
         return;
     }
     p = (volatile uint32_t*)(uintptr_t)probe_va;
@@ -1204,7 +1204,7 @@ void aarch64_vm_fault_probe(void) {
     /* 先に「張られていない」ことをテーブル側で確かめる。ここが 0 でなければ
      * 探針の前提が崩れているので、fault が上がらなくても当然になる */
     if (aarch64_vm_translate(probe_va) != 0) {
-        aarch64_uart_puts("  mmu probe : SKIP (探針アドレスが張られている)\n");
+        aarch64_uart_puts("  mmu probe : SKIP (probe address is mapped)\n");
         return;
     }
 
@@ -1216,7 +1216,7 @@ void aarch64_vm_fault_probe(void) {
     esr = g_aarch64_vm_fault_esr;
     if (esr == 0) {
         /* 読めてしまった = MMU が翻訳していない (SCTLR.M が立っていない等) */
-        aarch64_uart_puts("  mmu probe : BAD (未マップの VA が読めた)\n");
+        aarch64_uart_puts("  mmu probe : BAD (unmapped VA was readable)\n");
         return;
     }
 
@@ -1232,7 +1232,7 @@ void aarch64_vm_fault_probe(void) {
         aarch64_uart_putchar((char)('0' + (int)(dfsc & 3ULL)));
         aarch64_uart_puts(") ok\n");
     } else {
-        aarch64_uart_puts(" BAD (translation fault ではない)\n");
+        aarch64_uart_puts(" BAD (not a translation fault)\n");
     }
 }
 
@@ -1268,7 +1268,7 @@ void aarch64_vm_init(void) {
     uint64_t kstart_pa = aarch64_vm_ptr_pa(__kernel_start);
     uint64_t new_sp, cont;
 
-    aarch64_uart_puts("--- M2/M3b: MMU (4KB granule, VA 39bit, TTBR1 = カーネル) ---\n");
+    aarch64_uart_puts("--- M2/M3b: MMU (4KB granule, VA 39bit, TTBR1 = kernel) ---\n");
 
     /* **リンカスクリプトとヘッダで VA のずらし幅が一致しているか。**
      *
@@ -1281,7 +1281,7 @@ void aarch64_vm_init(void) {
      * (この関数の中で計算をいじった、など) を捕まえられるため。
      * 起動バナーが出ないときは、ここではなく start.S の計算を疑うこと。 */
     if (aarch64_link_va_offset() != AARCH64_KERNEL_VA_OFFSET) {
-        aarch64_uart_puts("  KERNEL_VA_OFFSET がリンカスクリプトと違う: ld=");
+        aarch64_uart_puts("  KERNEL_VA_OFFSET differs from linker script: ld=");
         aarch64_uart_puthex64(aarch64_link_va_offset());
         aarch64_uart_puts(" hdr=");
         aarch64_uart_puthex64(AARCH64_KERNEL_VA_OFFSET);
@@ -1293,17 +1293,17 @@ void aarch64_vm_init(void) {
     aarch64_vm_build_ident();      /* TTBR0: 移行のあいだだけの恒等 */
     aarch64_vm_build_user();       /* TTBR0: 上位へ飛んだ後のユーザー空間 */
     if (g_vm_failed) {
-        aarch64_uart_puts("aarch64-mmu-BAD (テーブル構築に失敗)\n");
+        aarch64_uart_puts("aarch64-mmu-BAD (failed to build tables)\n");
         return;
     }
 
     aarch64_uart_puts("  tables    : ");
     aarch64_uart_puthex64(g_tables_used);
-    aarch64_uart_puts("  (pmm から確保。空き ");
+    aarch64_uart_puts("  (allocated from pmm. free ");
     aarch64_uart_puthex64(aarch64_pmm_total() - aarch64_pmm_used());
-    aarch64_uart_puts(" ページ)\n  kernel VA : ");
+    aarch64_uart_puts(" pages)\n  kernel VA : ");
     aarch64_uart_puthex64(aarch64_phys_to_virt(kstart_pa));
-    aarch64_uart_puts("  (物理 ");
+    aarch64_uart_puts("  (phys ");
     aarch64_uart_puthex64(kstart_pa);
     aarch64_uart_puts(")\n");
 
@@ -1332,7 +1332,7 @@ void aarch64_vm_init(void) {
     aarch64_uart_puthex64(aarch64_vm_translate_in(g_user_root_pa, AARCH64_USER_VA_BASE));
     aarch64_uart_puts(aarch64_vm_translate_in(g_user_root_pa, AARCH64_USER_VA_BASE) ==
                       aarch64_vm_ptr_pa(__user_text_start)
-                      ? "  ok (.user_text を指している)\n" : "  BAD\n");
+                      ? "  ok (points at .user_text)\n" : "  BAD\n");
 
     if (aarch64_vm_translate_in(g_kernel_root_pa,
             aarch64_phys_to_virt(aarch64_vm_ptr_pa(__text_start))) == 0 ||
@@ -1342,7 +1342,7 @@ void aarch64_vm_init(void) {
             aarch64_phys_to_virt(b->memory_base + b->memory_size - 1)) == 0 ||
         aarch64_vm_translate_in(g_ident_root_pa, kstart_pa) == 0 ||
         aarch64_vm_translate_in(g_user_root_pa, AARCH64_USER_VA_BASE) == 0) {
-        aarch64_uart_puts("aarch64-mmu-BAD (有効化前の確認で 0 が出た)\n");
+        aarch64_uart_puts("aarch64-mmu-BAD (pre-enable check returned 0)\n");
         return;
     }
 
@@ -1352,7 +1352,7 @@ void aarch64_vm_init(void) {
     aarch64_mmu_enable();
 
     /* ここに文字が出れば「MMU on のまま、恒等マッピングで UART に届いている」 */
-    aarch64_uart_puts("  mmu on    : ok (まだ物理アドレスで走っている)\n");
+    aarch64_uart_puts("  mmu on    : ok (still running on physical address)\n");
 
     /* **新しいスタックを上位 VA に用意して飛ぶ。**
      * いまのスタックには物理アドレスの戻り先が積まれているので、そのまま

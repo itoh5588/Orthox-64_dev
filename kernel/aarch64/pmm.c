@@ -387,19 +387,19 @@ void aarch64_pmm_scan_report(void) {
     g_claim_calls = 0; g_scan_pages = 0; g_claim_wrap = 0;
     if (calls == 0) return;
 
-    aarch64_uart_puts("[pmm] 60s  確保 ");
+    aarch64_uart_puts("[pmm] 60s  alloc ");
     aarch64_uart_putdec64(calls);
-    aarch64_uart_puts("回  走査 ");
+    aarch64_uart_puts(" times  scanned ");
     aarch64_uart_putdec64(scan);
-    aarch64_uart_puts("頁  1回あたり ");
+    aarch64_uart_puts(" pages  per commit ");
     aarch64_uart_putdec64(scan / calls);
-    aarch64_uart_puts("頁  2周 ");
+    aarch64_uart_puts(" pages  2 laps ");
     aarch64_uart_putdec64(wrap);
-    aarch64_uart_puts("回  使用 ");
+    aarch64_uart_puts(" times  used ");
     aarch64_uart_putdec64(g_used);
     aarch64_uart_puts("/");
     aarch64_uart_putdec64(g_pages);
-    aarch64_uart_puts("頁  起点 ");
+    aarch64_uart_puts(" pages  origin ");
     aarch64_uart_putdec64(g_next_page);
     aarch64_uart_puts("\n");
 }
@@ -435,7 +435,7 @@ int aarch64_pmm_meta_fault(void) { return g_meta_fault; }
 #include "vmm.h"
 
 _Static_assert(PAGE_SIZE == AARCH64_PAGE_SIZE,
-               "共有層の PAGE_SIZE と aarch64 のページサイズがずれている");
+               "shared-layer PAGE_SIZE differs from aarch64 page size");
 
 static uint64_t pmm_page_index(uint64_t pa, int* ok) {
     *ok = 0;

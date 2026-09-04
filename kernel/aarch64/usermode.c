@@ -197,7 +197,7 @@ static void aarch64_svc(uint64_t* frame) {
         st->exit_code = frame[0];
         break;
     default:
-        aarch64_uart_puts("  [EL1] 未実装のシステムコール: ");
+        aarch64_uart_puts("  [EL1] unimplemented syscall: ");
         aarch64_uart_puthex64(nr);
         aarch64_uart_puts("\n");
         frame[0] = (uint64_t)-38;   /* -ENOSYS */
@@ -232,7 +232,7 @@ static void aarch64_dump_bad_user_frame(const uint64_t* frame, uint64_t esr, uin
     __asm__ volatile("mrs %0, tcr_el1"   : "=r"(tcr));
 
     aarch64_console_begin();
-    aarch64_uart_puts("\n*** aarch64 EL0 からの想定外の例外 ***\n");
+    aarch64_uart_puts("\n*** aarch64 unexpected exception from EL0 ***\n");
     aarch64_uart_puts("  CPU : mpidr=");
     aarch64_uart_puthex64(mpidr);
     aarch64_uart_puts(" cpu_id=");
@@ -386,9 +386,9 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
         struct task* cur = get_current_task();
         if (cur && cur->ppid != 0) {
             aarch64_console_begin();
-            aarch64_uart_puts("  [EL1] 落ちたので pid ");
+            aarch64_uart_puts("  [EL1] crashed, so pid ");
             aarch64_uart_putdec64((uint64_t)cur->pid);
-            aarch64_uart_puts(" を終了させる\n");
+            aarch64_uart_puts(" terminating\n");
             aarch64_console_end();
             /* **割り込みを開けてから。**この先は kernel_yield まで進み、
              * 閉じたままだと切り替えが来ない */
@@ -447,20 +447,20 @@ int aarch64_user_run_once(const char* label, uint64_t root_pa) {
     aarch64_uart_puthex64(st->svc_count);
     aarch64_uart_puts("  marker    : ");
     aarch64_uart_puthex64(st->exit_code);
-    aarch64_uart_puts(st->exit_code == 0 ? "  ok (私物のデータ)\n"
-                                            : "  BAD (前の空間の値が見えている)\n");
+    aarch64_uart_puts(st->exit_code == 0 ? "  ok (private data)\n"
+                                            : "  BAD (previous address space value is visible)\n");
 
     /* --- EL0 実行中に tick が入ったか -----------------------------------
      * **「下位 EL の IRQ」ベクタ (+0x480) が効いている証拠。** */
     aarch64_uart_puts("  el0 ticks : ");
     aarch64_uart_puthex64(ticks_after - ticks_before);
     aarch64_uart_puts((ticks_after - ticks_before) >= AARCH64_USER_MIN_TICKS
-                      ? "  ok\n" : "  BAD (EL0 で tick が入らない)\n");
+                      ? "  ok\n" : "  BAD (tick not delivered at EL0)\n");
 
     /* --- EL0 からカーネルのページを読んで落ちたか ------------------------ */
     aarch64_uart_puts("  user probe: ");
     if (st->fault_esr == 0) {
-        aarch64_uart_puts("BAD (EL0 からカーネルの .text が読めた)\n");
+        aarch64_uart_puts("BAD (kernel .text was readable from EL0)\n");
     } else {
         uint64_t ec = (st->fault_esr >> ESR_EC_SHIFT) & ESR_EC_MASK;
         uint64_t dfsc = st->fault_esr & ESR_DFSC_MASK;
@@ -474,7 +474,7 @@ int aarch64_user_run_once(const char* label, uint64_t root_pa) {
         if (ec == ESR_EC_DABT_LOW && (dfsc >> 2) == 0x3ULL) {
             aarch64_uart_puts(" (permission fault) ok\n");
         } else {
-            aarch64_uart_puts(" BAD (permission fault ではない)\n");
+            aarch64_uart_puts(" BAD (not a permission fault)\n");
         }
     }
 
@@ -483,16 +483,16 @@ int aarch64_user_run_once(const char* label, uint64_t root_pa) {
     aarch64_uart_puts("  bad ptr   : ");
     aarch64_uart_puthex64(st->bad_ptr_ret);
     aarch64_uart_puts(st->bad_ptr_ret == (uint64_t)-14
-                      ? "  ok (-EFAULT で弾いた)\n"
-                      : "  BAD (カーネルの VA を読ませてしまった)\n");
+                      ? "  ok (rejected with -EFAULT)\n"
+                      : "  BAD (allowed reading kernel VA)\n");
 
     /* --- SP_EL0 がフレーム経由で効いているか (M3c-2a) --------------------
      * **execve / fork がユーザーのスタックを組み替える経路そのもの。**
      * ここが効いていないと、共有層は sp を差し替えたつもりで差し替わらない */
     aarch64_uart_puts("  sp probe  : ");
     aarch64_uart_puthex64(st->sp_probe_saved);
-    aarch64_uart_puts(st->sp_probe_ok ? "  ok (SP_EL0 がフレーム経由で効く)\n"
-                                      : "  BAD (フレームの sp_el0 が届いていない)\n");
+    aarch64_uart_puts(st->sp_probe_ok ? "  ok (SP_EL0 works via the frame)\n"
+                                      : "  BAD (frame sp_el0 not propagated)\n");
 
     aarch64_console_end();
 
@@ -530,14 +530,14 @@ int aarch64_user_run(void) {
     int k1, k2, u1, u2;
     int ok = 1;
 
-    aarch64_uart_puts("--- M3a/M3b/M3c: EL0 + アドレス空間 + コンテキストスイッチ ---\n");
+    aarch64_uart_puts("--- M3a/M3b/M3c: EL0 + address space + context switch ---\n");
     aarch64_uart_puts("  user text : ");
     aarch64_uart_puthex64(aarch64_vm_user_entry_va());
     aarch64_uart_puts("\n  user sp   : ");
     aarch64_uart_puthex64(aarch64_vm_user_stack_top_va());
     aarch64_uart_puts("\n  probe tgt : ");
     aarch64_uart_puthex64(aarch64_user_probe_target());
-    aarch64_uart_puts("  (カーネルの .text。EL0 から読めてはいけない)\n");
+    aarch64_uart_puts("  (kernel .text. must not be readable from EL0)\n");
 
     /* **先に EL1 で同じだけ空回しして比べる。** これをやらないと、EL0 で
      * tick が入らなかったときに「EL0 の IRQ ベクタが効いていない」のか
@@ -547,13 +547,13 @@ int aarch64_user_run(void) {
         for (volatile uint64_t i = 0; i < AARCH64_USER_SPIN; i++) { }
         aarch64_uart_puts("  el1 ticks : ");
         aarch64_uart_puthex64(aarch64_timer_ticks() - t0);
-        aarch64_uart_puts("  (比較用。EL1 で同じだけ空回しした)\n");
+        aarch64_uart_puts("  (for comparison. spun the same loop at EL1)\n");
     }
 
     space_a = aarch64_vm_create_user_space();
     space_b = aarch64_vm_create_user_space();
     if (!space_a || !space_b || space_a == space_b) {
-        aarch64_uart_puts("  アドレス空間を 2 つ作れなかった\n");
+        aarch64_uart_puts("  could not create 2 address spaces\n");
         aarch64_uart_puts("aarch64-user-BAD\n");
         return 0;
     }
@@ -565,13 +565,13 @@ int aarch64_user_run(void) {
     k2 = aarch64_task_create(aarch64_kthread_body, 0);
 
     /* ユーザータスク 2 本。**それぞれ別のアドレス空間** */
-    g_task_label[3] = "空間 A";
-    g_task_label[4] = "空間 B";
+    g_task_label[3] = "space A";
+    g_task_label[4] = "space B";
     u1 = aarch64_task_create(aarch64_utask_body, space_a);
     u2 = aarch64_task_create(aarch64_utask_body, space_b);
 
     if (k1 < 0 || k2 < 0 || u1 < 0 || u2 < 0) {
-        aarch64_uart_puts("  タスクを作れなかった\n");
+        aarch64_uart_puts("  could not create task\n");
         aarch64_uart_puts("aarch64-user-BAD\n");
         return 0;
     }
@@ -589,7 +589,7 @@ int aarch64_user_run(void) {
     aarch64_uart_puts(" / ");
     aarch64_uart_puthex64(aarch64_task_counter(k2));
     aarch64_uart_puts(aarch64_task_counter(k1) == 200 && aarch64_task_counter(k2) == 200
-                      ? "  ok (両方最後まで回った)\n" : "  BAD\n");
+                      ? "  ok (both ran to completion)\n" : "  BAD\n");
     if (aarch64_task_counter(k1) != 200 || aarch64_task_counter(k2) != 200) ok = 0;
 
     aarch64_uart_puts("  switches  : ");

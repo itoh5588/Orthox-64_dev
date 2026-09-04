@@ -68,7 +68,7 @@ void arch_halt_forever(void) {
      *
      * 共有の linux_syscall.c ではなくここに置くのは、riscv64 の出力を
      * 変えないため */
-    aarch64_pmm_report_free("  pmm 残り  : ");
+    aarch64_pmm_report_free("  pmm remain: ");
     aarch64_wait_forever();
     for (;;) { }
 }

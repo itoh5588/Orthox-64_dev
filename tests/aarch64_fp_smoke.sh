@@ -150,7 +150,7 @@ grep -aq "bootstrap user exit" "$LOG"
 
 must_not "aarch64-exception-BAD" "$LOG"
 must_not "xv6bio: disk" "$LOG"
-must_not "vm: clone: 想定外のブロック写像" "$LOG"
-must_not "task: fork の子に current がいない" "$LOG"
+must_not "vm: clone: unexpected block mapping" "$LOG"
+must_not "task: fork child has no current" "$LOG"
 
 echo "aarch64 fp smoke test: PASS"

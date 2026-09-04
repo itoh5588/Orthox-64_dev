@@ -1628,7 +1628,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                     arch_syscall_set_return(frame, (uint64_t)(int64_t)-38);   /* -ENOSYS */
                     return;
                 }
-                puts("\n[EL1] reboot: 機械をリセットする\r\n");
+                puts("\n[EL1] reboot: resetting the machine\r\n");
                 if (arch_system_reset() < 0) {
                     arch_syscall_set_return(frame, (uint64_t)(int64_t)-38);   /* -ENOSYS */
                     return;

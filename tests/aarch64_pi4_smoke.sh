@@ -90,7 +90,7 @@ must_not() {  # $1 = 出てはいけない文字列
 grep -aq "aarch64-boot-ok" "$LOG"
 # **入口の EL。** armstub と同じく EL2 で来る。EL1 と出たら
 # 「降格路を通っていない」ので、実機との条件が変わっている
-grep -aq "(入口 EL2)" "$LOG"
+grep -aq "(entry EL2)" "$LOG"
 
 # ---- D: DTB (実物の Pi 4 の木) ----
 # **どれも QEMU virt とは違う値。** 既定値のままなら (dtb) が付かない
@@ -115,7 +115,7 @@ grep -aq "aarch64-virtio-none" "$LOG"
 # **タイマ割り込みが届いていること。** GIC-400 は GICv2 なので既存の実装で
 # 通る見込みだった、を実測に変える。ticks が進み、sleep が起きること
 grep -aq "aarch64-timer-ok" "$LOG"
-grep -aq "sleep     : .* ok (寝て、タイマに起こされた)" "$LOG"
+grep -aq "sleep     : .* ok (slept, woken by timer)" "$LOG"
 grep -aq "aarch64-sched-ok" "$LOG"
 
 # ---- MMU と EL0 ----

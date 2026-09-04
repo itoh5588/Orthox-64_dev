@@ -369,7 +369,7 @@ int aarch64_shared_layer_selftest(void) {
     uint64_t got;
 
     aarch64_console_begin();
-    puts("--- M3c-2a: 共有層 (pmm.h / arch_vm_*) ---\n");
+    puts("--- M3c-2a: shared layer (pmm.h / arch_vm_*) ---\n");
     aarch64_console_end();
 
     /* 1. 確保して PHYS_TO_VIRT 経由で触る */
@@ -425,8 +425,8 @@ done:
      * 前の判定は「ここが変わったら気づける」と書いてあり、実際に
      * aarch64-shared-BAD で気づけた。**期待値は実態に合わせて更新すること** —
      * 「まだ出来ていない」を前提にした数字を残すと、直したときに落ちる */
-    puts(pages_after == pages_before ? "  ok (確保したぶんが全部戻った)\n"
-                                     : "  BAD (見込みと違う)\n");
+    puts(pages_after == pages_before ? "  ok (everything allocated was freed)\n"
+                                     : "  BAD (not as expected)\n");
     if (pages_after != pages_before) ok = 0;
     puts(ok ? "aarch64-shared-ok\n" : "aarch64-shared-BAD\n");
     aarch64_console_end();
@@ -491,7 +491,7 @@ int aarch64_shared_task_selftest(void) {
     int ok = 1;
 
     aarch64_console_begin();
-    puts("--- M3c-2b: 共有スケジューラ (kernel/sched.c) ---\n");
+    puts("--- M3c-2b: shared scheduler (kernel/sched.c) ---\n");
     aarch64_console_end();
 
     /* **乗り換えは task_init の前。** 後にすると、その隙のタイマ割り込みが
@@ -518,8 +518,8 @@ int aarch64_shared_task_selftest(void) {
     aarch64_uart_putdec64(elapsed);
     /* 即座に戻ってきたら切り替えていない。**しきい値は境界に乗せない** —
      * 要求 50ms に対して 40ms 以上を合格とする (日報2026-08-09 追2-3) */
-    puts(elapsed >= (SHARED_SLEEP_MS - 10) ? " ms  ok (寝て、タイマに起こされた)\n"
-                                           : " ms  BAD (切り替わっていない)\n");
+    puts(elapsed >= (SHARED_SLEEP_MS - 10) ? " ms  ok (slept, woken by timer)\n"
+                                           : " ms  BAD (did not switch)\n");
     aarch64_console_end();
     if (elapsed < (SHARED_SLEEP_MS - 10)) ok = 0;
 
@@ -592,7 +592,7 @@ int aarch64_fs_selftest(void) {
     const char* disk_name;
 
     aarch64_console_begin();
-    puts("--- M4-3: xv6fs (virtio-blk / EMMC2 の上) ---\n");
+    puts("--- M4-3: xv6fs (on virtio-blk / EMMC2) ---\n");
     aarch64_console_end();
 
     /* **fs_init が storage_init も呼ぶ。** ramfs / fifo / VFS の
@@ -622,7 +622,7 @@ int aarch64_fs_selftest(void) {
     } else {
         /* ディスクを付けずに起動した回。**「無い」と「壊れた」を混ぜない** */
         aarch64_console_begin();
-        puts("  device    : 見つからない (-drive を付けずに起動した)\n");
+        puts("  device    : not found (booted without -drive)\n");
         puts("aarch64-fs-none\n");
         aarch64_console_end();
         return 1;
@@ -734,12 +734,12 @@ int aarch64_first_user_task(void) {
     arch_task_exec_frame_t frame;
 
     aarch64_console_begin();
-    puts("--- P1: 最初のユーザープロセス ---\n");
+    puts("--- P1: first user process ---\n");
     puts("  exec      : " AARCH64_INIT_PATH "\n");
     aarch64_console_end();
 
     if (!get_current_task()) {
-        puts("  BAD (current task がいない)\naarch64-init-BAD\n");
+        puts("  BAD (no current task)\naarch64-init-BAD\n");
         return 0;
     }
 
@@ -748,7 +748,7 @@ int aarch64_first_user_task(void) {
     aarch64_use_shared_syscalls_on();
 
     if (task_execve(&frame, AARCH64_INIT_PATH, argv, envp) < 0) {
-        puts("  exec      : BAD (execve が失敗)\naarch64-init-BAD\n");
+        puts("  exec      : BAD (execve failed)\naarch64-init-BAD\n");
         return 0;
     }
 

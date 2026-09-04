@@ -196,8 +196,8 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     grep -aq "timer irq : 0x000000000000001e  (dtb)" "$2"   # PPI 14 + 16 = 30
     # **スロット i の INTID = base + i が DTB で確かめられていること。**
     # 確かめずに決め打ちすると、別のデバイスの割り込みを待つ
-    grep -aq "virtio irq: 0x0000000000000030  (dtb、base + スロット番号で確認済み)" "$2"
-    must_not "(既定値)" "$2"     # 1 つでも既定値に落ちていたら失格
+    grep -aq "virtio irq: 0x0000000000000030  (dtb, verified via base + slot number)" "$2"
+    must_not "(default)" "$2"     # 1 つでも既定値に落ちていたら失格
 
     # M1: 例外ベクタ + GIC + generic timer で tick が入る
     #
@@ -219,11 +219,11 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     #   3. **カーネルが上位 VA で走っていること** (pc / sp / VBAR が 0xffffff80...)
     #   4. **恒等マッピングを外した後も文字が出ること**
     #      = カーネルが TTBR1 だけで走っている証拠
-    grep -aq "M2/M3b: MMU (4KB granule, VA 39bit, TTBR1 = カーネル)" "$2"
+    grep -aq "M2/M3b: MMU (4KB granule, VA 39bit, TTBR1 = kernel)" "$2"
     # カーネルが自分で決めた値。**EL1 起動と EL2 降格で同じ値になること**が
     # 要点 (起動時の値を読んで OR していたときは別の値になっていた)
     grep -aq "SCTLR_EL1 : 0x0000000030d0181d" "$2"
-    grep -aq "kernel VA : 0xffffff8040201000  (物理 0x0000000040201000)" "$2"
+    grep -aq "kernel VA : 0xffffff8040201000  (phys 0x0000000040201000)" "$2"
     # 有効化前の自前ウォーク。上位側 (TTBR1) と恒等側 (TTBR0) の両方を見る。
     # どちらが欠けても沈黙する: 恒等が欠ければ MMU on の瞬間、
     # 上位が欠ければ飛んだ瞬間
@@ -231,12 +231,12 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     grep -aq "ttbr1 gicc: 0x0000000008010000" "$2"
     grep -aq "ttbr1 ram : ${ram_last}" "$2"
     grep -aq "ttbr0 iden: 0x0000000040201000" "$2"
-    grep -aq "ttbr0 user: .*  ok (.user_text を指している)" "$2"
+    grep -aq "ttbr0 user: .*  ok (points at .user_text)" "$2"
     # 上位 VA へ移れたこと。pc / sp / VBAR / UART が全部 0xffffff80... になる
     grep -aq "high VA   : pc=0xffffff80.* sp=0xffffff80" "$2"
     grep -aq "vbar/uart : 0xffffff80.* / 0xffffff8009000000" "$2"
     # **恒等を外した後の行。** ここが出れば TTBR1 だけで走っている
-    grep -aq "恒等を外した。カーネルは TTBR1 だけで走っている" "$2"
+    grep -aq "identity map removed. kernel runs on TTBR1 only" "$2"
     # **段 (level) と ESR の値は固定しない。** 探針の VA は実行時に
     # 「HHDM の外側で未マップの所」を探して決めるので、どの段で翻訳が
     # 途切れるかは RAM の広さで変わる (実測: QEMU virt で level 1)。
@@ -279,7 +279,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     #   5. **カーネルの VA を write に渡すと -EFAULT で弾かれる**
     #      アドレス空間を分けただけでは防げない (カーネル自身は上位 VA を
     #      読めてしまう)。ポインタの検査が要る
-    grep -aq "M3a/M3b/M3c: EL0 + アドレス空間 + コンテキストスイッチ" "$2"
+    grep -aq "M3a/M3b/M3c: EL0 + address space + context switch" "$2"
     # **行が割れていないこと。** 並行に走る 2 本の出力は、1 行の途中で
     # 切り替わると混ざる (実測で 12 回中 5 回)。カーネルの動作自体は正しく
     # aarch64-user-ok も出るので、下の「数が 2 であること」だけだと
@@ -294,20 +294,20 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     [ "$(grep -ac "\[EL0\] hello from user mode" "$2")" = "2" ]
     [ "$(grep -ac "\[EL0\] resumed after permission fault" "$2")" = "2" ]
     # **2 回とも marker が 0** = データが私物
-    [ "$(grep -ac "marker    : 0x0000000000000000  ok (私物のデータ)" "$2")" = "2" ]
-    must_not "BAD (前の空間の値が見えている)" "$2"
+    [ "$(grep -ac "marker    : 0x0000000000000000  ok (private data)" "$2")" = "2" ]
+    must_not "BAD (previous address space value is visible)" "$2"
     [ "$(grep -ac "svc calls : 0x0000000000000005" "$2")" = "2" ]
     [ "$(grep -ac "el0 ticks : .*  ok" "$2")" = "2" ]
     # EL0 から読ませるのはカーネルの**上位 VA**。EL0 も TTBR1 を歩けるが、
     # AP が EL1 だけなので permission fault になる
     [ "$(grep -ac "user probe: ESR=0x000000009200000f FAR=0xffffff8040201000 (permission fault) ok" "$2")" = "2" ]
     # -14 = -EFAULT
-    [ "$(grep -ac "bad ptr   : 0xfffffffffffffff2  ok (-EFAULT で弾いた)" "$2")" = "2" ]
+    [ "$(grep -ac "bad ptr   : 0xfffffffffffffff2  ok (rejected with -EFAULT)" "$2")" = "2" ]
     # M3c-2a: フレームの sp_el0 が SP_EL0 に届いていること。
     # **SP_EL0 は例外で自動的に保たれる**ので、save も restore も外したまま
     # でも他の判定は全部通る (逆確認で実証)。カーネル側から意図的に
     # ずらして戻ってくるかを見て初めて効いている証拠になる
-    [ "$(grep -ac "sp probe  : .*  ok (SP_EL0 がフレーム経由で効く)" "$2")" = "2" ]
+    [ "$(grep -ac "sp probe  : .*  ok (SP_EL0 works via the frame)" "$2")" = "2" ]
     # M3c-1: コンテキストスイッチとプリエンプション
     #
     #   カーネルスレッド 2 本が両方 200 周する = 譲り合いが成立している
@@ -316,10 +316,10 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     # **ユーザータスク 2 本は並行に走る。** 出力が交錯すること自体が、
     # タイマ割り込みで切り替わっている証拠 (どちらも hello を出してから
     # 片方が終わる)
-    grep -aq "kthreads  : 0x00000000000000c8 / 0x00000000000000c8  ok (両方最後まで回った)" "$2"
+    grep -aq "kthreads  : 0x00000000000000c8 / 0x00000000000000c8  ok (both ran to completion)" "$2"
     grep -aq "switches  : .*  ok" "$2"
-    [ "$(grep -ac -- "--- 空間 A ttbr0=" "$2")" = "1" ]
-    [ "$(grep -ac -- "--- 空間 B ttbr0=" "$2")" = "1" ]
+    [ "$(grep -ac -- "--- space A ttbr0=" "$2")" = "1" ]
+    [ "$(grep -ac -- "--- space B ttbr0=" "$2")" = "1" ]
 
     grep -aq "aarch64-user-ok" "$2"
     must_not "aarch64-user-BAD" "$2"
@@ -333,7 +333,7 @@ check_one() {  # $1 = 見出し、$2 = ログ、$3 = 期待する RAM 容量、$
     grep -aq "Task system initialized." "$2"
     grep -aq "  current   :  ok" "$2"
     grep -aq "  idle task :  ok" "$2"
-    grep -aq "  sleep     : .*  ok (寝て、タイマに起こされた)" "$2"
+    grep -aq "  sleep     : .*  ok (slept, woken by timer)" "$2"
     grep -aq "aarch64-sched-ok" "$2"
     must_not "aarch64-sched-BAD" "$2"
 
@@ -370,9 +370,9 @@ check_one "EL3 起動 -> 降格" LOGs/aarch64-serial-el3.log 0x0000000020000000 
 # これが無いと、EL2 の回が実は EL1 で始まっていても気づけない
 # (降格後の CurrentEL はどの回も EL1 になるため)。
 # 入口 EL は start.S が降ろす前に控えて aarch64_entry_el に入れている
-grep -aq "(入口 EL1)" LOGs/aarch64-serial.log
-grep -aq "(入口 EL2)" LOGs/aarch64-serial-el2.log
-grep -aq "(入口 EL3)" LOGs/aarch64-serial-el3.log
+grep -aq "(entry EL1)" LOGs/aarch64-serial.log
+grep -aq "(entry EL2)" LOGs/aarch64-serial-el2.log
+grep -aq "(entry EL3)" LOGs/aarch64-serial-el3.log
 
 # **DTB を本当に読んでいるかの確認。** RAM を 1GB にすると DTB の memory も
 # 1GB になる。直書きの 512MB のままなら追随できないので、ここで落ちる。
@@ -404,8 +404,8 @@ if [ "$pages_8g_dec" -le 1048576 ]; then
 fi
 # 管理情報を RAM から切り出せていること。**8GB ぶんは 1088 ページ (4.25MB)** で、
 # 静的配列では現実的でない大きさ
-grep -aqE "pmm meta  : 0x[0-9a-f]{16} ページ  ok \(RAM から切り出した\)" LOGs/aarch64-serial-8g.log
-must_not "pmm meta  : 0x0000000000000000 ページ" LOGs/aarch64-serial-8g.log "管理情報を切り出せていない"
+grep -aqE "pmm meta  : 0x[0-9a-f]{16} pages  ok \(carved out from RAM\)" LOGs/aarch64-serial-8g.log
+must_not "pmm meta  : 0x0000000000000000 pages" LOGs/aarch64-serial-8g.log "管理情報を切り出せていない"
 
 # M4: virtio-blk を付けて起動する。**付けない 3 通りでは
 # aarch64-virtio-none になる** (デバイスが無いことを正しく検出している)
@@ -415,13 +415,13 @@ echo "--- M4 の判定 ---"
 # **「見つかった」だけでは証拠にならない。** 読んだ中身まで見る
 grep -aq "read lba0 : \"ORTHOX-AARCH64-M4-SEC000\"  ok" LOGs/aarch64-serial-disk.log
 # LBA 0 と違う中身が返ること = LBA が効いている
-grep -aq "read lba1 : \"ORTHOX-AARCH64-M4-SEC001\"  ok (LBA が効いている)" LOGs/aarch64-serial-disk.log
-grep -aq "write/read: ok (書いたものが読み戻せた)" LOGs/aarch64-serial-disk.log
+grep -aq "read lba1 : \"ORTHOX-AARCH64-M4-SEC001\"  ok (LBA is in effect)" LOGs/aarch64-serial-disk.log
+grep -aq "write/read: ok (what was written reads back)" LOGs/aarch64-serial-disk.log
 # **読み書きが通っただけでは、割り込みで完了した証拠にならない。**
 # ポーリングでも同じ結果になる。待ちを割り込みの印だけにしてあるので、
 # 回数が 0 でなければ本当に割り込みで抜けている
-grep -aq "intid     : 0x000000000000004f  (割り込みで完了を待つ)" LOGs/aarch64-serial-disk.log
-grep -aq "irq count : .*  ok (割り込みで完了した)" LOGs/aarch64-serial-disk.log
+grep -aq "intid     : 0x000000000000004f  (waiting for completion via interrupt)" LOGs/aarch64-serial-disk.log
+grep -aq "irq count : .*  ok (completed via interrupt)" LOGs/aarch64-serial-disk.log
 grep -aq "aarch64-virtio-ok" LOGs/aarch64-serial-disk.log
 must_not "aarch64-virtio-BAD" LOGs/aarch64-serial-disk.log
 

@@ -84,7 +84,7 @@ int aarch64_pcie_brcm_probe(void) {
      * で有効にする。**巻き戻せる状態で試すこと** */
     aarch64_uart_puts("  pcie brcm : ");
     puthex_n(b->pcie_brcm_base, 8);
-    aarch64_uart_puts("  (dtb。触らない — 4 語目で固まる実測あり)\n");
+    aarch64_uart_puts("  (dtb. do not touch -- measured hang at word 4)\n");
     return -4;
 #else
 
@@ -106,7 +106,7 @@ int aarch64_pcie_brcm_probe(void) {
      * 実機で最悪なのは「無応答で固まる」こと。**触る直前に印を出して
      * おけば、止まった場所が 1 行で分かる。**この行が出て次が出なければ、
      * レジスタ窓が生きていない (電源かクロック) と確定できる */
-    aarch64_uart_puts("  pcie probe: レジスタを読む (ここで止まったら窓が死んでいる)\n");
+    aarch64_uart_puts("  pcie probe: reading register (if it hangs here, the window is dead)\n");
 
     /* **窓の先頭を生で出す。** 意味づけはしない — 何が見えているかを
      * 実機で確かめるのが目的。全部 0 なら電源が来ていない、全部 f なら
@@ -130,17 +130,17 @@ int aarch64_pcie_brcm_probe(void) {
         aarch64_uart_puts(" bus ");
         puthex_n(rd32(RC_CFG_BUSNUM) & 0xffffffU, 6);
         if (vid == 0xffffU) {
-            aarch64_uart_puts("  BAD (誰も応答しない)\n");
+            aarch64_uart_puts("  BAD (nobody responded)\n");
             return -2;
         }
         if (vid == 0) {
-            aarch64_uart_puts("  BAD (全部 0。窓が生きていない)\n");
+            aarch64_uart_puts("  BAD (all zero. window is dead)\n");
             return -3;
         }
         /* **14e4 なら Broadcom。**ファームウェアがルートポートを
          * 立ち上げている証拠になる */
-        aarch64_uart_puts(vid == 0x14e4U ? "  ok (Broadcom のルートポートが応答した)\n"
-                                         : "  ? (応答はあるが Broadcom ではない)\n");
+        aarch64_uart_puts(vid == 0x14e4U ? "  ok (Broadcom root port responded)\n"
+                                         : "  ? (responded but not Broadcom)\n");
     }
     return 0;
 #endif
@@ -290,19 +290,19 @@ int aarch64_pcie_brcm_init(void) {
 #else
     /* **段ごとに印を出す。**実機で固まったとき、どこまで進んだかが
      * 1 行で分かる。QEMU で試せない以上、これが唯一の手がかりになる */
-    aarch64_uart_puts("  pcie init : 1 リセットを立てる\n");
+    aarch64_uart_puts("  pcie init : 1 assert reset\n");
     wr32(RGR1_SW_INIT_1, RGR1_PERST_MASK | RGR1_INIT_GENERIC);
     pcie_delay_us(200);
 
-    aarch64_uart_puts("  pcie init : 2 ブリッジのリセットを落とす (PERST は立てたまま)\n");
+    aarch64_uart_puts("  pcie init : 2 deassert bridge reset (PERST still asserted)\n");
     wr32(RGR1_SW_INIT_1, RGR1_PERST_MASK);
     pcie_delay_us(200);
 
-    aarch64_uart_puts("  pcie init : 3 SerDes の IDDQ を落とす\n");
+    aarch64_uart_puts("  pcie init : 3 deassert SerDes IDDQ\n");
     wr32(MISC_HARD_DEBUG, HARD_DEBUG_UP_VALUE);
     pcie_delay_us(200);
 
-    aarch64_uart_puts("  pcie init : 4 MISC_CTRL と外向き窓\n");
+    aarch64_uart_puts("  pcie init : 4 MISC_CTRL and outbound window\n");
     wr32(MISC_MISC_CTRL, MISC_CTRL_UP_VALUE);
     wr32(MISC_MEM_WIN0_LO, MEM_WIN0_LO_VALUE);   /* PCI 側の番地 (下位) */
     wr32(MISC_MEM_WIN0_HI, 0);                   /* PCI 側の番地 (上位) */
@@ -341,12 +341,12 @@ int aarch64_pcie_brcm_init(void) {
         aarch64_uart_puts("\n");
     }
 
-    aarch64_uart_puts("  pcie init : 5 PERST を落とす\n");
+    aarch64_uart_puts("  pcie init : 5 deassert PERST\n");
     wr32(RGR1_SW_INIT_1, 0);
     pcie_delay_us(100000);   /* 100ms。リンク訓練に時間がかかる */
 
     /* **ここで初めて読む。**待ちには必ず上限を付ける */
-    aarch64_uart_puts("  pcie init : 6 リンクを待つ\n");
+    aarch64_uart_puts("  pcie init : 6 wait for link\n");
     {
         uint32_t st = 0;
         for (int i = 0; i < 100; i++) {
@@ -357,9 +357,9 @@ int aarch64_pcie_brcm_init(void) {
         aarch64_uart_puts("  pcie link : status ");
         puthex_n(st, 8);
         if ((st & STATUS_LINK_UP) == STATUS_LINK_UP) {
-            aarch64_uart_puts("  ok (リンクが上がった)\n");
+            aarch64_uart_puts("  ok (link came up)\n");
         } else {
-            aarch64_uart_puts("  BAD (上がらない。期待は 0xb0 のビット)\n");
+            aarch64_uart_puts("  BAD (did not come up. expected bits of 0xb0)\n");
             return -2;
         }
     }
@@ -369,8 +369,8 @@ int aarch64_pcie_brcm_init(void) {
         uint32_t vid_did = rd32(RC_CFG_VENDOR);
         aarch64_uart_puts("  pcie rc   : ");
         puthex_n(vid_did, 8);
-        aarch64_uart_puts(vid_did == 0x271114E4U ? "  ok (実測値と一致)\n"
-                                                 : "  ? (実測は 0x271114e4)\n");
+        aarch64_uart_puts(vid_did == 0x271114E4U ? "  ok (matches measured value)\n"
+                                                 : "  ? (measured value is 0x271114e4)\n");
     }
     return 0;
 #endif
@@ -470,9 +470,9 @@ static int pcie_vl805_reload_firmware(uint8_t bus, uint8_t dev, uint8_t fn) {
     b[0] = i * 4U;
 
     rc = aarch64_mbox_property(b);
-    aarch64_uart_puts("  pcie fw   : VL805 のファームウェア再読み込み devaddr=");
+    aarch64_uart_puts("  pcie fw   : reloading VL805 firmware devaddr=");
     puthex_n(devaddr, 8);
-    aarch64_uart_puts(rc == 0 ? "  ok\n" : "  BAD (mailbox が失敗)\n");
+    aarch64_uart_puts(rc == 0 ? "  ok\n" : "  BAD (mailbox failed)\n");
     return rc;
 }
 
@@ -614,8 +614,8 @@ int aarch64_pcie_brcm_scan(void) {
                     puthex_n(va, 12);
                     aarch64_uart_puts(" -> pa=");
                     puthex_n(mapped, 12);
-                    aarch64_uart_puts(mapped == cpu_base ? "  ok (張られている)\n"
-                                                         : "  BAD (張られていない)\n");
+                    aarch64_uart_puts(mapped == cpu_base ? "  ok (mapped)\n"
+                                                         : "  BAD (not mapped)\n");
                 }
 
                 /* ---- Linux が動いている状態と突き合わせる ------------
@@ -640,7 +640,7 @@ int aarch64_pcie_brcm_scan(void) {
                          * (CPU 0x6_00000000..0x6_3fffffff の [39:32]) */
                         { 0x4080, 0x00000006 }, { 0x4084, 0x00000006 },
                     };
-                    aarch64_uart_puts("  pcie diff : (番地 いま 期待) 違うものだけ\n");
+                    aarch64_uart_puts("  pcie diff : (addr now expected) differences only\n");
                     for (uint32_t k = 0; k < sizeof(expect)/sizeof(expect[0]); k++) {
                         uint32_t got = rd32(expect[k].off);
                         if (got == expect[k].want) continue;
@@ -648,11 +648,11 @@ int aarch64_pcie_brcm_scan(void) {
                         puthex_n(expect[k].off, 4);
                         aarch64_uart_puts(" = ");
                         puthex_n(got, 8);
-                        aarch64_uart_puts("  期待 ");
+                        aarch64_uart_puts("  expected ");
                         puthex_n(expect[k].want, 8);
                         aarch64_uart_puts("\n");
                     }
-                    aarch64_uart_puts("  pcie diff : おわり\n");
+                    aarch64_uart_puts("  pcie diff : done\n");
                 }
 
                 /* **xHCI のレジスタが本当にそこにあるか確かめる。**
@@ -689,7 +689,7 @@ int aarch64_pcie_brcm_scan(void) {
                         aarch64_uart_puts(" vl805-status=");
                         puthex_n(st, 4);
                         if (w0 != 0xdeaddeadU && w0 != 0xffffffffU && w0 != 0) {
-                            aarch64_uart_puts("  ★ 応答した\n");
+                            aarch64_uart_puts("  * responded\n");
                             break;
                         }
                         aarch64_uart_puts("\n");
@@ -714,7 +714,7 @@ int aarch64_pcie_brcm_scan(void) {
         }
     }
     if (!found) {
-        aarch64_uart_puts("  pcie xhci : 見つからない\n");
+        aarch64_uart_puts("  pcie xhci : not found\n");
         return -2;
     }
     return 0;

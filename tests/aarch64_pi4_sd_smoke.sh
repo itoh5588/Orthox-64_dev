@@ -90,13 +90,13 @@ must_not() {
 # ---- 初期化 ----
 # **「見つかった」だけでは足りない。** 容量まで出させる。
 # CSD の 8 ビットずれを取り違えると桁が変わるので、ここで捕まる
-grep -aq "  emmc2     : 初期化 ok" "$LOG"
+grep -aq "  emmc2     : init ok" "$LOG"
 # 8MB のイメージ = 16384 ブロック。**期待値を書いて照合する**
-grep -aq "16384 ブロック" "$LOG"
+grep -aq "16384 blocks" "$LOG"
 # パーティションを切っていない生イメージなので、先頭から xv6fs が見つかる
-grep -aq "xv6fs     : カードの先頭から" "$LOG"
-must_not "emmc2     : カードが無い"
-must_not "emmc2     : 容量が 0 と出た"
+grep -aq "xv6fs     : from start of card" "$LOG"
+must_not "emmc2     : no card"
+must_not "emmc2     : capacity reported as 0"
 
 # ---- storage / xv6fs ----
 # **sd0 として登録され、xv6fs がその上に載ること**

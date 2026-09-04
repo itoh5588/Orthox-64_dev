@@ -153,8 +153,8 @@ grep -aq "bootstrap user exit" "$LOG"
 #   返していない   10097 / 130264  (1 回あたり 75 ページ漏れる)
 #
 # 桁が違うので、しきい値は半分で十分
-grep -aq "  pmm 残り  : " "$LOG"
-free_pages=$(grep -a "  pmm 残り  : " "$LOG" | head -1 | sed 's/.*: 0x\([0-9a-f]*\) .*/\1/')
+grep -aq "  pmm remain: " "$LOG"
+free_pages=$(grep -a "  pmm remain: " "$LOG" | head -1 | sed 's/.*: 0x\([0-9a-f]*\) .*/\1/')
 free_dec=$((16#$free_pages))
 echo "  fork/exit を 1600 回まわした後の空き: $free_dec ページ"
 # 起動直後が 0x1fcca (130250) ページ。漏れていなければ大半が残っているはず。
@@ -165,7 +165,7 @@ if [ "$free_dec" -lt 65000 ]; then
 fi
 
 must_not "aarch64-exception-BAD" "$LOG"
-must_not "vm: destroy: 想定外のブロック写像" "$LOG"
-must_not "vm: clone: 想定外のブロック写像" "$LOG"
+must_not "vm: destroy: unexpected block mapping" "$LOG"
+must_not "vm: clone: unexpected block mapping" "$LOG"
 
 echo "aarch64 vmleak smoke test: PASS"

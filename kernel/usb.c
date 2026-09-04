@@ -922,17 +922,17 @@ static void xhci_spin_calibrate(void) {
     g_spin_calib_ms = (uint32_t)elapsed;
     g_spin_loops_per_ms = (uint32_t)((uint64_t)n / elapsed);
 
-    puts("[usb] A-2 較正: ");
+    puts("[usb] A-2 calibration: ");
     putdec(g_spin_calib_ms);
-    puts("ms で ");
+    puts("ms for ");
     putdec(g_spin_calib_loops);
-    puts(" 回 → 1 回 = ");
+    puts(" times -> 1 time = ");
     putdec(g_spin_loops_per_ms ? (1000000ULL / (uint64_t)g_spin_loops_per_ms) : 0ULL);
-    puts("ns、旧上限 ");
+    puts("ns, old limit ");
     putdec(XHCI_OLD_SPIN_LIMIT);
-    puts(" 回 = ");
+    puts(" times = ");
     putdec(g_spin_loops_per_ms ? ((uint64_t)XHCI_OLD_SPIN_LIMIT / (uint64_t)g_spin_loops_per_ms) : 0ULL);
-    puts("ms 相当 → いまの上限は ");
+    puts("ms equivalent -> current limit is ");
     putdec(XHCI_WAIT_MS);
     puts("ms\r\n");
 }
@@ -1104,9 +1104,9 @@ static int xhci_cmd_noop(void) {
      * 理由は xhci_evt_dequeue の注釈にある */
     uint32_t stale = xhci_evt_drain();
     if (stale) {
-        puts("[usb] 滞留イベントを ");
+        puts("[usb] drained ");
         putdec(stale);
-        puts(" 個捨てた\r\n");
+        puts(" discarded\r\n");
     }
 
     uint64_t cmd_ptr = xhci_cmd_submit(0, 0, 0, (23U << 10)); // No-Op Command TRB
@@ -1177,7 +1177,7 @@ static int xhci_cmd_noop(void) {
                 puts("\r\n");
                 shown++;
             }
-            if (!shown) puts("[usb] evt[0..15] すべて 0 (1 つも書かれていない)\r\n");
+            if (!shown) puts("[usb] evt[0..15] all zero (none written)\r\n");
         }
     }
     return -3;
@@ -1553,13 +1553,13 @@ static uint32_t xhci_ring_push(uint64_t ring_phys, uint32_t* idx, uint32_t* cycl
             if (told < 4U) {
                 told++;
                 usb_arch_console_begin();
-                puts("[ring] 枠 255 で Link を書いた ring=0x");
+                puts("[ring] wrote Link at slot 255 ring=0x");
                 puthex(ring_phys);
                 puts(" cycle ");
                 putdec(*cycle);
                 puts(" -> ");
                 putdec((*cycle) ^ 1U);
-                puts(told == 4U ? "  (以降は出さない)\r\n" : "\r\n");
+                puts(told == 4U ? "  (suppressing further output)\r\n" : "\r\n");
                 usb_arch_console_end();
             }
         }
@@ -1646,9 +1646,9 @@ static int xhci_ep0_get_device_descriptor_retry(uint8_t slot_id, uint32_t tries)
         rc = xhci_ep0_get_device_descriptor(slot_id);
         if (rc == 0) {
             if (i) {
-                puts("[usb] device desc は ");
+                puts("[usb] device desc is ");
                 putdec(i + 1);
-                puts(" 回目で通った\r\n");
+                puts(" attempt(s), passed\r\n");
             }
             return 0;
         }
@@ -1730,7 +1730,7 @@ static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_ph
         /* **イベントが 1 つも来ないまま待ち切れた。**
          * ここは長いあいだ無言だった。CC が付く失敗と違って
          * 「そもそも返ってこない」ことが見えないと切り分けられない */
-        puts("[usb] ep0 IN *** イベントが来ない slot=");
+        puts("[usb] ep0 IN *** no event arrived slot=");
         putdec(slot_id);
         puts(" seq=");
         putdec(g_ep0_seq);
@@ -1767,13 +1767,13 @@ static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_ph
         putdec(g_usb_ep0_mps);
         puts(" setup=0x");
         puthex(setup);
-        puts("\r\n[usb]   段=");
+        puts("\r\n[usb]   stage=");
         /* **積んだ枠から引く。**TD が Link をまたぐと連番ではなくなるので、
          * idx0+1 / idx0+2 で当てにいくと段を取り違える */
         if (g_last_evt_trb == base + (uint64_t)i_setup * 16U)       puts("Setup");
         else if (g_last_evt_trb == base + (uint64_t)i_data * 16U)   puts("Data");
         else if (g_last_evt_trb == base + (uint64_t)i_status * 16U) puts("Status");
-        else                                                        puts("不明");
+        else                                                        puts("unknown");
         puts(" evt=0x");
         puthex(g_last_evt_trb);
         puts(" dw3=0x");
@@ -1781,7 +1781,7 @@ static int xhci_ep0_control_in(uint8_t slot_id, uint64_t setup, uint64_t data_ph
         puthex(ep[i_data * 4 + 3]); puts(" 0x");
         puthex(ep[i_status * 4 + 3]);
         puts("\r\n");
-        xhci_dump_dev_ctx("失敗", g_output_ctx_phys);
+        xhci_dump_dev_ctx("failed", g_output_ctx_phys);
         return -3;
     }
     return 0;
@@ -1905,7 +1905,7 @@ static void xhci_dump_dev_ctx(const char* tag, uint64_t out_ctx_phys) {
     if (out_ctx_phys == 0) {
         puts("[ctx] ");
         puts(tag);
-        puts(" 文脈が無い\r\n");
+        puts(" no context\r\n");
         return;
     }
     oc = (volatile uint32_t*)USB_VIRT((void*)out_ctx_phys);
@@ -2057,7 +2057,7 @@ static void xhci_freeze_snapshot(const char* tag, uint8_t slot_id, uint32_t idx0
         puts(" erdp=0x"); puthex(mmio_read32(g_rt_regs, 0x20 + 0x18));
         puts("\r\n");
     }
-    puts("===== [snap] おわり =====\r\n");
+    puts("===== [snap] end =====\r\n");
 }
 
 /* ---- 完了コード (Completion Code) のうち、実機で出会ったもの ---------------
@@ -2112,9 +2112,9 @@ static int xhci_ep0_recover_stall(uint8_t slot_id) {
         usb_arch_console_begin();
         puts("[recov] slot="); putdec(slot_id);
         puts(" epstate="); putdec(st);
-        puts(st == 1U ? " (Running → Stop Endpoint)\r\n" :
-             st == 2U ? " (Halted → Reset Endpoint)\r\n" :
-                        " (Stopped/Error → そのまま Set TR Dequeue)\r\n");
+        puts(st == 1U ? " (Running -> Stop Endpoint)\r\n" :
+             st == 2U ? " (Halted -> Reset Endpoint)\r\n" :
+                        " (Stopped/Error -> issuing Set TR Dequeue as-is)\r\n");
         usb_arch_console_end();
 
         if (st == 1U || st == 2U) {
@@ -2124,12 +2124,12 @@ static int xhci_ep0_recover_stall(uint8_t slot_id) {
                                       (type << 10) | (1U << 16) | ((uint32_t)slot_id << 24));
             if (!cmd_ptr) return -2;
             if (xhci_wait_cmd_completion(cmd_ptr, slot_id, &cc, &slot) < 0) {
-                puts("[recov] 完了イベントが来ない\r\n");
+                puts("[recov] no completion event\r\n");
                 return -3;
             }
             puts(st == 2U ? "[recov] Reset Endpoint cc=" : "[recov] Stop Endpoint cc=");
             putdec(cc);
-            puts(cc == 1 ? "  ok\r\n" : "  *** 失敗 (19=Context State Error)\r\n");
+            puts(cc == 1 ? "  ok\r\n" : "  *** failed (19=Context State Error)\r\n");
             if (cc != 1) return -4;
         }
     }
@@ -2145,11 +2145,11 @@ static int xhci_ep0_recover_stall(uint8_t slot_id) {
                               (16U << 10) | (1U << 16) | ((uint32_t)slot_id << 24));
     if (!cmd_ptr) return -5;
     if (xhci_wait_cmd_completion(cmd_ptr, slot_id, &cc, &slot) < 0) {
-        puts("[recov] Set TR Dequeue 完了イベントが来ない\r\n");
+        puts("[recov] no completion event for Set TR Dequeue\r\n");
         return -6;
     }
     puts("[recov] Set TR Dequeue cc="); putdec(cc);
-    puts(cc == 1 ? "  ok\r\n" : "  *** 失敗\r\n");
+    puts(cc == 1 ? "  ok\r\n" : "  *** failed\r\n");
     xhci_dump_dev_ctx("recov-post", xhci_dev_ctx_of(slot_id));
     return (cc == 1) ? 0 : -7;
 }
@@ -2280,7 +2280,7 @@ static int usb_hub_find_device(uint8_t slot_id, uint8_t nbr_ports,
         putdec(p);
         puts(" status=0x");
         puthex(st);
-        puts((st & HUB_PORT_CONNECTION) ? "  接続あり\r\n" : "\r\n");
+        puts((st & HUB_PORT_CONNECTION) ? "  connected\r\n" : "\r\n");
         usb_arch_console_end();
         if (!(st & HUB_PORT_CONNECTION)) continue;
 
@@ -2295,7 +2295,7 @@ static int usb_hub_find_device(uint8_t slot_id, uint8_t nbr_ports,
         putdec(p);
         puts(" reset -> status=0x");
         puthex(st);
-        puts((st & HUB_PORT_ENABLE) ? "  有効になった\r\n" : "  *** 有効にならなかった\r\n");
+        puts((st & HUB_PORT_ENABLE) ? "  became enabled\r\n" : "  *** did not become enabled\r\n");
         usb_arch_console_end();
         if (!(st & HUB_PORT_ENABLE)) continue;
 
@@ -3261,7 +3261,7 @@ static int xhci_port_reset(volatile uint8_t* op, uint8_t port) {
     putdec(major);
     puts(") reset -> portsc=0x");
     puthex(portsc);
-    puts((portsc & PORTSC_PED) ? "  有効になった\r\n" : "  *** 有効にならなかった\r\n");
+    puts((portsc & PORTSC_PED) ? "  became enabled\r\n" : "  *** did not become enabled\r\n");
     usb_arch_console_end();
 
     return (portsc & PORTSC_PED) ? 0 : -1;
@@ -3291,7 +3291,7 @@ static int usb_hub_attach_port(uint8_t hub_slot, uint8_t hub_port, uint32_t dev_
         int ad2 = xhci_cmd_address_device_full(
             dev_slot, g_xhci_port_id, route,
             dev_speed, tt_slot, tt_port, 0);
-        puts("[usb] hub 先 Address Device slot=");
+        puts("[usb] hub downstream Address Device slot=");
         putdec(dev_slot);
         puts(" port=");
         putdec(hub_port);
@@ -3343,14 +3343,14 @@ static int usb_hub_attach_port(uint8_t hub_slot, uint8_t hub_port, uint32_t dev_
                     }
                     if (d[1] != 1 ||
                         (m != 8 && m != 16 && m != 32 && m != 64)) {
-                        puts("[usb] 先頭 8 バイトが記述子でない\r\n");
+                        puts("[usb] first 8 bytes are not a descriptor\r\n");
                     } else if (m != g_usb_ep0_mps) {
                         int er = xhci_cmd_evaluate_context_mps(dev_slot, m);
                         puts("[usb] ep0 mps ");
                         putdec(g_usb_ep0_mps);
                         puts(" -> ");
                         putdec(m);
-                        puts(er == 0 ? "  ok\r\n" : "  *** 失敗\r\n");
+                        puts(er == 0 ? "  ok\r\n" : "  *** failed\r\n");
                         if (er == 0) g_usb_ep0_mps = (uint16_t)m;
                     }
                 }
@@ -3361,7 +3361,7 @@ static int usb_hub_attach_port(uint8_t hub_slot, uint8_t hub_port, uint32_t dev_
              * ハブと違ってポート要求を出すわけでもないので、
              * Configured へ進める理由が無い (2026-08-18 codex 相談) */
             int gd2 = xhci_ep0_get_device_descriptor_retry(dev_slot, 3);
-            puts("[usb] hub 先 GET_DESCRIPTOR(Device) ");
+            puts("[usb] hub downstream GET_DESCRIPTOR(Device) ");
             if (gd2 == 0) {
                 puts("OK vid=0x");
                 puthex_n(g_usb_vid, 4);
@@ -3376,7 +3376,7 @@ static int usb_hub_attach_port(uint8_t hub_slot, uint8_t hub_port, uint32_t dev_
                 puts("\r\n");
             }
         } else {
-            puts("  *** 失敗 code=");
+            puts("  *** failed code=");
             putdec((uint64_t)(uint32_t)(-ad2));
             puts("\r\n");
         }
@@ -3423,7 +3423,7 @@ static void usb_hotplug_release(void) {
         int dr = xhci_cmd_disable_slot(slot);
         puts("[usb] hotplug: slot ");
         putdec(slot);
-        puts(dr == 0 ? " を返した\r\n" : " を返せなかった\r\n");
+        puts(dr == 0 ? " returned\r\n" : " could not return\r\n");
         /* **返したスロットの EP0 リングも忘れる。**残しておくと、
          * 同じ番号が再び割り当てられたときに古いリングを使ってしまう */
         g_ep0_slot[slot].ring_phys = 0;
@@ -3439,27 +3439,27 @@ static uint64_t g_usb_heartbeat_next_ms;   /* A-3 の要約を次に出す時刻
 /* A-2 の 1 行。**較正の値を毎回添える** — 待ちの回数だけ見ても
  * それが何秒なのか分からないため */
 static void xhci_wait_dump(const char* name, const xhci_wait_stat_t* s) {
-    puts("[usb] A-2 待ち ");
+    puts("[usb] A-2 wait ");
     puts(name);
     puts(": n=");
     putdec(s->calls);
-    puts(" 即=");
+    puts(" immediate=");
     putdec(s->immediate);
-    puts(" 最大=");
+    puts(" max=");
     putdec(s->max_loops);
     /* **「回転」で出す。**A-1 の前は pump を呼んだ回数で、較正した
      * 221ns/回 を掛ければ時間になった。**いまは 1 回転が pump を
      * 含まないので、掛け算は成り立たない。**時間は max_ms を見る */
-    puts("回転 最大ms=");
+    puts(" spins  max ms=");
     putdec(s->max_ms);
-    puts(" 到達=");
+    puts(" reached=");
     putdec(s->timeouts);
     if (s->timeouts) {
         puts("(");
         putdec(s->timeout_ms);
         puts("ms)");
     }
-    puts(" 上限=");
+    puts(" limit=");
     putdec(XHCI_WAIT_MS);
     puts("ms\r\n");
 }
@@ -3475,7 +3475,7 @@ static void usb_hotplug_poll_owned(void) {
      * (2026-08-20 codex 相談 (d)) */
     if (!g_hub_poll_announced) {
         g_hub_poll_announced = 1;
-        puts("[usb] hotplug: 入った ready=");
+        puts("[usb] hotplug: entered ready=");
         putdec(g_usb_ready ? 1U : 0U);
         puts(" hub_slot=");
         putdec(g_hub_slot_id);
@@ -3491,7 +3491,7 @@ static void usb_hotplug_poll_owned(void) {
         static int told;
         if (!told) {
             told = 1;
-            puts("[usb] hotplug: ガードで戻った ready=");
+            puts("[usb] hotplug: returned by guard ready=");
             putdec(g_usb_ready ? 1U : 0U);
             puts(" hub_slot=");
             putdec(g_hub_slot_id);
@@ -3523,7 +3523,7 @@ static void usb_hotplug_poll_owned(void) {
         /* **要約は数行まとめて 1 単位にする (M-2)。**中は出力だけで、
          * 待ちも return も無いので長く握らない */
         usb_arch_console_begin();
-        puts("[usb] 経過 poll=");
+        puts("[usb] elapsed poll=");
         putdec(g_hub_poll_count);
         puts(" irq=");
         putdec(g_xhci_irq_count);
@@ -3571,20 +3571,20 @@ static void usb_hotplug_poll_owned(void) {
          *   最大=   完了までに回った回数の最大 (較正で us に直したもの)
          *   最大ms= 経過時間の最大。**回数からの換算の答え合わせ**
          *   到達=   上限まで回って諦めた回数。0 でなければ上限が短い */
-        xhci_wait_dump("転送", &g_wait_xfer);
-        xhci_wait_dump("コマンド", &g_wait_cmd);
+        xhci_wait_dump("transfer", &g_wait_xfer);
+        xhci_wait_dump("command", &g_wait_cmd);
 
         /* **取り分とレジスタ。**割り込みが仕事をしていない理由の切り分け。
          * iman の bit0 (IP) が立ちっぱなしなら、こちらが落とせていない */
-        puts("[usb] A-1 取り分 irq=");
+        puts("[usb] A-1 share irq=");
         putdec(g_xhci_irq_events);
-        puts(" 保険=");
+        puts(" fallback=");
         putdec(g_selfpump_events);
         puts(" kbd=");
         putdec(g_kbdpump_events);
-        puts(" 入口 eint=");
+        puts(" entry eint=");
         putdec(g_irq_eint);
-        puts("/なし=");
+        puts("/none=");
         putdec(g_irq_noeint);
         puts("/pcd=");
         putdec(g_irq_pcd);
@@ -3646,7 +3646,7 @@ static void usb_hotplug_poll_owned(void) {
             if (!changed || p != g_hub_dev_port) continue;
             puts("[usb] hotplug: port ");
             putdec(p);
-            puts(" 挿し直された (接続ビットは変わらず)\r\n");
+            puts(" replugged (connect bit unchanged)\r\n");
             usb_hotplug_release();
             g_hub_detach_count++;
             /* このまま下の「挿された」経路へ落とす */
@@ -3655,7 +3655,7 @@ static void usb_hotplug_poll_owned(void) {
 
         puts("[usb] hotplug: port ");
         putdec(p);
-        puts(now_conn ? " に挿された status=0x" : " から抜かれた status=0x");
+        puts(now_conn ? " plugged into status=0x" : " unplugged from status=0x");
         puthex(st);
         puts("\r\n");
 
@@ -3681,8 +3681,8 @@ static void usb_hotplug_poll_owned(void) {
             putdec(p);
             puts(" reset -> status=0x");
             puthex(rst);
-            puts((rst & HUB_PORT_ENABLE) ? "  有効になった\r\n"
-                                         : "  *** 有効にならなかった\r\n");
+            puts((rst & HUB_PORT_ENABLE) ? "  became enabled\r\n"
+                                         : "  *** did not become enabled\r\n");
             if (!(rst & HUB_PORT_ENABLE)) continue;
             st = rst;
         }
@@ -3691,7 +3691,7 @@ static void usb_hotplug_poll_owned(void) {
             uint32_t sp = (st & HUB_PORT_LOW_SPEED)  ? 2U :
                           (st & HUB_PORT_HIGH_SPEED) ? 3U : 1U;
             if (usb_hub_attach_port(g_hub_slot_id, p, sp) != 0) {
-                puts("[usb] hotplug: 掴めなかった\r\n");
+                puts("[usb] hotplug: could not acquire\r\n");
                 g_xhci_slot_id = g_hub_slot_id;
                 continue;
             }
@@ -3711,12 +3711,12 @@ static void usb_hotplug_poll_owned(void) {
                 putdec(g_usb_int_in_dci);
                 puts("\r\n");
             } else {
-                puts("*** 失敗 code=");
+                puts("*** failed code=");
                 putdec((uint64_t)(uint32_t)(-hk));
                 puts("\r\n");
             }
         } else {
-            puts("[usb] hotplug: 設定記述子が読めない / HID ではない\r\n");
+            puts("[usb] hotplug: could not read config descriptor / not HID\r\n");
         }
     }
     g_usb_busy = 0;
@@ -3861,7 +3861,7 @@ void usb_init(void) {
             if (!(pagesize & 1U)) {
                 puts("[usb] *** PAGESIZE=0x");
                 puthex(pagesize);
-                puts(" — 4KB が使えない。リングの確保が合っていない\r\n");
+                puts(" -- 4KB unusable. ring allocation is wrong\r\n");
             }
         }
 
@@ -3887,7 +3887,7 @@ void usb_init(void) {
          * 自分で xhci_evt_pump() を回すので、配線が違っていても動きは
          * 今までのポーリングに戻るだけ */
         usb_arch_irq_enable();
-        puts("[usb] 割り込みの口を開けた (来た数は [usb] ports: の irq= を見る)\r\n");
+        puts("[usb] opened the interrupt endpoint (see [usb] ports: irq= for count)\r\n");
 
         cmd_probe = xhci_cmd_noop();
         if (cmd_probe == 0) {
@@ -3929,7 +3929,7 @@ void usb_init(void) {
                 puthex(portsc);
                 puts(" USB");
                 putdec((p < XHCI_MAX_PORTS_TRACKED) ? g_port_major[p] : 0U);
-                puts((portsc & PORTSC_CCS) ? "  接続あり\r\n" : "\r\n");
+                puts((portsc & PORTSC_CCS) ? "  connected\r\n" : "\r\n");
             }
             for (uint8_t p = 1; p <= g_xhci_max_ports; p++) {
                 uint32_t portsc = mmio_read32(op, xhci_portsc_off(p));
@@ -3986,7 +3986,7 @@ void usb_init(void) {
                         uint32_t dev_speed = 0;
 
                         g_hub_slot_id = g_xhci_slot_id;
-                        puts("[usb] ハブを見つけた。その先を探す\r\n");
+                        puts("[usb] found a hub. probing downstream\r\n");
 
                         /* **ポート要求の前に設定を選ぶ。**Address 状態のまま
                          * SET_FEATURE を投げると実機の VL805 は STALL する */
@@ -3996,7 +3996,7 @@ void usb_init(void) {
                             if (hc == 0) {
                                 puts("ok\r\n");
                             } else {
-                                puts("*** 失敗 code=");
+                                puts("*** failed code=");
                                 putdec((uint64_t)(uint32_t)(-hc));
                                 puts("\r\n");
                                 (void)xhci_ep0_recover_stall(g_hub_slot_id);
@@ -4010,7 +4010,7 @@ void usb_init(void) {
                             puts("\r\n");
 
                             if (usb_hub_mark_slot(g_hub_slot_id, nbr, mtt) < 0) {
-                                puts("[usb] *** スロットに Hub ビットを立てられなかった\r\n");
+                                puts("[usb] *** could not set Hub bit on slot\r\n");
                             }
 
                             if (usb_hub_find_device(g_hub_slot_id, nbr, &hub_port, &dev_speed) == 0) {
@@ -4023,10 +4023,10 @@ void usb_init(void) {
                                     }
                                 }
                             } else {
-                                puts("[usb] ハブのどのポートにも何も繋がっていない\r\n");
+                                puts("[usb] nothing connected to any hub port\r\n");
                             }
                         } else {
-                            puts("[usb] *** ハブ記述子が読めなかった\r\n");
+                            puts("[usb] *** could not read hub descriptor\r\n");
                         }
                     }
 
