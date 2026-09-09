@@ -1,0 +1,1512 @@
+#include <stddef.h>
+#include <stdint.h>
+#include "fs.h"
+#include "pmm.h"
+#include "riscv64/boot.h"
+#include "riscv64/bootstrap_user.h"
+#include "linux_errno.h"
+#include "riscv64/syscall.h"
+#include "sys_internal.h"
+#include "task.h"
+#include "vmm.h"
+#include "xv6fs.h"
+
+struct linux_dirent64 {
+    uint64_t d_ino;
+    int64_t d_off;
+    uint16_t d_reclen;
+    uint8_t d_type;
+    char d_name[256];
+};
+
+/* Linux AT_REMOVEDIR (unlinkat の第3引数) */
+#define RISCV64_AT_REMOVEDIR 0x200
+
+/* Linux AT_FDCWD (*at 系の dirfd に渡すと「カレントディレクトリ基準」) */
+#define RISCV64_AT_FDCWD (-100)
+
+/* Linux AT_SYMLINK_NOFOLLOW (fstatat の第4引数)。**musl の実値は 0x100。**
+ * BSD 由来の 0x0002 と間違えると lstat が常に stat と同じ動きになる
+ * (aarch64/x86 側が 2026-08-31 の N-6 で踏んだのと同じ穴) */
+#define RISCV64_AT_SYMLINK_NOFOLLOW 0x100
+
+/* errno 定数は include/riscv64/errno.h (syscall.c と共有) */
+
+/* ---- 共有 open file description (fs_file_t) ------------------------------
+ *
+ * dup / fork で作った fd は Linux では同じ open file description を指すので、
+ * 片方で読み書きするともう片方の offset も進む。riscv64 は fs_clone_fd() が
+ * *dst = *src の丸ごと複製で、offset が fd ごとに独立していた。
+ *
+ * 実測 (user/riscv64_offset_probe.c、日報2026-08-08):
+ *   dup-write / dup-read / dup-lseek / fork-read  すべて相手の offset が 0 のまま
+ *   separate-open だけ正しく独立
+ *
+ * x86 (kernel/fs.c) は既に fs_file_t を共有しており 5/5 一致する。構造を
+ * そちらに揃える。offset / size / data を fd から file 側へ移し、fd は
+ * 参照を持つだけにする。
+ *
+ * pipe は移行しない。offset を持たないうえ、端ごとの本数 (readers/writers) を
+ * fd の aux1 で数える作りを入れたばかりなので、触ると検証済みの部分を
+ * 作り直すことになる。fs_clone_fd() は「file があれば参照を増やす、
+ * 無ければ従来の pipe 処理」で両立する。
+ */
+static fs_file_t* fs_alloc_file(void) {
+    void* phys = pmm_alloc(1);
+    fs_file_t* file;
+    if (!phys) return 0;
+    file = (fs_file_t*)PHYS_TO_VIRT(phys);
+    for (size_t i = 0; i < sizeof(*file); i++) ((uint8_t*)file)[i] = 0;
+    file->ref_count = 1;
+    return file;
+}
+
+static void fs_file_get(fs_file_t* file) {
+    if (!file) return;
+    file->ref_count++;
+}
+
+static void fs_file_put(fs_file_t* file) {
+    if (!file) return;
+    file->ref_count--;
+    if (file->ref_count > 0) return;
+    if (file->ops && file->ops->release) file->ops->release(file);
+    pmm_free((void*)VIRT_TO_PHYS((uint64_t)file), 1);
+}
+
+/* FT_DIR の dirents ページ / FT_MODULE の読み込みバッファは open ごとの資源。
+ * fd ではなく file が持つ。以前は fs_release_fd() が desc->data を無条件に
+ * pmm_free していたので、dir fd を dup すると二重解放になり得た。 */
+static void riscv64_fs_release_dir_file(fs_file_t* file) {
+    if (file && file->private_data && file->aux0) {
+        pmm_free((void*)VIRT_TO_PHYS((uint64_t)file->private_data), (size_t)file->aux0);
+    }
+}
+
+static const fs_file_ops_t g_dir_file_ops = { .release = riscv64_fs_release_dir_file };
+/* xv6fs / module / chardev / console は file 側に解放すべき資源を持たない
+ * (xv6fs は名前で引き直す作り、module は静的領域) */
+static const fs_file_ops_t g_plain_file_ops = { .release = 0 };
+
+size_t fs_fd_offset(const file_descriptor_t* fd) {
+    if (!fd) return 0;
+    return fd->file ? fd->file->offset : fd->offset;
+}
+
+void fs_fd_set_offset(file_descriptor_t* fd, size_t offset) {
+    if (!fd) return;
+    if (fd->file) fd->file->offset = offset;
+    else fd->offset = offset;
+}
+
+file_type_t fs_fd_type(const file_descriptor_t* fd) {
+    if (!fd) return FT_UNUSED;
+    return fd->file ? fd->file->type : fd->type;
+}
+
+/* size と data も共有側に置く。fd 側は file が無いときだけ見る */
+size_t fs_fd_size(const file_descriptor_t* fd) {
+    if (!fd) return 0;
+    return fd->file ? fd->file->size : fd->size;
+}
+
+void fs_fd_set_size(file_descriptor_t* fd, size_t size) {
+    if (!fd) return;
+    if (fd->file) fd->file->size = size;
+    else fd->size = size;
+}
+
+void* fs_fd_data(const file_descriptor_t* fd) {
+    if (!fd) return 0;
+    return fd->file ? fd->file->private_data : fd->data;
+}
+
+/* file_descriptor_t の size は fd ごとの写しで、open した時点の値で止まる。
+ * dup / fork で複製された fd は元の fd の書き込みを知らないため、Linux なら
+ * 読める内容が EOF になる。ファイルの本当の長さは inode にしか無いので、
+ * 長さを見る前にここで取り直す。
+ *
+ * これが無いと binutils の ar が壊れる: ar は mkstemp した一時ファイルを
+ * dup し、片方の fd で書いて、もう片方から読み戻してコピーする。読み戻しが
+ * 0 バイトになるため rc=0 のまま 0 バイトのアーカイブが出来上がる。 */
+void riscv64_fs_refresh_xv6fs_size(file_descriptor_t* f) {
+    uint32_t mode = 0;
+    uint64_t size = 0;
+    if (!f || fs_fd_type(f) != FT_XV6FS || f->name[0] == '\0') return;
+    if (xv6fs_stat_path(f->name, &mode, &size, 0, 0) != 0) return;
+    fs_fd_set_size(f, (size_t)size);
+}
+
+/* 待ち手が「寝ている」かの判定。read/write は TASK_SLEEPING で寝るが、
+ * ppoll は期限付きで待つため TASK_IO_WAIT になる。どちらも起こす対象 */
+static int riscv64_fs_task_is_waiting(const struct task* t) {
+    return t && (t->state == TASK_SLEEPING || t->state == TASK_IO_WAIT);
+}
+
+/* 待ち行列から取り出した面々を起こす。必ずロックの外で呼ぶこと
+ * (task_wake は g_task_lock と IPI を伴う) */
+static void riscv64_fs_wake_list(struct task** list, int n) {
+    for (int i = 0; i < n; i++) {
+        if (riscv64_fs_task_is_waiting(list[i])) task_wake(list[i]);
+    }
+}
+
+/* pipe fd がどちらの端か。sys_pipe2() が aux1 に 0=読み端 / 1=書き端 を入れて
+ * おり、fs_clone_fd() の丸ごとコピーでも保たれる。RISC-V に FIFO は無いので
+ * O_RDWR で開かれた pipe fd は存在しない。 */
+static int riscv64_pipe_fd_is_writer(const file_descriptor_t* desc) {
+    return desc && desc->aux1 == 1;
+}
+
+/* O_ACCMODE 判定: 書き込み可能な開き方か */
+static int riscv64_fs_flags_writable(int flags) {
+    int acc = flags & 3;
+    return acc == O_WRONLY || acc == O_RDWR;
+}
+
+/* 疑似キャラクタデバイス (xv6fs 上に inode を持たず、カーネルが直接応答する) */
+#define RISCV64_DEV_NONE     0
+#define RISCV64_DEV_NULL     1
+#define RISCV64_DEV_ZERO     2
+#define RISCV64_DEV_CONSOLE  3
+
+static int riscv64_fs_path_eq(const char* a, const char* b);
+
+static int riscv64_fs_special_dev(const char* resolved) {
+    if (!resolved) return RISCV64_DEV_NONE;
+    if (riscv64_fs_path_eq(resolved, "/dev/null")) return RISCV64_DEV_NULL;
+    if (riscv64_fs_path_eq(resolved, "/dev/zero")) return RISCV64_DEV_ZERO;
+    if (riscv64_fs_path_eq(resolved, "/dev/tty")) return RISCV64_DEV_CONSOLE;
+    if (riscv64_fs_path_eq(resolved, "/dev/console")) return RISCV64_DEV_CONSOLE;
+    return RISCV64_DEV_NONE;
+}
+
+static int riscv64_fs_path_eq(const char* a, const char* b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static void riscv64_fs_strcpy(char* dst, const char* src, size_t size) {
+    size_t i = 0;
+    if (!dst || size == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    while (src[i] && i + 1 < size) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+static void riscv64_fs_kstat_defaults(struct kstat* st, uint32_t mode, int64_t size) {
+    if (!st) return;
+    st->dev = 0;
+    st->ino = 0;
+    st->mode = mode;
+    st->uid = 0;
+    st->gid = 0;
+    st->nlink = 1;
+    st->rdev = 0;
+    st->size = size;
+    st->atime_sec = 0;
+    st->mtime_sec = 0;
+    st->ctime_sec = 0;
+}
+
+static uint8_t riscv64_fs_dirent_type(uint32_t mode) {
+    if ((mode & 0170000U) == KSTAT_MODE_DIR) return 4;
+    if ((mode & 0170000U) == KSTAT_MODE_FILE) return 8;
+    if ((mode & 0170000U) == KSTAT_MODE_CHR) return 2;
+    return 0;
+}
+
+static int riscv64_fs_append_dirent(struct orth_dirent* dirents, size_t max_count, size_t* count,
+                                    const char* name, uint32_t mode, uint32_t size) {
+    size_t index = *count;
+    size_t i = 0;
+    if (!dirents || !count || !name || index >= max_count) return -1;
+    dirents[index].mode = mode;
+    dirents[index].size = size;
+    while (name[i] && i + 1 < sizeof(dirents[index].name)) {
+        dirents[index].name[i] = name[i];
+        i++;
+    }
+    dirents[index].name[i] = '\0';
+    *count = index + 1;
+    return 0;
+}
+
+static int riscv64_fs_build_dirents(const char* resolved, struct orth_dirent* dirents, size_t max_count, size_t* out_count) {
+    size_t count = 0;
+    if (!resolved || !dirents || !out_count) return -1;
+    if (xv6fs_is_mounted()) {
+        return xv6fs_list_dir(resolved, dirents, max_count, out_count);
+    }
+    if (!riscv64_fs_path_eq(resolved, "/")) return -1;
+    if (riscv64_fs_append_dirent(dirents, max_count, &count, ".", KSTAT_MODE_DIR | 0755U, 0) < 0) return -1;
+    if (riscv64_fs_append_dirent(dirents, max_count, &count, "..", KSTAT_MODE_DIR | 0755U, 0) < 0) return -1;
+    if (riscv64_fs_append_dirent(dirents, max_count, &count, "bootstrap-user", KSTAT_MODE_FILE | 0644U, 0) < 0) return -1;
+    *out_count = count;
+    return 0;
+}
+
+/* '.' と '..' をその場で畳んでパスを正規化する。
+ *
+ * **畳まないと文字列が実体より長いまま残る。** cwd と相対パスを単純連結すると
+ *   /src/gcc-self/build/gcc + ../../gcc/ada/gcc-interface/ada-tree.def
+ *   = 64 文字
+ * になるが、file_descriptor_t の name[64] は 63 文字までしか保持できないので
+ * 黙って切り捨てられ、別のパスとして扱われて I/O error になる。
+ * 畳めば /src/gcc-self/gcc/ada/gcc-interface/ada-tree.def の 47 文字で収まる。
+ * (Orthox 上で GCC のソースをコンパイルしたときに実際に踏んだ)
+ *
+ * xv6fs は '..' の dirent を辿れるので畳まなくても解決自体はできるが、
+ * 長さのぶんだけ上限に当たりやすくなる。 */
+static void riscv64_fs_normalize_path(char* p) {
+    char* w = p;         /* 書き込み位置 */
+    const char* r = p;   /* 読み取り位置 */
+
+    if (!p) return;
+    if (*r == '/') { *w++ = '/'; r++; }
+
+    while (*r) {
+        const char* seg;
+        size_t len = 0;
+        size_t k;
+
+        while (*r == '/') r++;
+        if (!*r) break;
+        seg = r;
+        while (*r && *r != '/') { r++; len++; }
+
+        if (len == 1 && seg[0] == '.') continue;             /* "." は捨てる */
+        if (len == 2 && seg[0] == '.' && seg[1] == '.') {    /* ".." は 1 段戻る */
+            while (w > p && w[-1] != '/') w--;                /* 直前の要素を消す */
+            if (w > p + 1) w--;                               /* その前の '/' も (root は残す) */
+            continue;
+        }
+        /* **区切りは要素の前に書くこと。** 後ろに書くと、最後の要素の直後に
+         * '/' を書いた時点で読み取り側 (r) がまだ見ている終端 NUL を潰し、
+         * その先の残骸を読み続けてしまう (/dev/null が /dev/null/-user になった)。
+         * 前に書けば w は常に r より後ろに行かない。 */
+        if (w > p && w[-1] != '/') *w++ = '/';
+        for (k = 0; k < len; k++) *w++ = seg[k];
+    }
+
+    if (w == p) *w++ = '/';               /* 全部消えたら "/" */
+    *w = '\0';
+}
+
+static int riscv64_fs_resolve_path(const char* path, char* out, size_t size) {
+    struct task* current = get_current_task();
+    size_t i = 0;
+    size_t j = 0;
+
+    if (!path || !out || size == 0) return -1;
+    if (path[0] == '/') {
+        while (path[j] && i + 1 < size) out[i++] = path[j++];
+        if (path[j]) return -1;           /* 収まらなければ黙って切らずに失敗させる */
+        out[i] = '\0';
+        riscv64_fs_normalize_path(out);
+        return 0;
+    }
+    if (!current || current->cwd[0] == '\0') return -1;
+    while (current->cwd[j] && i + 1 < size) out[i++] = current->cwd[j++];
+    if (current->cwd[j]) return -1;
+    if (i > 0 && out[i - 1] != '/' && i + 1 < size) out[i++] = '/';
+    j = 0;
+    while (path[j] && i + 1 < size) out[i++] = path[j++];
+    if (path[j]) return -1;
+    out[i] = '\0';
+    riscv64_fs_normalize_path(out);
+    return 0;
+}
+
+static int riscv64_fs_resolve_dirfd_path(int dirfd, const char* path, char* out, size_t size) {
+    struct task* current = get_current_task();
+    size_t i = 0;
+    size_t j = 0;
+
+    if (!path || !out || size == 0) return -1;
+    if (path[0] == '/') return riscv64_fs_resolve_path(path, out, size);
+    if (dirfd == -100) return riscv64_fs_resolve_path(path, out, size);
+    if (!current || dirfd < 0 || dirfd >= MAX_FDS || !current->fds[dirfd].in_use) return -1;
+    if (current->fds[dirfd].type != FT_DIR || current->fds[dirfd].name[0] == '\0') return -1;
+
+    while (current->fds[dirfd].name[j] && i + 1 < size) out[i++] = current->fds[dirfd].name[j++];
+    if (i > 0 && out[i - 1] != '/' && i + 1 < size) out[i++] = '/';
+    j = 0;
+    while (path[j] && i + 1 < size) out[i++] = path[j++];
+    out[i] = '\0';
+    return 0;
+}
+
+int fs_get_file_data(const char* path, void** data, size_t* size) {
+    if (riscv64_bootstrap_user_file_data(path, data, size) == 0) return 0;
+    if (xv6fs_is_mounted()) {
+        uint32_t xv6_mode = 0;
+        uint64_t xv6_size = 0;
+        char resolved[256];
+        if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) goto notfound;
+        if (xv6fs_stat_path(resolved, &xv6_mode, &xv6_size, 0, 0) < 0) goto notfound;
+        if ((xv6_mode & 0170000U) != KSTAT_MODE_FILE) goto notfound;
+        if (data) {
+            size_t npages = ((size_t)xv6_size + PAGE_SIZE - 1U) / PAGE_SIZE;
+            struct xv6fs_inode* ip;
+            void* buf;
+            if (npages == 0) npages = 1;
+            buf = PHYS_TO_VIRT(pmm_alloc((int)npages));
+            if (!buf) goto notfound;
+            ip = xv6fs_namei(resolved);
+            if (!ip) {
+                pmm_free((void*)VIRT_TO_PHYS((uint64_t)buf), (int)npages);
+                goto notfound;
+            }
+            xv6fs_ilock(ip);
+            xv6fs_readi(ip, buf, 0, (uint32_t)xv6_size);
+            xv6fs_iunlock(ip);
+            xv6fs_iput(ip);
+            *data = buf;
+        }
+        if (size) *size = (size_t)xv6_size;
+        return 0;
+    }
+notfound:
+    if (data) *data = 0;
+    if (size) *size = 0;
+    return -1;
+}
+
+int sys_open(const char* path, int flags, int mode) {
+    struct task* current = get_current_task();
+    char resolved[256];
+    void* file_data = 0;
+    size_t file_size = 0;
+    int fd = -1;
+
+    if (!current || !path) return -LINUX_EFAULT;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+
+    // POSIX: open は最小の空き fd を返す。busybox ash はバックグラウンドジョブで
+    // close(0) 後の open が必ず 0 を返すことに依存している (`cmd &` の stdin=/dev/null)
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (!current->fds[i].in_use) {
+            fd = i;
+            break;
+        }
+    }
+    if (fd < 0) return -LINUX_EMFILE;
+
+    {
+        // 疑似キャラクタデバイスは xv6fs より先に解決する
+        int dev = riscv64_fs_special_dev(resolved);
+        if (dev != RISCV64_DEV_NONE) {
+            if (dev == RISCV64_DEV_CONSOLE) {
+                fs_init_console_fd(&current->fds[fd], flags);
+            } else {
+                fs_file_t* file = fs_alloc_file();
+                if (!file) return -LINUX_ENFILE;
+                file->type = FT_CHARDEV;
+                file->ops = &g_plain_file_ops;
+                current->fds[fd].type = FT_CHARDEV;
+                current->fds[fd].file = file;
+                current->fds[fd].data = 0;
+                current->fds[fd].size = 0;
+                current->fds[fd].offset = 0;
+                current->fds[fd].in_use = 1;
+                current->fds[fd].flags = flags;
+                current->fds[fd].fd_flags = 0;
+                current->fds[fd].aux0 = (uint32_t)dev;
+                current->fds[fd].aux1 = 0;
+            }
+            riscv64_fs_strcpy(current->fds[fd].name, resolved, sizeof(current->fds[fd].name));
+            return fd;
+        }
+    }
+
+    {
+        // ディレクトリ判定: O_DIRECTORY 指定、または xv6fs 上のディレクトリ
+        int is_dir = (flags & O_DIRECTORY) != 0;
+        uint32_t xv6_mode = 0;
+        uint64_t xv6_size = 0;
+        int have_xv6 = 0;
+        if (xv6fs_is_mounted() && xv6fs_stat_path(resolved, &xv6_mode, &xv6_size, 0, 0) == 0) {
+            have_xv6 = 1;
+            if ((xv6_mode & 0170000U) == KSTAT_MODE_DIR) is_dir = 1;
+        }
+        if (!xv6fs_is_mounted() && riscv64_fs_path_eq(resolved, "/")) is_dir = 1;
+
+        // O_CREAT: xv6fs 上に存在しなければ通常ファイルを新規作成する
+        if (!have_xv6 && !is_dir && (flags & O_CREAT) != 0 && xv6fs_is_mounted()) {
+            int create_mode = (mode & 07777) ? (mode & 07777) : 0644;
+            if (xv6fs_create_file(resolved, create_mode, 0) == 0 &&
+                xv6fs_stat_path(resolved, &xv6_mode, &xv6_size, 0, 0) == 0) {
+                have_xv6 = 1;
+                if ((xv6_mode & 0170000U) == KSTAT_MODE_DIR) is_dir = 1;
+            }
+        }
+
+        if (is_dir) {
+            /* ディレクトリの中身を open 時に丸ごと写し取る。
+             *
+             * 入りきらないと「一部だけ見える」状態になり、しかも何も言わない。
+             * 4 ページ = 64 エントリ固定だった頃、GCC のビルドディレクトリ
+             * (185 エントリ) で後から作った .o が列挙に出ず、`echo *.o` が
+             * 展開されないという形で出た。個別の stat では見えるので、
+             * 気付くまで遠回りした。
+             *
+             * 収まらなかったら諦めずにページ数を増やして取り直す。
+             * count == cap は「ちょうど入った」と「溢れた」の区別が付かないので、
+             * 安全側 (取り直し) に倒す。 */
+            size_t pages = 4;
+            size_t cap;
+            void* dir_page;
+            struct orth_dirent* dirents;
+            size_t count = 0;
+
+            /* 必要な大きさは先に決める。足りなければ捨てて取り直す、という
+             * 形にすると、そのたびに全エントリの inode を読み直すことになり、
+             * 185 エントリのディレクトリで `echo *.o` が返らなくなった。
+             * ディレクトリの size をエントリ 1 個分で割れば個数の上限が出る。 */
+            if (xv6fs_is_mounted()) {
+                uint64_t dsize = 0;
+                if (xv6fs_stat_path(resolved, 0, &dsize, 0, 0) == 0) {
+                    size_t need = (size_t)(dsize / sizeof(struct xv6fs_dirent));
+                    size_t want = (need * sizeof(struct orth_dirent) + PAGE_SIZE - 1) / PAGE_SIZE;
+                    if (want + 1 > pages) pages = want + 1;
+                }
+            }
+            if (pages > 512) return -1;   /* 2MB を超えるディレクトリは扱わない */
+
+            cap = pages * PAGE_SIZE / sizeof(struct orth_dirent);
+            dir_page = pmm_alloc(pages);
+            if (!dir_page) return -1;
+            dirents = (struct orth_dirent*)PHYS_TO_VIRT(dir_page);
+            for (size_t i = 0; i < pages * PAGE_SIZE; i++) ((uint8_t*)dirents)[i] = 0;
+            if (riscv64_fs_build_dirents(resolved, dirents, cap, &count) < 0) {
+                pmm_free(dir_page, pages);
+                return -1;
+            }
+            /* 見積もりを超えた = 一部しか見えていない。黙って切り捨てない */
+            if (count >= cap) {
+                pmm_free(dir_page, pages);
+                return -1;
+            }
+            {
+                fs_file_t* file = fs_alloc_file();
+                if (!file) {
+                    pmm_free(dir_page, pages);
+                    return -LINUX_ENFILE;
+                }
+                file->type = FT_DIR;
+                file->ops = &g_dir_file_ops;
+                file->private_data = dirents;
+                file->size = count * sizeof(struct orth_dirent);
+                file->aux0 = (uint32_t)pages;   /* release が pmm_free する枚数 */
+                current->fds[fd].file = file;
+            }
+            current->fds[fd].data = 0;
+            current->fds[fd].size = 0;
+            current->fds[fd].aux0 = (uint32_t)pages;
+            current->fds[fd].type = FT_DIR;
+            current->fds[fd].offset = 0;
+            current->fds[fd].in_use = 1;
+            current->fds[fd].flags = flags;
+            current->fds[fd].fd_flags = 0;
+            current->fds[fd].aux1 = 0;
+            riscv64_fs_strcpy(current->fds[fd].name, resolved, sizeof(current->fds[fd].name));
+            return fd;
+        }
+
+        if (have_xv6) {
+            if ((xv6_mode & 0170000U) != KSTAT_MODE_FILE) return -1;
+            // O_TRUNC は書き込み用に開いた場合のみ有効
+            if ((flags & O_TRUNC) != 0 && riscv64_fs_flags_writable(flags) && xv6_size != 0) {
+                if (xv6fs_truncate_file(resolved, 0) < 0) return -1;
+                xv6_size = 0;
+            }
+            {
+                fs_file_t* file = fs_alloc_file();
+                if (!file) return -LINUX_ENFILE;
+                file->type = FT_XV6FS;
+                file->ops = &g_plain_file_ops;
+                file->size = (size_t)xv6_size;
+                // O_APPEND は末尾から書き始める (以後の write でも都度末尾へ)
+                file->offset = (flags & O_APPEND) ? (size_t)xv6_size : 0;
+                current->fds[fd].file = file;
+            }
+            current->fds[fd].type = FT_XV6FS;
+            current->fds[fd].data = 0;
+            current->fds[fd].size = 0;
+            current->fds[fd].offset = 0;
+            current->fds[fd].in_use = 1;
+            current->fds[fd].flags = flags;
+            current->fds[fd].fd_flags = 0;
+            current->fds[fd].aux0 = 0;
+            current->fds[fd].aux1 = 0;
+            riscv64_fs_strcpy(current->fds[fd].name, resolved, sizeof(current->fds[fd].name));
+            return fd;
+        }
+    }
+
+    if (fs_get_file_data(resolved, &file_data, &file_size) < 0) return -LINUX_ENOENT;
+
+    {
+        fs_file_t* file = fs_alloc_file();
+        if (!file) return -LINUX_ENFILE;
+        file->type = FT_MODULE;
+        file->ops = &g_plain_file_ops;   /* 埋め込み ELF は静的領域。解放不要 */
+        file->private_data = file_data;
+        file->size = file_size;
+        current->fds[fd].file = file;
+    }
+    current->fds[fd].type = FT_MODULE;
+    current->fds[fd].data = 0;
+    current->fds[fd].size = 0;
+    current->fds[fd].offset = 0;
+    current->fds[fd].in_use = 1;
+    current->fds[fd].flags = flags;
+    current->fds[fd].aux0 = 0;
+    current->fds[fd].aux1 = 0;
+    riscv64_fs_strcpy(current->fds[fd].name, resolved, sizeof(current->fds[fd].name));
+    return fd;
+}
+
+int sys_openat(int dirfd, const char* path, int flags, int mode) {
+    char resolved[256];
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+    return sys_open(resolved, flags, mode);
+}
+
+int64_t sys_write(int fd, const void* buf, size_t count) {
+    struct task* current = get_current_task();
+    const uint8_t* src = (const uint8_t*)buf;
+
+    if (!current) return -LINUX_EPERM;
+    if (!buf) return -LINUX_EFAULT;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -LINUX_EBADF;
+    if (current->fds[fd].type == FT_PIPE) {
+        pipe_t* pipe = (pipe_t*)current->fds[fd].data;
+        size_t written = 0;
+        if (!pipe) return -1;
+        while (written < count) {
+            size_t space;
+            size_t chunk;
+            struct task* readers_to_wake[FS_WAITQ_MAX];
+            int n_readers = 0;
+            uint64_t irqf = spin_lock_irqsave(&pipe->lock);
+            if (pipe->readers == 0) {
+                spin_unlock_irqrestore(&pipe->lock, irqf);
+                /* 読み手が全部閉じた: EPIPE 相当 */
+                return written > 0 ? (int64_t)written : -32;
+            }
+            space = PIPE_BUF_SIZE - pipe->count;
+            if (space == 0) {
+                task_mark_sleeping(current);
+                fs_waitq_add(&pipe->write_wq, current);
+                spin_unlock_irqrestore(&pipe->lock, irqf);
+                kernel_yield();
+                irqf = spin_lock_irqsave(&pipe->lock);
+                fs_waitq_remove(&pipe->write_wq, current);
+                spin_unlock_irqrestore(&pipe->lock, irqf);
+                continue;
+            }
+            chunk = count - written;
+            if (chunk > space) chunk = space;
+            for (size_t i = 0; i < chunk; i++) {
+                pipe->buffer[pipe->write_pos] = (char)src[written + i];
+                pipe->write_pos = (pipe->write_pos + 1) % PIPE_BUF_SIZE;
+                pipe->count++;
+            }
+            written += chunk;
+            n_readers = fs_waitq_take_all(&pipe->read_wq, readers_to_wake, FS_WAITQ_MAX);
+            spin_unlock_irqrestore(&pipe->lock, irqf);
+            riscv64_fs_wake_list(readers_to_wake, n_readers);
+        }
+        return (int64_t)written;
+    }
+    if (current->fds[fd].type == FT_CHARDEV) {
+        /* /dev/null, /dev/zero: 書き込みは捨てる */
+        return (int64_t)count;
+    }
+    if (current->fds[fd].type == FT_XV6FS) {
+        file_descriptor_t* f = &current->fds[fd];
+        size_t off;
+        if (!riscv64_fs_flags_writable(f->flags)) return -9; /* EBADF */
+        if (f->name[0] == '\0') return -LINUX_EBADF;
+        if (count == 0) return 0;
+        if (f->flags & O_APPEND) {
+            uint32_t xv6_mode = 0;
+            uint64_t xv6_size = 0;
+            if (xv6fs_stat_path(f->name, &xv6_mode, &xv6_size, 0, 0) == 0) {
+                fs_fd_set_size(f, (size_t)xv6_size);
+            }
+            fs_fd_set_offset(f, fs_fd_size(f));
+        }
+        off = fs_fd_offset(f);
+        if (xv6fs_write_file(f->name, (uint64_t)off, buf, count) < 0) return -LINUX_ENOSPC;
+        fs_fd_set_offset(f, off + count);
+        if (fs_fd_offset(f) > fs_fd_size(f)) fs_fd_set_size(f, fs_fd_offset(f));
+        return (int64_t)count;
+    }
+    if (current->fds[fd].type != FT_CONSOLE) return -LINUX_EBADF;
+
+    {
+        /* **termios の ONLCR を開く。** 実機のシリアル端末は LF だけでは
+         * 行頭に戻らず、次の行が前の行の終端位置から始まる (Pi 4 実機の
+         * ash で `ls` の段組みが階段状に崩れて発覚。aarch64 と同じ修正)。
+         * QEMU の -serial stdio ではホスト端末が吸収するので見えない。
+         *
+         * **既に CR が置かれている所には足さない。** */
+        extern int arch_console_onlcr_enabled(void);   /* kernel/linux_syscall.c */
+        int onlcr = arch_console_onlcr_enabled();
+        for (size_t i = 0; i < count; i++) {
+            if (onlcr && src[i] == '\n' && (i == 0 || src[i - 1] != '\r')) {
+                riscv64_uart_putchar('\r');
+            }
+            riscv64_uart_putchar((char)src[i]);
+        }
+    }
+    return (int64_t)count;
+}
+
+int64_t sys_read(int fd, void* buf, size_t count) {
+    struct task* current = get_current_task();
+    file_descriptor_t* f;
+    size_t remaining;
+    size_t to_read;
+
+    if (!current) return -LINUX_EPERM;
+    if (!buf) return -LINUX_EFAULT;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -LINUX_EBADF;
+    f = &current->fds[fd];
+    if (f->type == FT_CONSOLE) {
+        uint8_t* dst = (uint8_t*)buf;
+        size_t read_count = 0;
+        if (count == 0) return 0;
+        while (read_count == 0) {
+            /* 「空だから寝る」までを不可分にする。分けると、その隙に届いた
+             * 文字で誰も起こしてくれず固まる (UART 割り込み化で顕在化する) */
+            int got = riscv64_console_read_or_wait((char*)dst, (int)count, current);
+            if (got <= 0) {
+                kernel_yield();
+                riscv64_console_clear_waiter(current);
+                continue;
+            }
+            read_count = (size_t)got;
+            /* termios の ECHO が落ちていれば何も出さない (raw モードの
+             * 行編集は自前でエコーするので、ここで出すと二重になる) */
+            if (fd == 0 && riscv64_console_echo_enabled()) {
+                for (size_t i = 0; i < read_count; i++) {
+                    int ch = dst[i];
+                    if (ch == '\n') {
+                        riscv64_uart_puts("\r\n");
+                    } else if (ch == '\b' || ch == 0x7f) {
+                        riscv64_uart_puts("\b \b");
+                    } else {
+                        riscv64_uart_putchar((char)ch);
+                    }
+                }
+            }
+        }
+        return (int64_t)read_count;
+    }
+    if (f->type == FT_DIR) return -LINUX_EISDIR;
+    if (f->type == FT_CHARDEV) {
+        if (f->aux0 == RISCV64_DEV_ZERO) {
+            for (size_t i = 0; i < count; i++) ((uint8_t*)buf)[i] = 0;
+            return (int64_t)count;
+        }
+        return 0; /* /dev/null は常に EOF */
+    }
+    if (f->type == FT_PIPE) {
+        pipe_t* pipe = (pipe_t*)f->data;
+        if (!pipe) return -1;
+        for (;;) {
+            size_t to_read;
+            struct task* writers_to_wake[FS_WAITQ_MAX];
+            int n_writers = 0;
+            uint64_t irqf = spin_lock_irqsave(&pipe->lock);
+            if (pipe->count == 0 && pipe->writers == 0) {
+                spin_unlock_irqrestore(&pipe->lock, irqf);
+                return 0; /* 書き手が全部閉じた → EOF */
+            }
+            if (pipe->count == 0) {
+                task_mark_sleeping(current);
+                fs_waitq_add(&pipe->read_wq, current);
+                spin_unlock_irqrestore(&pipe->lock, irqf);
+                kernel_yield();
+                irqf = spin_lock_irqsave(&pipe->lock);
+                fs_waitq_remove(&pipe->read_wq, current);
+                spin_unlock_irqrestore(&pipe->lock, irqf);
+                continue;
+            }
+            to_read = (count > pipe->count) ? pipe->count : count;
+            for (size_t i = 0; i < to_read; i++) {
+                ((char*)buf)[i] = pipe->buffer[pipe->read_pos];
+                pipe->read_pos = (pipe->read_pos + 1) % PIPE_BUF_SIZE;
+                pipe->count--;
+            }
+            n_writers = fs_waitq_take_all(&pipe->write_wq, writers_to_wake, FS_WAITQ_MAX);
+            spin_unlock_irqrestore(&pipe->lock, irqf);
+            riscv64_fs_wake_list(writers_to_wake, n_writers);
+            return (int64_t)to_read;
+        }
+    }
+    if (f->type == FT_XV6FS) {
+        struct xv6fs_inode* ip;
+        int got;
+        /* dup / fork した相方が書いた分は fd->file を共有しているので見える。
+         * ここで取り直すのは**別々に open した fd** が書いた分。size は
+         * open した時点の写しなので、他プロセスの追記を知らない。
+         * 本物の長さは inode にしか無い。
+         *
+         * (これが無いと binutils の ar が壊れた。ar は mkstemp した一時
+         *  ファイルを dup し、片方で書いてもう片方から読み戻す。74 バイト
+         *  書いたアーカイブが 0 バイトになっていた。この dup の経路自体は
+         *  fs_file_t の共有で塞がったが、別 open の経路は残るので取り直しは必要) */
+        riscv64_fs_refresh_xv6fs_size(f);
+        if (fs_fd_offset(f) >= fs_fd_size(f)) return 0;
+        remaining = fs_fd_size(f) - fs_fd_offset(f);
+        to_read = (count > remaining) ? remaining : count;
+        ip = xv6fs_namei(f->name);
+        if (!ip) return -1;
+        xv6fs_ilock(ip);
+        got = xv6fs_readi(ip, buf, (uint32_t)fs_fd_offset(f), (uint32_t)to_read);
+        xv6fs_iunlock(ip);
+        xv6fs_iput(ip);
+        if (got < 0) return -1;
+        fs_fd_set_offset(f, fs_fd_offset(f) + (size_t)got);
+        return (int64_t)got;
+    }
+    if (fs_fd_type(f) != FT_MODULE) return -LINUX_EBADF;
+    if (fs_fd_offset(f) >= fs_fd_size(f)) return 0;
+
+    remaining = fs_fd_size(f) - fs_fd_offset(f);
+    to_read = (count > remaining) ? remaining : count;
+    for (size_t i = 0; i < to_read; i++) {
+        ((uint8_t*)buf)[i] = ((const uint8_t*)fs_fd_data(f))[fs_fd_offset(f) + i];
+    }
+    fs_fd_set_offset(f, fs_fd_offset(f) + to_read);
+    return (int64_t)to_read;
+}
+
+/* stat の本体。**follow=0 は lstat** —— 最後の要素がシンボリックリンク
+ * なら辿らず、リンクそのものを見る。追跡する版としない版で違うのは
+ * xv6fs_stat_path / xv6fs_lstat_path のどちらを呼ぶかだけなので、経路は
+ * 1 本にまとめてある。resolved は解決済みの絶対パス */
+static int riscv64_fs_stat_resolved(const char* resolved, struct kstat* st, int follow) {
+    void* file_data = 0;
+    size_t file_size = 0;
+
+    {
+        int dev = riscv64_fs_special_dev(resolved);
+        if (dev != RISCV64_DEV_NONE) {
+            riscv64_fs_kstat_defaults(st, KSTAT_MODE_CHR | 0666U, 0);
+            st->dev = 1;
+            st->ino = 100U + (uint64_t)dev;
+            st->rdev = 1;
+            return 0;
+        }
+    }
+
+    if (xv6fs_is_mounted()) {
+        uint32_t xv6_mode = 0;
+        uint64_t xv6_size = 0;
+        uint32_t xv6_rdev = 0;
+        int64_t  xv6_mtime = 0;
+        int rc = follow ? xv6fs_stat_path(resolved, &xv6_mode, &xv6_size, &xv6_mtime, &xv6_rdev)
+                        : xv6fs_lstat_path(resolved, &xv6_mode, &xv6_size, &xv6_mtime, &xv6_rdev);
+        if (rc == 0) {
+            uint64_t xv6_ino = 0;
+            riscv64_fs_kstat_defaults(st, xv6_mode, (int64_t)xv6_size);
+            st->rdev = xv6_rdev;
+            /* **既定は 0。**ここで上書きしないと make の依存解決が働かない
+             * (aarch64 側と同じ穴。2026-08-28) */
+            st->mtime_sec = xv6_mtime;
+            st->ctime_sec = xv6_mtime;
+            /* **本物の inode 番号を返すこと。** ここを定数 2 にしていたため
+             * すべてのディレクトリが同じ ino になり、Orthox 上の gcc が
+             * インクルードパスの重複判定 (dev+ino で比較する) で /include を
+             * "duplicate" と見なして捨て、stdio.h が見つからなくなっていた。 */
+            if (xv6fs_ino_path(resolved, &xv6_ino) == 0) st->ino = xv6_ino;
+            return 0;
+        }
+        // xv6fs に無くても埋め込み /bootstrap-user は見せる
+    }
+
+    if (riscv64_fs_path_eq(resolved, "/")) {
+        riscv64_fs_kstat_defaults(st, KSTAT_MODE_DIR | 0755U, 0);
+        st->ino = 1;
+        return 0;
+    }
+
+    /* 存在しないパスは必ず -ENOENT を返すこと。-1 のままだと musl 側で EPERM に
+     * なり、`rm -f nonexistent` が "Operation not permitted" で失敗する
+     * (busybox は lstat の ENOENT を見て -f を黙って成功扱いにする) */
+    if (fs_get_file_data(resolved, &file_data, &file_size) < 0) return -LINUX_ENOENT;
+    riscv64_fs_kstat_defaults(st, KSTAT_MODE_FILE | 0644U, (int64_t)file_size);
+    st->ino = ((uint64_t)(uintptr_t)file_data) >> 4;
+    return 0;
+}
+
+int sys_stat(const char* path, struct kstat* st) {
+    char resolved[256];
+    if (!path || !st) return -LINUX_EFAULT;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+    return riscv64_fs_stat_resolved(resolved, st, 1);
+}
+
+int sys_fstat(int fd, struct kstat* st) {
+    struct task* current = get_current_task();
+    file_descriptor_t* f;
+
+    if (!current) return -LINUX_EPERM;
+    if (!st) return -LINUX_EFAULT;
+    if (fd == 0 || fd == 1 || fd == 2) {
+        riscv64_fs_kstat_defaults(st, KSTAT_MODE_CHR | 0666U, 0);
+        st->dev = 1;
+        st->ino = (uint64_t)fd + 1U;
+        st->rdev = 1;
+        return 0;
+    }
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -LINUX_EBADF;
+    f = &current->fds[fd];
+
+    if (f->type == FT_CONSOLE || f->type == FT_CHARDEV) {
+        riscv64_fs_kstat_defaults(st, KSTAT_MODE_CHR | 0666U, 0);
+        st->dev = 1;
+        st->ino = (uint64_t)fd + 1U;
+        st->rdev = 1;
+        return 0;
+    }
+    if (f->type == FT_DIR) {
+        riscv64_fs_kstat_defaults(st, KSTAT_MODE_DIR | 0755U, 0);
+        st->ino = 1;
+        return 0;
+    }
+    if ((f->type == FT_MODULE || f->type == FT_XV6FS) && f->name[0] != '\0') {
+        return sys_stat(f->name, st);
+    }
+    return -LINUX_EBADF;
+}
+
+int sys_fstatat(int dirfd, const char* path, struct kstat* st, int flags) {
+    char resolved[256];
+    /* **AT_SYMLINK_NOFOLLOW を捨てない。**ここを (void)flags にしていたため
+     * riscv64 では lstat が stat と同じ動きになり、busybox の ls -l が
+     * シンボリックリンクを通常ファイルとして表示していた (シンボリック
+     * リンクだと分からないので readlinkat(78) にも到達しない、2026-09-04)。
+     * 知らないフラグは従来どおり無視する —— ここで EINVAL を返すように
+     * すると、今まで通っていた呼び出しを落としかねない */
+    if (!path || !st) return -LINUX_EFAULT;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+    return riscv64_fs_stat_resolved(resolved, st,
+                                    (flags & RISCV64_AT_SYMLINK_NOFOLLOW) ? 0 : 1);
+}
+
+int sys_chdir(const char* path) {
+    struct task* current = get_current_task();
+    struct kstat st;
+    char resolved[256];
+
+    if (!current || !path || path[0] == '\0') return -LINUX_ENOENT;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+    if (sys_stat(resolved, &st) < 0) return -LINUX_ENOENT;
+    if ((st.mode & 0170000U) != KSTAT_MODE_DIR) return -LINUX_ENOTDIR;
+    riscv64_fs_strcpy(current->cwd, resolved, sizeof(current->cwd));
+    return 0;
+}
+
+int sys_fchdir(int fd) {
+    struct task* current = get_current_task();
+    file_descriptor_t* f;
+
+    if (!current) return -LINUX_EPERM;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -LINUX_EBADF;
+    f = &current->fds[fd];
+    if (f->type != FT_DIR || f->name[0] == '\0') return -LINUX_ENOTDIR;
+    return sys_chdir(f->name);
+}
+
+/* ------------------------------------------------------------------ */
+/* 書き込み系エントリポイント (すべて xv6fs のパスベース API に委譲)   */
+/* ------------------------------------------------------------------ */
+
+/* xv6fs のパス API は失敗を -1 でしか返さないので、事前に stat して errno を
+ * 決める。`rm -f` は lstat の ENOENT を見て黙って成功扱いにするため、ここが
+ * EPERM だと `rm -f nonexistent` が失敗する */
+static int riscv64_fs_unlink_resolved(const char* resolved) {
+    struct kstat st;
+    if (sys_stat(resolved, &st) < 0) return -LINUX_ENOENT;
+    if ((st.mode & 0170000U) == KSTAT_MODE_DIR) return -LINUX_EISDIR;
+    return xv6fs_unlink_path(resolved) == 0 ? 0 : -LINUX_EPERM;
+}
+
+static int riscv64_fs_rmdir_resolved(const char* resolved) {
+    struct kstat st;
+    if (sys_stat(resolved, &st) < 0) return -LINUX_ENOENT;
+    if ((st.mode & 0170000U) != KSTAT_MODE_DIR) return -LINUX_ENOTDIR;
+    /* xv6fs_rmdir_path が弾くのは実質「空でない」ケース */
+    return xv6fs_rmdir_path(resolved) == 0 ? 0 : -LINUX_ENOTEMPTY;
+}
+
+int sys_unlink(const char* path) {
+    char resolved[256];
+    if (!path || path[0] == '\0') return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+    return riscv64_fs_unlink_resolved(resolved);
+}
+
+int sys_rmdir(const char* path) {
+    char resolved[256];
+    if (!path || path[0] == '\0') return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+    return riscv64_fs_rmdir_resolved(resolved);
+}
+
+int sys_unlinkat(int dirfd, const char* path, int flags) {
+    char resolved[256];
+    if (!path || path[0] == '\0') return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+    if (flags & RISCV64_AT_REMOVEDIR) return riscv64_fs_rmdir_resolved(resolved);
+    return riscv64_fs_unlink_resolved(resolved);
+}
+
+int sys_link(const char* oldpath, const char* newpath) {
+    char old_resolved[256];
+    char new_resolved[256];
+    struct kstat st;
+    if (!oldpath || !newpath || oldpath[0] == '\0' || newpath[0] == '\0') return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    if (riscv64_fs_resolve_path(oldpath, old_resolved, sizeof(old_resolved)) < 0) return -LINUX_ENOENT;
+    if (riscv64_fs_resolve_path(newpath, new_resolved, sizeof(new_resolved)) < 0) return -LINUX_ENOENT;
+    if (sys_stat(new_resolved, &st) == 0) return -17; /* EEXIST */
+    if (sys_stat(old_resolved, &st) < 0) return -LINUX_ENOENT;
+    return xv6fs_link_path(old_resolved, new_resolved) == 0 ? 0 : -LINUX_EPERM;
+}
+
+int sys_linkat(int olddirfd, const char* oldpath, int newdirfd, const char* newpath, int flags) {
+    char old_resolved[256];
+    char new_resolved[256];
+    (void)flags; /* AT_SYMLINK_FOLLOW: xv6fs に symlink が無いので無視してよい */
+    if (!oldpath || !newpath || oldpath[0] == '\0' || newpath[0] == '\0') return -LINUX_ENOENT;
+    if (riscv64_fs_resolve_dirfd_path(olddirfd, oldpath, old_resolved, sizeof(old_resolved)) < 0) return -LINUX_ENOENT;
+    if (riscv64_fs_resolve_dirfd_path(newdirfd, newpath, new_resolved, sizeof(new_resolved)) < 0) return -LINUX_ENOENT;
+    return sys_link(old_resolved, new_resolved);
+}
+
+/* readlinkat(2) / symlinkat(2) (2026-09-04)。
+ *
+ * **riscv64 は kernel/fs.c ではなく本ファイルを使う**ので、共有の
+ * kernel/linux_syscall.c が呼ぶ fs_readlinkat / fs_symlinkat を riscv64
+ * 側にも持たないとリンクが通らない (2026-08-31 の N-6 で aarch64/x86 側
+ * にだけ足したため、riscv64 が undefined symbol で落ちていた)。
+ *
+ * シンボリックリンクの実体は共有の kernel/xv6fs.c が既に持っており、
+ * パス解決 (namex) の追跡も共有側で済んでいる。ここはパス解決を riscv64
+ * の流儀に合わせて委ねるだけ。**riscv64 に ramfs は無い**ので、
+ * kernel/fs.c にある /tmp (ramfs) の分岐は要らない */
+int64_t fs_readlinkat(int dirfd, const char* path, char* buf, size_t bufsiz) {
+    char resolved[256];
+    struct kstat st;
+    int n;
+
+    if (!path || !buf) return -LINUX_EFAULT;
+    if (!xv6fs_is_mounted()) return -LINUX_ENOENT;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+
+    n = xv6fs_readlink_path(resolved, buf, bufsiz);
+    if (n >= 0) return n;
+    /* 読めなかった理由を分ける。実体があるならシンボリックリンクでは
+     * ないということなので EINVAL、無ければ ENOENT */
+    if (sys_stat(resolved, &st) < 0) return -LINUX_ENOENT;
+    return -LINUX_EINVAL;
+}
+
+int64_t fs_readlink(const char* path, char* buf, size_t bufsiz) {
+    return fs_readlinkat(RISCV64_AT_FDCWD, path, buf, bufsiz);
+}
+
+int fs_symlinkat(const char* target, int dirfd, const char* linkpath) {
+    char resolved[256];
+
+    if (!target || !linkpath || target[0] == '\0' || linkpath[0] == '\0') return -LINUX_EFAULT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, linkpath, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+
+    /* xv6fs_symlink_path が 0 以外を返すのは実質「既にある」場合 */
+    return xv6fs_symlink_path(target, resolved) == 0 ? 0 : -LINUX_EEXIST;
+}
+
+int fs_symlink(const char* target, const char* linkpath) {
+    return fs_symlinkat(target, RISCV64_AT_FDCWD, linkpath);
+}
+
+/* child が parent の下にあるか。正規化済みの絶対パスどうしで見る。
+ * ディレクトリのハードリンクが無いので実体とパスが 1 対 1 になり、
+ * 文字列だけで「自分の子孫の下へ入ろうとしている」を判定できる */
+static int riscv64_fs_path_is_under(const char* parent, const char* child) {
+    size_t i = 0;
+    while (parent[i] && parent[i] == child[i]) i++;
+    if (parent[i] != '\0') return 0;
+    return child[i] == '/';
+}
+
+/* rename(2)。riscv64 の musl は renameat2(276) を出す。
+ * **以前はここで EXDEV を返し、mv の copy+unlink に退かせていた。**
+ * xv6fs に rename が入ったので本来の意味で付け替える */
+int sys_renameat(int olddirfd, const char* oldpath,
+                 int newdirfd, const char* newpath, unsigned int flags) {
+    char old_resolved[256];
+    char new_resolved[256];
+    size_t i;
+    /* RENAME_NOREPLACE(1) / RENAME_EXCHANGE(2) / RENAME_WHITEOUT(4) は未対応。
+     * 黙って普通の rename にすると上書き事故になるので断る */
+    if (flags != 0) return -LINUX_EINVAL;
+    if (!oldpath || !newpath || oldpath[0] == '\0' || newpath[0] == '\0')
+        return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    if (riscv64_fs_resolve_dirfd_path(olddirfd, oldpath,
+                                      old_resolved, sizeof(old_resolved)) < 0)
+        return -LINUX_ENOENT;
+    if (riscv64_fs_resolve_dirfd_path(newdirfd, newpath,
+                                      new_resolved, sizeof(new_resolved)) < 0)
+        return -LINUX_ENOENT;
+    /* 同じ名前どうしなら何もせずに成功 (POSIX) */
+    for (i = 0; old_resolved[i] && old_resolved[i] == new_resolved[i]; i++) { }
+    if (old_resolved[i] == '\0' && new_resolved[i] == '\0') return 0;
+    if (riscv64_fs_path_is_under(old_resolved, new_resolved))
+        return -LINUX_EINVAL;
+    return xv6fs_rename_path(old_resolved, new_resolved);
+}
+
+/* statfs(2) / fstatfs(2)。xv6fs が 1 つだけなのは riscv64 も同じなので、
+ * パスも fd も見ずに同じ答えを返す。**空き容量が見えないまま長いビルドを
+ * 回すのは危ない**ので入れた (2026-08-30) */
+int sys_statfs(const char* path, struct orth_statfs* out) {
+    struct xv6fs_statfs st;
+    if (!out) return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    (void)path;
+    if (xv6fs_statfs(&st) < 0) return -LINUX_EPERM;
+    out->bsize   = st.bsize;
+    out->blocks  = st.blocks;
+    out->bfree   = st.bfree;
+    out->bavail  = st.bfree;
+    out->files   = st.files;
+    out->ffree   = st.ffree;
+    out->namelen = st.namelen;
+    return 0;
+}
+
+int sys_fstatfs(int fd, struct orth_statfs* out) {
+    (void)fd;
+    return sys_statfs(0, out);
+}
+
+/* utimensat(2)。**無条件に 0 を返してはいけない。**
+ *
+ * busybox の touch は「まず utimensat、ENOENT なら open(O_CREAT)」の順で
+ * 動くので、常に成功を返すと**touch がファイルを作らなくなる**
+ * (2026-08-30、aarch64 で GCC の configure がこれで落ちた)。
+ *
+ * times は見ない —— 常に「いま」にする (UTIME_NOW 相当)。make が
+ * 「出力が入力より新しいか」で判断するので、時刻は動かす必要がある */
+int sys_utimensat(int dirfd, const char* path, const void* times, int flags) {
+    char resolved[256];
+    struct kstat st;
+    (void)times; (void)flags;
+    if (!path || path[0] == '\0') return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0)
+        return -LINUX_ENOENT;
+    if (sys_stat(resolved, &st) < 0) return -LINUX_ENOENT;
+    return xv6fs_touch_path(resolved) == 0 ? 0 : -LINUX_ENOENT;
+}
+
+int sys_mkdir(const char* path, int mode) {
+    char resolved[256];
+    struct kstat st;
+    if (!path || path[0] == '\0') return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+    if (sys_stat(resolved, &st) == 0) return -17; /* EEXIST */
+    /* xv6fs_mkdir_path が弾くのは実質「親ディレクトリが無い」ケース */
+    return xv6fs_mkdir_path(resolved, (mode & 07777) ? (mode & 07777) : 0755) == 0
+               ? 0 : -LINUX_ENOENT;
+}
+
+int sys_mkdirat(int dirfd, const char* path, int mode) {
+    char resolved[256];
+    if (!path || path[0] == '\0') return -LINUX_ENOENT;
+    if (riscv64_fs_resolve_dirfd_path(dirfd, path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+    return sys_mkdir(resolved, mode);
+}
+
+int sys_truncate(const char* path, uint64_t length) {
+    char resolved[256];
+    if (!path || path[0] == '\0') return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+    return xv6fs_truncate_file(resolved, length) == 0 ? 0 : -LINUX_ENOENT;
+}
+
+int sys_ftruncate(int fd, uint64_t length) {
+    struct task* current = get_current_task();
+    file_descriptor_t* f;
+
+    if (!current) return -LINUX_EPERM;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -LINUX_EBADF;
+    f = &current->fds[fd];
+    if (f->type != FT_XV6FS || f->name[0] == '\0') return -LINUX_EINVAL;
+    if (!riscv64_fs_flags_writable(f->flags)) return -LINUX_EBADF;
+    if (xv6fs_truncate_file(f->name, length) < 0) return -LINUX_EINVAL;
+    fs_fd_set_size(f, (size_t)length);
+    if (fs_fd_offset(f) > fs_fd_size(f)) fs_fd_set_offset(f, fs_fd_size(f));
+    return 0;
+}
+
+int sys_chmod(const char* path, uint32_t mode) {
+    char resolved[256];
+    if (!path || path[0] == '\0') return -LINUX_ENOENT;
+    if (!xv6fs_is_mounted()) return -LINUX_EROFS;
+    if (riscv64_fs_resolve_path(path, resolved, sizeof(resolved)) < 0) return -LINUX_ENOENT;
+    return xv6fs_chmod_path(resolved, mode & 07777U) == 0 ? 0 : -LINUX_ENOENT;
+}
+
+int sys_sync(void) {
+    if (!xv6fs_is_mounted()) return 0;
+    return xv6fs_sync();
+}
+
+void fs_release_fd(file_descriptor_t* desc) {
+    struct task* readers_to_wake[FS_WAITQ_MAX];
+    struct task* writers_to_wake[FS_WAITQ_MAX];
+    int n_readers = 0;
+    int n_writers = 0;
+    int free_pipe = 0;
+
+    if (!desc || !desc->in_use) return;
+
+    if (desc->type == FT_PIPE) {
+        pipe_t* pipe = (pipe_t*)desc->data;
+        if (pipe) {
+            uint64_t flags = spin_lock_irqsave(&pipe->lock);
+            if (pipe->ref_count > 0) pipe->ref_count--;
+            /* 端ごとの本数も減らす。ここで writers が 0 になった場合に
+             * read_wq で寝ている側を起こさないと EOF に気づけない (下の
+             * take_all がその役)。 */
+            if (riscv64_pipe_fd_is_writer(desc)) {
+                if (pipe->writers > 0) pipe->writers--;
+            } else {
+                if (pipe->readers > 0) pipe->readers--;
+            }
+            n_readers = fs_waitq_take_all(&pipe->read_wq, readers_to_wake, FS_WAITQ_MAX);
+            n_writers = fs_waitq_take_all(&pipe->write_wq, writers_to_wake, FS_WAITQ_MAX);
+            free_pipe = (pipe->ref_count == 0);
+            spin_unlock_irqrestore(&pipe->lock, flags);
+            riscv64_fs_wake_list(readers_to_wake, n_readers);
+            riscv64_fs_wake_list(writers_to_wake, n_writers);
+            if (free_pipe) {
+                pmm_free((void*)VIRT_TO_PHYS((uint64_t)pipe), PIPE_PAGES);
+            }
+        }
+    } else if (desc->file) {
+        /* dirents ページなどの資源は file->ops->release が持つので、
+         * 最後の参照が消えたときだけ解放される。
+         * 以前はここで desc->data を無条件に pmm_free していたため、
+         * dir fd を dup すると二重解放になり得た。 */
+        fs_file_put(desc->file);
+    }
+
+    desc->in_use = 0;
+    desc->file = 0;
+    desc->data = 0;
+    desc->size = 0;
+    desc->offset = 0;
+    desc->fd_flags = 0;
+    desc->name[0] = '\0';
+}
+
+int sys_close(int fd) {
+    struct task* current = get_current_task();
+
+    if (!current) return -LINUX_EPERM;
+    if (fd < 0 || fd >= MAX_FDS) return -LINUX_EBADF;
+    if (!current->fds[fd].in_use) return -LINUX_EBADF;
+    fs_release_fd(&current->fds[fd]);
+    return 0;
+}
+
+int sys_pipe2(int* pipefd, int flags) {
+    struct task* current = get_current_task();
+    void* phys;
+    pipe_t* pipe;
+    int fd1 = -1;
+    int fd2 = -1;
+
+    if (!current) return -LINUX_EPERM;
+    if (!pipefd) return -LINUX_EFAULT;
+    /* O_CLOEXEC(0x80000)/O_NONBLOCK(0x800) 以外は未対応 */
+    if (flags & ~(0x80000 | 0x800)) return -LINUX_EINVAL;
+
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (!current->fds[i].in_use) {
+            if (fd1 == -1) fd1 = i;
+            else { fd2 = i; break; }
+        }
+    }
+    if (fd1 == -1 || fd2 == -1) return -LINUX_EMFILE;
+
+    phys = pmm_alloc(PIPE_PAGES);
+    if (!phys) return -LINUX_EMFILE;
+    pipe = (pipe_t*)PHYS_TO_VIRT(phys);
+    pipe->read_pos = 0;
+    pipe->write_pos = 0;
+    pipe->count = 0;
+    pipe->ref_count = 2;
+    pipe->readers = 1;
+    pipe->writers = 1;
+    fs_waitq_init(&pipe->read_wq);
+    fs_waitq_init(&pipe->write_wq);
+    spinlock_init(&pipe->lock);
+
+    for (int end = 0; end < 2; end++) {
+        int fd = end == 0 ? fd1 : fd2;
+        current->fds[fd].type = FT_PIPE;
+        current->fds[fd].data = pipe;
+        current->fds[fd].size = 0;
+        current->fds[fd].offset = 0;
+        current->fds[fd].in_use = 1;
+        current->fds[fd].flags = end == 0 ? O_RDONLY : O_WRONLY;
+        current->fds[fd].fd_flags = (flags & 0x80000) ? FD_CLOEXEC : 0;
+        current->fds[fd].aux0 = 0;
+        current->fds[fd].aux1 = (uint32_t)end;
+        current->fds[fd].name[0] = '\0';
+    }
+    pipefd[0] = fd1;
+    pipefd[1] = fd2;
+    return 0;
+}
+
+int sys_dup3(int oldfd, int newfd, int flags) {
+    struct task* current = get_current_task();
+    if (!current) return -LINUX_EPERM;
+    if (oldfd < 0 || oldfd >= MAX_FDS || !current->fds[oldfd].in_use) return -LINUX_EBADF;
+    if (newfd < 0 || newfd >= MAX_FDS) return -LINUX_EBADF;
+    if (oldfd == newfd) return newfd;
+    if (current->fds[newfd].in_use) fs_release_fd(&current->fds[newfd]);
+    if (fs_clone_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -LINUX_EBADF;
+    current->fds[newfd].fd_flags = (flags & 0x80000) ? FD_CLOEXEC : 0;
+    return newfd;
+}
+
+int sys_dup(int oldfd) {
+    struct task* current = get_current_task();
+    int newfd = -1;
+    if (!current) return -LINUX_EPERM;
+    if (oldfd < 0 || oldfd >= MAX_FDS || !current->fds[oldfd].in_use) return -LINUX_EBADF;
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (!current->fds[i].in_use) { newfd = i; break; }
+    }
+    if (newfd == -1) return -LINUX_EMFILE;
+    if (fs_clone_fd(&current->fds[newfd], &current->fds[oldfd]) < 0) return -LINUX_EBADF;
+    current->fds[newfd].fd_flags = 0;
+    return newfd;
+}
+
+/* fcntl コマンド (musl/Linux ABI) */
+#define RISCV64_F_DUPFD          0
+#define RISCV64_F_GETFD          1
+#define RISCV64_F_SETFD          2
+#define RISCV64_F_GETFL          3
+#define RISCV64_F_SETFL          4
+#define RISCV64_F_DUPFD_CLOEXEC  1030
+
+int sys_fcntl(int fd, int cmd, uint64_t arg) {
+    struct task* current = get_current_task();
+
+    if (!current) return -LINUX_EPERM;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -LINUX_EBADF;
+
+    switch (cmd) {
+        case RISCV64_F_DUPFD:
+        case RISCV64_F_DUPFD_CLOEXEC: {
+            int minfd = (int)arg;
+            if (minfd < 0 || minfd >= MAX_FDS) return -LINUX_EINVAL;
+            for (int newfd = minfd; newfd < MAX_FDS; newfd++) {
+                if (current->fds[newfd].in_use) continue;
+                if (fs_clone_fd(&current->fds[newfd], &current->fds[fd]) < 0) return -LINUX_EBADF;
+                current->fds[newfd].fd_flags =
+                    (cmd == RISCV64_F_DUPFD_CLOEXEC) ? FD_CLOEXEC : 0;
+                return newfd;
+            }
+            return -24; /* EMFILE */
+        }
+        case RISCV64_F_GETFD:
+            return current->fds[fd].fd_flags;
+        case RISCV64_F_SETFD:
+            current->fds[fd].fd_flags = (int)arg & FD_CLOEXEC;
+            return 0;
+        case RISCV64_F_GETFL:
+            return current->fds[fd].flags;
+        case RISCV64_F_SETFL:
+            /* アクセスモードは変更不可 (POSIX) */
+            current->fds[fd].flags = (current->fds[fd].flags & 3) | ((int)arg & ~3);
+            return 0;
+        default:
+            return -22; /* EINVAL */
+    }
+}
+
+int fs_clone_fd(file_descriptor_t* dst, const file_descriptor_t* src) {
+    if (!dst || !src) return -1;
+    *dst = *src;
+    /* 共有 open file description を持つ型は参照を増やすだけ。offset / size /
+     * data は file 側にあるので、丸ごと複製した fd の写しは使われない。
+     * これで dup / fork した fd が offset を共有する (Linux と同じ) */
+    if (src->in_use && src->file) {
+        fs_file_get(src->file);
+        return 0;
+    }
+    if (src->in_use && src->type == FT_PIPE && src->data) {
+        pipe_t* pipe = (pipe_t*)src->data;
+        uint64_t flags = spin_lock_irqsave(&pipe->lock);
+        pipe->ref_count++;
+        /* dup / dup2 / fcntl(F_DUPFD) / fork のいずれもここを通る。
+         * 増えるのは複製元と同じ端だけ。 */
+        if (riscv64_pipe_fd_is_writer(src)) pipe->writers++;
+        else pipe->readers++;
+        spin_unlock_irqrestore(&pipe->lock, flags);
+    }
+    return 0;
+}
+
+void fs_close_cloexec_descriptors(struct task* task) {
+    if (!task) return;
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (task->fds[i].in_use && (task->fds[i].fd_flags & FD_CLOEXEC)) {
+            fs_release_fd(&task->fds[i]);
+        }
+    }
+}
+
+int fs_init_console_fd(file_descriptor_t* fd, int flags) {
+    fs_file_t* file;
+    if (!fd) return -1;
+    file = fs_alloc_file();
+    if (!file) return -1;
+    file->type = FT_CONSOLE;
+    file->ops = &g_plain_file_ops;
+    fd->file = file;
+    fd->type = FT_CONSOLE;
+    fd->data = 0;
+    fd->size = 0;
+    fd->offset = 0;
+    fd->in_use = 1;
+    fd->flags = flags;
+    fd->fd_flags = 0;
+    fd->aux0 = 0;
+    fd->aux1 = 0;
+    fd->name[0] = '\0';
+    return 0;
+}
+
+// 埋め込み ELF は静的領域なので解放不要。xv6fs から読んだバッファは pmm 返却
+void fs_free_exec_buffer(const char* path, void* data, size_t size) {
+    void* embedded = 0;
+    size_t embedded_size = 0;
+    (void)path;
+    if (!data || size == 0) return;
+    if (riscv64_bootstrap_user_file_data("/bootstrap-user", &embedded, &embedded_size) == 0 &&
+        data == embedded) {
+        return;
+    }
+    {
+        size_t npages = (size + PAGE_SIZE - 1U) / PAGE_SIZE;
+        if (npages == 0) npages = 1;
+        pmm_free((void*)VIRT_TO_PHYS((uint64_t)data), (int)npages);
+    }
+}
+
+int sys_getdents(int fd, struct orth_dirent* dirp, size_t count) {
+    struct task* current = get_current_task();
+    file_descriptor_t* f;
+    size_t remaining;
+    size_t to_copy;
+
+    if (!current) return -LINUX_EPERM;
+    if (!dirp) return -LINUX_EFAULT;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -LINUX_EBADF;
+    f = &current->fds[fd];
+    if (f->type != FT_DIR || !fs_fd_data(f)) return -LINUX_ENOTDIR;
+    if (fs_fd_offset(f) >= fs_fd_size(f)) return 0;
+    remaining = fs_fd_size(f) - fs_fd_offset(f);
+    to_copy = (count > remaining) ? remaining : count;
+    for (size_t i = 0; i < to_copy; i++) {
+        ((uint8_t*)dirp)[i] = ((uint8_t*)fs_fd_data(f))[fs_fd_offset(f) + i];
+    }
+    fs_fd_set_offset(f, fs_fd_offset(f) + to_copy);
+    return (int)to_copy;
+}
+
+int sys_getdents64(int fd, void* dirp, size_t count) {
+    struct task* current = get_current_task();
+    file_descriptor_t* f;
+    struct orth_dirent* src;
+    uint8_t* out = (uint8_t*)dirp;
+    size_t out_used = 0;
+    size_t index;
+
+    if (!current) return -LINUX_EPERM;
+    if (!dirp) return -LINUX_EFAULT;
+    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -LINUX_EBADF;
+    f = &current->fds[fd];
+    if (f->type != FT_DIR || !fs_fd_data(f)) return -LINUX_ENOTDIR;
+    if (fs_fd_offset(f) >= fs_fd_size(f)) return 0;
+
+    src = (struct orth_dirent*)fs_fd_data(f);
+    index = fs_fd_offset(f) / sizeof(struct orth_dirent);
+
+    while ((index + 1) * sizeof(struct orth_dirent) <= fs_fd_size(f)) {
+        struct linux_dirent64 ent;
+        size_t name_len = 0;
+        size_t reclen;
+        size_t next_off;
+
+        for (size_t i = 0; i < sizeof(ent); i++) ((uint8_t*)&ent)[i] = 0;
+        while (src[index].name[name_len] && name_len + 1 < sizeof(ent.d_name)) {
+            ent.d_name[name_len] = src[index].name[name_len];
+            name_len++;
+        }
+        ent.d_name[name_len] = '\0';
+        ent.d_ino = (uint64_t)index + 1;
+        next_off = (index + 1) * sizeof(struct orth_dirent);
+        ent.d_off = (int64_t)next_off;
+        ent.d_type = riscv64_fs_dirent_type(src[index].mode);
+        reclen = offsetof(struct linux_dirent64, d_name) + name_len + 1;
+        reclen = (reclen + 7U) & ~7U;
+        ent.d_reclen = (uint16_t)reclen;
+
+        if (out_used + reclen > count) break;
+        for (size_t i = 0; i < reclen; i++) {
+            out[out_used + i] = ((uint8_t*)&ent)[i];
+        }
+        out_used += reclen;
+        index++;
+    }
+
+    fs_fd_set_offset(f, index * sizeof(struct orth_dirent));
+    return (int)out_used;
+}

@@ -1,0 +1,244 @@
+/*
+ * フレームバッファのテキストコンソール。**カーネルのログを HDMI にも出す。**
+ *
+ * シリアルは残す。**画面はシリアルの代わりではなく、増設**である:
+ *   - 実機で画面だけ見たいとき (変換器を繋がずに済む)
+ *   - 画面が出ていること自体が、フレームバッファの健全性の確認になる
+ *
+ * ---- 描き方 ----------------------------------------------------------------
+ *
+ * 字形は kernel/aarch64/font12x24.c (scripts/gen_font12x24.py が生成)。
+ * **1024x768 で等倍 12x24 = 85 桁 x 32 行。**
+ *
+ * 以前は 8x8 を 2 倍に引き伸ばして 16x16 の升目にしていた。**縦の情報量が
+ * 8 ドットしか無いものを 2 倍にしても情報は増えない**ので、角ばって読み
+ * にくかった。12x24 は本物の字形なので、拡大せずにそのまま描く。
+ *
+ * ---- 遅さについて ----------------------------------------------------------
+ *
+ * **フレームバッファは Normal NC (キャッシュ無効) で張ってある** ので、
+ * 読み書きはどちらも DRAM に直行する。とくにスクロールは画面 1 枚ぶんを
+ * 読んで書くので重い。**64 ビット単位でまとめて動かして回数を減らしている。**
+ *
+ * それでも起動ログを全部流すと目に見えて時間がかかる。**シリアルの方が
+ * 速いので、速さが要る場面ではそちらを見ること。**
+ */
+#include <stdint.h>
+#include "aarch64/fb.h"
+#include "aarch64/boot.h"
+#include "aarch64/vm.h"
+
+/* 96 個目は「表に無い文字」の升目 (scripts/gen_font12x24.py) */
+#define FONT_MISSING 95
+/* **1 行 16bit で、上位 12bit が字形 (bit15 が左端)** */
+extern const uint16_t aarch64_font12x24[96][24];
+
+#define FONT_W 12U
+#define FONT_H 24U
+
+/* 拡大率。**本物の 12x24 字形なので等倍。**1024x768 で 85 桁 x 32 行 */
+#define AARCH64_FBCON_SCALE 1U
+
+#define FBCON_FG 0x00c8c8c8U     /* 明るすぎない灰。白は目が疲れる */
+#define FBCON_BG 0x00000000U
+
+static int      g_ready;
+static uint32_t g_cols, g_rows;
+static uint32_t g_col, g_row;
+static uint32_t g_stride;        /* 1 行 (画素) */
+static uint32_t g_cell_w, g_cell_h;
+
+/* fb.c と同じ理屈。**MMU の前後で番地の見え方が変わる。**
+ * 判断は「MMU が入っているか」で行う (vm.h の aarch64_vm_mmu_enabled) */
+static volatile uint32_t* fbcon_ptr(void) {
+    const aarch64_fb_info_t* fb = aarch64_fb_info();
+    if (aarch64_vm_mmu_enabled()) return (volatile uint32_t*)(uintptr_t)AARCH64_FB_VA_BASE;
+    return (volatile uint32_t*)(uintptr_t)fb->base;
+}
+
+static void fbcon_clear_rows(uint32_t y0, uint32_t rows_px) {
+    volatile uint32_t* p = fbcon_ptr();
+    const aarch64_fb_info_t* fb = aarch64_fb_info();
+    uint32_t x, y;
+    for (y = y0; y < y0 + rows_px && y < fb->height; y++) {
+        for (x = 0; x < fb->width; x++) p[y * g_stride + x] = FBCON_BG;
+    }
+}
+
+void aarch64_fbcon_init(void) {
+    const aarch64_fb_info_t* fb = aarch64_fb_info();
+    g_ready = 0;
+    if (!fb || fb->base == 0 || fb->pitch == 0) return;
+
+    g_stride = fb->pitch / 4U;
+    g_cell_w = FONT_W * AARCH64_FBCON_SCALE;
+    g_cell_h = FONT_H * AARCH64_FBCON_SCALE;
+    g_cols = fb->width / g_cell_w;
+    g_rows = fb->height / g_cell_h;
+    if (g_cols == 0 || g_rows == 0) return;
+
+    g_col = g_row = 0;
+    fbcon_clear_rows(0, fb->height);
+    g_ready = 1;
+}
+
+int aarch64_fbcon_ready(void) { return g_ready; }
+uint32_t aarch64_fbcon_cols(void) { return g_cols; }
+uint32_t aarch64_fbcon_rows(void) { return g_rows; }
+
+static void fbcon_draw_glyph(uint32_t cx, uint32_t cy, char ch) {
+    volatile uint32_t* p = fbcon_ptr();
+    const uint16_t* g;
+    uint32_t gx, gy, sx, sy;
+    uint32_t px0 = cx * g_cell_w;
+    uint32_t py0 = cy * g_cell_h;
+    unsigned char c = (unsigned char)ch;
+
+    /* **升目の外には決して書かない (F-1)。**
+     *
+     * 2026-08-26 と 08-27 の実機で、ここが画面の 1 行下 (y=768) に書いて
+     * 落ちた。**1024x768 の画面は 0x300000 バイトで、FAR は 0x300030** —
+     * ちょうど 1 行ぶん外の、左から 2 升目。
+     *
+     * 本当の原因は下の 2 つ (newline の作り直しと putc の排他) で潰したが、
+     * **状態がどう壊れても画面の外に書かない**ことは、ここで独立に
+     * 保証しておく価値がある。表示が欠けるのは我慢できるが、
+     * カーネルが落ちるのは我慢できない。 */
+    if (cx >= g_cols || cy >= g_rows) return;
+
+    /* **表に無い文字は空白にしない。** 「字が無い」と「空白」を混ぜると
+     * 化けに気づけない。専用の升目を出す。
+     *
+     * **日本語 (UTF-8) はここを通る。** 1 文字が 3 バイトなので升目が
+     * 3 つ並ぶ。起動ログの説明文はほぼこれになる */
+    if (c < 0x20 || c > 0x7e) {
+        g = aarch64_font12x24[FONT_MISSING];
+    } else {
+        g = aarch64_font12x24[c - 0x20];
+    }
+
+    for (gy = 0; gy < FONT_H; gy++) {
+        uint16_t bits = g[gy];
+        for (gx = 0; gx < FONT_W; gx++) {
+            /* **bit15 が左端。**下位 4bit は使わない (12bit を 16bit に収めている) */
+            uint32_t v = (bits & (0x8000U >> gx)) ? FBCON_FG : FBCON_BG;
+            for (sy = 0; sy < AARCH64_FBCON_SCALE; sy++) {
+                uint32_t row = (py0 + gy * AARCH64_FBCON_SCALE + sy) * g_stride
+                             + px0 + gx * AARCH64_FBCON_SCALE;
+                for (sx = 0; sx < AARCH64_FBCON_SCALE; sx++) p[row + sx] = v;
+            }
+        }
+    }
+}
+
+/* 1 行ぶん上へずらす。
+ *
+ * **64 ビット単位で動かす。** NC のフレームバッファは 1 回の読み書きが
+ * そのまま DRAM に出るので、32 ビットずつだと回数が倍になる。
+ * ピッチは 4 の倍数だが 8 の倍数とは限らないので、端数は 32 ビットで拾う */
+static void fbcon_scroll(void) {
+    const aarch64_fb_info_t* fb = aarch64_fb_info();
+    volatile uint32_t* p = fbcon_ptr();
+    uint32_t move_px = (g_rows - 1U) * g_cell_h;
+    uint32_t y, x;
+    uint32_t pairs = fb->width / 2U;
+
+    for (y = 0; y < move_px; y++) {
+        volatile uint64_t* dst = (volatile uint64_t*)(p + y * g_stride);
+        volatile uint64_t* src = (volatile uint64_t*)(p + (y + g_cell_h) * g_stride);
+        for (x = 0; x < pairs; x++) dst[x] = src[x];
+        if (fb->width & 1U) {
+            p[y * g_stride + fb->width - 1U] = p[(y + g_cell_h) * g_stride + fb->width - 1U];
+        }
+    }
+    fbcon_clear_rows(move_px, g_cell_h);
+}
+
+/* **g_row が範囲外の値を一瞬でも持たないようにする (F-1)。**
+ *
+ * もとは `if (++g_row >= g_rows) { fbcon_scroll(); g_row = g_rows - 1; }`
+ * だった。これは **g_row = 32 (= g_rows) のまま fbcon_scroll() を呼ぶ。**
+ * スクロールは画面 1 枚を非キャッシュのメモリで写すのでミリ秒かかり、
+ * **その間ずっと「画面の 1 行下」を指した状態が見えていた。**
+ *
+ * 1 コアなら誰も見ないので問題にならない。**4 コアだと、その窓の間に
+ * 別のコアが同じ g_row を読んで描く。** 下の排他で塞いだが、
+ * そもそも壊れた値を持たない形にしておく。 */
+static void fbcon_newline(void) {
+    g_col = 0;
+    if (g_row + 1U >= g_rows) {
+        fbcon_scroll();
+        g_row = g_rows - 1U;
+    } else {
+        g_row++;
+    }
+}
+
+/* **1 文字。ここが唯一の入口。** aarch64_uart_putchar から呼ばれる。
+ * 画面が無い機械では何もしないので、呼び出し側は条件を書かなくてよい。
+ *
+ * ---- UTF-8 の続きバイトは捨てる --------------------------------------------
+ *
+ * **カーネルのログは日本語を含む。**UTF-8 なので 1 文字が 2〜4 バイトに
+ * なるが、8x8 の ASCII フォントしか無いので描けない。
+ *
+ * 素直に 1 バイト 1 升で出すと**1 文字が升目 3 つ**になり、行が伸びて
+ * 桁が崩れる (実測: 説明文の行が折り返して読めなくなった)。
+ *
+ * **先頭バイトだけ升目 1 つを出し、続きバイト (0b10xxxxxx) は捨てる。**
+ * こうすると 1 文字 = 升目 1 つになり、**数値や ASCII の桁が揃ったまま
+ * 残る。**読めないことに変わりはないが、読める部分が読めるようになる。
+ *
+ * **空白にはしない。**「字が無い」と「空白」を混ぜると化けに気づけない */
+/* ---- 排他 (F-1) -----------------------------------------------------------
+ *
+ * **g_row / g_col / 画面そのものを、複数のコアが同時に触っていた。**
+ *
+ * `aarch64_uart_puts` は aarch64_console_begin/end で囲んであるが、
+ * **`aarch64_uart_putchar` と `aarch64_uart_putdec64` は囲んでいない**
+ * (boot.c)。この 2 つもここへ落ちてくるので、囲まれた書き手と囲まれて
+ * いない書き手が同時に走る。実機のログに
+ *
+ *     [ep0] seq=13 slot=1 IN  bReq=0x00 wIndex=1 idx0=  part 39    : type=
+ *
+ * と 2 人ぶんが混ざっていたのが、その場に居た証拠。
+ *
+ * **新しいロックを足さず、コンソールのものを使う。**理由が 2 つある:
+ *
+ *   - **同じ CPU からの再入を許す作りになっている** (owner + depth)。
+ *     puts の途中から putchar 経由でここへ来るし、'\t' はこの関数自身を
+ *     呼び戻す。素の spinlock だと自分で自分を待って止まる
+ *   - **IRQ を止めっぱなしにしない。** スクロールはミリ秒かかるので、
+ *     その間 IRQ を閉じると SD の完了もタイマも取り逃す
+ *
+ * **try 方式にはしない。**取れなかったときに落とす手もあるが、画面から
+ * 文字が虫食いで消えると「壊れている」のか「出していない」のか
+ * 区別できなくなる。画面は遅くてよい。 */
+static void fbcon_putc_locked(char c);
+
+void aarch64_fbcon_putc(char c) {
+    if (!g_ready) return;
+
+    aarch64_console_begin();
+    fbcon_putc_locked(c);
+    aarch64_console_end();
+}
+
+static void fbcon_putc_locked(char c) {
+    unsigned char u = (unsigned char)c;
+
+    if (c == '\n') { fbcon_newline(); return; }
+    if (c == '\r') { g_col = 0; return; }
+    if (c == '\t') {
+        do { fbcon_putc_locked(' '); } while (g_col & 7U);
+        return;
+    }
+    if (c == '\b') { if (g_col > 0) g_col--; return; }
+
+    /* UTF-8 の続きバイト。**先頭バイトで 1 つ出したので、ここは捨てる** */
+    if ((u & 0xc0U) == 0x80U) return;
+
+    if (g_col >= g_cols) fbcon_newline();
+    fbcon_draw_glyph(g_col, g_row, c);
+    g_col++;
+}

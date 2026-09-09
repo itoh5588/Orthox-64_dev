@@ -1,0 +1,11 @@
+*rename_lib:
+old_lib
+
+*lib:
+/Users/itoh/orthOS-64/user/syscalls.o /Users/itoh/orthOS-64/ports/user_stubs.o -lc
+
+*rename_startfile:
+old_startfile
+
+*startfile:
+/Users/itoh/orthOS-64/user/crt0.o

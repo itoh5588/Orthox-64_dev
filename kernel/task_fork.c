@@ -1,0 +1,108 @@
+#include <stdint.h>
+#include <stddef.h>
+#include "kassert.h"
+#include "task_internal.h"
+#include "pmm.h"
+#include "vmm.h"
+#include "fs.h"
+
+extern struct task* task_list;
+
+static void kernel_strcpy(char* dst, const char* src, size_t size) {
+    size_t i = 0;
+    if (!dst || size == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    while (src[i] && i + 1 < size) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+int task_fork(arch_syscall_frame_t* frame) {
+    struct task* parent = get_current_task();
+    struct task* child;
+    uint32_t spawn_cpu;
+    void* kstack_phys;
+    uint64_t flags;
+    KASSERT(parent != 0);
+    KASSERT(frame != 0);
+    KASSERT(arch_task_context_get_address_space(&parent->ctx) != 0);
+    // The heavy setup below (address-space copy, kernel stack, fd clone) runs
+    // outside g_task_lock: the parent is blocked here and the big kernel lock
+    // already serializes it against other syscalls. Holding g_task_lock with
+    // IRQs off across vmm_copy_pml4 would stall every other CPU's scheduler
+    // tick for the whole copy. Only the final publish needs the lock.
+    child = task_alloc_struct();
+    if (!child) {
+        return -1;
+    }
+    child->ppid = parent->pid;
+    child->pgid = parent->pgid;
+    child->sid = parent->sid;
+    child->sig_pending = 0;
+    child->sig_mask = parent->sig_mask;
+    for (int i = 0; i < 32; i++) {
+        child->sig_handlers[i] = parent->sig_handlers[i];
+        child->sig_action_masks[i] = parent->sig_action_masks[i];
+        child->sig_action_flags[i] = parent->sig_action_flags[i];
+    }
+    child->heap_break = parent->heap_break;
+    child->mmap_end = parent->mmap_end;
+    child->umask = parent->umask;    /* umask は fork で引き継ぐ */
+    child->user_entry = parent->user_entry;
+    child->user_stack = parent->user_stack;
+    child->user_stack_top = parent->user_stack_top;
+    child->user_stack_bottom = parent->user_stack_bottom;
+    child->user_stack_guard = parent->user_stack_guard;
+    child->user_fs_base = parent->user_fs_base;
+    child->tls_vaddr = parent->tls_vaddr;
+    child->tls_filesz = parent->tls_filesz;
+    child->tls_memsz = parent->tls_memsz;
+    child->tls_align = parent->tls_align;
+    child->timeslice_ticks = TASK_TIMESLICE_TICKS;
+    arch_address_space_t child_as = arch_vm_clone_address_space(arch_task_context_get_address_space(&parent->ctx));
+    arch_task_context_set_address_space(&child->ctx, child_as);
+    if (!child_as) {
+        task_free_struct(child);
+        return -1;
+    }
+    kernel_strcpy(child->cwd, parent->cwd, sizeof(child->cwd));
+    kstack_phys = pmm_alloc(4);
+    if (!kstack_phys) {
+        arch_vm_destroy_user_address_space(child_as);
+        task_free_struct(child);
+        return -1;
+    }
+    child->kstack_top = (uint64_t)PHYS_TO_VIRT(kstack_phys) + 4 * PAGE_SIZE;
+    child->os_stack_ptr = child->kstack_top;
+    arch_task_commit_fork_child(&child->ctx, child->kstack_top, &parent->ctx, frame);
+    for (int i = 0; i < MAX_FDS; i++) {
+        if (fs_clone_fd(&child->fds[i], &parent->fds[i]) < 0) {
+            for (int j = 0; j < i; j++) {
+                fs_release_fd(&child->fds[j]);
+            }
+            if (arch_task_context_get_address_space(&child->ctx) && arch_task_context_get_address_space(&child->ctx) != arch_vm_kernel_address_space()) {
+                arch_vm_destroy_user_address_space(child_as);
+            }
+            pmm_free((void*)VIRT_TO_PHYS(child->kstack_top - 4 * PAGE_SIZE), 4);
+            task_free_struct(child);
+            return -1;
+        }
+    }
+    KASSERT(child->kstack_top != 0);
+    KASSERT(arch_task_context_get_address_space(&child->ctx) != 0);
+    flags = task_lock_irqsave();
+    child->pid = task_next_pid_locked();
+    spawn_cpu = task_choose_fork_cpu_locked((uint32_t)parent->cpu_affinity);
+    task_mark_ready_on_cpu_locked_internal(child, spawn_cpu);
+    child->next = task_list;
+    task_list = child;
+    task_rebalance_ready_task_locked_internal(child);
+    task_unlock_irqrestore(flags);
+    task_request_resched_cpu((uint32_t)child->cpu_affinity);
+    return child->pid;
+}

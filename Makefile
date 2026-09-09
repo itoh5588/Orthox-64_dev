@@ -1,0 +1,1677 @@
+# OS 判定
+UNAME_S := $(shell uname -s)
+
+# コンパイラ設定
+CC = clang
+LD = lld -flavor gnu
+TARGET = x86_64-elf
+XGCC = x86_64-elf-gcc
+XAR = x86_64-elf-ar
+
+# RISC-V 64 ツールチェーン (homebrew LLVM clang を優先)
+RISCV64_CC = $(shell if [ -x /opt/homebrew/opt/llvm/bin/clang ]; then printf /opt/homebrew/opt/llvm/bin/clang; \
+	elif [ -x /usr/local/opt/llvm/bin/clang ]; then printf /usr/local/opt/llvm/bin/clang; \
+	else printf clang; fi)
+RISCV64_OBJCOPY = $(shell if [ -x /opt/homebrew/opt/llvm/bin/llvm-objcopy ]; then printf /opt/homebrew/opt/llvm/bin/llvm-objcopy; \
+	elif [ -x /usr/local/opt/llvm/bin/llvm-objcopy ]; then printf /usr/local/opt/llvm/bin/llvm-objcopy; \
+	else printf llvm-objcopy; fi)
+RISCV64_LLVM_AR = $(shell if [ -x /opt/homebrew/opt/llvm/bin/llvm-ar ]; then printf /opt/homebrew/opt/llvm/bin/llvm-ar; \
+	elif [ -x /usr/local/opt/llvm/bin/llvm-ar ]; then printf /usr/local/opt/llvm/bin/llvm-ar; \
+	else printf llvm-ar; fi)
+RISCV64_LLVM_RANLIB = $(shell if [ -x /opt/homebrew/opt/llvm/bin/llvm-ranlib ]; then printf /opt/homebrew/opt/llvm/bin/llvm-ranlib; \
+	elif [ -x /usr/local/opt/llvm/bin/llvm-ranlib ]; then printf /usr/local/opt/llvm/bin/llvm-ranlib; \
+	else printf llvm-ranlib; fi)
+
+BUILD_DIR = build
+USER_BUILD_DIR = $(BUILD_DIR)/musl/user
+
+# フラグ
+KERNEL_CFLAGS = -target $(TARGET) -std=c11 -ffreestanding -fno-stack-protector -fno-stack-check \
+	-fno-lto -fno-PIE -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
+	-mcmodel=kernel -O2 -Wall -Wextra -Iinclude -Iports/lwip/src/include -MMD -MP
+KERNEL_CFLAGS += $(KERNEL_CFLAGS_EXTRA)
+
+KERNEL_LDFLAGS = -nostdlib -static -T scripts/kernel.ld
+
+# 調査用に一時的なフラグを足す口 (例: RISCV64_EXTRA_CFLAGS=-DRISCV64_SYSCALL_TRACE=1)
+RISCV64_EXTRA_CFLAGS ?=
+RISCV64_CFLAGS = --target=riscv64-none-elf -march=rv64gc -mabi=lp64 -ffreestanding \
+	-fno-stack-protector -fno-stack-check -fno-lto -fno-PIE -mcmodel=medany -O2 -Wall -Wextra \
+	-Iinclude -MMD -MP $(RISCV64_EXTRA_CFLAGS)
+# ブート時に /bootstrap-user へ渡す argv (例: make riscv64-ash-run は sh を渡す)
+RISCV64_BOOTSTRAP_ARG0_VALUE ?=
+RISCV64_BOOTSTRAP_ARG1_VALUE ?=
+RISCV64_BOOTSTRAP_ARG2_VALUE ?=
+RISCV64_BOOTSTRAP_ARG3_VALUE ?=
+ifneq ($(RISCV64_BOOTSTRAP_ARG0_VALUE),)
+RISCV64_CFLAGS += '-DRISCV64_BOOTSTRAP_ARG0="$(RISCV64_BOOTSTRAP_ARG0_VALUE)"'
+endif
+ifneq ($(RISCV64_BOOTSTRAP_ARG1_VALUE),)
+RISCV64_CFLAGS += '-DRISCV64_BOOTSTRAP_ARG1="$(RISCV64_BOOTSTRAP_ARG1_VALUE)"'
+endif
+ifneq ($(RISCV64_BOOTSTRAP_ARG2_VALUE),)
+RISCV64_CFLAGS += '-DRISCV64_BOOTSTRAP_ARG2="$(RISCV64_BOOTSTRAP_ARG2_VALUE)"'
+endif
+ifneq ($(RISCV64_BOOTSTRAP_ARG3_VALUE),)
+RISCV64_CFLAGS += '-DRISCV64_BOOTSTRAP_ARG3="$(RISCV64_BOOTSTRAP_ARG3_VALUE)"'
+endif
+RISCV64_CFLAGS += $(RISCV64_CFLAGS_EXTRA)
+RISCV64_LDFLAGS = -nostdlib -static -m elf64lriscv -T scripts/kernel-riscv64.ld
+RISCV64_USER_CFLAGS = --target=riscv64-none-elf -march=rv64gc -mabi=lp64 -ffreestanding \
+	-fno-stack-protector -fno-lto -fno-PIE -O2 -Wall -Wextra -Iinclude -MMD -MP
+RISCV64_USER_LDFLAGS = -nostdlib -static -m elf64lriscv --entry=_start -Ttext 0x400000
+
+RISCV64_MUSL_SYSROOT = ports/musl-install-riscv64
+RISCV64_MUSL_CFLAGS = --target=riscv64-linux-musl -march=rv64gc -mabi=lp64d -ffreestanding \
+	-fno-PIE -O2 -I$(RISCV64_MUSL_SYSROOT)/include -MMD -MP
+RISCV64_MUSL_LDFLAGS = -nostdlib -static -m elf64lriscv --entry=_start -Ttext 0x400000
+
+# libc / sysroot 設定
+LIBC_IMPL = musl
+MUSL_SYSROOT = ports/musl-install
+USER_SYSROOT = $(MUSL_SYSROOT)
+
+USER_INCLUDEDIR = $(USER_SYSROOT)/include
+USER_LIBDIR = $(USER_SYSROOT)/lib
+LIBC = $(USER_LIBDIR)/libc.a
+
+# ユーザープログラム用フラグ
+USER_CFLAGS = -target $(TARGET) -std=c11 -ffreestanding -fno-PIE -O2 \
+	-Iinclude -I$(USER_INCLUDEDIR) -MMD -MP
+
+USER_LDFLAGS = -m elf_x86_64 -nostdlib -static -Ttext 0x400000
+
+# x86_64-elf-gcc が無い環境では host clang/gcc の libgcc を使う
+LIBGCC = 
+
+# 出力ファイル名
+KERNEL_ELF = kernel.elf
+RISCV64_KERNEL_ELF = out/kernel-riscv64.elf
+RISCV64_MUSL_PROBE_ELF = out/riscv64-musl-probe.elf
+RISCV64_PREEMPT_PROBE_ELF = out/riscv64-preempt-probe.elf
+RISCV64_SLEEP_PROBE_ELF = out/riscv64-sleep-probe.elf
+RISCV64_ERRNO_PROBE_ELF = out/riscv64-errno-probe.elf
+RISCV64_OFFSET_PROBE_ELF = out/riscv64-offset-probe.elf
+RISCV64_BOOTSTRAP_USER_BUILD_ELF = out/bootstrap-user-riscv64-default.elf
+# 埋め込み対象の外部ユーザー ELF (差し替え可能)
+RISCV64_BOOTSTRAP_USER_SRC_ELF ?= $(RISCV64_BOOTSTRAP_USER_BUILD_ELF)
+# objcopy のシンボル名を安定させるため固定パスへコピーしてから埋め込む
+RISCV64_BOOTSTRAP_USER_EMBED_ELF = out/bootstrap-user-riscv64.elf
+PIPE_TEST_ELF = user/pipetest.elf
+PIPE_STRESS_ELF = user/pipestress.elf
+PIPEEND_PROBE_ELF = user/pipeend_probe.elf
+SMP_STRESS_ELF = user/smpstress.elf
+SCHEDMIX_ELF = user/schedmix.elf
+REAP_TEST_ELF = user/reaptest.elf
+SH_ELF = user/sh.elf
+AT_TEST_ELF = user/at_test.elf
+WADSTDIO_TEST_ELF = user/wadstdio_test.elf
+LOOP_ELF = user/loop.elf
+VRAM_TEST_ELF = user/testvram.elf
+TIME_TEST_ELF = user/testtime.elf
+SHOWCPU_ELF = user/showcpu.elf
+RUNQSTAT_ELF = user/runqstat.elf
+TCPHELLO_ELF = user/tcphello.elf
+FORKCPU_TEST_ELF = user/forkcputest.elf
+FORKMODE_ELF = user/forkmode.elf
+KEY_TEST_ELF = user/testkey.elf
+SOUND_TEST_ELF = user/testsound.elf
+SIGNAL_TEST_ELF = user/signaltest.elf
+TTY_TEST_ELF = user/ttytest.elf
+SIGMASK_TEST_ELF = user/sigmasktest.elf
+SIGACTION_TEST_ELF = user/sigactiontest.elf
+FCHDIR_TEST_ELF = user/fchdirtest.elf
+TTYLINK_TEST_ELF = user/ttylinktest.elf
+MKDIR_TEST_ELF = user/mkdirtest.elf
+WADHEAD_TEST_ELF = user/wadheadtest.elf
+TICKRATE_TEST_ELF = user/tickratecheck.elf
+UDP_ECHO_TEST_ELF = user/udpecho.elf
+UDP_NB_TEST_ELF = user/udpnb.elf
+HTTPS_FETCH_ELF = user/httpsfetch.elf
+STATERRNO_ELF = user/staterrno.elf
+PYENC_CHECK_ELF = user/pyenccheck.elf
+MUSL_DIRCHECK_ELF = user/musldircheck.elf
+MUSL_FORKPROBE_ELF = user/muslforkprobe.elf
+MUSL_EXECPROBE_ELF = user/muslexecprobe.elf
+MUSL_ENVSHOW_ELF = user/muslenvshow.elf
+VBLK_TEST_ELF = user/vblk_test.elf
+VBLK_STRESS_ELF = user/vblkstress.elf
+KILO_ELF = user/kilo.elf
+FILE_ELF = user/file.elf
+VMERRNO_TEST_ELF = user/vmerrno_test.elf
+COWTEST_ELF = user/cowtest.elf
+FTRUNCSAVE_TEST_ELF = user/ftruncsave_test.elf
+PREADPWRITE_TEST_ELF = user/preadpwrite_test.elf
+XV6_SPARSE_TEST_ELF = user/xv6_sparse_test.elf
+XV6_RECLAIM_TEST_ELF = user/xv6_reclaim_test.elf
+XV6_LARGEWRITE_TEST_ELF = user/xv6_largewrite_test.elf
+HELLO_DYN_ELF = user/hello_dyn.elf
+DYNLINK_LIB_A_SO = user/libdyn_a.so
+DYNLINK_LIB_B_SO = user/libdyn_b.so
+DYNLINK_PLUGIN_SO = user/libdyn_plugin.so
+DYNLINK_CPP_SO = user/libdyn_cpp.so
+DYNLINK_MULTI_TLS_ELF = user/dynlink_multi_tls.elf
+DYNLINK_DLOPEN_ELF = user/dynlink_dlopen.elf
+DYNLINK_MALLOC_ELF = user/dynlink_malloc.elf
+BUSYBOX_ASH_DYN_ELF = user/busybox-ash-dyn.elf
+GCC_DYN_ELF = user/gcc-dyn.elf
+RUST_HELLO_STD_ELF = ports/rust/hello_std
+GCC_MUSL_ELF = user/gcc.elf
+CC1_MUSL_ELF = user/cc1.elf
+AS_MUSL_ELF = user/as.elf
+LD_MUSL_ELF = user/ld.elf
+MAKE_MUSL_ELF = user/make.elf
+DOOM_MUSL_ELF = user/doomgeneric.elf
+BUSYBOX_ASH_MUSL_ELF = user/busybox-ash.elf
+BUSYBOX_ASH_APPLETS = ash sh busybox cat chmod cp echo env false head httpd ls mkdir mv printenv printf pwd rm rmdir stat tail test touch true wc
+ISO = orthos.iso
+ROOTFS_IMG = rootfs.img
+XV6FS_IMG  = rootfs-xv6.img
+ROOTFS_FILES = $(shell find rootfs -type f 2>/dev/null)
+ROOTFS_REBUILD ?= 1
+ROOTFS_VBLK_ARGS = -drive if=none,id=rootfs,file=$(ROOTFS_IMG),format=raw -device virtio-blk-pci,drive=rootfs
+
+# ソース
+# ---- x86_64 の実装 ---------------------------------------------------------
+# **kernel/x86_64/ に置いてあるものが x86 依存。**2026-09-07 に kernel/ 直下
+# から移した。それまでは「アーキに依らない層」と「x86 の実装」が同じ
+# ディレクトリに居て、**どちらの層なのかは Makefile のこのリストを読むまで
+# 分からなかった** (同名の別実装が 18 種あった)。置き場が層を表すようにする。
+X86_64_SRCS = kernel/x86_64/init.c kernel/x86_64/kassert.c kernel/x86_64/pmm.c \
+	kernel/x86_64/gdt.c kernel/x86_64/gdt_flush.S kernel/x86_64/vmm.c \
+	kernel/x86_64/idt.c kernel/x86_64/interrupt.S kernel/x86_64/lapic.c \
+	kernel/x86_64/pic.c kernel/x86_64/smp.c kernel/x86_64/spinlock.c \
+	kernel/x86_64/syscall_entry.S kernel/x86_64/task_switch.S \
+	kernel/x86_64/keyboard.c kernel/x86_64/pci.c kernel/x86_64/sound.c \
+	kernel/x86_64/uname.c kernel/x86_64/rng.c \
+	kernel/x86_64/sys_vm.c kernel/x86_64/sys_time.c kernel/x86_64/sys_device.c \
+	kernel/x86_64/syscall_msr.c \
+	kernel/x86_64/virtio.c kernel/x86_64/virtio_net.c kernel/x86_64/virtio_blk.c
+
+# ---- syscall 層 ------------------------------------------------------------
+# **x86 だけが使っているが、x86 依存ではない。**同じ syscall を aarch64 と
+# riscv64 は kernel/linux_syscall.c (2399 行) で実装していて、**二重になって
+# いる** (mmap は sys_vm.c 側と linux_syscall.c 側の両方にある)。
+# **x86_64/ へ移すと「x86 専用」と誤って固定してしまう**ので、統合するまで
+# kernel/ 直下に置いたままにする
+SYSCALL_SRCS = kernel/syscall.c kernel/sys_trace.c kernel/sys_signal.c \
+	kernel/sys_proc.c kernel/sys_fs.c kernel/sys_random.c kernel/sys_net.c \
+	kernel/irq.c kernel/bottom_half.c
+
+# ---- アーキに依らない層 ----------------------------------------------------
+# **aarch64 / riscv64 も同じものを組んでいる** (AARCH64_SHARED_C_SRCS /
+# RISCV64_SHARED_C_SRCS を参照)
+CORE_SRCS = kernel/elf.c kernel/task.c kernel/task_exec.c kernel/task_fork.c \
+	kernel/sched.c kernel/wait.c kernel/fs.c kernel/vfs.c kernel/storage.c \
+	kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c kernel/net.c \
+	kernel/net_socket.c kernel/lwip_port.c kernel/cstring.c kernel/cstdio.c \
+	kernel/cstdlib.c kernel/usb.c
+
+SRCS = $(X86_64_SRCS) $(SYSCALL_SRCS) $(CORE_SRCS)
+
+RISCV64_C_SRCS = kernel/riscv64/boot.c kernel/riscv64/bootstrap_user.c kernel/riscv64/elf.c \
+	kernel/riscv64/entry.c kernel/riscv64/fs.c kernel/riscv64/net_socket.c kernel/riscv64/plic.c kernel/riscv64/pmm.c \
+	kernel/riscv64/runtime.c kernel/riscv64/smp.c kernel/riscv64/task.c kernel/riscv64/trap.c kernel/riscv64/syscall.c \
+	kernel/riscv64/virtio_blk_mmio.c kernel/riscv64/vm.c
+RISCV64_SHARED_C_SRCS = kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c \
+	kernel/linux_syscall.c \
+	kernel/wait.c kernel/elf.c kernel/cstring.c kernel/cstdio.c \
+	kernel/storage.c kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c
+RISCV64_ASM_SRCS = kernel/riscv64/start.S kernel/riscv64/trap.S kernel/riscv64/entry.S
+
+LWIP_CORE_SRCS = \
+	ports/lwip/src/core/def.c \
+	ports/lwip/src/core/dns.c \
+	ports/lwip/src/core/inet_chksum.c \
+	ports/lwip/src/core/init.c \
+	ports/lwip/src/core/ip.c \
+	ports/lwip/src/core/mem.c \
+	ports/lwip/src/core/memp.c \
+	ports/lwip/src/core/netif.c \
+	ports/lwip/src/core/pbuf.c \
+	ports/lwip/src/core/raw.c \
+	ports/lwip/src/core/stats.c \
+	ports/lwip/src/core/sys.c \
+	ports/lwip/src/core/tcp.c \
+	ports/lwip/src/core/tcp_in.c \
+	ports/lwip/src/core/tcp_out.c \
+	ports/lwip/src/core/timeouts.c \
+	ports/lwip/src/core/udp.c
+LWIP_IPV4_SRCS = \
+	ports/lwip/src/core/ipv4/dhcp.c \
+	ports/lwip/src/core/ipv4/etharp.c \
+	ports/lwip/src/core/ipv4/icmp.c \
+	ports/lwip/src/core/ipv4/ip4.c \
+	ports/lwip/src/core/ipv4/ip4_addr.c
+LWIP_NETIF_SRCS = ports/lwip/src/netif/ethernet.c
+LWIP_SRCS = $(LWIP_CORE_SRCS) $(LWIP_IPV4_SRCS) $(LWIP_NETIF_SRCS)
+BEARSSL_SRCS = $(shell find ports/BearSSL/src -type f -name '*.c' ! -name '._*' 2>/dev/null)
+BEARSSL_OBJS = $(patsubst ports/BearSSL/src/%.c, $(BUILD_DIR)/bearssl/%.o, $(BEARSSL_SRCS))
+BEARSSL_A = $(BUILD_DIR)/bearssl/libbearssl.a
+
+# オブジェクトファイル (build ディレクトリ以下に配置)
+OBJS = $(patsubst kernel/%.c, $(BUILD_DIR)/kernel/%.o, $(filter %.c, $(SRCS))) \
+       $(patsubst kernel/%.S, $(BUILD_DIR)/kernel/%.o, $(filter %.S, $(SRCS))) \
+       $(patsubst ports/lwip/src/%.c, $(BUILD_DIR)/lwip/%.o, $(LWIP_SRCS))
+
+RISCV64_OBJS = $(patsubst kernel/riscv64/%.c, $(BUILD_DIR)/riscv64/kernel/%.o, $(RISCV64_C_SRCS)) \
+	$(patsubst kernel/%.c, $(BUILD_DIR)/riscv64/kernel/shared/%.o, $(RISCV64_SHARED_C_SRCS)) \
+	$(patsubst kernel/riscv64/%.S, $(BUILD_DIR)/riscv64/kernel/%_asm.o, $(RISCV64_ASM_SRCS)) \
+	$(BUILD_DIR)/riscv64/kernel/bootstrap_user_blob.o
+
+DEPS = $(OBJS:.o=.d) \
+       $(USER_BUILD_DIR)/crt0.d $(USER_BUILD_DIR)/syscalls.d $(USER_BUILD_DIR)/syscall_wrap.d \
+       $(USER_BUILD_DIR)/user_test.d $(USER_BUILD_DIR)/exec_test.d $(USER_BUILD_DIR)/pipe_test.d $(USER_BUILD_DIR)/pipestress.d $(USER_BUILD_DIR)/pipeend_probe.d $(USER_BUILD_DIR)/smpstress.d $(USER_BUILD_DIR)/schedmix.d \
+       $(USER_BUILD_DIR)/at_test.d \
+       $(USER_BUILD_DIR)/sh.d $(USER_BUILD_DIR)/gcc.d $(USER_BUILD_DIR)/as.d $(USER_BUILD_DIR)/ld.d \
+       $(USER_BUILD_DIR)/loop.d $(USER_BUILD_DIR)/cowtest.d $(USER_BUILD_DIR)/rotest.d \
+       $(USER_BUILD_DIR)/testvram.d $(USER_BUILD_DIR)/testtime.d $(USER_BUILD_DIR)/testkey.d \
+       $(USER_BUILD_DIR)/showcpu.d $(USER_BUILD_DIR)/runqstat.d $(USER_BUILD_DIR)/tcphello.d \
+       $(USER_BUILD_DIR)/testsound.d $(USER_BUILD_DIR)/mmaptest.d $(USER_BUILD_DIR)/reaptest.d \
+       $(USER_BUILD_DIR)/robusttest.d $(USER_BUILD_DIR)/signaltest.d $(USER_BUILD_DIR)/ttytest.d \
+       $(USER_BUILD_DIR)/sigmasktest.d $(USER_BUILD_DIR)/sigactiontest.d \
+       $(USER_BUILD_DIR)/fchdirtest.d $(USER_BUILD_DIR)/ttylinktest.d \
+       $(USER_BUILD_DIR)/mkdirtest.d $(USER_BUILD_DIR)/wadheadtest.d \
+       $(USER_BUILD_DIR)/vmerrno_test.d $(USER_BUILD_DIR)/ftruncsave_test.d \
+       $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
+       $(USER_BUILD_DIR)/vblkstress.d
+
+.PHONY: aarch64-socket-probe aarch64-socket-smoke aarch64-httpsfetch aarch64-https-smoke aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-usb-kbd-smoke aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-netboot aarch64-pi4-smoke aarch64-pi4-qemu-boot aarch64-pi4-sd-smoke aarch64-smp-load riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+
+all: $(ISO)
+
+include mk/user-musl.mk
+
+user/crt0.o: user/crt0.S
+	$(XGCC) -std=c11 -ffreestanding -fno-PIE -O2 -Iinclude -Iports/musl-install/include -c $< -o $@
+
+user/syscalls.o: user/syscalls.c
+	$(XGCC) -std=c11 -ffreestanding -fno-PIE -O2 -Iinclude -Iports/musl-install/include -c $< -o $@
+
+toolchain: toolchain-musl
+
+doom: $(DOOM_MUSL_ELF)
+
+$(DOOM_MUSL_ELF): FORCE
+	@if [ ! -d user/doomgeneric/doomgeneric ]; then \
+		echo "ERROR: DOOM source is missing: user/doomgeneric/doomgeneric" >&2; \
+		echo "Fetch doomgeneric upstream and apply/place the Orthox-64 port before running make doom." >&2; \
+		echo "Example: git clone https://github.com/ozkl/doomgeneric /tmp/doomgeneric" >&2; \
+		echo "Then place the ported source under user/doomgeneric/doomgeneric." >&2; \
+		exit 1; \
+	fi
+	$(MAKE) -C user/doomgeneric/doomgeneric LIBC_IMPL=musl OUTPUT=doomgeneric.elf
+	cp user/doomgeneric/doomgeneric/doomgeneric.elf $(DOOM_MUSL_ELF)
+
+busybox-ash-musl:
+	$(MAKE) -C $(CURDIR) LIBC_IMPL=musl __busybox_ash_musl
+
+busybox-ash-musl-install:
+	$(MAKE) -C $(CURDIR) LIBC_IMPL=musl __busybox_ash_musl_install
+
+$(KERNEL_ELF): $(OBJS)
+	$(LD) $(KERNEL_LDFLAGS) $(OBJS) -o $@
+
+$(BUILD_DIR)/kernel/%.o: kernel/%.c
+	@mkdir -p $(@D)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/kernel/%.o: kernel/%.S
+	@mkdir -p $(@D)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+# ---- AArch64 (QEMU virt) ------------------------------------------------
+# 日報2026-08-02 の段取り 1。virtio-mmio が使えるので M4 で
+# kernel/riscv64/virtio_blk_mmio.c を流用できる。Pi 固有の話は出さない。
+# アドレスは QEMU が吐いた DTB の実測値 (kernel/aarch64/boot.c 冒頭に記録)
+AARCH64_CC = $(RISCV64_CC)
+AARCH64_KERNEL_ELF = out/kernel-aarch64.elf
+AARCH64_C_SRCS = kernel/aarch64/boot.c kernel/aarch64/gic.c kernel/aarch64/timer.c \
+	kernel/aarch64/dtb.c \
+	kernel/aarch64/vm.c kernel/aarch64/usermode.c kernel/aarch64/pmm.c \
+	kernel/aarch64/task.c kernel/aarch64/virtio_blk_mmio.c kernel/aarch64/virtio_net_mmio.c \
+	kernel/aarch64/genet.c kernel/aarch64/net_backend.c kernel/aarch64/rng.c \
+	kernel/aarch64/emmc2.c kernel/aarch64/runtime.c \
+	kernel/aarch64/smp.c \
+	kernel/aarch64/stubs.c kernel/aarch64/syscall.c kernel/aarch64/console.c \
+	kernel/aarch64/mailbox.c kernel/aarch64/fb.c kernel/aarch64/fbcon.c kernel/aarch64/font12x24.c \
+	kernel/aarch64/sound.c \
+	kernel/aarch64/pci.c kernel/aarch64/kbd.c kernel/aarch64/pcie_brcm.c kernel/aarch64/fb_pci.c
+# 共有層のうち、**いま繋がるものだけ**を取り込む (M3c-2a)。
+# どれが入るかは推測せず、llvm-nm -u で未解決シンボルを実測して決めた。
+#
+#   cstring / cstdio / vfs   外部要求ゼロ
+#   storage                  memcpy だけ (cstring が出す)
+#   task / sched / wait      共有タスク層が要る          -> M3c-2b
+#   xv6bio / xv6log / xv6fs  storage の登録と wait が要る -> M4-3
+#   **kassert は使えない**   cli / hlt を直書きしている (x86 専用)。
+#                            kernel_panic は runtime.c に置いた。
+#                            -fsyntax-only では通り -c で落ちるので、
+#                            構文チェックだけで「入る」と判断しないこと
+# **usb.c は共有層に入る。** xHCI の中身 (リング / スロット / TRB) は
+# アーキに依らない。唯一の依存だった 1ms 待ちは USB_NOW_MS() に切り出した
+#
+# **net.c/net_socket.c/lwip_port.c も同様に共有層に入れた (N-9 手1)。**
+# x86 版 kernel/virtio_net.c は PCI 前提で aarch64 では使えないので、
+# 実体は kernel/aarch64/virtio_net_mmio.c (include/virtio_net.h を実装)。
+# lwip_port.c の x86 依存 (lapic / 生 asm の cli/sti) は共有層の
+# arch_time_now_ms / irq_save_disable・irq_restore に切り出して外した
+AARCH64_SHARED_C_SRCS = kernel/usb.c \
+	kernel/cstring.c kernel/cstdio.c kernel/vfs.c kernel/storage.c \
+	kernel/task.c kernel/sched.c kernel/wait.c \
+	kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c \
+	kernel/fs.c kernel/elf.c kernel/task_exec.c kernel/task_fork.c \
+	kernel/linux_syscall.c kernel/sys_fs.c \
+	kernel/net.c kernel/net_socket.c kernel/lwip_port.c kernel/cstdlib.c
+AARCH64_ASM_SRCS = kernel/aarch64/start.S kernel/aarch64/vectors.S \
+	kernel/aarch64/entry.S kernel/aarch64/user_blob.S kernel/aarch64/switch.S
+# -mstrict-align は必須。**MMU を入れる前の C は Device メモリの上で走る。**
+# AArch64 は MMU off のとき全アクセスが Device-nGnRnE 扱いになり、
+# **非整列アクセスは SCTLR_EL1.A に関係なく必ず Alignment fault になる**。
+# これを付けないと clang が局所配列の 0 埋めなどで平気で 4 バイト境界への
+# 8 バイト書き込み (stur xzr, [x13, #0x14]) を出す。
+#
+#   実測: aarch64_dtb_scan で ESR 0x96000061 (DFSC 0x21 = Alignment fault)。
+#   VBAR_EL1 を入れる前なので PC 0x200 で無限ループし **1 文字も出ない**。
+#
+# **QEMU 8.2.2 は Device メモリの整列を強制しないので素通りしていた。**
+# 11.0.3 と実機では落ちる。版が古いほうが甘いので、緩いほうで通ったことを
+# 根拠にしないこと (日報2026-08-13)。
+AARCH64_CFLAGS = --target=aarch64-none-elf -mgeneral-regs-only -mstrict-align \
+	-ffreestanding -fno-stack-protector -fno-stack-check -fno-lto -fno-PIE \
+	-mcmodel=small -O2 -Wall -Wextra -Iinclude -Iports/lwip/src/include -MMD -MP
+# 最初に exec するプログラム。既定は P1 の /bin/hello。
+# P2 のスモークはここを /bin/musl-probe に差し替えて起動する
+AARCH64_INIT_PATH_VALUE ?=
+ifneq ($(AARCH64_INIT_PATH_VALUE),)
+AARCH64_CFLAGS += '-DAARCH64_INIT_PATH="$(AARCH64_INIT_PATH_VALUE)"'
+endif
+# 逆確認用の差し込み口。**検査が本当に火を噴くことを確かめる**のに使う
+# (例: make aarch64-kernel AARCH64_CFLAGS_EXTRA=-DORTHOX_NO_TLS_SWITCH)。
+# **CFLAGS の変更を make は追跡しない**ので、切り替えるときは
+# build/aarch64 を消してから作り直すこと (AARCH64_INIT_PATH_VALUE が
+# init_path.stamp を持っているのと同じ理由)
+AARCH64_CFLAGS_EXTRA ?=
+AARCH64_CFLAGS += $(AARCH64_CFLAGS_EXTRA)
+
+# 物理のロードアドレス。**機械ごとに違う** (scripts/kernel-aarch64.ld の注記)。
+#   QEMU virt          0x40200000  (既定)
+#   Raspberry Pi 3/4   0x00080000  ファームウェアがここへ置いて飛んでくる
+# 例: make aarch64-kernel8 AARCH64_LOAD_PA=0x80000
+AARCH64_LOAD_PA ?= 0x40200000
+# DTB を読む前の出力先。機械ごとに違う (include/aarch64/boot.h の注記)
+#   QEMU virt  0x09000000 (既定) / Pi 3  0x3F201000 / Pi 4  0xFE201000
+# start.S の通過点を UART に直接出す探針。**切り分けのための一時的な道具。**
+# boot.c の最初の puts より前で死ぬと 1 文字も出ないので、そこを測るには
+# start.S から直に PL011 を叩くしかない。
+# 番地は AARCH64_EARLY_UART と同じだが、**.S から使うので ULL の付かない
+# 生の値**を別に渡す (movz/movk の即値に ULL は書けない)
+# 画面へのコンソール出力を切る。**切り分け用。**
+# fbcon の描画で落ちるかを見るときに使う (HDMI を使わないなら実害無し)
+AARCH64_NO_FBCON ?=
+ifneq ($(AARCH64_NO_FBCON),)
+AARCH64_CFLAGS += -DAARCH64_NO_FBCON=1
+endif
+
+# SD (EMMC2) を DMA でなく従来の PIO で動かす。**切り分け用。**
+# ADMA2 + 割り込み完了を入れた後 (M-4c)、遅い側と比べたいときに使う
+AARCH64_EMMC2_PIO ?=
+ifneq ($(AARCH64_EMMC2_PIO),)
+AARCH64_CFLAGS += -DAARCH64_EMMC2_PIO=1
+endif
+
+# caps に ADMA2 が無くても DMA を使う。**QEMU で道を確かめるための道具。**
+# raspi4b が模しているのは旧 arasan で ADMA2 を名乗らないが、QEMU の sdhci の
+# 共通部は ADMA2 を実装している。実機では要らない (EMMC2 は自分で名乗る)
+AARCH64_EMMC2_FORCE_DMA ?=
+ifneq ($(AARCH64_EMMC2_FORCE_DMA),)
+AARCH64_CFLAGS += -DAARCH64_EMMC2_FORCE_DMA=1
+endif
+
+AARCH64_START_PROBE ?=
+ifneq ($(AARCH64_START_PROBE),)
+AARCH64_CFLAGS += -DAARCH64_START_PROBE=1 -DAARCH64_START_PROBE_UART=$(AARCH64_EARLY_UART)
+endif
+
+# **60 秒ごとの計器 ([cpu]/[pc]/[tasks]/[sd]/[pmm]/[log]、USB の heartbeat)。**
+# 性能調査 (P-1/P-10/D-5 など) のために積んだもので、既定では黙る。
+# ash で作業中に 1 分おきへ割り込み、実使用では邪魔になるため (2026-09-04)。
+# 要るときだけ付ける: make aarch64-pi4-boot AARCH64_VERBOSE_DIAG=1
+AARCH64_VERBOSE_DIAG ?=
+ifneq ($(AARCH64_VERBOSE_DIAG),)
+AARCH64_CFLAGS += -DAARCH64_VERBOSE_DIAG=1
+endif
+
+# **EL0 に渡す時刻の表示帯 (TZ)。**カーネルは CLOCK_REALTIME を UTC で
+# 持ったままにして、**見せ方だけ**を変える (時計をずらすと TLS の
+# 証明書の有効期間の判定が狂う)。musl は tzdata が無くても POSIX 形式なら
+# 解釈するので、`Asia/Tokyo` ではなく `JST-9` と書く (符号は POSIX の
+# 決まりで、東経 9 時間が -9)。
+#   別の地域: make aarch64-pi4-netboot ORTHOX_TZ=CET-1
+ORTHOX_TZ ?= JST-9
+AARCH64_CFLAGS += '-DORTHOX_TZ="$(ORTHOX_TZ)"'
+
+# **EL0 に渡す PATH。**busybox 群が /bin、ツールチェーンが /usr/bin。
+#   変えるとき: make aarch64-pi4-netboot ORTHOX_PATH=/bin:/usr/bin:/opt/bin
+ORTHOX_PATH ?= /bin:/usr/bin
+AARCH64_CFLAGS += '-DORTHOX_PATH="$(ORTHOX_PATH)"'
+
+AARCH64_EARLY_UART ?=
+ifneq ($(AARCH64_EARLY_UART),)
+AARCH64_CFLAGS += -DAARCH64_EARLY_UART=$(AARCH64_EARLY_UART)ULL
+endif
+# **CNTFRQ_EL0 は EL3 でしか書けない** (start.S)。EL3 で飛んでくる構成
+# (実機の kernel_old=1 など) でここが 0 のままだと、タイマの計算が全部壊れる。
+# 空なら何もしない。**既に入っている値は上書きしない**ので、armstub や QEMU が
+# 入れてくれる構成では効かない。
+#   Raspberry Pi 4 (BCM2711)  54000000  ← armstub8.S の OSC_FREQ
+AARCH64_CNTFRQ_HZ ?=
+ifneq ($(AARCH64_CNTFRQ_HZ),)
+AARCH64_CFLAGS += -DAARCH64_CNTFRQ_HZ=$(AARCH64_CNTFRQ_HZ)
+endif
+# **EL3 で飛んできたときだけ使う GIC の番地** (start.S)。
+# GICv2 のセキュリティ拡張では GICD_IGROUPR と**セキュア側の GICC** が
+# セキュア側からしか触れず、ここを通らないと非セキュア EL1 は割り込みを
+# 1 本も受け取れない。**両方要る** (実測: GICD だけでは動かなかった)。
+# DTB を読む前なので直書きするしかない。分からなければ空のまま。
+#   QEMU virt          0x08000000 / 0x08010000
+#   Raspberry Pi 4     0xFF841000 / 0xFF842000  (実物の DTB で確認済み)
+#
+# **EL1 / EL2 で来たときは 1 命令も実行されない** (CurrentEL == 3 の中だけ)
+# ので、既定を入れておいても既存の経路には影響しない。
+# AARCH64_LOAD_PA と同じく virt の値を既定にしてある
+AARCH64_EARLY_GICD ?= 0x08000000
+AARCH64_EARLY_GICC ?= 0x08010000
+# **EMMC2 の番地を差し替える検証専用の口。既定では空。**
+# QEMU の raspi4b は SD カードを旧 sdhci (0xFE300000) に繋いでいて EMMC2 は
+# 空なので、ドライバの中身を確かめるときだけここに 0xFE300000 を渡す。
+# **実機向けには渡さない** (実機の 0xFE300000 は WiFi の SDIO)
+# **USB キーボードの探針。** スモークでだけ立てる。通常の起動では
+# 12 秒もキーを待たれると困る
+# **BCM2711 の PCIe を触る探針。既定では無効。**
+# 実測で 4 語目を読むと固まる (2026-08-16、実機)。有効にするときは
+# 巻き戻せる状態で
+# **PWM で 3.5mm ジャックに音を出す。既定では無効。**
+# QEMU の raspi4b は PWM1 (0xFE20C800) を持たないので、触ると
+# external abort で落ちる (ESR=0x96000050)。実機でしか試せない
+AARCH64_SOUND ?=
+ifneq ($(AARCH64_SOUND),)
+AARCH64_CFLAGS += -DAARCH64_SOUND=1
+endif
+
+# **fork の写しの計器 (V-1)。既定では無効。**
+# 60 秒ごとの要約に [fork] n= pages= ms= を 1 行足す。
+# 2026-08-23 の実測では **fork の写しは全体の 0.067%** で、CoW を入れる
+# 価値は無いと分かった。**消さずに残してある** — CoW を検討するときや、
+# ページ複製のコストを疑うときにまた要る (kernel/aarch64/vm.c の注記)
+AARCH64_FORK_STATS ?=
+ifneq ($(AARCH64_FORK_STATS),)
+AARCH64_CFLAGS += -DAARCH64_FORK_STATS=1
+endif
+
+# **音の自己診断。既定では無効。**
+# 3 音 x (1 秒 + 0.5 秒) + 三角波で毎回 4 回鳴り、起動が約 5 秒延びる。
+# **PWM のクロックや FIFO の道を疑うときだけ付ける** (kernel/aarch64/boot.c)
+AARCH64_SOUND_SELFTEST ?=
+ifneq ($(AARCH64_SOUND_SELFTEST),)
+AARCH64_CFLAGS += -DAARCH64_SOUND_SELFTEST=1
+endif
+
+# **BCM2711 の PCIe を立ち上げる。既定では無効。**
+# QEMU で一切検証できないので、実機で 1 段ずつ確かめる用
+# 起こす副コアの上限。**切り分け用。**実機で「まず 1 コアで通るか」を
+# 見るときに AARCH64_SMP_MAX_CPUS=1 を渡す。既定は絞らない
+AARCH64_SMP_MAX_CPUS ?=
+ifneq ($(AARCH64_SMP_MAX_CPUS),)
+AARCH64_CFLAGS += -DAARCH64_SMP_MAX_CPUS=$(AARCH64_SMP_MAX_CPUS)
+endif
+
+AARCH64_PCIE_BRCM_INIT ?=
+ifneq ($(AARCH64_PCIE_BRCM_INIT),)
+AARCH64_CFLAGS += -DAARCH64_PCIE_BRCM_INIT=1
+endif
+
+AARCH64_PCIE_BRCM_PROBE ?=
+ifneq ($(AARCH64_PCIE_BRCM_PROBE),)
+AARCH64_CFLAGS += -DAARCH64_PCIE_BRCM_PROBE=1
+endif
+
+AARCH64_USB_KBD_PROBE ?=
+ifneq ($(AARCH64_USB_KBD_PROBE),)
+AARCH64_CFLAGS += -DAARCH64_USB_KBD_PROBE=1
+endif
+
+AARCH64_EMMC2_BASE ?=
+ifneq ($(AARCH64_EMMC2_BASE),)
+AARCH64_CFLAGS += -DAARCH64_EMMC2_BASE_OVERRIDE=$(AARCH64_EMMC2_BASE)ULL
+endif
+ifneq ($(AARCH64_EARLY_GICD),)
+AARCH64_CFLAGS += -DAARCH64_EARLY_GICD=$(AARCH64_EARLY_GICD)
+endif
+ifneq ($(AARCH64_EARLY_GICC),)
+AARCH64_CFLAGS += -DAARCH64_EARLY_GICC=$(AARCH64_EARLY_GICC)
+endif
+AARCH64_LDFLAGS = -nostdlib -static -m aarch64elf -T scripts/kernel-aarch64.ld \
+	--defsym=AARCH64_LOAD_PA=$(AARCH64_LOAD_PA)
+# **lwIP 本体は x86 と同じソース (LWIP_SRCS) をそのまま使う。**
+# 変えたのはコンパイラと CFLAGS だけ (build/aarch64/lwip/ に分けて置く)
+AARCH64_LWIP_OBJS = $(patsubst ports/lwip/src/%.c, $(BUILD_DIR)/aarch64/lwip/%.o, $(LWIP_SRCS))
+AARCH64_OBJS = $(patsubst kernel/aarch64/%.c, $(BUILD_DIR)/aarch64/kernel/%.o, $(AARCH64_C_SRCS)) \
+	$(patsubst kernel/%.c, $(BUILD_DIR)/aarch64/shared/%.o, $(AARCH64_SHARED_C_SRCS)) \
+	$(patsubst kernel/aarch64/%.S, $(BUILD_DIR)/aarch64/kernel/%_asm.o, $(AARCH64_ASM_SRCS)) \
+	$(AARCH64_LWIP_OBJS)
+
+# ---- CFLAGS が変わったら組み直す ------------------------------------------
+#
+# **make はコマンド行の変化を追わない。** ソースが変わっていなければ、
+# 番地の差し替え (AARCH64_EMMC2_BASE など) や探針の有効化
+# (AARCH64_USB_KBD_PROBE) を指定しても**前のビルドがそのまま使われる。**
+#
+# 実際これで嵌まった: スモークを続けて回すと、**先に回したスモークが
+# 作ったカーネルを次のスモークが使い**、探針が入っていないまま
+# 「探針まで来なかった」で落ちた。**実行順で結果が変わる**状態だった。
+#
+# CFLAGS を書いた印を置き、中身が変わったときだけ更新する。
+# オブジェクトはこれに依存させる
+AARCH64_CFLAGS_STAMP = $(BUILD_DIR)/aarch64/.cflags
+$(shell mkdir -p $(BUILD_DIR)/aarch64)
+$(shell printf '%s' '$(AARCH64_CFLAGS)' > $(BUILD_DIR)/aarch64/.cflags.new;         cmp -s $(BUILD_DIR)/aarch64/.cflags.new $(AARCH64_CFLAGS_STAMP)           || cp $(BUILD_DIR)/aarch64/.cflags.new $(AARCH64_CFLAGS_STAMP);         rm -f $(BUILD_DIR)/aarch64/.cflags.new)
+
+$(BUILD_DIR)/aarch64/kernel/%.o: kernel/aarch64/%.c $(AARCH64_CFLAGS_STAMP)
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/aarch64/shared/%.o: kernel/%.c $(AARCH64_CFLAGS_STAMP)
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/aarch64/kernel/%_asm.o: kernel/aarch64/%.S $(AARCH64_CFLAGS_STAMP)
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/aarch64/lwip/%.o: ports/lwip/src/%.c $(AARCH64_CFLAGS_STAMP)
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_CFLAGS) -c $< -o $@
+
+$(AARCH64_KERNEL_ELF): $(AARCH64_OBJS)
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_LDFLAGS) $(AARCH64_OBJS) -o $@
+
+aarch64-kernel: $(AARCH64_KERNEL_ELF)
+
+# ---- Raspberry Pi 向けの生バイナリ (kernel8.img) --------------------------
+# **Pi のファームウェアは ELF を読まない。** kernel8.img を 0x80000 に置いて
+# そこへ飛ぶだけなので、ELF の区画情報を落とした生イメージが要る。
+#
+# **-O binary は LMA (物理) の順に並べる。** このカーネルは上位 VA でリンクし
+# AT(...) で物理を指定してあるので、VMA で並べると 2^40 の穴が空いて
+# 巨大なファイルになる。objcopy が LMA を見ることに依存している。
+#
+# .bss は含まれない (NOBITS)。start.S が自分で 0 埋めする。
+AARCH64_KERNEL8_IMG = out/kernel8.img
+$(AARCH64_KERNEL8_IMG): $(AARCH64_KERNEL_ELF)
+	@mkdir -p $(@D)
+	llvm-objcopy -O binary $< $@
+	@echo "kernel8.img: $$(stat -c %s $@) バイト (ロード先 $(AARCH64_LOAD_PA))"
+
+aarch64-kernel8: $(AARCH64_KERNEL8_IMG)
+
+# ---- Raspberry Pi 4 で起動する一式 ----------------------------------------
+# **QEMU の raspi4b でも実機でも同じものを使う。** 中身と使い方は
+# scripts/pi4/README.md に書いた。
+#
+#   ロード先    0x80000     ファームウェアがここに置いて飛んでくる
+#   早期 UART   0xFE201000  DTB を読む前の出力先 (Pi 4 の PL011)
+#   CNTFRQ      54000000    EL3 で飛んできたときだけ使う (BCM2711 の OSC_FREQ)
+#   GICD/GICC   0xFF841000 / 0xFF842000  同上。armstub を経由すれば不要
+# **AARCH64_SOUND=1 はこの target だけ。**3.5mm ジャックは PWM1
+# (0xFE20C800) が鳴らすが、**QEMU の raspi4b は PWM1 を持たない**
+# (QEMU にあるのは PWM0 の 0x20C000 だけ)。触ると external abort で
+# 落ちるので、実機向けのここでだけ有効にする (2026-08-19 実測)
+
+# **init は /bin/ash を既定にする。**素で走らせると
+# AARCH64_INIT_PATH_VALUE が空 = カーネルの既定 /bin/hello になり、
+# **焼いてもシェルが出てこない** (2026-09-05 に踏んだ)。実機は ash で
+# 運用しているので、打ち忘れても同じものが出るようにする。
+# 別のものを入れたいとき: make aarch64-pi4-netboot AARCH64_INIT_PATH_VALUE=/bin/doom
+PI4_INIT_PATH ?= $(if $(AARCH64_INIT_PATH_VALUE),$(AARCH64_INIT_PATH_VALUE),/bin/ash)
+# **xHCI (USB キーボード) は PCIe の初期化が要る。**scripts/pi4/dev_up.sh が
+# 出していたヒントと既定を揃える
+PI4_PCIE_BRCM_INIT ?= $(if $(AARCH64_PCIE_BRCM_INIT),$(AARCH64_PCIE_BRCM_INIT),1)
+
+aarch64-pi4-boot:
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
+	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \
+	    AARCH64_CNTFRQ_HZ=54000000 AARCH64_SOUND=1 \
+	    AARCH64_PCIE_BRCM_INIT=$(PI4_PCIE_BRCM_INIT) \
+	    AARCH64_INIT_PATH_VALUE=$(PI4_INIT_PATH) \
+	    AARCH64_EARLY_GICD=0xFF841000 AARCH64_EARLY_GICC=0xFF842000
+	@mkdir -p out/pi4-boot
+	cp out/kernel8.img out/pi4-boot/
+	cp scripts/pi4/config.txt out/pi4-boot/
+	@echo "=== out/pi4-boot/ ==="
+	@ls -la out/pi4-boot/
+	@# **焼く前に init の行き先を見せる。**ここが違うと起動しても
+	@# シェルが出ず、原因が分かりにくい
+	@echo "init に exec するもの: $$(strings out/pi4-boot/kernel8.img 2>/dev/null | grep -m1 '^/bin/' || echo '(strings が無い)')"
+	@echo "SD カードの boot パーティション直下に置く (scripts/pi4/README.md)"
+
+# netboot で配る所へ流し込む。**SD の抜き差しをやめるための道具**
+# (scripts/pi4/README.md の「netboot」)。
+#
+# 配信ルートは Windows 側に置く。**WSL2 は NAT の中に居て LAN に出られず、
+# netsh portproxy は UDP を転送しない**ので、TFTP サーバは Windows で走らせる。
+# 場所を変えたいときは PI4_NETBOOT_ROOT を渡す
+PI4_NETBOOT_ROOT ?= /mnt/c/Users/itoh5/pi4-netboot/root
+
+aarch64-pi4-netboot: aarch64-pi4-boot
+	@test -d "$(PI4_NETBOOT_ROOT)" || { \
+	    echo "ERROR: 配信ルートが無い: $(PI4_NETBOOT_ROOT)" >&2; \
+	    echo "scripts/pi4/README.md の「netboot」の手順で作る" >&2; \
+	    exit 1; }
+	cp out/pi4-boot/kernel8.img out/pi4-boot/config.txt "$(PI4_NETBOOT_ROOT)/"
+	@echo "=== $(PI4_NETBOOT_ROOT) ==="
+	@ls -la "$(PI4_NETBOOT_ROOT)/"
+	@missing=""; for f in start4.elf fixup4.dat bcm2711-rpi-4-b.dtb; do \
+	    test -f "$(PI4_NETBOOT_ROOT)/$$f" || missing="$$missing $$f"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+	    echo "警告: ファームウェアが足りない:$$missing" >&2; \
+	    echo "  SD の boot パーティションから 1 度だけコピーする" >&2; \
+	fi
+	@echo "Pi の電源を入れ直せば LAN から読まれる。SD は抜かない"
+
+# Pi 4 の起動確認 (QEMU の raspi4b)。**実機の代わりにはならない**が、
+# 起動形式 / DTB / GIC-400 / MMU / EL0 までは実機なしで回帰を見られる。
+# raspi4b は QEMU 9.0 以降。無ければ SKIP する
+# **QEMU 用は音を切って組む。** aarch64-pi4-boot は実機向けに
+# AARCH64_SOUND=1 で組むが、**QEMU の raspi4b は PWM1 (0xFE20C800) を
+# 持たない**ので触ると external abort になる (ESR=0x96000050)。
+#
+# 以前は aarch64-pi4-boot の成果物をそのまま QEMU に掛けていて、
+# **smoke が構造的に必ず落ちていた** (2026-08-24 に判明)。
+# 実機向けの out/pi4-boot/ には触らず、別の置き場に作る
+aarch64-pi4-qemu-boot:
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
+	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \
+	    AARCH64_CNTFRQ_HZ=54000000 \
+	    AARCH64_EARLY_GICD=0xFF841000 AARCH64_EARLY_GICC=0xFF842000
+	@mkdir -p out/pi4-qemu
+	cp out/kernel8.img out/pi4-qemu/
+
+aarch64-pi4-smoke: aarch64-pi4-qemu-boot
+	PI4_IMG=out/pi4-qemu/kernel8.img bash ./tests/aarch64_pi4_smoke.sh
+
+# SD カードドライバ (EMMC2) の確認。**QEMU は SD を旧 sdhci に繋いでいる**ので、
+# 検証用に番地を差し替えて組む (tests/aarch64_pi4_sd_smoke.sh の注記)。
+# **実機向けの out/pi4-boot/ には入れない**
+aarch64-pi4-sd-smoke: $(AARCH64_USER_HELLO)
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
+	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \
+	    AARCH64_CNTFRQ_HZ=54000000 \
+	    AARCH64_EARLY_GICD=0xFF841000 AARCH64_EARLY_GICC=0xFF842000 \
+	    AARCH64_EMMC2_BASE=0xFE300000
+	bash ./tests/aarch64_pi4_sd_smoke.sh
+
+# ---- DOOM (aarch64) --------------------------------------------------------
+#
+# **user/doomgeneric/doomgeneric/Makefile は使わない。** あちらは clang と
+# x86 / newlib を前提にした分岐が積んであり、aarch64 の本物のクロス GCC とは
+# 噛み合わない。ソースの一覧だけ SRC_DOOM から借りて、組むのは自前の
+# scripts/build_doom_aarch64.sh
+AARCH64_DOOM_ELF = out/doomgeneric-aarch64.elf
+# **raspi4b は QEMU 9.0 以降。** apt のものでは足りないので自前ビルドを見に行く
+QEMU_RASPI4B = $(shell for c in "$$HOME/qemu-build/build/qemu-system-aarch64" \
+	"$$HOME/qemu-local/bin/qemu-system-aarch64" \
+	"$$(command -v qemu-system-aarch64 2>/dev/null)"; do \
+	[ -x "$$c" ] && "$$c" -machine help 2>/dev/null | grep -q "^raspi4b " && { printf %s "$$c"; break; }; done)
+
+aarch64-doom: $(AARCH64_DOOM_ELF)
+
+# **AARCH64_MUSL_SYSROOT はここより後ろで定義されるので使えない。**
+# 前提行は読んだ時点で展開されるため、空になって '/lib/libc.a' を探しに行く
+$(AARCH64_DOOM_ELF): ports/musl-install-aarch64/lib/libc.a
+	bash ./scripts/build_doom_aarch64.sh $(abspath $(AARCH64_DOOM_ELF))
+
+# QEMU の raspi4b で DOOM を動かす。**実機と同じ道** (mailbox の
+# フレームバッファ + EMMC2 の xv6fs) を通る。
+# **番地は pi4-sd-smoke と同じ差し替えが要る** — raspi4b の SD は
+# 旧 sdhci (0xFE300000) に繋がっている
+# **画面を人が見る用。** VNC で出す。
+#
+# **-display sdl は WSLg では映らない** (窓は開くが真っ黒のまま。Wayland でも
+# SDL_VIDEODRIVER=x11 でも同じ。ゲスト側は正しく描けていることを monitor の
+# screendump で確認済み)。この qemu は gtk を持っていないので、**VNC が
+# 唯一まともに映る道**。Windows 側の VNC ビューアで localhost:5901 に繋ぐ。
+#
+# 判定は付いていない (人が見るためのもの)。自動で確かめるのは
+# aarch64-doom-run のほう
+aarch64-doom-vnc: $(AARCH64_DOOM_ELF)
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
+	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \
+	    AARCH64_CNTFRQ_HZ=54000000 \
+	    AARCH64_EARLY_GICD=0xFF841000 AARCH64_EARLY_GICC=0xFF842000 \
+	    AARCH64_EMMC2_BASE=0xFE300000 AARCH64_INIT_PATH_VALUE=/bin/doom
+	@echo "VNC: localhost:5901 に繋ぐこと (Ctrl-C で止める)"
+	$(QEMU_RASPI4B) -machine raspi4b -vnc :1 \
+	    -kernel out/kernel8.img -dtb tests/dtb/bcm2711-rpi-4-b.dtb \
+	    -drive file=out/aarch64-doom-disk.img,if=sd,format=raw
+
+# USB キーボード。**実機の Pi 4 では踏めない** (raspi4b は PCIe が無い)。
+# QEMU virt が唯一の検証の場
+# DOOM を USB キーボードで操作できること。**全段を通す**
+# (USB -> xHCI -> 変換 -> syscall -> DOOM)。virt でしか揃わない
+aarch64-doom-key-smoke: $(AARCH64_DOOM_ELF)
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 AARCH64_INIT_PATH_VALUE=/bin/doom
+	bash ./tests/aarch64_doom_key_smoke.sh
+
+# **USB キーボードで ash を打てること。**これが通ると「HDMI とキーボード
+# だけで完結した計算機」になる
+# **変数はここより後ろで定義されるので使えない** (前提行は読んだ時点で展開)
+aarch64-kbd-shell-smoke: out/busybox-aarch64-musl.elf
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 AARCH64_INIT_PATH_VALUE=/bin/ash
+	bash ./tests/aarch64_kbd_shell_smoke.sh
+
+aarch64-usb-kbd-smoke:
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 AARCH64_USB_KBD_PROBE=1
+	bash ./tests/aarch64_usb_kbd_smoke.sh
+
+# **キーボードを USB2 ハブの先に置いた形。**実機の Raspberry Pi 4 では
+# 4 つの Type-A が VL805 内蔵ハブの向こうにあり、**ハブを列挙しないと
+# キーボードに一生届かない。**実機の往復は 1 回 5 分かかるので、
+# ここで潰せるものは潰す
+aarch64-usb-hub-smoke:
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 AARCH64_USB_KBD_PROBE=1
+	ORTHOX_USB_KBD_HUB=1 bash ./tests/aarch64_usb_kbd_smoke.sh
+
+aarch64-doom-run: $(AARCH64_DOOM_ELF)
+	$(MAKE) -C $(CURDIR) aarch64-kernel8 \
+	    AARCH64_LOAD_PA=0x80000 AARCH64_EARLY_UART=0xFE201000 \
+	    AARCH64_CNTFRQ_HZ=54000000 \
+	    AARCH64_EARLY_GICD=0xFF841000 AARCH64_EARLY_GICC=0xFF842000 \
+	    AARCH64_EMMC2_BASE=0xFE300000 AARCH64_INIT_PATH_VALUE=/bin/doom
+	bash ./tests/aarch64_doom_run.sh
+
+aarch64-run: $(AARCH64_KERNEL_ELF)
+	qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 512M -smp 1 \
+		-nographic -kernel $(AARCH64_KERNEL_ELF)
+
+# aarch64 の最小ユーザープログラム (P1)。libc 無し。
+# **ELF を読んで EL0 で走らせ、svc が共有システムコール層に届く**ことの確認用
+AARCH64_USER_HELLO = out/aarch64-hello.elf
+$(AARCH64_USER_HELLO): user/aarch64_hello.S scripts/user-aarch64.ld
+	@mkdir -p $(@D) $(BUILD_DIR)/aarch64/user
+	$(AARCH64_CC) --target=aarch64-none-elf -ffreestanding -fno-PIE -c $< -o $(BUILD_DIR)/aarch64/user/hello.o
+	$(LD) -nostdlib -static -m aarch64elf -T scripts/user-aarch64.ld $(BUILD_DIR)/aarch64/user/hello.o -o $@
+
+aarch64-user-bin: $(AARCH64_USER_HELLO)
+
+# ---- P2: musl 静的プログラム ---------------------------------------------
+# build_musl.sh は TARGET が引数なので、riscv64 のレシピをそのまま使える。
+# **sysroot は riscv64 と別に持つ** (同じ場所に入れると上書きし合う)。
+#
+# riscv64 と違って -march / -mabi は要らない (aarch64 は 1 つしか無い)。
+AARCH64_MUSL_SYSROOT = ports/musl-install-aarch64
+# libc.so を作るのに要るコンパイラランタイム (__lttf2 等の binary128 ヘルパ)。
+# clang は compiler-rt の名前を答えるが aarch64 版が入っていないので、
+# 手持ちのクロス GCC のものを使う
+AARCH64_LIBGCC = ports/cross-aarch64/lib/gcc/aarch64-linux-musl/4.7.4/libgcc.a
+AARCH64_MUSL_CFLAGS = --target=aarch64-linux-musl -ffreestanding \
+	-fno-PIE -O2 -I$(AARCH64_MUSL_SYSROOT)/include -MMD -MP
+# **リンカスクリプトは使わない。** user-aarch64.ld は hello 専用で
+# .init_array 等を落とす。musl は ld の既定配置で通る (riscv64 と同じ)
+AARCH64_MUSL_LDFLAGS = -nostdlib -static -m aarch64elf --entry=_start -Ttext 0x400000
+AARCH64_MUSL_PROBE_ELF = out/aarch64-musl-probe.elf
+
+# **--enable-shared にしてある** (2026-08-28)。それまでは riscv64 の
+# レシピをそのまま写して --disable-shared だったが、これは 2026-08-10 に
+# 「riscv64 のレシピをそのまま使える」で持ち込まれた既定で、判断した記録が
+# 無い。x86 は最初から共有あり (ports/musl-install/lib/libc.so) で、
+# aarch64 だけが静的に取り残されていた。
+#
+# 共有にすると libc.a に加えて次が出る:
+#   lib/libc.so                  本体 (動的リンカを兼ねる。musl の作り)
+#   lib/ld-musl-aarch64.so.1     libc.so への symlink
+$(AARCH64_MUSL_SYSROOT)/lib/libc.a:
+	MUSL_CC="$(AARCH64_CC)" MUSL_AR="$(RISCV64_LLVM_AR)" MUSL_RANLIB="$(RISCV64_LLVM_RANLIB)" \
+	MUSL_CONFIGURE_EXTRA="--enable-shared" \
+	MUSL_LIBCC="$(abspath $(AARCH64_LIBGCC))" \
+	./ports/build_musl.sh $(abspath ports/musl) $(abspath $(AARCH64_MUSL_SYSROOT)) aarch64-linux-musl $(abspath $(BUILD_DIR)/musl-aarch64-build)
+
+aarch64-musl-sysroot: $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+
+# init のパスが変わったら runtime.o を作り直す (stale 防止スタンプ)。
+# **CFLAGS の変更を make は追跡しない。** これが無いと musl-probe 版で
+# 焼いた runtime.o がそのまま残り、次の aarch64-smoke が /bin/musl-probe を
+# 探しに行って落ちる (riscv64 の bootstrap_args.stamp と同じ理由)
+$(BUILD_DIR)/aarch64/init_path.stamp: FORCE
+	@mkdir -p $(@D)
+	@echo "$(AARCH64_INIT_PATH_VALUE)" > $@.tmp; \
+	if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+$(BUILD_DIR)/aarch64/kernel/runtime.o: $(BUILD_DIR)/aarch64/init_path.stamp
+
+# **機械ごとの値が変わったら aarch64 の全 .o を作り直す。**
+# ロード先 / 早期 UART / CNTFRQ / GIC の番地は -D と --defsym で渡していて、
+# **make はこれを追跡しない**。追跡しないと、virt 構成で作った .o から
+# kernel8.img を作ってしまい、0x80000 に置いても 1 文字も出ない
+# (実測: aarch64-pi4-smoke がこれで落ちた)。
+#
+# 逆確認用の AARCH64_CFLAGS_EXTRA も同じ理由でここに入れてある。
+# これで「切り替えるときは build/aarch64 を消す」手作業が要らなくなった
+$(BUILD_DIR)/aarch64/machine.stamp: FORCE
+	@mkdir -p $(@D)
+	@echo "$(AARCH64_LOAD_PA)|$(AARCH64_EARLY_UART)|$(AARCH64_CNTFRQ_HZ)|$(AARCH64_EARLY_GICD)|$(AARCH64_EARLY_GICC)|$(AARCH64_EMMC2_BASE)|$(AARCH64_CFLAGS_EXTRA)" > $@.tmp; \
+	if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+$(AARCH64_OBJS): $(BUILD_DIR)/aarch64/machine.stamp
+
+$(BUILD_DIR)/aarch64-musl/user/crt0.o: user/crt0_musl_aarch64.S $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_MUSL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/aarch64-musl/user/%.o: user/%.c $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_MUSL_CFLAGS) -c $< -o $@
+
+$(AARCH64_MUSL_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_musl_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_musl_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-musl-probe: $(AARCH64_MUSL_PROBE_ELF)
+
+# P3-1: fork の検査。musl と同じ作りで、中身だけ差し替える
+AARCH64_FORK_PROBE_ELF = out/aarch64-fork-probe.elf
+$(AARCH64_FORK_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_fork_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_fork_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-fork-probe: $(AARCH64_FORK_PROBE_ELF)
+
+# N-10: ソケット syscall が EL0 から使えるかの検査。musl / fork の probe と
+# 同じ作りで中身だけ差し替える
+AARCH64_SOCKET_PROBE_ELF = out/aarch64-socket-probe.elf
+$(AARCH64_SOCKET_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_socket_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+# **-z max-page-size=4096 が要る。**aarch64 の lld は既定で 64KB 境界に
+# セグメントを置くので、中身が 9KB 程度でもファイルは 4 倍に膨れる
+# (同じソースで実測: 81,032 -> 19,592 バイト)。実機の rootfs にある枠へ
+# --replace で差し込むには小さくないと入らない —— 枠の上限は
+# /bin/hello の 70,376 バイトで、膨れたままでは入らなかった (2026-09-05)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) -z max-page-size=4096 $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_socket_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-socket-probe: $(AARCH64_SOCKET_PROBE_ELF)
+
+# ---- HTTPS (BearSSL) を aarch64 に通す (2026-09-05) ------------------------
+#
+# **BearSSL は x86 用の規則しか無かった。**中身はアーキ非依存の C99 で、
+# 294 ファイルとも aarch64 でそのままコンパイルが通ることを確認してある
+# (x86 専用の最適化経路 aes_x86ni / ghash_pclmul は ifdef で自分を無効に
+# するので、混ざっていても害は無い)。
+#
+# ソースは x86 版と同じものを使い、**出力先だけ分ける**
+# (build/bearssl は x86、build/bearssl-aarch64 は aarch64)。
+BEARSSL_AARCH64_OBJS = $(patsubst ports/BearSSL/src/%.c, $(BUILD_DIR)/bearssl-aarch64/%.o, $(BEARSSL_SRCS))
+BEARSSL_AARCH64_A = $(BUILD_DIR)/bearssl-aarch64/libbearssl.a
+
+$(BUILD_DIR)/bearssl-aarch64/%.o: ports/BearSSL/src/%.c
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_MUSL_CFLAGS) -std=c99 \
+		-Iports/BearSSL/inc -Iports/BearSSL/src -c $< -o $@
+
+$(BEARSSL_AARCH64_A): $(BEARSSL_AARCH64_OBJS)
+	@mkdir -p $(@D)
+# **$(AR) ではなく llvm-ar。**$(AR) はホストの ar で aarch64 の
+# オブジェクトを読めない。aarch64 musl のビルドが使うものと揃える
+	$(RISCV64_LLVM_AR) rcs $@ $^
+
+# httpsfetch 本体。**ORTHOX_LINUX_ABI を立てる** —— x86 の独自 syscall
+# ヘッダ (include/syscall.h) は musl と一緒に使えないので、そちらを外して
+# 名前解決は「引けない」と答える形になる (手3 で resolv.conf に繋ぐ)
+$(BUILD_DIR)/aarch64-musl/user/httpsfetch.o: user/httpsfetch.c user/https_ta.h \
+		$(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(AARCH64_CC) $(AARCH64_MUSL_CFLAGS) -DORTHOX_LINUX_ABI=1 \
+		-Iports/BearSSL/inc -Iuser -c $< -o $@
+
+AARCH64_HTTPS_FETCH_ELF = out/aarch64-httpsfetch.elf
+$(AARCH64_HTTPS_FETCH_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/httpsfetch.o $(BEARSSL_AARCH64_A) \
+		$(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+# **$(AARCH64_LIBGCC) が要る。**httpsfetch は printf を使い、musl の
+# vfprintf が binary128 (long double) のヘルパ __divtf3 / __fixtfsi 等を
+# 引く。clang は compiler-rt の名前を答えるが aarch64 版が入っていないので、
+# libc.so を組むのと同じクロス GCC のものを使う
+	$(LD) $(AARCH64_MUSL_LDFLAGS) -z max-page-size=4096 \
+		$(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/httpsfetch.o \
+		$(BEARSSL_AARCH64_A) $(AARCH64_MUSL_SYSROOT)/lib/libc.a \
+		$(AARCH64_LIBGCC) -o $@
+
+aarch64-httpsfetch: $(AARCH64_HTTPS_FETCH_ELF)
+
+# TLS の検査 (2026-09-05 新設)。**これまで TLS には自動試験が無かった。**
+# ash から叩くので、カーネルの init は /bin/ash で組む
+aarch64-https-smoke: $(AARCH64_HTTPS_FETCH_ELF) out/busybox-aarch64-musl.elf
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/ash
+	bash ./tests/aarch64_https_smoke.sh
+
+
+aarch64-socket-smoke: $(AARCH64_SOCKET_PROBE_ELF)
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/socket-probe
+	bash ./tests/aarch64_socket_smoke.sh
+
+aarch64-fork-smoke: $(AARCH64_FORK_PROBE_ELF)
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/fork-probe
+	bash ./tests/aarch64_fork_smoke.sh
+
+# P3-2: コンソール入力 (PL011 の受信割り込み)
+AARCH64_CONSOLE_PROBE_ELF = out/aarch64-console-probe.elf
+$(AARCH64_CONSOLE_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_console_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_console_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-console-probe: $(AARCH64_CONSOLE_PROBE_ELF)
+
+aarch64-console-smoke: $(AARCH64_CONSOLE_PROBE_ELF)
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/console-probe
+	bash ./tests/aarch64_console_smoke.sh
+
+# P3-3: FP/SIMD がタスク切り替えを跨いで保たれるか
+AARCH64_FP_PROBE_ELF = out/aarch64-fp-probe.elf
+$(AARCH64_FP_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_fp_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_fp_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-fp-probe: $(AARCH64_FP_PROBE_ELF)
+
+# rename(2) の検査。**番号がアーキで違うところで落ちていた** (aarch64 は
+# renameat(38)、riscv64 は renameat2(276))。mv は rename が失敗しても
+# copy+unlink に退くので、mv では検出できない
+AARCH64_RENAME_PROBE_ELF = out/aarch64-rename-probe.elf
+$(AARCH64_RENAME_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_rename_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_rename_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-rename-probe: $(AARCH64_RENAME_PROBE_ELF)
+
+# /reboot —— カーネルを差し替えるたびに人へ電源の入れ直しを頼まずに済む。
+# **静的リンクで作ること** (S-11 で libc.so を置いてから、実機の gcc の
+# 既定が動的リンクに変わった。ローダが揃わないと not found になる)
+AARCH64_REBOOT_ELF = out/aarch64-reboot.elf
+$(AARCH64_REBOOT_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_reboot.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_reboot.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-reboot: $(AARCH64_REBOOT_ELF)
+
+# G-1 の台本の完了検出を実機なしで確かめる。**日報2026-08-29 の誤検出 3 件を
+# そのまま入力に混ぜて、当たらないことを見る**
+pi4-g1-marker-test:
+	bash ./tests/pi4_g1_marker_test.sh
+
+aarch64-rename-smoke: $(AARCH64_RENAME_PROBE_ELF)
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/rename-probe
+	bash ./tests/aarch64_rename_smoke.sh
+
+aarch64-fp-smoke: $(AARCH64_FP_PROBE_ELF)
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/fp-probe
+	bash ./tests/aarch64_fp_smoke.sh
+
+# P3-4: fork した子のアドレス空間が返っているか
+AARCH64_VMLEAK_PROBE_ELF = out/aarch64-vmleak-probe.elf
+$(AARCH64_VMLEAK_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_vmleak_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/aarch64_vmleak_probe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-vmleak-probe: $(AARCH64_VMLEAK_PROBE_ELF)
+
+aarch64-vmleak-smoke: $(AARCH64_VMLEAK_PROBE_ELF)
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/vmleak-probe
+	bash ./tests/aarch64_vmleak_smoke.sh
+
+# 最初のユーザープロセスとして musl の probe を exec する。
+# **fork はまだ無いので 1 プロセスしか走らない** (P3 で入れる)
+aarch64-musl-smoke: $(AARCH64_MUSL_PROBE_ELF)
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/musl-probe
+	bash ./tests/aarch64_musl_smoke.sh
+
+aarch64-smoke: $(AARCH64_KERNEL_ELF) $(AARCH64_USER_HELLO)
+	bash ./tests/aarch64_smoke.sh
+
+# virtio-net (QEMU virt) で lwIP が繋がるか (N-9 手1)。実機には繋がる相手が
+# まだ無いので QEMU 限定。DHCP / ARP / ping まで見る
+aarch64-net-smoke:
+	bash ./tests/aarch64_net_smoke.sh
+
+# **判定そのものが火を噴くかを確かめる。** 通常どおり回してから、
+# 通ったログに禁止文字列を注入して、否定判定が全部落ちることを見る
+# (日報2026-08-09 追9-6: `! grep` は set -e の対象外で 15 か所が空振りしていた)
+aarch64-smoke-selftest: $(AARCH64_KERNEL_ELF) $(AARCH64_USER_HELLO)
+	bash ./tests/aarch64_smoke.sh --self-test
+
+# ---- P4: busybox ash (aarch64 + musl) --------------------------------------
+#
+# riscv64-busybox-musl の aarch64 版だが、**CC の方針が違う。**
+#   riscv64  clang + sysroot を手で並べる
+#   aarch64  ports/cross-aarch64 の GCC が --with-sysroot で解決するので、
+#            ドライバ (ports/orthos-aarch64-musl-gcc.sh) は
+#            「じゃまな指定を落とす」だけ
+#
+# **AR/RANLIB/STRIP もクロス側を渡す。** 既定はホストの ar に落ちるので、
+# 渡さないと applets/built-in.o の部分リンクで x86 のアーカイブができる。
+AARCH64_MUSL_CC_DRIVER ?= ports/orthos-aarch64-musl-gcc.sh
+AARCH64_CROSS_BIN ?= $(abspath ports/cross-aarch64/bin)
+AARCH64_CROSS_TOOL_PREFIX ?= $(AARCH64_CROSS_BIN)/aarch64-linux-musl-
+AARCH64_BUSYBOX_ASH_MUSL_ELF = out/busybox-aarch64-musl.elf
+
+aarch64-busybox-musl: $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p out
+	ORTHOS_CC=$(abspath $(AARCH64_MUSL_CC_DRIVER)) \
+	ORTHOS_SYSROOT=$(abspath $(AARCH64_MUSL_SYSROOT)) \
+	ORTHOS_INCLUDEDIR=$(abspath $(AARCH64_MUSL_SYSROOT))/include \
+	ORTHOS_EXTRA_CFLAGS="-DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_LINEEDIT_PTR_HACK=1 -DORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS=1" \
+	ORTHOS_AR="$(AARCH64_CROSS_TOOL_PREFIX)ar" \
+	ORTHOS_RANLIB="$(AARCH64_CROSS_TOOL_PREFIX)ranlib" \
+	ORTHOS_STRIP="$(AARCH64_CROSS_TOOL_PREFIX)strip" \
+	./ports/build_busybox_ash.sh $(abspath ports/busybox) $(abspath $(AARCH64_BUSYBOX_ASH_MUSL_ELF))
+
+# 最初のユーザープロセスとして ash を exec する。
+# **fork / waitpid / pipe が要る** (P3-1 が通っていること)
+# 動的リンクの一式 (共有 musl / .so 間参照 / TLS / dlopen)。
+# **共有 musl が要る** ($(AARCH64_MUSL_SYSROOT)/lib/libc.so)
+aarch64-dynlink-smoke: $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	bash ./tests/aarch64_dynlink_smoke.sh
+
+aarch64-ash-smoke: aarch64-busybox-musl
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/ash
+	bash ./tests/aarch64_ash_smoke.sh
+
+# SMP の負荷試験 (P-7)。**複数コアでしか出ない取りこぼしを狙う。**
+# SMP_CPUS=1 と比べれば「SMP のせいか」が切り分けられる
+aarch64-smp-load: aarch64-busybox-musl
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/ash
+	bash ./tests/aarch64_smp_load.sh
+
+$(RISCV64_KERNEL_ELF): $(RISCV64_OBJS)
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_LDFLAGS) $(RISCV64_OBJS) -o $@
+
+$(BUILD_DIR)/riscv64/kernel/%.o: kernel/riscv64/%.c
+	@mkdir -p $(@D)
+	$(RISCV64_CC) $(RISCV64_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/riscv64/kernel/shared/%.o: kernel/%.c
+	@mkdir -p $(@D)
+	$(RISCV64_CC) $(RISCV64_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/riscv64/kernel/%_asm.o: kernel/riscv64/%.S
+	@mkdir -p $(@D)
+	$(RISCV64_CC) $(RISCV64_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/riscv64/user/%.o: user/%.c
+	@mkdir -p $(@D)
+	$(RISCV64_CC) $(RISCV64_USER_CFLAGS) -c $< -o $@
+
+$(RISCV64_BOOTSTRAP_USER_BUILD_ELF): $(BUILD_DIR)/riscv64/user/riscv64_hello.o
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_USER_LDFLAGS) $< -o $@
+
+# 埋め込み元 ELF のパスが変わったら blob を再生成する (stale 防止スタンプ)
+$(BUILD_DIR)/riscv64/bootstrap_user_src.stamp: FORCE
+	@mkdir -p $(@D)
+	@echo "$(RISCV64_BOOTSTRAP_USER_SRC_ELF)" > $@.tmp; \
+	if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+# bootstrap argv が変わったら boot.o を再コンパイルする
+$(BUILD_DIR)/riscv64/bootstrap_args.stamp: FORCE
+	@mkdir -p $(@D)
+	@echo "$(RISCV64_BOOTSTRAP_ARG0_VALUE)|$(RISCV64_BOOTSTRAP_ARG1_VALUE)|$(RISCV64_BOOTSTRAP_ARG2_VALUE)|$(RISCV64_BOOTSTRAP_ARG3_VALUE)" > $@.tmp; \
+	if ! cmp -s $@.tmp $@ 2>/dev/null; then mv $@.tmp $@; else rm -f $@.tmp; fi
+
+$(BUILD_DIR)/riscv64/kernel/boot.o: $(BUILD_DIR)/riscv64/bootstrap_args.stamp
+
+$(BUILD_DIR)/riscv64/kernel/bootstrap_user_blob.o: $(RISCV64_BOOTSTRAP_USER_SRC_ELF) $(BUILD_DIR)/riscv64/bootstrap_user_src.stamp
+	@mkdir -p $(@D)
+	@if [ "$<" != "$(RISCV64_BOOTSTRAP_USER_EMBED_ELF)" ]; then cp "$<" "$(RISCV64_BOOTSTRAP_USER_EMBED_ELF)"; fi
+	$(RISCV64_OBJCOPY) -I binary -O elf64-littleriscv $(RISCV64_BOOTSTRAP_USER_EMBED_ELF) $@
+
+$(RISCV64_MUSL_SYSROOT)/lib/libc.a:
+	MUSL_CC="$(RISCV64_CC)" MUSL_AR="$(RISCV64_LLVM_AR)" MUSL_RANLIB="$(RISCV64_LLVM_RANLIB)" \
+	MUSL_EXTRA_CFLAGS="-march=rv64gc -mabi=lp64d" MUSL_CONFIGURE_EXTRA="--disable-shared" \
+	./ports/build_musl.sh $(abspath ports/musl) $(abspath $(RISCV64_MUSL_SYSROOT)) riscv64-linux-musl $(abspath $(BUILD_DIR)/musl-riscv64-build)
+
+riscv64-musl-sysroot: $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+
+$(BUILD_DIR)/riscv64-musl/user/crt0.o: user/crt0_musl_riscv64.S $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(RISCV64_CC) $(RISCV64_MUSL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/riscv64-musl/user/%.o: user/%.c $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(RISCV64_CC) $(RISCV64_MUSL_CFLAGS) -c $< -o $@
+
+$(RISCV64_MUSL_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_musl_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_musl_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+riscv64-musl-probe: $(RISCV64_MUSL_PROBE_ELF)
+
+$(RISCV64_PREEMPT_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_preempt_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_preempt_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+riscv64-preempt-probe: $(RISCV64_PREEMPT_PROBE_ELF)
+
+$(RISCV64_SLEEP_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_sleep_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_sleep_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+riscv64-sleep-probe: $(RISCV64_SLEEP_PROBE_ELF)
+
+$(RISCV64_ERRNO_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_errno_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_errno_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+riscv64-errno-probe: $(RISCV64_ERRNO_PROBE_ELF)
+
+$(RISCV64_OFFSET_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_offset_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_offset_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+riscv64-offset-probe: $(RISCV64_OFFSET_PROBE_ELF)
+
+# user/riscv64-bin/<name>.c → rootfs の /bin/<name>。ファイルを置くだけで拾われる。
+# リンクは busybox と同じ ports/orthos-riscv64-musl-gcc.sh に任せる
+# (musl の crt1.o と riscv64-elf-gcc の libgcc をまとめてくれる。libgcc が無いと
+#  musl の printf が long double 用の __divtf3 で未解決になる)
+RISCV64_USER_BIN_SRCS = $(wildcard user/riscv64-bin/*.c)
+RISCV64_USER_BIN_ELFS = $(patsubst user/riscv64-bin/%.c,$(BUILD_DIR)/riscv64-bin/%.elf,$(RISCV64_USER_BIN_SRCS))
+
+# musl ユーザーランドを作るコンパイラドライバ。既定は clang 版 (macOS の従来経路)。
+# 移植した GCC 4.7.4 で作るときは
+#   make riscv64-ash-smoke RISCV64_MUSL_CC_DRIVER=ports/orthos-riscv64-musl-gcc474.sh ...
+RISCV64_MUSL_CC_DRIVER ?= ports/orthos-riscv64-musl-gcc.sh
+
+$(BUILD_DIR)/riscv64-bin/%.elf: user/riscv64-bin/%.c $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	./$(RISCV64_MUSL_CC_DRIVER) -O2 -Wall -Wextra $< -o $@
+
+riscv64-user-bin: $(RISCV64_USER_BIN_ELFS)
+
+RISCV64_BUSYBOX_ASH_MUSL_ELF = out/busybox-riscv64-musl.elf
+
+riscv64-busybox-musl: $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p out
+	ORTHOS_CC=$(abspath $(RISCV64_MUSL_CC_DRIVER)) \
+	ORTHOS_SYSROOT=$(abspath $(RISCV64_MUSL_SYSROOT)) \
+	ORTHOS_INCLUDEDIR=$(abspath $(RISCV64_MUSL_SYSROOT))/include \
+	ORTHOS_EXTRA_CFLAGS="-DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_LINEEDIT_PTR_HACK=1 -DORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS=1" \
+	ORTHOS_AR="$(RISCV64_LLVM_AR)" ORTHOS_RANLIB="$(RISCV64_LLVM_RANLIB)" \
+	ORTHOS_STRIP="$(shell if [ -x /opt/homebrew/opt/llvm/bin/llvm-strip ]; then printf /opt/homebrew/opt/llvm/bin/llvm-strip; else printf llvm-strip; fi)" \
+	./ports/build_busybox_ash.sh $(abspath ports/busybox) $(abspath $(RISCV64_BUSYBOX_ASH_MUSL_ELF))
+
+# レガシー syscall 番号の混入と番号ズレの監査 (過去 2 度衝突で実害が出ている)
+# パス正規化の単体テスト (ホスト側・1 秒未満、QEMU 不要)。
+# kernel/riscv64/fs.c から関数をその場で抜き出して回すので実装と乖離しない。
+riscv64-path-test:
+	bash ./tests/riscv64_path_normalize_test.sh
+
+riscv64-syscall-audit: riscv64-path-test
+	python3 scripts/check_riscv64_syscalls.py
+
+riscv64-kernel: riscv64-syscall-audit $(RISCV64_KERNEL_ELF)
+
+riscv64-run: $(RISCV64_KERNEL_ELF)
+	bash ./run_qemu_riscv64.sh
+
+riscv64-smoke: $(RISCV64_KERNEL_ELF)
+	bash ./tests/riscv64_smoke.sh
+
+riscv64-musl-smoke: $(RISCV64_MUSL_PROBE_ELF)
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_MUSL_PROBE_ELF)
+	bash ./tests/riscv64_musl_smoke.sh
+
+# CPU を占有し続ける子の裏で親が復帰できるか = タイマープリエンプションの検証
+riscv64-preempt-smoke: $(RISCV64_PREEMPT_PROBE_ELF)
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_PREEMPT_PROBE_ELF)
+	bash ./tests/riscv64_preempt_smoke.sh
+
+# nanosleep が本当に寝て起きるか = タイマー起床経路の検証
+riscv64-sleep-smoke: $(RISCV64_SLEEP_PROBE_ELF)
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_SLEEP_PROBE_ELF)
+	bash ./tests/riscv64_sleep_smoke.sh
+
+# 失敗系の syscall が正しい errno を返すかの検証 (-1 は EPERM として顕在化する)
+# dup / fork した fd が offset を共有するか (Linux の open file description)。
+# 探針は書き込みをするので、スクリプト側で rootfs イメージの複製に対して回す
+riscv64-offset-smoke: $(RISCV64_OFFSET_PROBE_ELF)
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_OFFSET_PROBE_ELF)
+	bash ./tests/riscv64_offset_smoke.sh
+
+riscv64-errno-smoke: $(RISCV64_ERRNO_PROBE_ELF)
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_ERRNO_PROBE_ELF)
+	bash ./tests/riscv64_errno_smoke.sh
+
+# -smp 4 で副 hart が idle まで上がり、ユーザーランドが完走するかの検証
+riscv64-smp-smoke: $(RISCV64_PREEMPT_PROBE_ELF)
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_PREEMPT_PROBE_ELF)
+	bash ./tests/riscv64_smp_smoke.sh
+
+RISCV64_ROOTFS_IMG = out/rootfs-riscv64-xv6.img
+RISCV64_ROOTFS_APPLETS = ash sh busybox basename cat chmod cmp cp cut date dd df dirname du \
+                         echo env expr false find grep head hexdump ln ls md5sum mkdir mktemp \
+                         mv od printenv printf pwd realpath rev rm rmdir sed seq sleep sort \
+                         stat sync tail tee test touch tr true uname uniq wc which xargs yes
+
+# riscv64 用 xv6fs rootfs イメージ。
+# applet は busybox 本体へのハードリンクにする (xv6fs に symlink 型が無いため)。
+# build_rootfs_xv6fs.py がホスト側のハードリンクを検出して 1 inode に集約するので、
+# applet を増やしてもイメージは busybox 1 本分しか太らない。
+# rootfs に追加で入れたいディレクトリツリー (既定は無し。空白区切りで複数可)。
+# セルフホスト一式を入れるときは
+#   make riscv64-rootfs RISCV64_ROOTFS_EXTRA="ports/orthox-native build/riscv64-native-root"
+RISCV64_ROOTFS_EXTRA ?=
+
+riscv64-rootfs: riscv64-busybox-musl $(RISCV64_USER_BIN_ELFS)
+	rm -rf $(BUILD_DIR)/riscv64-rootfs
+	mkdir -p $(BUILD_DIR)/riscv64-rootfs/bin $(BUILD_DIR)/riscv64-rootfs/etc $(BUILD_DIR)/riscv64-rootfs/tmp
+	cp $(RISCV64_BUSYBOX_ASH_MUSL_ELF) $(BUILD_DIR)/riscv64-rootfs/bin/busybox
+	for a in $(filter-out busybox,$(RISCV64_ROOTFS_APPLETS)); do \
+	    ln -f $(BUILD_DIR)/riscv64-rootfs/bin/busybox $(BUILD_DIR)/riscv64-rootfs/bin/$$a; \
+	done
+	for e in $(RISCV64_USER_BIN_ELFS); do \
+	    cp $$e $(BUILD_DIR)/riscv64-rootfs/bin/$$(basename $$e .elf); \
+	done
+	printf 'hello from riscv64 xv6fs rootfs\n' > $(BUILD_DIR)/riscv64-rootfs/etc/motd
+	printf 'root:x:0:0:root:/:/bin/sh\n' > $(BUILD_DIR)/riscv64-rootfs/etc/passwd
+	printf 'root:x:0:\n' > $(BUILD_DIR)/riscv64-rootfs/etc/group
+	printf 'PATH=/bin:/usr/bin\nexport PATH\n' > $(BUILD_DIR)/riscv64-rootfs/etc/profile
+	@for d in $(RISCV64_ROOTFS_EXTRA); do \
+	    echo "rootfs に $$d を追加"; \
+	    cp -a $$d/. $(BUILD_DIR)/riscv64-rootfs/; \
+	done
+	python3 scripts/build_rootfs_xv6fs.py $(BUILD_DIR)/riscv64-rootfs $(RISCV64_ROOTFS_IMG) | tail -4
+
+# busybox ash を対話シェルとして起動 (stdin/stdout = シリアルコンソール)
+riscv64-ash-run: riscv64-busybox-musl riscv64-rootfs
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_BUSYBOX_ASH_MUSL_ELF) RISCV64_BOOTSTRAP_ARG0_VALUE=sh
+	bash ./run_qemu_riscv64.sh
+
+riscv64-ash-smoke: riscv64-busybox-musl riscv64-rootfs
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_BUSYBOX_ASH_MUSL_ELF) RISCV64_BOOTSTRAP_ARG0_VALUE=sh
+	bash ./tests/riscv64_ash_smoke.sh
+
+# 同じ ash smoke を 4 hart で。コンソール入力 / virtio-blk / pmm の排他が
+# 効いているかの検証 (どれか 1 つでも欠けると入力の文字落ちやページフォルトになる)
+riscv64-ash-smoke-smp4: riscv64-busybox-musl riscv64-rootfs
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_BUSYBOX_ASH_MUSL_ELF) RISCV64_BOOTSTRAP_ARG0_VALUE=sh
+	SMP_CPUS=4 bash ./tests/riscv64_ash_smoke.sh
+
+$(BUILD_DIR)/lwip/%.o: ports/lwip/src/%.c
+	@mkdir -p $(@D)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/bearssl/%.o: ports/BearSSL/src/%.c
+	@mkdir -p $(@D)
+	$(CC) -target $(TARGET) -std=c99 -ffreestanding -fno-PIE -O2 -Iports/BearSSL/inc -Iports/BearSSL/src -I$(MUSL_SYSROOT)/include -MMD -MP -c $< -o $@
+
+$(BEARSSL_A): $(BEARSSL_OBJS)
+	@mkdir -p $(@D)
+	ar rcs $@ $^
+
+Limine/limine:
+	@if [ -x template/limine/limine ]; then \
+		cp template/limine/limine template/limine/limine-bios.sys template/limine/limine-bios-cd.bin template/limine/limine-uefi-cd.bin Limine/; \
+		cp template/limine/BOOTX64.EFI template/limine/BOOTIA32.EFI Limine/; \
+	elif [ -x OLD_limine/limine ]; then \
+		cp OLD_limine/limine OLD_limine/limine-bios.sys OLD_limine/limine-bios-cd.bin OLD_limine/limine-uefi-cd.bin Limine/; \
+		cp OLD_limine/BOOTX64.EFI OLD_limine/BOOTIA32.EFI Limine/; \
+	elif [ -f Limine/configure ]; then \
+		CC=cc CFLAGS="-O2 -pipe" LDFLAGS="" $(MAKE) -C Limine limine; \
+	else \
+		echo "ERROR: Limine build files are missing. Restore template/limine or run Limine/bootstrap + configure." >&2; \
+		exit 1; \
+	fi
+
+TEST_ELFS = $(MMAP_TEST_ELF) $(REAP_TEST_ELF) $(ROBUST_TEST_ELF) $(VRAM_TEST_ELF) $(TIME_TEST_ELF) $(KEY_TEST_ELF) $(SOUND_TEST_ELF) $(SIGNAL_TEST_ELF) $(TTY_TEST_ELF) $(SIGMASK_TEST_ELF) $(SIGACTION_TEST_ELF) $(FCHDIR_TEST_ELF) $(TTYLINK_TEST_ELF) $(MKDIR_TEST_ELF) $(WADHEAD_TEST_ELF)
+
+FORCE:
+
+$(ROOTFS_IMG): FORCE busybox-ash-musl-install $(ROOTFS_FILES) $(USER_BUILD_DIR)/crt0.o $(USER_BUILD_DIR)/syscalls.o $(UDP_ECHO_TEST_ELF) $(UDP_NB_TEST_ELF) $(HTTPS_FETCH_ELF) $(TIME_TEST_ELF) $(TICKRATE_TEST_ELF) $(SHOWCPU_ELF) $(RUNQSTAT_ELF) $(TCPHELLO_ELF) $(FORKCPU_TEST_ELF) $(FORKMODE_ELF) $(PIPE_STRESS_ELF) $(PIPEEND_PROBE_ELF) $(SMP_STRESS_ELF) $(SCHEDMIX_ELF) $(REAP_TEST_ELF) $(SIGNAL_TEST_ELF) $(SIGMASK_TEST_ELF) $(SIGACTION_TEST_ELF) $(STATERRNO_ELF) $(PYENC_CHECK_ELF) $(MUSL_DIRCHECK_ELF) $(MUSL_FORKPROBE_ELF) $(MUSL_EXECPROBE_ELF) $(MUSL_ENVSHOW_ELF) $(VBLK_TEST_ELF) $(VBLK_STRESS_ELF) $(SOUND_TEST_ELF) $(GCC_MUSL_ELF) $(CC1_MUSL_ELF) $(AS_MUSL_ELF) $(LD_MUSL_ELF) $(MAKE_MUSL_ELF) $(KILO_ELF) $(FILE_ELF) $(VMERRNO_TEST_ELF) $(COWTEST_ELF) $(FTRUNCSAVE_TEST_ELF) $(PREADPWRITE_TEST_ELF) $(XV6_SPARSE_TEST_ELF) $(XV6_RECLAIM_TEST_ELF) $(XV6_LARGEWRITE_TEST_ELF) $(HELLO_DYN_ELF) $(DYNLINK_LIB_A_SO) $(DYNLINK_LIB_B_SO) $(DYNLINK_PLUGIN_SO) $(DYNLINK_CPP_SO) $(DYNLINK_MULTI_TLS_ELF) $(DYNLINK_DLOPEN_ELF) $(DYNLINK_MALLOC_ELF) $(BUSYBOX_ASH_DYN_ELF) $(GCC_DYN_ELF)
+	@if [ "$(ROOTFS_REBUILD)" = "0" ] && [ -f "$(ROOTFS_IMG)" ]; then \
+		echo "Keeping existing $(ROOTFS_IMG) (ROOTFS_REBUILD=0)"; \
+	else \
+			mkdir -p rootfs/bin rootfs/lib; \
+		mkdir -p rootfs/work rootfs/src rootfs/tmp rootfs/home; \
+		bash scripts/populate_c_env_musl.sh; \
+		rm -f rootfs/bin/ash.orthos rootfs/bin/busybox.orthos; \
+		rm -f rootfs/bin/cc1.orthos rootfs/bin/cc1.orthos.elf rootfs/bin/gcc.orthos.elf; \
+		rm -f rootfs/bin/as.orthos rootfs/bin/ld.orthos; \
+		rm -f rootfs/bin/gcc.elf rootfs/bin/cc1.elf rootfs/bin/as.elf rootfs/bin/ld.elf rootfs/bin/make.elf; \
+		rm -f rootfs/crt0.orthos.o rootfs/syscalls.orthos.o rootfs/libc.orthos.a; \
+		cp $(GCC_MUSL_ELF) rootfs/usr/bin/gcc; \
+		cp $(GCC_MUSL_ELF) rootfs/usr/bin/cc; \
+		cp $(CC1_MUSL_ELF) rootfs/usr/bin/cc1; \
+		cp $(AS_MUSL_ELF) rootfs/usr/bin/as; \
+		cp $(LD_MUSL_ELF) rootfs/usr/bin/ld; \
+		cp $(MAKE_MUSL_ELF) rootfs/usr/bin/make; \
+		cp $(SH_ELF) rootfs/usr/bin/sh; \
+		cp $(GCC_MUSL_ELF) rootfs/bin/gcc; \
+		cp $(GCC_MUSL_ELF) rootfs/bin/cc; \
+		cp $(CC1_MUSL_ELF) rootfs/bin/cc1; \
+		cp $(AS_MUSL_ELF) rootfs/bin/as; \
+		cp $(LD_MUSL_ELF) rootfs/bin/ld; \
+		cp $(MAKE_MUSL_ELF) rootfs/bin/make; \
+		cp $(SH_ELF) rootfs/bin/sh; \
+		chmod +x rootfs/usr/bin/gcc rootfs/usr/bin/cc rootfs/usr/bin/cc1 rootfs/usr/bin/as rootfs/usr/bin/ld rootfs/usr/bin/make; \
+		chmod +x rootfs/usr/bin/sh; \
+		chmod +x rootfs/bin/gcc rootfs/bin/cc rootfs/bin/cc1 rootfs/bin/as rootfs/bin/ld rootfs/bin/make; \
+		chmod +x rootfs/bin/sh; \
+		cp $(USER_BUILD_DIR)/crt0.o rootfs/crt0.o; \
+		cp $(USER_BUILD_DIR)/syscalls.o rootfs/syscalls.o; \
+		cp $(UDP_ECHO_TEST_ELF) rootfs/bin/udpecho.elf; \
+		cp $(UDP_NB_TEST_ELF) rootfs/bin/udpnb.elf; \
+		cp $(HTTPS_FETCH_ELF) rootfs/bin/httpsfetch.elf; \
+		cp $(STATERRNO_ELF) rootfs/bin/staterrno.elf; \
+		cp $(TIME_TEST_ELF) rootfs/bin/testtime.elf; \
+		cp $(TICKRATE_TEST_ELF) rootfs/bin/tickratecheck.elf; \
+		cp $(SHOWCPU_ELF) rootfs/bin/showcpu.elf; \
+		cp $(RUNQSTAT_ELF) rootfs/bin/runqstat.elf; \
+		cp $(TCPHELLO_ELF) rootfs/bin/tcphello.elf; \
+		cp $(FORKCPU_TEST_ELF) rootfs/bin/forkcputest.elf; \
+		cp $(FORKMODE_ELF) rootfs/bin/forkmode.elf; \
+		cp $(PIPE_STRESS_ELF) rootfs/bin/pipestress.elf; \
+		cp $(PIPEEND_PROBE_ELF) rootfs/bin/pipeend_probe.elf; \
+		cp $(SMP_STRESS_ELF) rootfs/bin/smpstress.elf; \
+		cp $(SCHEDMIX_ELF) rootfs/bin/schedmix.elf; \
+		cp $(REAP_TEST_ELF) rootfs/bin/reaptest.elf; \
+		cp $(SIGNAL_TEST_ELF) rootfs/bin/signaltest.elf; \
+		cp $(SIGMASK_TEST_ELF) rootfs/bin/sigmasktest.elf; \
+		cp $(SIGACTION_TEST_ELF) rootfs/bin/sigactiontest.elf; \
+		cp $(PYENC_CHECK_ELF) rootfs/bin/pyenccheck; \
+		cp $(MUSL_DIRCHECK_ELF) rootfs/bin/musldircheck; \
+		cp $(MUSL_FORKPROBE_ELF) rootfs/bin/muslforkprobe.elf; \
+		cp $(MUSL_EXECPROBE_ELF) rootfs/bin/muslexecprobe.elf; \
+		cp $(MUSL_ENVSHOW_ELF) rootfs/bin/muslenvshow.elf; \
+		cp $(VBLK_TEST_ELF) rootfs/bin/vblk_test; \
+		cp $(VBLK_STRESS_ELF) rootfs/bin/vblkstress; \
+		cp $(SOUND_TEST_ELF) rootfs/bin/testsound; \
+		if [ -f "$(DOOM_MUSL_ELF)" ]; then cp $(DOOM_MUSL_ELF) rootfs/bin/doom-musl.elf; fi; \
+		rm -f rootfs/bin/edit; \
+		cp $(KILO_ELF) rootfs/bin/kilo; \
+		cp $(FILE_ELF) rootfs/bin/file; \
+		cp $(VMERRNO_TEST_ELF) rootfs/bin/vmerrno_test.elf; \
+		cp $(COWTEST_ELF) rootfs/bin/cowtest.elf; \
+		cp $(FTRUNCSAVE_TEST_ELF) rootfs/bin/ftruncsave_test.elf; \
+		cp $(PREADPWRITE_TEST_ELF) rootfs/bin/preadpwrite_test.elf; \
+		cp $(XV6_SPARSE_TEST_ELF) rootfs/bin/xv6_sparse_test.elf; \
+		cp $(XV6_RECLAIM_TEST_ELF) rootfs/bin/xv6_reclaim_test.elf; \
+		cp $(XV6_LARGEWRITE_TEST_ELF) rootfs/bin/xv6_largewrite_test.elf; \
+		cp $(HELLO_DYN_ELF) rootfs/bin/hello_dyn.elf; \
+			cp $(DYNLINK_MULTI_TLS_ELF) rootfs/bin/dynlink_multi_tls.elf; \
+			cp $(DYNLINK_DLOPEN_ELF) rootfs/bin/dynlink_dlopen.elf; \
+			cp $(DYNLINK_MALLOC_ELF) rootfs/bin/dynlink_malloc.elf; \
+			cp $(BUSYBOX_ASH_DYN_ELF) rootfs/bin/busybox.dyn; \
+			cp $(GCC_DYN_ELF) rootfs/bin/gcc.dyn; \
+			cp $(DYNLINK_LIB_A_SO) rootfs/lib/libdyn_a.so; \
+			cp $(DYNLINK_LIB_B_SO) rootfs/lib/libdyn_b.so; \
+			cp $(DYNLINK_PLUGIN_SO) rootfs/lib/libdyn_plugin.so; \
+			cp $(DYNLINK_CPP_SO) rootfs/lib/libdyn_cpp.so; \
+			mkdir -p rootfs/kbuild/kernel rootfs/kbuild/lwip/core/ipv4 rootfs/kbuild/lwip/netif; \
+			KBUILD=rootfs/src/kernel-build; \
+			rm -rf "$$KBUILD"; \
+			mkdir -p "$$KBUILD/ports/lwip/src"; \
+			cp -r kernel "$$KBUILD/"; \
+			cp -r include "$$KBUILD/"; \
+			cp -r ports/lwip/src/include "$$KBUILD/ports/lwip/src/"; \
+			cp -r ports/lwip/src/core "$$KBUILD/ports/lwip/src/"; \
+			mkdir -p "$$KBUILD/ports/lwip/src/netif"; \
+			cp ports/lwip/src/netif/ethernet.c "$$KBUILD/ports/lwip/src/netif/"; \
+			mkdir -p "$$KBUILD/scripts"; \
+			cp scripts/kernel.ld "$$KBUILD/scripts/"; \
+			cp scripts/Makefile.kernel-native "$$KBUILD/Makefile"; \
+			python3 scripts/build_rootfs_xv6fs.py rootfs $(ROOTFS_IMG); \
+		fi
+
+$(XV6FS_IMG): $(ROOTFS_FILES)
+	python3 scripts/build_rootfs_xv6fs.py rootfs $(XV6FS_IMG)
+
+rootfs-xv6.img: $(XV6FS_IMG)
+
+ifeq ($(UNAME_S),Darwin)
+LIMINE_BINARY_DEP =
+else
+LIMINE_BINARY_DEP = Limine/limine
+endif
+
+$(ISO): $(KERNEL_ELF) $(SH_ELF) iso/limine.conf $(LIMINE_BINARY_DEP) $(ROOTFS_IMG)
+	rm -rf iso_root
+	mkdir -p iso_root/boot/limine
+	cp $(KERNEL_ELF) iso_root/boot/kernel.elf
+	cp $(SH_ELF) iso_root/boot/sh.elf
+	cp $(ROOTFS_IMG) iso_root/boot/rootfs.img
+	cp iso/limine.conf iso_root/boot/limine/limine.conf
+
+	mkdir -p iso_root/EFI/BOOT
+	cp Limine/limine-bios.sys Limine/limine-bios-cd.bin Limine/limine-uefi-cd.bin iso_root/boot/limine/
+	cp Limine/BOOTX64.EFI iso_root/EFI/BOOT/
+	cp Limine/BOOTIA32.EFI iso_root/EFI/BOOT/
+	xorriso -as mkisofs -v -R -r -J -b boot/limine/limine-bios-cd.bin \
+		-no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
+		-apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
+		-efi-boot-part --efi-boot-image --protective-msdos-label \
+		iso_root -o $(ISO)
+ifneq ($(UNAME_S),Darwin)
+	$(CURDIR)/Limine/limine bios-install $(ISO)
+endif
+	rm -rf iso_root
+
+
+# ★ rootfs.img を作り直したら、下の x86-*-smoke より先に
+#      make nativekernelbuildsmoke
+#    を 1 回流すこと。理由は次のとおり (日報2026-08-08 §5)。
+#
+#    /etc/bootcmd はブート時に /etc/native_kernel_build_smoke.sh を起動し、
+#    OS 内で make -j4 でカーネルを組む。イメージに /kbuild/kernel の .o が
+#    揃っていれば実質 no-op で数秒で終わるが、作り直した直後は /kbuild が
+#    空なので約 50 ファイルを OS 内の cc1 でフルコンパイルすることになる。
+#    そうなると:
+#      x86-kernel-smoke    kernel-native-build: PASS が持ち時間内に出ない
+#      x86-pipe-end-smoke  ビルドで塞がった ash に探針が届かない
+#    のどちらも時間切れで落ちる。カーネルの退行ではないので注意。
+#
+#    /kbuild は rootfs/ ステージングからは作れない (OS 内で育つ状態)。
+#    nativekernelbuildsmoke は virtio-blk 経由で root を書けるように起動する
+#    ので (kernel/init.c:196-211)、フルビルドの結果が rootfs.img に残る。
+#
+#    なお $(ROOTFS_IMG) は FORCE 依存なので、ISO を作る系のターゲット
+#    (run / persist-run / nativekernelbuildsmoke など) を叩くと rootfs.img が
+#    作り直され、この /kbuild は消える。下の x86-*-smoke 3 つはスクリプト側で
+#    ISO を組んで既存の rootfs.img をそのまま使うので、叩いても消えない。
+
+# x86 カーネルの回帰テスト。ISO はスクリプト側で組む
+# (rootfs.img は既存のものを使う。macOS では x86 ユーザーランドを再ビルドできない)
+x86-kernel-smoke: $(KERNEL_ELF)
+	bash ./tests/x86_kernel_smoke.sh
+
+# 失敗系の syscall が正しい errno を返すかの検証 (-1 は EPERM として顕在化する)
+x86-errno-smoke: $(KERNEL_ELF)
+	bash ./tests/x86_errno_smoke.sh
+
+# pipe / FIFO の端ごとの本数 (EOF は writers==0 / EPIPE は readers==0)。
+# rootfs.img に /bin/pipeend_probe.elf が要る (make rootfs.img で入る)
+x86-pipe-end-smoke: $(KERNEL_ELF)
+	bash ./tests/x86_pipe_end_smoke.sh
+
+run: $(ISO)
+	bash tests/run_qemu_stdio.sh
+
+persist-run: ROOTFS_REBUILD=0
+persist-run: $(ISO) $(ROOTFS_IMG)
+	bash tests/run_qemu_stdio.sh \
+		$(ROOTFS_VBLK_ARGS)
+
+ac97run: $(ISO)
+	bash tests/run_qemu_ac97.sh
+
+ac97smoke: $(ISO)
+	bash ./tests/ac97_smoke.sh $(ISO)
+
+doomac97smoke: $(ISO)
+	bash ./tests/doom_ac97_smoke.sh $(ISO)
+
+musltoolchainsmoke: $(ISO)
+	bash ./tests/musl_toolchain_smoke.sh
+
+muslforkprobesmoke: $(ISO)
+	bash ./tests/musl_forkprobe_smoke.sh $(ISO)
+
+muslexecprobesmoke: $(ISO)
+	bash ./tests/musl_execprobe_smoke.sh $(ISO)
+
+muslforkexecwaitsmoke: $(ISO)
+	bash ./tests/musl_forkexecwait_smoke.sh $(ISO)
+
+muslbusyboxsmoke: $(ISO)
+	bash ./tests/musl_busybox_smoke.sh $(ISO)
+
+muslbusyboxenvshowsmoke: $(ISO)
+	bash ./tests/musl_busybox_envshow_smoke.sh $(ISO)
+
+dynlinkrealappsmoke: $(ISO)
+	bash ./tests/dynlink_realapp_smoke.sh $(ISO)
+
+vmsyscallsmoke: $(ISO)
+	bash ./tests/vm_syscall_smoke.sh $(ISO)
+
+cowmprotectsmoke: $(ISO)
+	bash ./tests/cow_mprotect_smoke.sh $(ISO)
+
+timesyscallsmoke: $(ISO)
+	bash ./tests/time_syscall_smoke.sh $(ISO)
+
+signalsyscallsmoke: $(ISO)
+	bash ./tests/signal_syscall_smoke.sh $(ISO)
+
+ftruncsavesmoke: $(ISO)
+	bash ./tests/ftruncate_save_smoke.sh $(ISO)
+
+preadpwritesmoke: $(ISO)
+	bash ./tests/pread_pwrite_smoke.sh $(ISO)
+
+xv6sparsesmoke: $(ISO)
+	bash ./tests/xv6_sparse_smoke.sh $(ISO)
+
+xv6reclaimsmoke: $(ISO)
+	bash ./tests/xv6_reclaim_smoke.sh $(ISO)
+
+xv6largewritesmoke: $(ISO)
+	bash ./tests/xv6_largewrite_smoke.sh $(ISO)
+
+virtionetirqsmoke: $(ISO)
+	bash ./tests/virtio_net_irq_smoke.sh $(ISO)
+
+virtioblkinflightsmoke: $(ISO)
+	bash ./tests/virtio_blk_inflight_smoke.sh $(ISO)
+
+virtioq35smoke: $(ISO)
+	bash ./tests/virtio_q35_msix_smoke.sh $(ISO)
+
+irqbottomhalfstresssmoke: $(ISO)
+	bash ./tests/irq_bottom_half_stress_smoke.sh $(ISO)
+
+irqbottomhalfsmpstresssmoke: $(ISO)
+	bash ./tests/irq_bottom_half_smp_stress_smoke.sh $(ISO)
+
+finalsmokesuite:
+	bash ./tests/final_smoke_suite.sh
+
+nativekernelbuildsmoke: $(ISO)
+	bash ./tests/native_kernel_build_smoke.sh $(ISO)
+
+nativekernelbootsmoke: $(ISO)
+	bash ./tests/native_kernel_boot_smoke.sh $(ISO)
+
+pythonnumpysmoke: $(ISO)
+	bash ./tests/python_numpy_smoke.sh $(ISO)
+
+smprun: $(ISO)
+	bash tests/run_qemu_stdio.sh \
+		-smp 2
+
+persistsmprun: ROOTFS_REBUILD=0
+persistsmprun: $(ISO) $(ROOTFS_IMG)
+	bash tests/run_qemu_stdio.sh \
+		$(ROOTFS_VBLK_ARGS) \
+		-smp 2
+
+smp4run: $(ISO)
+	bash tests/run_qemu_stdio.sh \
+		-smp 4
+
+netrun: $(ISO)
+	bash tests/run_qemu_stdio.sh \
+		-netdev user,id=net0,hostfwd=tcp::8080-:8080,hostfwd=udp::12345-:12345,hostfwd=udp::12346-:12346 \
+		-device virtio-net-pci,netdev=net0
+
+persistnetrun: ROOTFS_REBUILD=0
+persistnetrun: $(ISO) $(ROOTFS_IMG)
+	bash tests/run_qemu_stdio.sh \
+		$(ROOTFS_VBLK_ARGS) \
+		-netdev user,id=net0,hostfwd=tcp::8080-:8080,hostfwd=udp::12345-:12345,hostfwd=udp::12346-:12346 \
+		-device virtio-net-pci,netdev=net0
+
+doommsulrun: $(ISO)
+	bash tests/run_doom_musl.sh
+
+doommuslrun: doommsulrun
+
+usb-img:
+	@if [ ! -f $(USB_IMG) ]; then \
+		echo "Creating $(USB_IMG) (256M)"; \
+		truncate -s 256M $(USB_IMG); \
+	fi
+	@python3 scripts/make_usb_img.py $(USB_IMG)
+	@printf 'OrthOS USB TEST BLOCK 0002\nREAD(10) verification pattern\n' | \
+		dd of=$(USB_IMG) bs=512 seek=2 conv=notrunc status=none
+	@printf 'OrthOS USB TEST BLOCK 0003\nThird sector marker\n' | \
+		dd of=$(USB_IMG) bs=512 seek=3 conv=notrunc status=none
+
+usb: $(ISO) usb-img
+	bash tests/run_qemu_stdio.sh \
+		-device qemu-xhci,id=xhci \
+		-drive if=none,id=usbdisk,file=$(USB_IMG),format=raw \
+		-device usb-storage,bus=xhci.0,drive=usbdisk
+
+clean:
+	rm -rf $(BUILD_DIR) $(KERNEL_ELF) $(USER_ELF) $(EXEC_ELF) $(PIPE_TEST_ELF) $(SH_ELF) $(GCC_ELF) $(LOOP_ELF) $(ISO)
+	rm -f $(MUSL_USER_ELF) $(MUSL_SH_ELF)
+	rm -f user/*.elf
+	rm -rf iso_root
+	rm -f rootfs.tar
+	$(MAKE) -C Limine clean
+
+-include $(DEPS)
+-include $(RISCV64_OBJS:.o=.d)
+# aarch64 のぶんが抜けていた。**ヘッダを変えても再ビルドされない**状態で、
+# M2b で aarch64 に初めてヘッダ (include/aarch64/) を入れたときから潜在して
+# いた。それまで aarch64 にヘッダが 1 つも無かったので表面化しなかった
+-include $(AARCH64_OBJS:.o=.d)

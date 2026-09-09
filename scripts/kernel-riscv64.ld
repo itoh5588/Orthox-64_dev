@@ -1,0 +1,40 @@
+ENTRY(_start)
+
+SECTIONS
+{
+    . = 0x80200000;
+    __kernel_start = .;
+
+    .text : ALIGN(0x1000) {
+        __text_start = .;
+        *(.text.start)
+        *(.text .text.*)
+        __text_end = .;
+    }
+
+    .rodata : ALIGN(0x1000) {
+        __rodata_start = .;
+        *(.rodata .rodata.*)
+        __rodata_end = .;
+    }
+
+    .data : ALIGN(0x1000) {
+        __data_start = .;
+        *(.data .data.*)
+        __data_end = .;
+    }
+
+    .bss : ALIGN(0x1000) {
+        __bss_start = .;
+        *(.bss .bss.*)
+        *(COMMON)
+        __bss_end = .;
+    }
+    __kernel_end = .;
+
+    /DISCARD/ : {
+        *(.comment)
+        *(.eh_frame)
+        *(.note .note.*)
+    }
+}

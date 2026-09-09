@@ -1,0 +1,75 @@
+/*
+ * aarch64 にまだ無いもの (C-1a)。
+ *
+ * kernel/fs.c / task_exec.c を共有層から取り込むと、x86 にしか無い周辺
+ * (キーボード / USB / ネットワーク) が芋づるで要求される。**必要なのは
+ * 11 個だけ**で、llvm-nm -u で実測して決めた。
+ *
+ * **ブートローダのモジュールはここから外れた。**受け取り方は arch hook
+ * (include/aarch64/bootmod.h) になったので、x86 の名前を名乗る必要が無い。
+ *
+ * ここに集める方針:
+ *
+ *   1. **黙って成功を返さない。** 「まだ無い」と「何もしなくてよい」は
+ *      別のこと。前者は失敗を返し、後者は正しく何もする必要が無い理由を書く
+ *   2. **黙って固まらせない。** 待ち続ける形にすると、原因不明のハングに
+ *      化ける。無いものは無いと即座に返す
+ *   3. 1 か所にまとめる。散らすと「何が未実装か」が読めなくなる
+ */
+#include <stdint.h>
+#include <stddef.h>
+#include "linux_syscall.h"   /* arch_random_bytes */
+#include "task.h"
+
+/* ---- コンソール入力 (キーボード) ----------------------------------------
+ *
+ * **kernel/aarch64/console.c に本物が入った (P3)。**
+ * M3c-2b までは、PL011 の受信割り込みが無いので kb_read が負を返していた
+ * (「入力が無い」ではなく「入力の口が無い」= read を失敗させるのが正しい)。
+ * いまは口があるので、来ていなければ 0 を返して待ち手に登録される */
+
+/* ---- 時刻 ----------------------------------------------------------------
+ *
+ * x86 の LAPIC タイマ由来の ms。**aarch64 には本物がある**ので繋ぐ
+ * (ここだけはスタブではない) */
+uint64_t arch_time_now_ms(void);
+
+/* ---- ネットワーク --------------------------------------------------------
+ *
+ * net_socket_read_fd/write_fd の実体は kernel/net_socket.c (共有層、
+ * N-9 手1 で aarch64 にも繋いだ)。ここには置かない — 置くと多重定義になる */
+
+/* ---- 乱数 ----------------------------------------------------------------
+ *
+ * kernel/sys_random.c は rdrand / rdtsc を直書きしていて aarch64 では
+ * コンパイルできない (`invalid output constraint '=a'`)。
+ *
+ * **2026-09-05 に本物を入れた** (kernel/aarch64/rng.c)。実機は BCM2711 の
+ * RNG200、QEMU virt は virtio-rng。TLS が鍵の材料をここから取るので、
+ * 予測できる値を返すわけにいかない。
+ *
+ * **源が無ければ -ENOSYS のまま。** 適当な値を返すと、呼ぶ側は乱数を
+ * 得たつもりで進む。これは /dev/urandom (kernel/fs.c) の口でもある */
+int64_t sys_getrandom(void* buf, size_t len, unsigned flags) {
+    int64_t got;
+    (void)flags;
+    if (!buf) return -14;               /* EFAULT */
+    got = arch_random_bytes(buf, len);
+    if (got < 0) return -38;            /* ENOSYS: 源が無い */
+    return got;
+}
+
+/* ---- USB -----------------------------------------------------------------
+ *
+ * **kernel/usb.c を共有層として取り込んだので、ここのスタブは外した**
+ * (USB キーボードのため。日報2026-08-16)。本物が
+ * usb_block_device_ready / usb_read_block を出す */
+
+/* ---- virtio コンソール出力 ----------------------------------------------
+ *
+ * x86 のログ収集用の出口。aarch64 では PL011 に直接出しているので要らない。
+ * **書けたふりをしない** (書けたことにすると、出ていないログを出たと数える) */
+int virtio_kout_write_raw(uint64_t byte_offset, const void* buf, size_t count) {
+    (void)byte_offset; (void)buf; (void)count;
+    return -1;
+}

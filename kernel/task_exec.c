@@ -1,0 +1,749 @@
+#include <stdint.h>
+#include <stddef.h>
+#include "task_internal.h"
+#include "pmm.h"
+#include "vmm.h"
+#include "elf64.h"
+#include "fs.h"
+
+/* argv と envp を写す場所。**1 本ごとの上限ではなく合計で見る。**
+ *
+ * 以前は argv_storage[128][4096] という固定の枠だったので、**1 本でも
+ * 4096 バイトを超えると exec が失敗した。**GCC の最上位 Makefile は
+ * $(HOST_EXPORTS) を展開した 9,451 バイトのレシピを /bin/sh -c に渡すので、
+ * make all-host が 1 段目 (libiberty) から進まなかった (2026-08-30)。
+ *
+ * **見つけにくい形で出る。**exec の失敗をシェルも make も一律 127 と
+ * 「not found」で報告するので、`make: /bin/sh: No such file or directory`
+ * になる。/bin/sh は在るのに無いと言われるので、最初はファイルシステムを
+ * 疑うことになる。最小再現はこれ:
+ *     A=`awk 'BEGIN{s="";for(i=0;i<5000;i++)s=s "x";print s}'`
+ *     /bin/sh -c "echo OK; : $A"     -> /bin/sh: not found
+ *   (3000 バイトなら通る)
+ *
+ * Linux も 1 本ごとではなく合計 (ARG_MAX) で見る。同じ形にする。
+ * 副産物として、exec 1 回あたりの確保が 1MB から 272KB に減る。 */
+#define EXEC_ARG_TOTAL       (256 * 1024)
+#define EXEC_COPY_PAGES      80
+#define EXEC_MAX_PATH_LEN    1024
+/* argv + envp の本数。**128 では GCC が組めない。**
+ *
+ * make が下位ディレクトリへ降りるときに渡す環境と引数だけで 128 本を
+ * 超える (libiberty の stamp-picdir という 3 行のルールで超えた)。
+ * リンクはもっと要る —— `ar rcs libbackend.a *.o` は 344 個。
+ *
+ * Linux の MAX_ARG_STRINGS は 0x7FFFFFFF で、**実際の制限は合計サイズだけ。**
+ * ここも本数はポインタ配列の大きさでしかないので、広く取って
+ * EXEC_ARG_TOTAL で頭打ちにする。2048 本 × 平均 128 バイトで丁度 256KB。 */
+#define EXEC_MAX_VEC_STRINGS 2048
+/* 引数が多すぎるときに返す errno。共有カーネルには errno ヘッダが無いので
+ * kernel/fs.c と同じくファイル内で定義する (Linux asm-generic の値) */
+#define E2BIG 7
+#define ELOOP 40   /* #! の入れ子が深すぎる (Linux と同じ番号) */
+#define EXEC_ET_DYN_LOAD_BASE 0x400000ULL
+
+/* 動的リンカ (ld-musl) を置く番地。
+ *
+ * **アーキテクチャで使える VA の幅が違う。**x86_64 は 48bit あるので
+ * 0x7fc000000000 に置けるが、**aarch64 (T0SZ=25) と riscv64 (Sv39) は
+ * 39bit しか無く、使えるのは 0x7fffffffff まで**。39bit の機械で
+ * 0x7fc000000000 を指すと、その番地を表すページテーブルの段が存在しない
+ * ため、飛んだ瞬間に level 0 の translation fault になる
+ * (2026-08-29 に aarch64 で実測: ESR=0x82000004 / FAR=ELR=入口の番地)。
+ *
+ * 39bit 側は 0x6000000000 に置く。ユーザスタックの天井 (約 0x4000000000)
+ * より上で、39bit の上限にはまだ 128GB の余裕がある。 */
+#if defined(__x86_64__)
+#define EXEC_INTERP_LOAD_BASE 0x7fc000000000ULL
+#else
+#define EXEC_INTERP_LOAD_BASE 0x6000000000ULL
+#endif
+
+#ifndef ORTHOX_MEM_TRACE
+#define ORTHOX_MEM_TRACE 0
+#endif
+
+#ifndef ORTHOX_MEM_PROGRESS
+#define ORTHOX_MEM_PROGRESS 0
+#endif
+
+extern void puts(const char* s);
+extern void puthex(uint64_t v);
+extern int fs_get_file_data(const char* path, void** data, size_t* size);
+extern void fs_free_exec_buffer(const char* path, void* data, size_t size);
+
+static void* kernel_memset(void* s, int c, size_t n) {
+    unsigned char* p = s;
+    while (n--) *p++ = (unsigned char)c;
+    return s;
+}
+
+#if ORTHOX_MEM_PROGRESS || ORTHOX_MEM_TRACE
+static int task_comm_is_name(const struct task* t, const char* name) {
+    int i = 0;
+    if (!t || !name) return 0;
+    while (t->comm[i] && name[i]) {
+        if (t->comm[i] != name[i]) return 0;
+        i++;
+    }
+    return t->comm[i] == '\0' && name[i] == '\0';
+}
+#endif
+
+struct exec_copy_buf {
+    char  path[EXEC_MAX_PATH_LEN];
+    char* argv[EXEC_MAX_VEC_STRINGS + 1];
+    char* envp[EXEC_MAX_VEC_STRINGS + 1];
+    char* argv2[EXEC_MAX_VEC_STRINGS + 1];  /* #! の組み換えで使う並べ替え先 */
+    int   used;                             /* storage の使用済みバイト数 */
+    char  storage[EXEC_ARG_TOTAL];          /* argv と envp を順に詰める */
+};
+
+/* **枠に収まることを組み立て時に確かめる。**pmm_alloc はページ数で頼むので、
+ * 構造体を太らせたときに気付ける場所がここしかない */
+_Static_assert(sizeof(struct exec_copy_buf) <= EXEC_COPY_PAGES * 4096,
+               "exec_copy_buf does not fit in EXEC_COPY_PAGES");
+
+static int copy_user_cstring(const char* src, char* dst, int size) {
+    if (!src || !dst || size <= 0) return -1;
+    if ((uint64_t)src < 0x1000ULL) return -1;
+    int i = 0;
+    for (; i + 1 < size; i++) {
+        char ch = src[i];
+        dst[i] = ch;
+        if (!ch) return 0;
+    }
+    dst[size - 1] = '\0';
+    return -1;
+}
+
+/* カーネル側の 1 本を storage の残りに足し、その番地を返す。溢れたら 0。
+ * **既に詰めた分は動かさない** —— 呼び出し側が持っているポインタが生き続ける */
+static char* arg_push(struct exec_copy_buf* b, const char* src) {
+    int len = 0, i;
+    char* dst;
+    if (!src) return 0;
+    while (src[len]) len++;
+    len++;
+    if (b->used + len > EXEC_ARG_TOTAL) return 0;
+    dst = b->storage + b->used;
+    for (i = 0; i < len; i++) dst[i] = src[i];
+    b->used += len;
+    return dst;
+}
+
+/* ユーザ空間の 1 本を storage の残りに写す。**残り全部を使ってよい** ——
+ * 1 本ごとの枠は設けない。収まらなければ -E2BIG */
+static int arg_push_user(struct exec_copy_buf* b, const char* src, char** out) {
+    int room, i;
+    char* dst;
+    if (!src) return -1;
+    if ((uint64_t)src < 0x1000ULL) return -1;
+    room = EXEC_ARG_TOTAL - b->used;
+    if (room <= 1) return -E2BIG;
+    dst = b->storage + b->used;
+    for (i = 0; i + 1 < room; i++) {
+        char ch = src[i];
+        dst[i] = ch;
+        if (!ch) { b->used += i + 1; *out = dst; return 0; }
+    }
+    return -E2BIG;   /* 残りに収まらなかった */
+}
+
+static int copy_user_string_vector(struct exec_copy_buf* b,
+                                   char* const user_vec[], char** kernel_vec) {
+    int count = 0, rc;
+    if (!kernel_vec) return -1;
+    if (!user_vec) {
+        kernel_vec[0] = 0;
+        return 0;
+    }
+    /* ベクタ配列ポインタ自体も検証する (NULL 近傍の deref はカーネル死を招く) */
+    if ((uint64_t)(uintptr_t)user_vec < 0x1000ULL) return -1;
+    while (count < EXEC_MAX_VEC_STRINGS) {
+        const char* src = user_vec[count];
+        if (!src) break;
+        rc = arg_push_user(b, src, &kernel_vec[count]);
+        if (rc < 0) return rc;
+        count++;
+    }
+    /* **上限で打ち切ったまま成功を返さないこと。** 以前はここで黙って
+     * 終端していたので、129 個目以降が消えたまま exec が成功していた。
+     *   ar rcs libbackend.a *.o   ← 344 個渡して届くのは 126 個。
+     *                                216 個が入っていないアーカイブが出来て ar は成功する
+     * Linux と同じく E2BIG を返して呼び出し側に分割させる。 */
+    if (count == EXEC_MAX_VEC_STRINGS && user_vec[count]) return -E2BIG;
+    kernel_vec[count] = 0;
+    return 0;
+}
+
+static const char* path_basename(const char* path) {
+    const char* base = path;
+    if (!path) return "";
+    for (const char* p = path; *p; p++) {
+        if (*p == '/') base = p + 1;
+    }
+    return base;
+}
+
+static int streq(const char* a, const char* b) {
+    if (!a || !b) return 0;
+    while (*a && *b) {
+        if (*a != *b) return 0;
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+static int resolve_interp_file(const char* interp_path, void** file_addr, size_t* file_size) {
+    if (fs_get_file_data(interp_path, file_addr, file_size) == 0) {
+        return 0;
+    }
+
+    const char* base = path_basename(interp_path);
+    if (streq(base, "ld-musl-x86_64.so.1")) {
+        return fs_get_file_data("/lib/ld-musl-x86_64.so.1", file_addr, file_size);
+    }
+
+    return -1;
+}
+
+static int alloc_user_stack(arch_address_space_t address_space, struct task* t, int stack_pages, uint8_t* stack_pages_out[]) {
+    if (!address_space || !t || stack_pages <= USER_STACK_GUARD_PAGES) return -1;
+    uint64_t stack_bottom_vaddr = USER_STACK_TOP_VADDR - (uint64_t)stack_pages * PAGE_SIZE;
+    uint64_t mapped_bottom_vaddr = stack_bottom_vaddr + USER_STACK_GUARD_PAGES * PAGE_SIZE;
+    for (int i = 0; i < stack_pages - USER_STACK_GUARD_PAGES; i++) {
+        void* stack_phys = pmm_alloc(1);
+        if (!stack_phys) return -1;
+        uint8_t* stack_mem = (uint8_t*)PHYS_TO_VIRT(stack_phys);
+        kernel_memset(stack_mem, 0, PAGE_SIZE);
+        arch_vm_map_page(address_space,
+                     mapped_bottom_vaddr + (uint64_t)i * PAGE_SIZE,
+                     (uint64_t)stack_phys,
+                     arch_vm_user_page_flags(1, 0));
+        if (stack_pages_out) stack_pages_out[i] = stack_mem;
+    }
+    t->user_stack_top = USER_STACK_TOP_VADDR;
+    t->user_stack_bottom = mapped_bottom_vaddr;
+    t->user_stack_guard = stack_bottom_vaddr;
+    return 0;
+}
+
+/* スタックの下端へのフォルトを埋める。**呼ぶのは EL0 のフォルト処理から。**
+ *
+ * 落ちた番地が「まだ張っていないスタックの範囲」なら、そこまで 1 ページずつ
+ * 張り足して 0 を返す。呼び出し元は落ちた命令をやり直させる。範囲の外なら
+ * -1 を返し、呼び出し元がタスクを落とす。
+ *
+ * **上限を越えたときは伸ばさない。** 無限再帰を黙って 8MiB 食わせてから
+ * 落とすより、決めた所で止めた方が原因が分かる。
+ *
+ * 訳は task_internal.h の USER_STACK_MAX_PAGES に書いた。 */
+int task_grow_user_stack(struct task* t, uint64_t fault_addr) {
+    arch_address_space_t address_space;
+    uint64_t limit, page_va;
+
+    if (!t || !t->user_stack_top) return -1;
+
+    address_space = (arch_address_space_t)arch_task_context_get_address_space(&t->ctx);
+    if (!address_space) return -1;
+
+    /* 張ってある所で落ちたなら別の理由 (権限違反など)。ここでは扱わない */
+    if (fault_addr >= t->user_stack_bottom) return -1;
+    if (fault_addr >= t->user_stack_top) return -1;
+
+    limit = t->user_stack_top - (uint64_t)USER_STACK_MAX_PAGES * PAGE_SIZE;
+    if (fault_addr < limit) return -1;          /* 上限を越えた */
+
+    page_va = fault_addr & ~((uint64_t)PAGE_SIZE - 1);
+
+    /* **下端から落ちた番地まで隙間なく張る。** 大きなフレームを一度に
+     * 掘る関数だと、間のページを飛ばして下を触りに来ることがある */
+    while (t->user_stack_bottom > page_va) {
+        uint64_t va = t->user_stack_bottom - PAGE_SIZE;
+        void* phys = pmm_alloc(1);
+        if (!phys) return -1;
+        kernel_memset((uint8_t*)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
+        arch_vm_map_page(address_space, va, (uint64_t)phys,
+                         arch_vm_user_page_flags(1, 0));
+        t->user_stack_bottom = va;
+    }
+    t->user_stack_guard = t->user_stack_bottom - PAGE_SIZE;
+    return 0;
+}
+
+static int stack_write_bytes(uint8_t* stack_pages[], uint64_t mapped_bottom_vaddr,
+                             uint64_t stack_top_vaddr, uint64_t user_addr,
+                             const void* src, int len) {
+    const uint8_t* in = (const uint8_t*)src;
+    if (!stack_pages || !src || len < 0) return -1;
+    if (user_addr < mapped_bottom_vaddr || user_addr + (uint64_t)len > stack_top_vaddr) return -1;
+    uint64_t rel = user_addr - mapped_bottom_vaddr;
+    int remaining = len;
+    while (remaining > 0) {
+        uint64_t page_index = rel / PAGE_SIZE;
+        uint64_t page_off = rel % PAGE_SIZE;
+        int chunk = (int)(PAGE_SIZE - page_off);
+        if (chunk > remaining) chunk = remaining;
+        if (!stack_pages[page_index]) return -1;
+        for (int i = 0; i < chunk; i++) {
+            stack_pages[page_index][page_off + (uint64_t)i] = in[i];
+        }
+        in += chunk;
+        rel += (uint64_t)chunk;
+        remaining -= chunk;
+    }
+    return 0;
+}
+
+static int stack_write_u64(uint8_t* stack_pages[], uint64_t mapped_bottom_vaddr,
+                           uint64_t stack_top_vaddr, uint64_t user_addr, uint64_t value) {
+    return stack_write_bytes(stack_pages, mapped_bottom_vaddr, stack_top_vaddr,
+                             user_addr, &value, (int)sizeof(value));
+}
+
+static int copy_user_string_to_stack(uint8_t* stack_pages[], uint64_t mapped_bottom_vaddr,
+                                     uint64_t stack_top_vaddr, uint64_t* current_sp,
+                                     const char* src, uint64_t* user_addr_out) {
+    if ((uint64_t)src < 0x1000ULL) {
+        puts("Exec: invalid user string pointer ");
+        puthex((uint64_t)src);
+        puts("\r\n");
+        return -1;
+    }
+    int len = 0;
+    while (src[len]) len++;
+    len++;
+    if (*current_sp < mapped_bottom_vaddr + (uint64_t)len) return -1;
+    *current_sp -= (uint64_t)len;
+    if (*current_sp < mapped_bottom_vaddr || *current_sp >= stack_top_vaddr) return -1;
+    if (stack_write_bytes(stack_pages, mapped_bottom_vaddr, stack_top_vaddr, *current_sp, src, len) < 0) {
+        return -1;
+    }
+    *user_addr_out = *current_sp;
+    return 0;
+}
+
+enum {
+    AT_NULL = 0,
+    AT_PHDR = 3,
+    AT_PHENT = 4,
+    AT_PHNUM = 5,
+    AT_PAGESZ = 6,
+    AT_ENTRY = 9,
+    AT_UID = 11,
+    AT_EUID = 12,
+    AT_GID = 13,
+    AT_EGID = 14,
+    AT_SECURE = 23,
+    AT_RANDOM = 25,
+};
+
+/* **ptrs はカーネルスタックに置かないこと。**カーネルスタックは 4 ページ
+ * (16KB) しか無いのに、EXEC_MAX_VEC_STRINGS 個 x 8 バイト x 2 は 32KB ある。
+ * ここに置いて溢れさせると、ユーザのレジスタにカーネルの番地が載って
+ * EL0 から踏む —— ESR=0x9200000e (permission fault) で落ちた (2026-08-30)。
+ * 外側のラッパがヒープから渡す。 */
+static int prepare_user_stack_with_ptrs(arch_address_space_t address_space, struct task* t,
+                                        const struct elf_info* info,
+                                        const struct elf_info* interp_info,
+                                        char* const argv[], char* const envp[],
+                                        uint64_t* env_ptrs, uint64_t* arg_ptrs) {
+    uint8_t* stack_pages[USER_STACK_PAGES];
+    for (int i = 0; i < USER_STACK_PAGES; i++) stack_pages[i] = 0;
+    if (alloc_user_stack(address_space, t, USER_STACK_PAGES, stack_pages) < 0) {
+        puts("Exec: alloc_user_stack failed\r\n");
+        return -1;
+    }
+
+    int argc = 0; if (argv) while (argv[argc]) argc++;
+    int envc = 0; if (envp) while (envp[envc]) envc++;
+    /* **上限を超えたら失敗させること。** 以前はここで argc / envc を
+     * EXEC_MAX_VEC_STRINGS に詰めていたが、それは「超えた分を黙って捨てて
+     * 成功を返す」ことになる。呼び出し側は成功したと思って先に進むので、
+     * 誰も気付かないまま結果だけが欠ける。
+     *   ar rcs libbackend.a *.o     ← 344 個渡しても 126 個しか届かず、
+     *                                  216 個が消えたアーカイブが出来て ar は成功する
+     * Linux も引数が多すぎれば E2BIG を返す。 */
+    if (argc > EXEC_MAX_VEC_STRINGS || envc > EXEC_MAX_VEC_STRINGS) {
+        puts("Exec: too many argv/envp strings (E2BIG)\r\n");
+        return -E2BIG;
+    }
+    uint64_t current_str_addr = t->user_stack_top;
+    current_str_addr -= 16;
+    uint64_t random_base = current_str_addr;
+    if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top,
+                        random_base, 0x0123456789abcdefULL) < 0 ||
+        stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top,
+                        random_base + 8, 0xfedcba9876543210ULL) < 0) {
+        return -1;
+    }
+
+    for (int i = envc - 1; i >= 0; i--) {
+        if (copy_user_string_to_stack(stack_pages, t->user_stack_bottom, t->user_stack_top,
+                                      &current_str_addr, envp[i], &env_ptrs[i]) < 0) {
+            return -1;
+        }
+    }
+    for (int i = argc - 1; i >= 0; i--) {
+        if (copy_user_string_to_stack(stack_pages, t->user_stack_bottom, t->user_stack_top,
+                                      &current_str_addr, argv[i], &arg_ptrs[i]) < 0) {
+            return -1;
+        }
+    }
+
+    current_str_addr &= ~7ULL;
+    if (current_str_addr < t->user_stack_bottom + (uint64_t)(envc + argc + 32) * 8ULL) {
+        return -1;
+    }
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, 0) < 0) return -1;
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, AT_NULL) < 0) return -1;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, random_base) < 0) return -1;
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, AT_RANDOM) < 0) return -1;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, 0) < 0) return -1;
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, AT_SECURE) < 0) return -1;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, 0) < 0) return -1;
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, AT_EGID) < 0) return -1;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, 0) < 0) return -1;
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, AT_GID) < 0) return -1;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, 0) < 0) return -1;
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, AT_EUID) < 0) return -1;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, 0) < 0) return -1;
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, AT_UID) < 0) return -1;
+
+    if (info->has_interp) {
+        current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, interp_info ? interp_info->load_bias : 0) < 0) return -1;
+        current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, 7 /* AT_BASE */) < 0) return -1;
+    }
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, (uint64_t)info->entry) < 0) return -1;
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, AT_ENTRY) < 0) return -1;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, PAGE_SIZE) < 0) return -1;
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, AT_PAGESZ) < 0) return -1;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, info->phnum) < 0) return -1;
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, AT_PHNUM) < 0) return -1;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, info->phent) < 0) return -1;
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, AT_PHENT) < 0) return -1;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, info->phdr_vaddr) < 0) return -1;
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, AT_PHDR) < 0) return -1;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, 0) < 0) return -1;
+
+    for (int i = envc - 1; i >= 0; i--) {
+        current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, env_ptrs[i]) < 0) return -1;
+    }
+    t->user_envp = current_str_addr;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, 0) < 0) return -1;
+    for (int i = argc - 1; i >= 0; i--) {
+        current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, arg_ptrs[i]) < 0) return -1;
+    }
+    t->user_argv = current_str_addr;
+
+    current_str_addr -= 8; if (stack_write_u64(stack_pages, t->user_stack_bottom, t->user_stack_top, current_str_addr, (uint64_t)argc) < 0) return -1;
+    t->user_argc = (uint64_t)argc;
+
+    t->user_stack = current_str_addr;
+    return 0;
+}
+
+/* ポインタ表を置く場所。**カーネルスタックでは足りない** (上の注記)。
+ * 2048 個 x 8 バイト x 2 = 32KB = 8 ページ */
+#define EXEC_PTRS_PAGES ((EXEC_MAX_VEC_STRINGS * 8 * 2 + 4095) / 4096)
+
+int task_prepare_initial_user_stack(arch_address_space_t address_space, struct task* t,
+                                    const struct elf_info* info,
+                                    const struct elf_info* interp_info,
+                                    char* const argv[], char* const envp[]) {
+    void* ptrs_phys;
+    uint64_t* base;
+    int rc;
+    ptrs_phys = pmm_alloc(EXEC_PTRS_PAGES);
+    if (!ptrs_phys) {
+        puts("Exec: could not get pointer table\r\n");
+        return -1;
+    }
+    base = (uint64_t*)PHYS_TO_VIRT(ptrs_phys);
+    rc = prepare_user_stack_with_ptrs(address_space, t, info, interp_info, argv, envp,
+                                      base, base + EXEC_MAX_VEC_STRINGS);
+    pmm_free(ptrs_phys, EXEC_PTRS_PAGES);
+    return rc;
+}
+
+int task_execve(arch_syscall_frame_t* frame, const char* path, char* const argv[], char* const envp[]) {
+    void* file_addr = NULL;
+    size_t file_size = 0;
+    void* exec_copy_phys = 0;
+    struct exec_copy_buf* exec_copy = 0;
+    uint64_t old_cr3 = 0;
+    struct task* t = get_current_task();
+    if (t && t->deferred_cr3 && t->deferred_cr3 != arch_task_context_get_address_space(&t->ctx) &&
+        t->deferred_cr3 != arch_vm_kernel_address_space()) {
+        arch_vm_destroy_user_address_space(t->deferred_cr3);
+        t->deferred_cr3 = 0;
+    }
+    exec_copy_phys = pmm_alloc(EXEC_COPY_PAGES);
+    if (!exec_copy_phys) {
+        return -1;
+    }
+    exec_copy = (struct exec_copy_buf*)PHYS_TO_VIRT(exec_copy_phys);
+    kernel_memset(exec_copy, 0, EXEC_COPY_PAGES * PAGE_SIZE);
+    {
+        /* argv / envp の複製は -E2BIG を返すことがある。-1 に潰さず通す */
+        int vec_rc = copy_user_cstring(path, exec_copy->path, EXEC_MAX_PATH_LEN) < 0 ? -1 : 0;
+        if (vec_rc >= 0) {
+            vec_rc = copy_user_string_vector(exec_copy, argv, exec_copy->argv);
+        }
+        if (vec_rc >= 0) {
+            vec_rc = copy_user_string_vector(exec_copy, envp, exec_copy->envp);
+        }
+        if (vec_rc < 0) {
+            pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+            return vec_rc;
+        }
+    }
+    /* ---- #! (shebang) の解決 (2026-08-29) ---------------------------------
+     *
+     * **これが無いとシェルスクリプトを直接 exec できない。**elf.c が
+     * 「ELF: Invalid magic」で弾き、呼び出し側には 127 が返る。
+     * GCC を実機で組もうとして露見した —— configure も libtool も
+     * move-if-change も、**ビルドの過程で何千回もスクリプトを exec する。**
+     *
+     * Linux と同じ組み替えをする:
+     *   execve("/p/script", ["script", "a"])  かつ  #!/bin/sh -x
+     *     -> execve("/bin/sh", ["/bin/sh", "-x", "/p/script", "a"])
+     *
+     * **引数は 1 つまで。**Linux もそうで、"#!/bin/sh -e -x" は
+     * 「-e -x」という 1 つの引数になる。
+     *
+     * 入れ子は 4 段までにする。スクリプトが自分を指すと無限に回る。 */
+    for (int shebang_depth = 0; ; shebang_depth++) {
+        const char* head;
+        /* **カーネルスタックに 4KB を 2 本置かない。**インタプリタの経路は
+         * 短い (Linux も 1 行 128 バイトに制限していた時期がある) */
+        char interp[256];
+        char sharg[256];
+        int has_arg = 0, k, argc_now, i, n;
+
+        if (fs_get_file_data(exec_copy->path, &file_addr, &file_size) < 0) {
+            puts("Exec: File not found: "); puts(exec_copy->path); puts("\r\n");
+            pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+            return -1;
+        }
+        head = (const char*)file_addr;
+        if (file_size < 2 || head[0] != '#' || head[1] != '!') break;   /* ELF のはず */
+
+        if (shebang_depth >= 4) {
+            fs_free_exec_buffer(exec_copy->path, file_addr, file_size);
+            pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+            return -ELOOP;
+        }
+
+        /* 1 行目を読む。**改行までしか見ない** */
+        {
+            size_t pos = 2, lim = file_size;
+            if (lim > 1024) lim = 1024;             /* Linux も 1 行を制限する */
+            while (pos < lim && (head[pos] == ' ' || head[pos] == '\t')) pos++;
+            n = 0;
+            while (pos < lim && head[pos] != '\n' && head[pos] != ' ' &&
+                   head[pos] != '\t' && head[pos] != '\r' &&
+                   n + 1 < (int)sizeof(interp)) {
+                interp[n++] = head[pos++];
+            }
+            interp[n] = '\0';
+            if (n == 0) {                            /* "#!" だけ。ELF でもない */
+                fs_free_exec_buffer(exec_copy->path, file_addr, file_size);
+                pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+                return -1;
+            }
+            while (pos < lim && (head[pos] == ' ' || head[pos] == '\t')) pos++;
+            n = 0;
+            while (pos < lim && head[pos] != '\n' && head[pos] != '\r' &&
+                   n + 1 < (int)sizeof(sharg)) {
+                sharg[n++] = head[pos++];
+            }
+            /* 末尾の空白を落とす */
+            while (n > 0 && (sharg[n - 1] == ' ' || sharg[n - 1] == '\t')) n--;
+            sharg[n] = '\0';
+            has_arg = (n > 0);
+        }
+        fs_free_exec_buffer(exec_copy->path, file_addr, file_size);
+        file_addr = NULL;
+
+        /* argv を組み替える。**元の argv[0] は捨て、経路そのものを渡す** */
+        k = 1 + (has_arg ? 1 : 0);
+        argc_now = 0;
+        while (exec_copy->argv[argc_now]) argc_now++;
+        if (argc_now == 0) argc_now = 1;             /* argv[0] が無い呼び方に備える */
+        if (argc_now + k > EXEC_MAX_VEC_STRINGS) {
+            pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+            return -E2BIG;
+        }
+        /* **既にある文字列は動かさない。**連続バッファなのでスロットを
+         * ずらすことはできないが、その必要も無い —— 並べ替えるのは
+         * ポインタだけで、新しく要る interp / sharg / path の 3 本を
+         * 後ろに足せば足りる */
+        {
+            int nn = 0;
+            char* p3;
+            if (!(p3 = arg_push(exec_copy, interp))) {
+                pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+                return -E2BIG;
+            }
+            exec_copy->argv2[nn++] = p3;
+            if (has_arg) {
+                if (!(p3 = arg_push(exec_copy, sharg))) {
+                    pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+                    return -E2BIG;
+                }
+                exec_copy->argv2[nn++] = p3;
+            }
+            /* **path はこの後 interp で上書きするので、先に写しておく** */
+            if (!(p3 = arg_push(exec_copy, exec_copy->path))) {
+                pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+                return -E2BIG;
+            }
+            exec_copy->argv2[nn++] = p3;
+            for (i = 1; i < argc_now; i++) exec_copy->argv2[nn++] = exec_copy->argv[i];
+            exec_copy->argv2[nn] = 0;
+            for (i = 0; i <= nn; i++) exec_copy->argv[i] = exec_copy->argv2[i];
+            argc_now = nn;
+        }
+
+        /* 次はインタプリタを開く */
+        {
+            int j = 0;
+            while (interp[j] && j + 1 < EXEC_MAX_PATH_LEN) {
+                exec_copy->path[j] = interp[j]; j++;
+            }
+            exec_copy->path[j] = '\0';
+        }
+    }
+    arch_address_space_t address_space = arch_vm_create_user_address_space();
+    if (!address_space) {
+        puts("Exec: address space alloc failed\r\n");
+        pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+        return -1;
+    }
+    Elf64_Ehdr* ehdr = (Elf64_Ehdr*)file_addr;
+    uint64_t exec_load_bias = (ehdr->e_type == ET_DYN) ? EXEC_ET_DYN_LOAD_BASE : 0;
+    struct elf_info info = elf_load(address_space, file_addr, exec_load_bias);
+    fs_free_exec_buffer(exec_copy->path, file_addr, file_size);
+    file_addr = NULL;
+    if (!info.entry) {
+        pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+        return -1;
+    }
+
+    struct elf_info interp_info;
+    kernel_memset(&interp_info, 0, sizeof(interp_info));
+    void* interp_file_addr = NULL;
+    size_t interp_file_size = 0;
+
+    if (info.has_interp) {
+        if (resolve_interp_file(info.interp_path, &interp_file_addr, &interp_file_size) < 0) {
+            puts("Exec: Interpreter not found: "); puts(info.interp_path); puts("\r\n");
+            pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+            return -1;
+        }
+        interp_info = elf_load(address_space, interp_file_addr, EXEC_INTERP_LOAD_BASE);
+        fs_free_exec_buffer(info.interp_path, interp_file_addr, interp_file_size);
+        interp_file_addr = NULL;
+        if (!interp_info.entry) {
+            puts("Exec: Failed to load interpreter\r\n");
+            pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+            return -1;
+        }
+    }
+
+    {
+        /* 戻り値をそのまま返す。-E2BIG を -1 に潰すと、呼び出し側は
+         * 「ファイルが無い」と区別できなくなる */
+        int stack_rc = task_prepare_initial_user_stack(address_space, t, &info, &interp_info,
+                                                       exec_copy->argv, exec_copy->envp);
+        if (stack_rc < 0) {
+            pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+            arch_vm_destroy_user_address_space(address_space);
+            return stack_rc;
+        }
+    }
+
+    old_cr3 = arch_task_context_get_address_space(&t->ctx);
+    arch_task_context_set_address_space(&t->ctx, address_space);
+    task_set_comm_from_path(t, exec_copy->path);
+#if ORTHOX_MEM_PROGRESS
+    t->trace_progress = task_comm_is_name(t, "cc1");
+    t->trace_started_ms = arch_time_now_ms();
+    t->trace_last_ms = 0;
+    t->trace_syscalls = 0;
+    t->trace_brk_calls = 0;
+    t->trace_mmap_calls = 0;
+    t->trace_munmap_calls = 0;
+    t->trace_mremap_calls = 0;
+    t->trace_read_calls = 0;
+    t->trace_write_calls = 0;
+    t->trace_read_bytes = 0;
+    t->trace_write_bytes = 0;
+    t->trace_write_max = 0;
+    t->trace_open_calls = 0;
+    t->trace_close_calls = 0;
+    t->trace_stat_calls = 0;
+    t->trace_fstat_calls = 0;
+    t->trace_lseek_calls = 0;
+    t->trace_ioctl_calls = 0;
+    t->trace_clock_calls = 0;
+    t->trace_gettimeofday_calls = 0;
+    t->trace_cow_faults = 0;
+#endif
+#if ORTHOX_MEM_TRACE
+    if (task_comm_is_name(t, "cc1")) {
+        puts("[memtrace] exec cc1 pid=0x"); puthex((uint64_t)t->pid);
+        puts(" path="); puts(exec_copy->path);
+        puts(" file_size=0x"); puthex((uint64_t)file_size);
+        puts("\r\n");
+    }
+#else
+    (void)file_size;
+#endif
+    t->heap_break = info.max_vaddr;
+    t->mmap_end = USER_MMAP_BASE_VADDR;
+    t->user_entry = info.has_interp ? (uint64_t)interp_info.entry : (uint64_t)info.entry;
+    t->sig_pending = 0;
+    t->sig_mask = 0;
+    for (int i = 0; i < 32; i++) {
+        t->sig_handlers[i] = 0;
+        t->sig_action_masks[i] = 0;
+        t->sig_action_flags[i] = 0;
+    }
+    t->user_fs_base = 0;
+    t->tls_vaddr = info.tls_vaddr;
+    t->tls_filesz = info.tls_filesz;
+    t->tls_memsz = info.tls_memsz;
+    t->tls_align = info.tls_align;
+    arch_task_context_init_fp_state(&t->ctx);
+    fs_close_cloexec_descriptors(t);
+    struct arch_task_user_state user_state;
+    user_state.entry_pc = t->user_entry;
+    user_state.user_sp = t->user_stack;
+    user_state.arg0 = t->user_argc;
+    user_state.arg1 = t->user_argv;
+    user_state.arg2 = t->user_envp;
+    arch_task_commit_execve(&t->ctx, frame, &user_state, t->user_fs_base);
+    if (old_cr3 && old_cr3 != arch_task_context_get_address_space(&t->ctx) && old_cr3 != arch_vm_kernel_address_space()) {
+        t->deferred_cr3 = old_cr3;
+    }
+    pmm_free(exec_copy_phys, EXEC_COPY_PAGES);
+    return 0;
+}

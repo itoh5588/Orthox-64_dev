@@ -1,0 +1,177 @@
+# Build artifacts
+*.o
+*.elf
+user/*.so
+*.iso
+*.img
+*.dmg
+iso_root/
+build/
+# ビルド生成物の置き場。**rootfs の材料 (拡張子なしの ELF コピー) も入る**ので、
+# *.img / *.elf だけでは漏れる
+out/
+rootfs.tar
+rootfs/bin/
+rootfs/doom1.wad
+
+# Dependency files
+**/.deps/
+**/*.Po
+
+# macOS files
+.DS_Store
+
+# Logs and reports
+xorriso_log.txt
+iso_report.txt
+*.log
+serial.log
+qemu.log
+
+# Images (Screenshots)
+*.png
+スクリーンショット*.png
+!assets/*.png
+
+# Temporary files
+test1.iso
+test2.iso
+test_dir/
+
+# Ports (External software)
+# Ignore extracted sources and build directories
+ports/gcc-*/
+ports/binutils-*/
+ports/gmp-*/
+ports/mpfr-*/
+ports/mpc-*/
+ports/busybox/
+ports/musl/
+ports/musl-install/
+
+# Ignore tarballs and pre-built binaries
+ports/*.tar.gz
+ports/*.tar.bz2
+ports/*.a
+ports/a.out
+ports/conftest.c
+ports/test.c
+ports/test.cpp
+**/*.a
+**/*.tar.gz
+**/*.tar.bz2
+**/*.tgz
+**/*.tbz2
+**/*.tar
+**/*.zip
+#Docs/
+tests/binutils_test/README.md
+user/doomgeneric/
+rootfs/src/kernel-build/
+rootfs/tmp/kbuild/
+native-kernel.elf
+native-kernel-boot.iso
+native-kernel-boot-serial.log
+native-kernel-boot-build.log
+kernel-output.img
+
+# Private / internal files (root-level only; book-reader/ keeps its own CLAUDE.md)
+/CLAUDE.md
+RISCV-virt-Porting-Plan.md
+AArch64-virt-Porting-Plan.md
+SMP-Design.md
+future.md
+send_keys.py
+
+# Local workspace artifacts
+Docs/
+LOGs/
+logs/
+/.claude/
+.codex
+.vscode/
+DOOM_Script/
+GEMINI.md
+WORKFLOW_APPROVAL.md
+NewOS/
+OLD_limine/
+Web/
+ac97.wav
+final_log.txt
+retrofs-musl-serial.txt
+saba_check.jpg
+send_command.py
+test_input.txt
+scripts/__pycache__/
+scripts/build_rootfs_fat.sh
+run_doom_musl_linux.sh.bak
+run_qemu_saba.sh.bak
+rootfs/lib/
+rootfs/src/
+rootfs/usr/
+ports/Python-3.12.3/
+ports/bin_temp/
+ports/cmake/
+ports/make-4.4.1/
+ports/musl-build-riscv64-linux-musl/
+ports/musl-install-riscv64/
+ports/musl-install-aarch64/
+ports/ninja/
+ports/python-install/
+ports/rust/
+ports/rust_stubs.c.bak
+ports/rust_stubs.c.bak2
+
+# riscv64 GCC セルフホストのビルド成果物 (計 256MB)。
+# 作り方は ports/build_*_riscv*.sh と ports/port_riscv_to_gcc47.sh にある
+ports/.prereq-build/
+ports/.prereq-riscv64/
+ports/cross-riscv64/
+ports/make-4.4.1-riscv64/
+ports/orthox-native/
+ports/*.tar.xz
+
+# aarch64 GCC セルフホストのビルド成果物 (計 239MB)。
+# 作り方は ports/build_binutils_aarch64.sh と ports/port_aarch64_to_gcc47.sh にある。
+# ports/gcc-4.7.4-aarch64/ は上の ports/gcc-*/ で既に外れている
+ports/cross-aarch64/
+ports/.gcc494-aarch64-parts/
+
+# rootfs.img の退避 (rootfs.img.20260705 など)。*.img には当たらない
+rootfs.img.*
+
+# aarch64 スモークが作る xv6fs イメージの種 (tests/aarch64_smoke.sh)
+out/aarch64-test-fs/
+
+# P2 の musl スモークが作るもの (tests/aarch64_musl_smoke.sh)
+out/aarch64-musl-fs/
+
+# P3 のスモークが作るもの (fork / コンソール入力)
+out/aarch64-fork-fs/
+out/aarch64-console-fs/
+
+# P3-3 の FP スモークが作るもの
+out/aarch64-fp-fs/
+
+# P3-4 のスモークが作るもの
+out/aarch64-vmleak-fs/
+
+# Pi 4 の SD (EMMC2) スモークが作るもの (tests/aarch64_pi4_sd_smoke.sh)
+out/aarch64-pi4-sdfs/
+out/aarch64-pi4-sd.img
+
+# aarch64 セルフホストのビルド成果物 (計 100MB 超)。
+# 作り方は ports/build_binutils_orthox_aarch64.sh と
+# ports/build_gcc474_orthox_aarch64.sh にある
+ports/orthox-native-aarch64/
+ports/gcc-prereq-aarch64/
+ports/.prereq-aarch64/
+
+# aarch64 セルフホストの中間生成物。
+#   aarch64-selfhost-fs   イメージのステージング (60MB、750 ファイル)
+#   make-4.4.1-aarch64    Orthox 上で動く make のビルドツリー
+# 作り方は scripts/build_rootfs_aarch64_selfhost.sh と
+# ports/build_make_orthox_aarch64.sh にある
+out/aarch64-selfhost-fs/
+ports/make-4.4.1-aarch64/
+out/pi4-boot/

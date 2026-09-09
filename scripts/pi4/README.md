@@ -1,0 +1,478 @@
+# Raspberry Pi 4 で起動するための一式
+
+`make aarch64-pi4-boot` で `out/pi4-boot/` に組み立てる。
+**QEMU の raspi4b でも実機でも同じものを使う。**
+
+## 中身
+
+    kernel8.img   0x80000 にリンクした生バイナリ (ELF ではない)
+    config.txt    ファームウェアへの指示。scripts/pi4/config.txt の写し
+
+## 実機で使う
+
+SD カードの**先頭パーティション (FAT32 / boot)** の直下に置く。
+Raspberry Pi OS のカードなら、そこの config.txt を退避して差し替え、
+kernel8.img を置くだけでよい (ファームウェア一式は既にある)。
+
+空のカードから作る場合は、別途ファームウェアが要る:
+
+    start4.elf  fixup4.dat  bcm2711-rpi-4-b.dtb
+    (https://github.com/raspberrypi/firmware の boot/ から取れる。
+     Pi 4 に bootcode.bin は要らない — SPI EEPROM から起動するため)
+
+### **kernel8.img だけでなく config.txt も毎回コピーする**
+
+**正はこのリポジトリ側 (`scripts/pi4/config.txt`)。** SD の
+`config.txt.orthox` は切り分けの途中で書き換わることがあり、実際に
+`uart_2ndstage` が `0` と `1` で食い違ったまま残っていた
+(日報2026-08-15 §11)。**どちらが動いた版か後から分からなくなる。**
+
+    cp out/pi4-boot/kernel8.img out/pi4-boot/config.txt <boot パーティション>/
+
+カーネルだけ差し替えると、SD 側の古い `config.txt` が効き続ける。
+**2 つで 1 組**として扱い、SD 上で直接編集しない。切り分けのために
+設定を変えたくなったら `scripts/pi4/config.txt` を直してから組み直す
+— そうすれば「実機で動いた設定」が git に残る。
+
+## netboot — SD の抜き差しをやめる
+
+**2026-08-21 に作った。**一週間で 100 回を超える抜き差しをやらせていたので、
+道具のほうを直した。
+
+Pi 4 の **EEPROM ブートローダが LAN から起動一式を TFTP で取る。**
+これは**カーネルが走る前**の話なので、**Orthox-64 側に NIC ドライバは要らない**
+(Pi 4 の実 NIC は BCM GENET で、`kernel/virtio_net.c` は QEMU 用の別物)。
+
+**SD は挿しっぱなしでよい。**rootfs (xv6fs) は別パーティションにあり、
+そちらは今までどおり SD から読む。LAN から来るのは boot パーティションの
+中身だけ。
+
+### なぜサーバを Windows 側で走らせるのか
+
+| | |
+|---|---|
+| WSL2 は NAT の中 | `172.19.127.105/20`。LAN (`192.168.11.0/24`) に居ない |
+| `netsh portproxy` | **TCP のみ。UDP を転送しない**ので TFTP を通せない |
+| mirrored networking | 使える版だが **Docker のブリッジ 3 本と衝突する**懸念。WSL 全体に影響する |
+| **Windows で Python** | **採用。**標準ライブラリだけ。入れる物ゼロ |
+
+`scripts/pi4/tftp_server.py` は**読み出し専用**で、WRQ は `ERROR` で断る。
+
+### 毎朝の立ち上げ — `scripts/pi4/dev_up.sh`
+
+**PC を落とすと 3 つとも消える。**毎朝これを 1 回走らせる。
+
+    bash scripts/pi4/dev_up.sh
+
+| | |
+|---|---|
+| 1 | USB シリアルを WSL に繋ぐ (`usbipd attach`)。**共有済みでも attach は毎回要る** |
+| 2 | シリアルのキャプチャを立てる。**Pi の電源より先に** |
+| 3 | Windows 側の TFTP サーバを立てる。**無いと SD に退く** |
+
+**何度走らせても安全。**既に立っているものは触らない。
+場所を変えたいときは `PI4_FTDI_BUSID` / `PI4_TTY` / `PI4_NETBOOT_DIR`。
+
+**TFTP が立っていなくても Pi は起動する** (`BOOT_ORDER=0xf12` で SD に退く)。
+ただし SD に載っているのは**その時点で最後に書いたカーネル**で、
+`make aarch64-pi4-netboot` で配ったものではない。**「直したはずが直って
+いない」に見える**ので、電源を入れる前に 3 が ok かを見ること。
+
+#### 作るときに踏んだもの
+
+- **`pgrep -f "cat /dev/ttyUSB0"` は使えない。**その文字列をコマンドラインに
+  含むだけの別プロセス (判定を走らせているシェル自身など) に当たり、
+  落ちているのに「立っている」と誤判定する。**`pgrep -x cat` で名前が
+  ちょうど `cat` のものだけを見て、引数に tty があるかを確かめる**
+- **`Start-Process` にリダイレクトを付けると `powershell.exe` が戻らない。**
+  パイプを掴んだままになる。サーバ自体は立つので、**`&` で放して港
+  (UDP 69) で判定する**
+
+### 置き場所
+
+    C:\Users\itoh5\pi4-netboot\
+        tftp_server.py     scripts/pi4/ の写し (正はリポジトリ側)
+        tftp_server.bat    起動用。ダブルクリックでもよい
+        root\              ここが配信ルート
+
+`root\` に要るもの:
+
+    start4.elf  fixup4.dat  bcm2711-rpi-4-b.dtb   ← SD の boot から 1 度だけ
+    overlays\disable-bt.dtbo                       ← config.txt が使う
+    config.txt  kernel8.img                        ← make が毎回入れ替える
+
+### 使い方
+
+Windows 側でサーバを立てておく (立てっぱなしでよい):
+
+    C:\Users\itoh5\pi4-netboot\tftp_server.bat
+
+WSL 側で作って流し込む:
+
+    make aarch64-pi4-netboot AARCH64_PCIE_BRCM_INIT=1 AARCH64_INIT_PATH_VALUE=/bin/ash
+
+**`kernel8.img` と `config.txt` を 2 つで 1 組**として入れ替えるのは
+SD のときと同じ。**netboot では config.txt も LAN から来る**ので、
+**設定を変えるのにも SD を触らなくてよくなった** — これは SD 運用に無かった利点。
+
+あとは **Pi の電源を入れ直すだけ。**
+
+### シリアル番号のディレクトリは気にしなくてよい
+
+Pi 4 のブートローダは既定で `<シリアル番号>/start4.elf` のように前置きして
+要求する。**サーバ側が 1 段落として読み直す**ので、`root\` の直下に置けば
+どちらの形でも当たる。**要求名はログに出る**ので、そこでシリアル番号が読める。
+
+### ホスト側の下ごしらえ (2026-08-21 に実施済み)
+
+**1. ファイアウォール。**イーサネットのプロファイルが `Public` なので、
+UDP 69 の受信を **LAN からに限って**開ける (管理者の PowerShell で 1 回だけ)。
+`C:\Users\itoh5\pi4-netboot\add-firewall-rule.ps1` に置いてある。
+
+    New-NetFirewallRule -DisplayName "Orthox Pi4 TFTP" -Direction Inbound `
+      -Protocol UDP -LocalPort 69 -RemoteAddress 192.168.11.0/24 `
+      -Profile Any -Action Allow
+
+消すときは `Remove-NetFirewallRule -DisplayName "Orthox Pi4 TFTP"`。
+
+**2. この PC の IP を固定する。****`TFTP_IP` は EEPROM に焼き込む**ので、
+DHCP で番地が変わると netboot が死ぬ (SD には退くので起動はする)。
+`192.168.11.23/24` を静的にした (`set-static-ip.ps1`)。DHCP に戻すなら:
+
+    Set-NetIPInterface -InterfaceIndex 7 -Dhcp Enabled
+    Set-DnsClientServerAddress -InterfaceIndex 7 -ResetServerAddresses
+
+### EEPROM の設定 (SD を触る最後の 1 回)
+
+**`C:\Users\itoh5\pi4-netboot\eeprom-staging\` に用意してある。**
+SD の boot パーティション直下に **3 つ**置いて電源を入れるだけ。
+
+    pieeprom.upd  pieeprom.sig  recovery.bin
+
+次の起動で ROM が `recovery.bin` を走らせて EEPROM を書き換え、成功すると
+`recovery.bin` は自分を `recovery.000` に改名する (rpi-eeprom の README)。
+**2 回目以降は普通に起動する。**
+
+焼く設定 (元は `firmware-2711/default` の `pieeprom-2026-05-17.bin`):
+
+| | |
+|---|---|
+| `BOOT_ORDER=0xf12` | **右から左に読む。**`2`=NETWORK `1`=SD `f`=RESTART。**LAN が駄目なら SD に退く**ので、PC を落としていても起動する |
+| `TFTP_IP=192.168.11.23` | DHCP の server-ip を上書きする。**家庭用ルータが DHCP option 66 を吐けなくてよくなる** |
+| `BOOT_UART=1` | ブートローダのログが GPIO14/15 に 115200 で出る。**いままで見えていなかった段** |
+| `NET_INSTALL_AT_POWER_ON=0` | 既定は 1。起動のたびに network install の画面を出させない |
+| `DHCP_TIMEOUT=15000` | 既定 45000。**PC が落ちているときに SD へ退くまでを短く** |
+| `TFTP_FILE_TIMEOUT=10000` | 既定 30000。同上 |
+
+**失敗してもブリックにはならない。**Raspberry Pi Imager の
+「Misc utility images」で予備の SD に復旧イメージを書けば工場出荷に戻せる
+(rpi-eeprom の README「Reset to factory defaults」)。
+
+#### ★ 焼くと**ブートローダの版が変わる**
+
+いま Pi に載っている版は **`BOOT_UART=0` のため分からない**。
+**ファームウェアが残す PCIe / xHCI の状態は USB の切り分けの前提そのもの**
+なので、**USB の計測を取り終える前に焼かないこと。**
+
+### 動いているかの見分け
+
+サーバのログに要求が並ぶ。**1 行も出ないならブートローダが TFTP まで
+来ていない** — EEPROM の `BOOT_ORDER` かファイアウォールを疑う。
+
+    [tftp] 送出 b5a02594/start4.elf -> 192.168.11.4:xxxxx  2305632 バイト  blksize=1468 ...
+    [tftp] 完了 ...
+
+**この Pi の実測値 (2026-08-21):**
+
+| | |
+|---|---|
+| シリアル番号 | `b5a02594` (TFTP の前置きに使われる) |
+| MAC | `dc:a6:32:93:45:82` (ルータで DHCP 予約するなら) |
+| 取る IP | `192.168.11.4` (ルータの DHCP) |
+| リンク | 1000 Mbps full duplex |
+| **ネットワーク段** | **リンク確立から start4.elf 起動まで 1.9 秒** |
+| start4.elf の転送 | 2305632 バイトを 0.93 秒 |
+
+### ★ `打ち切り ... 相手が降りた` は異常ではない
+
+ブートローダは **「その名前があるか」を確かめるためだけに RRQ を投げる**。
+`start4.elf` を 1 度要求し、**OACK の `tsize` を見た時点で目的を達して
+転送を放棄する** (公式文書の `TFTP_PREFIX`: prefixed ディレクトリに
+`start4.elf` が無ければ prefix を消す、の判定がこれ)。
+
+**降りた相手に投げ続けても意味が無い**ので、**block 1 だけ再送を 3 回で
+打ち切る** (2 個目から先は通常の 7 回)。ログもそれと分かる文言にしてある。
+
+    [tftp] 打ち切り start4.elf  相手が降りた (存在確認の探針とみられる)
+
+**ログの出る順は実時間の順ではない。**打ち切りの行は、その転送が始まった
+数秒後に出る。**失敗 → 再試行に見えるが、そうではない。**
+
+## シリアルの見方
+
+**HDMI には何も出ない。** シリアルが唯一の出力。
+
+    GPIO14 (pin 8)  = Pi の TX -> 変換器の RX
+    GPIO15 (pin 10) = Pi の RX -> 変換器の TX
+    GND    (pin 6)
+    115200 8N1
+
+使っている変換器は **KJ-6882 USB to 3-Pin TTL Serial Cable 3.3V** (FT232R)。
+3 本しか出ていない。**TXD/RXD はケーブル側から見た名前なので Pi とは交差する。**
+
+| Pi のピン | Pi 側 | 色 | ケーブル |
+|---|---|---|---|
+| pin 6  | GND               | 黒 | pin 1 GND |
+| pin 8  | GPIO14 = Pi の TX | 緑 | pin 3 RXD |
+| pin 10 | GPIO15 = Pi の RX | 白 | pin 2 TXD |
+
+**FT_PROG の `Invert RS232 Signals` は全部オフにする。**これで入出力とも
+115200 で通る (2026-08-15 実測。実機の ash を対話操作できた)。
+
+**反転を入れると壊れる。**`Invert TXD` を立てると入力が復元不能に化け、
+`Invert RXD` を立てると出力が化ける。詳細は下の
+「反転設定をいじって一日潰した」。
+
+**変換器は 3.3V のものを使う。5V を GPIO に入れると Pi が壊れる。**
+Pi 側には電源を挿さない (変換器の VCC は繋がない)。
+
+`config.txt` の `uart_2ndstage=1` でファームウェア自身のログも出る。
+**最初の 1 回は必ず入れること** — カーネルから 1 文字も出ないときに
+「配線が悪い」のか「カーネルが動いていない」のかを切り分けられる。
+
+ホスト側 (WSL からは USB シリアルが見えないことがある。見えなければ
+Windows 側の端末を使う):
+
+    screen /dev/ttyUSB0 115200        (抜けるのは Ctrl-A K)
+    または  picocom -b 115200 /dev/ttyUSB0
+
+## 初回起動で見るもの (上から順に)
+
+**いきなりカーネルまで行かない。** どこで止まったかで原因が分かれる。
+
+| # | 出るはずのもの | 出なければ疑う所 |
+|---|---|---|
+| 1 | ファームウェアのログ | 配線 / `config.txt` / SD の中身。**カーネル以前** |
+| 2 | `--- Orthox-64 aarch64 boot ---` | 早期 UART の番地、ロード先、`arm_64bit=1` |
+| 3 | `CurrentEL : EL1  (入口 ELx)` | — (**入口 EL がここで分かる**。armstub 経由なら EL2) |
+| 4 | `aarch64-dtb-ok` までの各行 | DTB の解釈。`(dtb)` か `(既定値)` かを見る |
+| 5 | `memory : ...` | **実機ではファームウェアが DTB を書き換える**ので |
+|   |  | `(dtb)` で実機の容量が出るはず。`(既定値)` なら 512MB に退いている |
+| 6 | `aarch64-timer-ok` / `sleep ... ok` | GIC-400 |
+| 7 | `emmc2 : 初期化 ok` | **SD カード。QEMU では配線が違って確かめられなかった所** |
+
+**2 が出ない場合、まず 1 が出ているかを見る。** 1 も出ていなければ
+配線かカードの問題で、カーネルは無実。
+
+**化けた文字だけが大量に出ても、変換器の反転を疑う前に `config.txt` を見る**
+(次節)。
+
+### Pi 側が無実かは 3 コマンドで確定する
+
+Raspberry Pi OS を起動できるなら、**変換器を疑う前にここを潰す。**
+
+    cat /proc/device-tree/aliases/serial0   -> /soc/serial@7e201000 なら PL011
+    vcgencmd measure_clock uart             -> 48000000 前後なら既定どおり
+    stty -F /dev/ttyAMA0 -a                 -> speed が想定どおりか
+
+**3 つとも正常なら Pi 側は無実。**48MHz なら 115200 は誤差 -0.016% で、
+化ける余地は無い。`serial0` が `ttyS0` を指していたら `disable-bt` が
+効いておらず、**mini-UART が GPIO14/15 に出ている** — core_freq に連動して
+ボーレートがずれるので、これだけで化ける。
+
+**「9600 なら読める / 115200 で化ける」という速度依存があっても、
+Pi 側が原因とは限らない。**先にこの 3 つを取れば 1 回で切り分けられる。
+
+## 反転設定をいじって一日潰した
+
+**結論から: KJ-6882 (FT232R) に反転回路は無い。`Invert` は全部オフが正解。**
+経緯は日報2026-08-15。
+
+### 実測した 4 通り (2026-08-15)
+
+| Invert TXD | Invert RXD | 出力 Pi -> PC | 入力 PC -> Pi |
+|---|---|---|---|
+| **オフ** | **オフ** | **読める** | **通る** ← これが正解 |
+| オン | オフ | 読める | **復元不能に化ける** |
+| オフ | オン | 化ける | 通る |
+| オン | オン | 読める | 効かない |
+
+**全部オフで実機の ash を対話操作できた。**`ls` も `cat` も
+リダイレクトも通る。
+
+### 初回の化けは反転が原因ではなかった (真因は未確定)
+
+初回起動で「大量の文字化けだけが出て 1 行も読めない」状態になり、
+FT_PROG で反転を入れたら読めるようになった。**それで「ケーブルが反転して
+いる」と判断したが、誤りだった。**全部オフでも読めるのだから、反転回路は
+最初から無い。
+
+当時は `config.txt` の日本語コメントが直後の行を壊しており、
+**`dtoverlay=disable-bt` が無効 = GPIO14/15 に出ていたのは mini-UART** だった
+可能性が高い。mini-UART は core_freq に連動してボーレートがずれるので、
+ビットのずれと反転に似た化け方をする。**確かめていないので断定はしない。**
+
+**教訓: 化けたときに真っ先に EEPROM を書き換えないこと。**
+`config.txt` と `pinctrl` と `measure_clock` を先に潰す。設定を書き換えると
+「効いた気がする」変化が起きて、真因から遠ざかる。
+
+### 反転を入れるとどう化けるか (診断の材料として)
+
+規則的な化けは「反転」か「ビットのずれ」を示す。**反転信号を非反転受信器で
+読むと、フレーム同期がずれて情報が落ちる。**
+
+受信器は「1 が続く線が 0 に落ちた瞬間」をスタートビットとして同期する。
+反転信号はアイドルが 0 なので、**データビット中の 1→0 を勝手にスタートと
+思い込み、ずれた位置から 8 ビットを拾う。**
+
+`Invert TXD` = オンで実測 (Pi 側が受ける方向):
+
+    a(0x61)→O(0x4F)   b(0x62)→'(0x27)   c(0x63)→N(0x4E)
+
+`a` の例。反転フレームは `1 0 1 1 1 1 0 0 1 0` で、受信器は位置 1 の 0 を
+スタートと誤認し、位置 2..9 を拾って `0x4F` になる。計算と実測が一致する。
+
+**ずれ幅は文字の中身で変わる** (`a` は 1 ビット、`b` は 2 ビット)。
+落ちたビットは戻らないので、**カーネル側で補正しても復元できない。**
+
+**エラーとして弾かれないので速度違いと見分けがつかない。**
+
+### ループバックで分かること / 分からないこと
+
+TX と RX を直結して打ち返す試験では、**送受の反転が打ち消し合う**ので
+**反転の向きは分からない。**設定が正しいかの判定には使えない。
+
+**使えるのは「変換器の出力段と線が生きているか」の確認だけ。**
+文字が返れば、少なくとも断線ではないと分かる。
+
+### FT_PROG の使い方 (FTDI 公式 / 無料)
+
+**設定を戻すときにも要る。**
+
+1. **端末を閉じる** (COM を掴んでいると書き込みに失敗する)
+2. `DEVICES → Scan and Parse` (F5)
+3. `Hardware Specific → Invert RS232 Signals`
+4. **チェックは全部外す**
+5. `DEVICES → Program` → **Program** ボタン
+   (隣の **Erase** を押さない。`Only Program Blank Devices` は外したまま)
+6. **USB から抜いて挿し直す** (EEPROM は接続時に読まれる)
+
+### 送信が効かないときの切り分け (Pi 側で完結する)
+
+**キーを打つ必要も、ループバックも要らない。**`pinctrl` でアイドルレベルを見る。
+
+    pinctrl get 14,15
+    15: a0    pu | lo     <- **アイドルが 0 = 反転している。これが原因**
+    15: a0    pu | hi     <- 正常 (ただし内部プルアップでも hi になるので、
+                             これだけでは「線が繋がっている」証拠にはならない)
+
+**UART のアイドルは論理 1。**0 だと PL011 はスタートビット (1->0) を
+永久に待ち、1 文字も受信しない。
+
+線が届いているかを確かめるには、**別のピンに挿してプルアップで受ける**:
+
+    (白線を pin 12 に挿し替えて)
+    pinctrl set 18 ip pu
+    pinctrl get 18
+    18: ip    pu | lo     <- **プルアップに逆らって 0 = 線はここまで届いている**
+
+**getty 経由で判定してはいけない。**`-echo` なので打っても画面に出ない。
+生で読むこと:
+
+    sudo pkill -9 -f 'agetty.*ttyAMA0'
+    sudo cat /dev/ttyAMA0
+
+### 直しても冒頭の化けは残る (無害)
+
+**Pi 4 の EEPROM ブートローダ**のログで、`config.txt` より前に動くので
+`uart_2ndstage=0` では止められない。この段階ではまだ `disable-bt` が
+効かず mini-UART 経由で出るため、core_freq 依存でずれて化ける。
+**`--- Orthox-64 aarch64 boot ---` からが本番。**
+
+## 実機で確かめた値 (2026-08-15)
+
+| 項目 | 実機 | |
+|---|---|---|
+| 入口 EL | **EL2** | armstub8 経由。QEMU の raspi4b と同じで降格路はそのまま動いた |
+| `MPIDR_EL1` | `0x80000000` | 他の 3 コアは start.S の判定で止まっている |
+| DTB | `0x2eff1e00` size `0xe1a7` | x0 で渡ってきた |
+| UART | `0xFE201000` (dtb) | `disable-bt` が効いて PL011 が GPIO14/15 に回っている |
+| GICD / GICC | `0xFF841000` / `0xFF842000` (dtb) | GIC-400。タイマ割り込みが通った |
+| EMMC2 | `0xFE340000` irq 158 (dtb) | **初期化 ok。**16GB SDHC を認識 |
+| timer freq | 54 MHz | 想定どおり |
+| cpus | 4 | |
+
+**boot / dtb / timer / mmu / shared / user / sched / emmc2 / xv6fs / exec
+はすべて ok。****SD から /bin/hello を読んで EL0 で実行できた。**
+MMU も EL0 も実機で無修正のまま動いた。
+
+## SD カードの構成 (実機)
+
+**Pi 4 の SD スロットは 1 つしかない。**カードの先頭には Orthox 自身を起動する
+boot パーティションが要るので、**xv6fs は別のパーティションに置き、
+カーネルが MBR を読んで magic (0x10203040) で探す。**
+
+    p1  16384      1064959   512M  c  FAT32  ← boot。kernel8.img / config.txt
+    p2  1064960    12681215  5.5G  83 Linux  ← Raspberry Pi OS (作業用に残してある)
+    p3  12681216   30392319  8.4G  83 Linux  ← **Orthox の xv6fs**
+
+**`config.txt` と `kernel8.img` は p1 にあるので Windows から触れる。**
+rootfs (p3) は xv6fs なので Windows からも Linux からも見えない。
+更新手順は日報2026-08-15 §6。
+
+## 実機で残っている問題
+
+- **115200 だと化ける。9600 なら読める** (2026-08-15 時点)。ケーブルも配線も
+  無実で、PL011 のクロック設定の疑い。`init_uart_clock=48000000` を試す途中
+- **`memory : (既定値)` で 512MB に退いている。**配布 DTB の /memory@0 を
+  ファームウェアが書き換えるはずだが、その値を取れていない
+- **UART の受信割り込み (SPI 121 -> INTID 153)。**`GICD_ITARGETSR` を入れた
+  効果は、ash まで進まないと確かめられない (日報2026-08-13 §4)
+
+## なぜ config.txt に disable-bt が要るか
+
+**Pi 4 の PL011 (UART0) は既定で Bluetooth に取られている。**
+GPIO14/15 に出ているのは mini-UART のほう。`dtoverlay=disable-bt` で
+Bluetooth を外すと PL011 が GPIO14/15 に回る。
+
+これで**カーネル側は GPIO の alt-func もクロックも触らなくてよい**
+(ファームウェアがやる)。洗い出しの項目 E がほぼ不要になる。
+
+## QEMU の raspi4b で使う
+
+    qemu-system-aarch64 -machine raspi4b -nographic \
+      -kernel out/pi4-boot/kernel8.img -dtb tests/dtb/bcm2711-rpi-4-b.dtb
+
+**QEMU 9.x 以降が要る。** 8.2 には raspi4b が無い (raspi3b まで)。
+raspi3b でも起動形式 (0x80000 / 生バイナリ / EL2) の確認はできるが、
+**割り込みコントローラと周辺は Pi 4 と別物**なのでそこから先は見られない。
+
+判定つきで回すなら:
+
+    make aarch64-pi4-smoke
+
+起動形式 / DTB (ranges と status) / GIC-400 のタイマ割り込み / MMU / EL0 まで
+見る。**raspi4b を持つ qemu が無ければ SKIP** して失敗にしない
+(環境が無いことと、カーネルが壊れていることを混ぜない)。
+
+**`-dtb` は必須。** 付けないと x0 に 0x100 が入って DTB が渡らない。
+実機はファームウェアが `bcm2711-rpi-4-b.dtb` を読んで渡すので、
+付けたほうが実機に近い。
+
+## QEMU と実機で違ったところ
+
+- **RAM のサイズ。** 配布 DTB の /memory@0 は reg = <0x0 0x0 0x0> で、
+  実機ではファームウェアが起動時に書き換える (tests/dtb/README.md)。
+  **2026-08-15 の実機では書き換えた値を取れず `(既定値)` の 512MB に退いた。**
+  未解決
+- **Pi 4 の RAM は 0x0 から始まる** (QEMU virt は 0x40000000 から)。
+  カーネルのロード先も 0x80000 なので pmm の初期化範囲の前提が変わる。
+  実機でも `pmm` は問題なく立ち上がった
+- uart irq = 153 (SPI 121 + 32)。**実機の DTB から `0x99` = 153 が取れた。
+  計算は合っていた** (割り込みが実際に届くかは ash まで進まないと分からない)
+- **EMMC2。** QEMU の raspi4b は SD を旧 sdhci (0xFE300000) に繋いでいて
+  EMMC2 は空 (日報2026-08-13 §6)。**実機では CONTROL0 のバス電源を
+  入れていなかったため CMD0 が返らなかった。**標準 SDHCI の Power Control
+  (bit8 = SD Bus Power / bits9-11 = 電圧) を書いたら通った。土台にした
+  rpi-boot は BCM2708 の ARASAN 向けで、あちらは電源をメールボックスで
+  入れるためこのレジスタを書かない (日報2026-08-15 §4)

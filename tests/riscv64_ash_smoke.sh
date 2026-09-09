@@ -1,0 +1,261 @@
+#!/bin/bash
+# busybox ash を対話シェルとして起動し、シリアル (stdio) 経由でコマンドを
+# 流し込んで応答を検証する。SMP_CPUS=4 のように指定すると複数 hart で走る。
+# 実行前に以下でカーネルをビルドしておくこと:
+#   make riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=out/busybox-riscv64-musl.elf RISCV64_BOOTSTRAP_ARG0_VALUE=sh
+# (make riscv64-ash-smoke がこの手順をまとめて行う)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+mkdir -p LOGs
+
+QEMU_BIN="$(command -v qemu-system-riscv64 2>/dev/null || true)"
+if [ -z "$QEMU_BIN" ] && [ -x /opt/homebrew/bin/qemu-system-riscv64 ]; then
+    QEMU_BIN=/opt/homebrew/bin/qemu-system-riscv64
+fi
+if [ -z "$QEMU_BIN" ] && [ -x /usr/local/bin/qemu-system-riscv64 ]; then
+    QEMU_BIN=/usr/local/bin/qemu-system-riscv64
+fi
+if [ -z "$QEMU_BIN" ]; then
+    echo "qemu-system-riscv64 not found" >&2
+    exit 1
+fi
+
+FW_PATH=""
+if [ -f /opt/homebrew/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin ]; then
+    FW_PATH=/opt/homebrew/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+elif [ -f /usr/local/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin ]; then
+    FW_PATH=/usr/local/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+elif [ -f /usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin ]; then
+    # Debian/Ubuntu の qemu-system-misc はここに置く
+    FW_PATH=/usr/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+else
+    echo "OpenSBI firmware not found" >&2
+    exit 1
+fi
+
+SERIAL_LOG=LOGs/riscv64-ash-serial.log
+rm -f "$SERIAL_LOG"
+
+ROOTFS_IMG=out/rootfs-riscv64-xv6.img
+DRIVE_ARGS=()
+if [ -f "$ROOTFS_IMG" ]; then
+    DRIVE_ARGS=(-drive "file=$ROOTFS_IMG,if=none,format=raw,id=vblk0" -device virtio-blk-device,drive=vblk0)
+fi
+
+(
+    sleep 8
+    printf 'echo interactive-ok\n'
+    sleep 2
+    printf 'pwd\n'
+    sleep 2
+    printf 'x=42; echo val=$x\n'
+    sleep 2
+    printf 'ls /bin\n'
+    sleep 2
+    printf 'cat /etc/motd\n'
+    sleep 2
+    printf '/bin/echo external-exec-ok\n'
+    sleep 3
+    printf 'echo a b c | wc\n'
+    sleep 3
+    printf 'echo redirect-ok > /w.txt\n'
+    sleep 2
+    printf 'cat /w.txt\n'
+    sleep 2
+    printf 'echo append-ok >> /w.txt\n'
+    sleep 2
+    printf 'cat /w.txt | wc -l\n'
+    sleep 3
+    printf 'mkdir /d 2>/dev/null; test -d /d && echo mkdir-ok\n'
+    sleep 3
+    printf 'cat /etc/motd > /d/copy.txt; cat /d/copy.txt\n'
+    sleep 3
+    printf 'rm /w.txt; cat /w.txt || echo unlink-ok\n'
+    sleep 3
+    # 疑似キャラクタデバイス (/dev/null)
+    printf 'cat /dev/null && echo devnull-read-ok\n'
+    sleep 3
+    printf 'echo x > /dev/null && echo devnull-write-ok\n'
+    sleep 3
+    # バックグラウンドジョブ (子は stdin を /dev/null に差し替える)。
+    # 変数展開を挟んでコマンド行のエコーと出力を区別する
+    printf 'BG=ok; /bin/echo bg-job-$BG &\n'
+    sleep 4
+    printf 'echo after-bg-ok\n'
+    sleep 3
+    # 追加 applet (テキスト処理 / パイプ)
+    printf 'printf "b\\na\\nc\\na\\n" > /s.txt; sort /s.txt | uniq | tr "\\n" "-"; echo TEXT\n'
+    sleep 4
+    printf 'grep -c a /s.txt | sed s/^/grepcount=/\n'
+    sleep 4
+    # command substitution 内のパイプ: child exit が親の wait4 を起床すること。
+    # 以前は SMP でここが停止した。/s.txt は b,a,c,a の 4 行。
+    printf 'echo "subpipe=$(cat /s.txt | wc -l)"\n'
+    sleep 4
+    # 読み端を dup してから書き手が終わるケース。pipe が読み/書きを区別せず
+    # ref_count の合計だけで EOF を判定していたころは、書き手ゼロでも
+    # ref_count==2 のままで read が返らず固まった。
+    printf 'echo "dupeof=$(cat /s.txt | { exec 4<&0; wc -l; })"\n'
+    sleep 4
+    # 読み手が先に消えるケース: 書き側は EPIPE で止まり、ハングしないこと。
+    printf 'yes 2>/dev/null | head -2 | wc -l | sed s/^/sigpipe=/\n'
+    sleep 4
+    # readlinkat 経由 (以前は getdents64 に化けて EPERM だった)
+    printf 'realpath /etc/motd\n'
+    sleep 3
+    # ハードリンク (linkat)
+    printf 'rm -f /h.txt; ln /etc/motd /h.txt && cat /h.txt\n'
+    sleep 4
+    # vfork (clone CLONE_VM|CLONE_VFORK) 経由で exec する applet
+    printf 'echo xargs-in | xargs echo\n'
+    sleep 4
+    printf 'uname -m\n'
+    sleep 3
+    # CONFIG_FEATURE_SH_MATH: 算術展開
+    printf 'i=6; echo math=$((i*7+0))\n'
+    sleep 3
+    # CONFIG_ASH_BASH_COMPAT: ${var/from/to} 置換と [[ ]]
+    printf 'v=abcdef; echo subst=${v/cd/-}\n'
+    sleep 3
+    # 部分文字列展開。エコーバックに ${...} がそのまま出るので grep は結果側だけに当たる
+    printf 'echo slice=${v:2:2}\n'
+    sleep 3
+    # CONFIG_FEATURE_EDITING: 行編集が backspace を処理する。
+    # X を打ってから \b で消すので、エコーにも出力にも edit-okX は現れない
+    printf 'e=ok; echo edit-$eX\b\n'
+    sleep 3
+    # CONFIG_FEATURE_TAB_COMPLETION: /bin/orthin<TAB> が /bin/orthinfo に補完される
+    printf 'c=ok; /bin/orthin\t| tail -1; echo tab-$c\n'
+    sleep 5
+    # nanosleep のタイマー起床経路。ここで止まるなら寝たきり (詳細は
+    # tests/riscv64_sleep_smoke.sh)
+    printf 'sleep 1; echo sleep-ok\n'
+    sleep 5
+    # 自作コマンド (user/riscv64-bin) がビルドされて /bin に入っているか
+    printf 'orthinfo | tail -1\n'
+    sleep 4
+    # exec の引数上限。**超えた分を黙って捨てないこと。**
+    # 以前は 129 個目以降を落として成功を返していたので、
+    #   ar rcs libbackend.a *.o   ← 344 個渡して 126 個しか届かない
+    # のように「エラーは出ないが結果が欠ける」形になっていた。
+    # 上限を超えたら E2BIG で失敗し、収まる本数なら通ること。
+    #
+    # **本数の上限は 2026-08-30 の deca2dc で 128 -> 2048 に広がった**
+    # (kernel/task_exec.c の EXEC_MAX_VEC_STRINGS。合計は EXEC_ARG_TOTAL の
+    # 256KB)。それまでの 200 個ではもう踏めないので、倍々で 4096 個作って
+    # 超えるようにした (2026-09-04)。1 個ずつ数えるループだと 4096 回まわって
+    # 遅いため、"$a $a" で倍にしていく
+    printf 'a=x; i=0; while [ $i -lt 12 ]; do a="$a $a"; i=$((i+1)); done\n'
+    sleep 6
+    # **$( ... | ... ) を使わないこと。** コマンド置換の中にパイプがある形は
+    # -smp 4 で止まる (別件。日報2026-08-04 参照)。ここで使うと E2BIG の
+    # 検査のはずが別のバグを踏んで落ちる
+    printf '/bin/echo $a > /dev/null 2>/e2big.txt; echo argv4096-done\n'
+    sleep 6
+    printf 'cat /e2big.txt\n'
+    sleep 4
+    printf 'b=""; i=0; while [ $i -lt 50 ]; do b="$b y$i"; i=$((i+1)); done\n'
+    sleep 6
+    # 50 個は全部届くこと。末尾の y49 が出れば切り捨てられていない
+    printf '/bin/echo $b | tail -c 4\n'
+    sleep 6
+    printf 'exit\n'
+    sleep 3
+) | "$QEMU_BIN" \
+    -machine virt \
+    -cpu rv64 \
+    -m 512M \
+    -smp "${SMP_CPUS:-1}" \
+    -bios "$FW_PATH" \
+    -kernel out/kernel-riscv64.elf \
+    -display none \
+    -serial stdio \
+    -monitor none "${DRIVE_ARGS[@]}" > "$SERIAL_LOG" 2>&1 &
+QEMU_PID=$!
+
+cleanup() {
+    kill "$QEMU_PID" 2>/dev/null || true
+    wait "$QEMU_PID" 2>/dev/null || true
+    pkill -f qemu-system-riscv64 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# 送信側の sleep 合計が 130 秒あるので、上限はそれより十分大きく取ること。
+# 4 hart のときはゲストが遅く、150 秒だと最後のコマンドが間に合わずに落ちる
+# (E2BIG の検査を足したときに実際に踏んだ)。
+for _ in {1..240}; do
+    if grep -aq "bootstrap user exit" "$SERIAL_LOG" 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
+
+echo "--- RISC-V ash Serial Output ---"
+cat "$SERIAL_LOG"
+echo "--------------------------------"
+
+# **判定は CR を除いたコピーに当てる。**
+#
+# カーネルは termios の ONLCR に従って LF を CRLF で出す (実機のシリアル端末は
+# LF だけでは行頭に戻らないため)。そのままだと行の中身が "riscv64\r" になり、
+# `^riscv64$` のような行末アンカーが当たらない。
+# **表示は元のログ、判定はこちら**。
+tr -d '\r' < "$SERIAL_LOG" > "$SERIAL_LOG.nocr"
+SERIAL_LOG="$SERIAL_LOG.nocr"
+
+grep -aq "built-in shell (ash)" "$SERIAL_LOG"
+grep -aq "riscv64 supervisor timer interrupt" "$SERIAL_LOG"
+grep -aq "interactive-ok" "$SERIAL_LOG"
+grep -aq "^/" "$SERIAL_LOG"
+grep -aq "val=42" "$SERIAL_LOG"
+if [ -f "$ROOTFS_IMG" ]; then
+    grep -aq "xv6fs mounted on vblk0" "$SERIAL_LOG"
+    grep -aq "busybox" "$SERIAL_LOG"
+    grep -aq "hello from riscv64 xv6fs rootfs" "$SERIAL_LOG"
+    grep -aq "external-exec-ok" "$SERIAL_LOG"
+    grep -aqE "1 +3 +6" "$SERIAL_LOG"
+    # 書き込み系 (リダイレクト / 追記 / mkdir / unlink)
+    grep -aq "redirect-ok" "$SERIAL_LOG"
+    grep -aqE "^ *2$" "$SERIAL_LOG"          # cat /w.txt | wc -l → 2 行 (追記が効いている)
+    grep -aq "mkdir-ok" "$SERIAL_LOG"
+    grep -aq "unlink-ok" "$SERIAL_LOG"
+    grep -aq "devnull-read-ok" "$SERIAL_LOG"
+    grep -aq "devnull-write-ok" "$SERIAL_LOG"
+    # `cmd &`: 子が 1 度だけ実行され (close(0) が fork に化けていないこと)、
+    # かつ /dev/null の open に失敗しないこと
+    grep -aq "bg-job-ok" "$SERIAL_LOG"
+    [ "$(grep -ac "bg-job-ok" "$SERIAL_LOG")" = "1" ]
+    ! grep -aq "can't open '/dev/null'" "$SERIAL_LOG"
+    grep -aq "after-bg-ok" "$SERIAL_LOG"
+    # 追加 applet
+    grep -aq "a-b-c-TEXT" "$SERIAL_LOG"        # sort | uniq | tr
+    grep -aq "grepcount=2" "$SERIAL_LOG"       # grep -c | sed
+    grep -aq "subpipe=4" "$SERIAL_LOG"         # $(cmd | cmd) が SMP で停止しない
+    grep -aq "dupeof=4" "$SERIAL_LOG"          # 読み端を dup しても EOF が来る
+    grep -aq "sigpipe=2" "$SERIAL_LOG"         # 読み手が消えた書き側が EPIPE で抜ける
+    grep -aq "^/etc/motd$" "$SERIAL_LOG"       # realpath (readlinkat が EINVAL を返すこと)
+    grep -aq "xargs-in" "$SERIAL_LOG"          # xargs = vfork + exec
+    grep -aq "^riscv64$" "$SERIAL_LOG"         # uname -m
+    grep -aq "math=42" "$SERIAL_LOG"           # $((...)) = FEATURE_SH_MATH
+    grep -aq "subst=ab-ef" "$SERIAL_LOG"       # ${var/from/to} = ASH_BASH_COMPAT
+    grep -aq "slice=cd" "$SERIAL_LOG"          # ${v:2:2} = ASH_BASH_COMPAT
+    grep -aq "edit-ok" "$SERIAL_LOG"           # 行編集の backspace = FEATURE_EDITING
+    ! grep -aq "edit-okX" "$SERIAL_LOG"        # X が消えていること
+    grep -aq "tab-ok" "$SERIAL_LOG"            # TAB 補完後もコマンドが通る
+    grep -aq "sleep-ok" "$SERIAL_LOG"          # sleep = nanosleep のタイマー起床
+    grep -aq "orthinfo : ok" "$SERIAL_LOG"     # user/riscv64-bin のビルド導線
+    # exec の引数上限。上限 (2048 本) を超えたら「切り捨てて成功」ではなく
+    # E2BIG で失敗すること。黙って切り捨てていた頃は /e2big.txt が空で、
+    # この行が出なかった
+    grep -aq "argv4096-done" "$SERIAL_LOG"
+    grep -aq "Argument list too long" "$SERIAL_LOG"
+    grep -aq "^y49$" "$SERIAL_LOG"             # 上限内 (50 個) は全部届く
+    # ln (linkat): /h.txt が motd の内容を持つ = ハードリンクが張れている
+    [ "$(grep -ac "hello from riscv64 xv6fs rootfs" "$SERIAL_LOG")" -ge 3 ]
+fi
+grep -aq "bootstrap user exit" "$SERIAL_LOG"
+
+echo "riscv64 ash smoke test: PASS"
