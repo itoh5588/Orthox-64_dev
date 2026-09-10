@@ -8,6 +8,40 @@
 #include "arch_vm.h"
 #include "arch_time.h"
 
+/* ---- ユーザー空間の番地の割り当て ---------------------------------------
+ *
+ * **共有層から見える所に置く (2026-09-10)。**もとは kernel/task_internal.h に
+ * あったが、あちらは共有層から見えない (linux_syscall.c:318 に同じ理由の
+ * 記述がある)。そのため kernel/linux_syscall.c の mmap は上限を関数の中に
+ * 直書きしていた。**値はどのアーキも今までと同じ。**
+ */
+// Sv39 (riscv64) / 4KB granule + T0SZ=25 (aarch64) は **どちらも 39bit VA**
+// なので、ユーザースタックを 2^38 未満に置く。
+//
+// **aarch64 をここに入れ忘れると、x86 と同じ 2^47 を要求して落ちる。**
+// P2 (musl) で実際に踏んだ:
+//   ESR=0x92000004 (下位 EL のデータアボート, translation fault level 0)
+//   FAR=0x00007fffffffef00   ELR=crt0 の `ldr x1, [x9]`
+// P1 の hello が通っていたのは、あれが sp を一度も触らなかったため。
+// **「ユーザープロセスが動いた」はスタックが張れている証拠にならない。**
+//
+// **上限もここに置く (2026-09-10)。**kernel/linux_syscall.c の mmap が
+// Sv39 の値 (0x3F00000000) を関数の中に直書きしており、x86 と共通化する
+// ときに持ち込めなかった。値はどのアーキも今までと同じ。
+#if defined(__riscv) || defined(__aarch64__)
+#define USER_STACK_TOP_VADDR   0x0000003FFFFFF000ULL
+#define USER_MMAP_BASE_VADDR   0x0000002000000000ULL
+#define USER_MMAP_TOP_VADDR    0x0000003F00000000ULL
+#else
+#define USER_STACK_TOP_VADDR   0x7FFFFFFFF000ULL
+#define USER_MMAP_BASE_VADDR   0x4000000000ULL
+/* **x86 は kernel/x86_64/sys_vm.c が別に MMAP_BASE_ADDR / MMAP_TOP_ADDR を
+ * 持っており、そちらが本家。**上はここと違う値 (0x200000000000) で、
+ * find_mmap_gap が切り上げるため USER_MMAP_BASE_VADDR は mmap の配置に
+ * 効いていない。**揃えるのは mmap を統合するときにする。** */
+#define USER_MMAP_TOP_VADDR    0x00007F0000000000ULL
+#endif
+
 struct elf_info;
 struct orth_runq_stat;
 struct wait_queue;

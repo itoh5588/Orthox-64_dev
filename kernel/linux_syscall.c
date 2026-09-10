@@ -64,8 +64,6 @@ static void linux_notify_parent_exit(struct task* child) {
     if (parent->state == TASK_SLEEPING) (void)task_wake(parent);
 }
 
-#define LINUX_USER_MMAP_BASE_VADDR 0x0000002000000000ULL
-
 /* 未実装の syscall を ENOSYS で返すとき、番号を 1 回だけ出す。
  * 黙って失敗値を返すと、呼び出し側が戻り値を見ていない場合に
  * 「成功したのに何も起きない」形になり、原因の特定が極端に難しくなる。
@@ -1373,8 +1371,10 @@ static void* linux_bootstrap_sys_mmap(void* addr, size_t length, int prot, int f
     struct task* current = get_current_task();
     arch_address_space_t address_space;
     uint64_t base;
-    /* Sv39 のユーザー VA 上限 (2^38)。スタック領域 (0x3FFFFxxxxx) 手前まで */
-    uint64_t limit = 0x0000003F00000000ULL;
+    /* ユーザー VA の上限。アーキごとの値は kernel/task_internal.h に
+     * 置いてある (riscv64 / aarch64 は Sv39 の 2^38 で、スタック領域
+     * 0x3FFFFxxxxx の手前まで) */
+    uint64_t limit = USER_MMAP_TOP_VADDR;
     uint64_t size;
     uint64_t map_flags;
     int is_anonymous;
@@ -1408,7 +1408,7 @@ static void* linux_bootstrap_sys_mmap(void* addr, size_t length, int prot, int f
         if (base == 0 || base + size < base) return linux_mmap_err(LINUX_EINVAL);
     } else {
         base = current->mmap_end;
-        if (base < LINUX_USER_MMAP_BASE_VADDR) base = LINUX_USER_MMAP_BASE_VADDR;
+        if (base < USER_MMAP_BASE_VADDR) base = USER_MMAP_BASE_VADDR;
         base = linux_align_up_page(base);
         while (base + size <= limit) {
             uint64_t off = 0;
