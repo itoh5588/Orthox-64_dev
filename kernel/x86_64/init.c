@@ -329,5 +329,14 @@ void _start(void) {
         }
     }
 
+#ifdef X86_VERBOSE_DIAG
+    /* **ここから下は暇。**この起動タスクは idle_task にならないまま
+     * idle ループへ落ちるので、[pc] に「暇である」と教える
+     * (kernel/x86_64/pcstat.c) */
+    {
+        extern void x86_pc_mark_idle_loop(void);
+        x86_pc_mark_idle_loop();
+    }
+#endif
     task_idle_loop(1);
 }

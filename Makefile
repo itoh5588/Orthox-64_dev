@@ -31,6 +31,16 @@ KERNEL_CFLAGS = -target $(TARGET) -std=c11 -ffreestanding -fno-stack-protector -
 	-mcmodel=kernel -O2 -Wall -Wextra -Iinclude -Iports/lwip/src/include -MMD -MP
 KERNEL_CFLAGS += $(KERNEL_CFLAGS_EXTRA)
 
+# **60 秒ごとの標本化プロファイラ ([pc])。**既定では黙る —— AARCH64_VERBOSE_DIAG と
+# 同じ約束で、性能調査のときだけ付ける (kernel/x86_64/pcstat.c)。
+# 要るときだけ付ける: make x86-kernel-smoke X86_VERBOSE_DIAG=1
+# **CFLAGS の変更を make は追跡しない**ので、切り替えるときは build/ を
+# 消してから作り直すこと
+X86_VERBOSE_DIAG ?=
+ifneq ($(X86_VERBOSE_DIAG),)
+KERNEL_CFLAGS += -DX86_VERBOSE_DIAG=1
+endif
+
 KERNEL_LDFLAGS = -nostdlib -static -T scripts/kernel.ld
 
 # 調査用に一時的なフラグを足す口 (例: RISCV64_EXTRA_CFLAGS=-DRISCV64_SYSCALL_TRACE=1)
@@ -183,7 +193,7 @@ X86_64_SRCS = kernel/x86_64/init.c kernel/x86_64/kassert.c kernel/x86_64/pmm.c \
 	kernel/x86_64/pic.c kernel/x86_64/smp.c kernel/x86_64/spinlock.c \
 	kernel/x86_64/syscall_entry.S kernel/x86_64/task_switch.S \
 	kernel/x86_64/keyboard.c kernel/x86_64/pci.c kernel/x86_64/sound.c \
-	kernel/x86_64/uname.c kernel/x86_64/rng.c \
+	kernel/x86_64/uname.c kernel/x86_64/rng.c kernel/x86_64/pcstat.c \
 	kernel/x86_64/sys_vm.c kernel/x86_64/sys_time.c kernel/x86_64/sys_device.c \
 	kernel/x86_64/syscall_msr.c \
 	kernel/x86_64/virtio.c kernel/x86_64/virtio_net.c kernel/x86_64/virtio_blk.c

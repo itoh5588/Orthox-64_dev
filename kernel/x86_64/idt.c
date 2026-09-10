@@ -9,6 +9,10 @@
 
 void puts(const char *s);
 void puthex(uint64_t v);
+#ifdef X86_VERBOSE_DIAG
+void x86_pc_sample(uint64_t rip);   /* kernel/x86_64/pcstat.c */
+void x86_pc_report(void);
+#endif
 
 #define MSR_GS_BASE        0xC0000101
 #define MSR_KERNEL_GS_BASE 0xC0000102
@@ -190,6 +194,14 @@ void interrupt_dispatch(struct interrupt_frame* frame) {
         puts(" ERR: "); puthex(frame->error_code);
         puts("\r\n");
     }
+#ifdef X86_VERBOSE_DIAG
+    /* **BKL を取る前に採る。**rip は割り込み入口で積まれているので値は
+     * どちらでも正しいが、kernel_lock_enter() の後に置くと BKL が埋まって
+     * いる tick だけ待たされ、標本の分布が歪む。aarch64 も
+     * aarch64_irq_handler (kernel/aarch64/boot.c:1135) がロック無しで
+     * 呼んでいる */
+    if (frame->int_no == INT_VECTOR_TIMER) x86_pc_sample(frame->rip);
+#endif
     kernel_lock_enter();
     if (frame->int_no == INT_VECTOR_PAGE_FAULT) {
         extern void vmm_page_fault_handler(struct interrupt_frame* frame);
@@ -211,6 +223,15 @@ void interrupt_dispatch(struct interrupt_frame* frame) {
             bottom_half_run();
         }
         lapic_timer_tick();
+#ifdef X86_VERBOSE_DIAG
+        /* **60 秒ごとに 1 行。**100Hz なので 6000 tick。数えるのも出すのも
+         * CPU 0 だけ —— 全 CPU で数えると 4 倍の速さで進む
+         * (kernel/aarch64/timer.c:419 と同じ理由) */
+        if (cpu && cpu->cpu_id == 0) {
+            static uint64_t diag_ticks;
+            if ((++diag_ticks % 6000ULL) == 0ULL) x86_pc_report();
+        }
+#endif
         task_on_timer_tick();
         lapic_eoi();
         kernel_lock_exit();
