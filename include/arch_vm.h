@@ -38,7 +38,19 @@ static inline void arch_sync_icache_range(void* va, uint64_t len) {
 static inline uint64_t arch_vm_user_page_flags(int writable, int executable) {
     uint64_t flags = PTE_PRESENT | PTE_USER;
     if (writable) flags |= PTE_WRITABLE;
-    (void)executable;
+    /* **実行不可なら NX を立てる (2026-09-10)。**ここは executable を捨てて
+     * おり、**ユーザーページが全て実行可能なまま貼られていた。**
+     * 同じファイルの aarch64 / riscv64 は最初から見ており、
+     * kernel/x86_64/sys_vm.c の sys_mmap も同じ形で立てている
+     * (`if (!(prot & PROT_EXEC)) map_flags |= PTE_NX;`) —— **x86 の
+     * この 1 箇所だけが流儀から漏れていた。**
+     *
+     * 効くのは ELF の非 PF_X 段 (kernel/elf.c:36) とユーザースタック
+     * (kernel/task_exec.c の arch_vm_user_page_flags(1, 0))。
+     * EFER.NXE は Limine が渡す時点で立っている —— 立っていなければ
+     * 予約ビット違反になるので、sys_mmap が既に NX を立てて動いている
+     * ことがその証拠。 */
+    if (!executable) flags |= PTE_NX;
     return flags;
 }
 
