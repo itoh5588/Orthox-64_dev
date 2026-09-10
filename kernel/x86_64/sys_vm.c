@@ -402,9 +402,24 @@ int sys_munmap(void* addr, size_t length) {
     uint64_t size = align_up_page((uint64_t)length);
     if (!is_user_mmap_range_valid(base, size)) return -22;
 
-    uint64_t* pml4 = (uint64_t*)PHYS_TO_VIRT(current->ctx.cr3);
+    /* **arch hook で外し、返すのはこちらでやる (2026-09-10)。**
+     * kernel/linux_syscall.c:738 の munmap と同じ形。共有層の契約は
+     * 「arch_vm_unmap_page は写像を外すだけで持ち主を変えない」で、
+     * そこへ寄せていく途中。動作は unmap_one_page と同じ。
+     *
+     * **外れたことを確かめてから返す。**vmm_get_phys は 2MB ページでも
+     * 番地を返すが (kernel/x86_64/vmm.c:187)、arch_vm_unmap_page は
+     * 2MB を触らずに戻る。確かめずに返すと、**まだ写像されているページを
+     * 取り上げる。**mmap は 2MB を作らないので普段は通らない道だが、
+     * unmap_one_page が持っていた PTE_HUGE の番人をここでも残す。 */
+    arch_address_space_t address_space = arch_task_context_get_address_space(&current->ctx);
     for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        unmap_one_page(pml4, base + off);
+        uint64_t va = base + off;
+        uint64_t phys = arch_vm_get_phys(address_space, va);
+        arch_vm_unmap_page(address_space, va);
+        if (phys && arch_vm_get_phys(address_space, va) == 0) {
+            pmm_free((void*)(uintptr_t)(phys & ~(PAGE_SIZE - 1ULL)), 1);
+        }
     }
     return 0;
 }

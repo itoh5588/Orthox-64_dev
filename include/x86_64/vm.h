@@ -55,10 +55,36 @@ static inline uint64_t arch_vm_get_phys(arch_address_space_t address_space, uint
     return vmm_get_phys(arch_vm_address_space_root(address_space), vaddr);
 }
 
+/* **写像を外すだけ。物理ページは返さない (2026-09-10)。**
+ *
+ * 契約は kernel/linux_syscall.c:721 に明記してある —— 呼び手が
+ * arch_vm_get_phys してから自分で pmm_free する。aarch64 も riscv64 も
+ * これに従う (riscv64 は 2026-09-10 まで外れていた)。
+ *
+ * **ここは「vmm.c に unmap が無い」としてスタブだったが、中身は在った** ——
+ * kernel/x86_64/sys_vm.c の unmap_one_page がそれで、あちらは自分で
+ * pmm_free もする。**契約に合わせて解放しない形で書く。**
+ *
+ * 2MB ページは mmap が作らないので触らない (unmap_one_page と同じ)。 */
 static inline void arch_vm_unmap_page(arch_address_space_t address_space, uint64_t vaddr) {
-    /* vmm.c has no unmap helper; upper layers handle unmap via remap. Stub. */
-    (void)address_space;
-    (void)vaddr;
+    uint64_t* pml4 = arch_vm_address_space_root(address_space);
+    uint64_t* pdp;
+    uint64_t* pd;
+    uint64_t* pt;
+    uint64_t* pte;
+
+    if (!pml4) return;
+    if (!(pml4[PML4_IDX(vaddr)] & PTE_PRESENT)) return;
+    pdp = (uint64_t*)PHYS_TO_VIRT(pml4[PML4_IDX(vaddr)] & PTE_ADDR_MASK);
+    if (!(pdp[PDP_IDX(vaddr)] & PTE_PRESENT)) return;
+    pd = (uint64_t*)PHYS_TO_VIRT(pdp[PDP_IDX(vaddr)] & PTE_ADDR_MASK);
+    if (!(pd[PD_IDX(vaddr)] & PTE_PRESENT)) return;
+    if (pd[PD_IDX(vaddr)] & PTE_HUGE) return;
+    pt = (uint64_t*)PHYS_TO_VIRT(pd[PD_IDX(vaddr)] & PTE_ADDR_MASK);
+    pte = &pt[PT_IDX(vaddr)];
+    if (!(*pte & PTE_PRESENT)) return;
+    *pte = 0;
+    __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
 }
 
 static inline void arch_vm_update_page_flags(arch_address_space_t address_space, uint64_t vaddr, uint64_t new_flags) {
