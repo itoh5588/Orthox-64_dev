@@ -493,3 +493,19 @@ void vmm_page_fault_handler(struct interrupt_frame* frame) {
     puts("\r\n");
     for(;;) __asm__("hlt");
 }
+
+/* ユーザーのページテーブルを書き替えた後 (2026-09-11)。
+ *
+ * **x86 だけ持っていなかった。**aarch64 は kernel/aarch64/syscall.c:47、
+ * riscv64 は kernel/riscv64/syscall.c:59 にあり、共有層
+ * (kernel/linux_syscall.c) の mmap / munmap / mprotect が呼んでいる。
+ * mmap を共有層へ寄せるにあたって x86 にも要る。
+ *
+ * x86 に「全部捨てる」命令は無いので **CR3 を読んで書き戻す** ——
+ * グローバルページ以外の TLB が落ちる。この書き方は同じファイルの
+ * vmm_fork_address_space (:277) が既に使っている。 */
+void arch_syscall_flush_tlb(void) {
+    uint64_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    __asm__ volatile("mov %0, %%cr3" : : "r"(cr3) : "memory");
+}

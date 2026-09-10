@@ -212,6 +212,7 @@ SYSCALL_SRCS = kernel/syscall.c kernel/sys_trace.c kernel/sys_signal.c \
 # **aarch64 / riscv64 も同じものを組んでいる** (AARCH64_SHARED_C_SRCS /
 # RISCV64_SHARED_C_SRCS を参照)
 CORE_SRCS = kernel/elf.c kernel/task.c kernel/task_exec.c kernel/task_fork.c \
+	kernel/sys_mmap.c \
 	kernel/sched.c kernel/wait.c kernel/fs.c kernel/vfs.c kernel/storage.c \
 	kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c kernel/net.c \
 	kernel/net_socket.c kernel/lwip_port.c kernel/cstring.c kernel/cstdio.c \
@@ -224,7 +225,7 @@ RISCV64_C_SRCS = kernel/riscv64/boot.c kernel/riscv64/bootstrap_user.c kernel/ri
 	kernel/riscv64/runtime.c kernel/riscv64/smp.c kernel/riscv64/task.c kernel/riscv64/trap.c kernel/riscv64/syscall.c \
 	kernel/riscv64/virtio_blk_mmio.c kernel/riscv64/vm.c
 RISCV64_SHARED_C_SRCS = kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c \
-	kernel/linux_syscall.c \
+	kernel/linux_syscall.c kernel/sys_mmap.c \
 	kernel/wait.c kernel/elf.c kernel/cstring.c kernel/cstdio.c \
 	kernel/storage.c kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c
 RISCV64_ASM_SRCS = kernel/riscv64/start.S kernel/riscv64/trap.S kernel/riscv64/entry.S
@@ -371,7 +372,7 @@ AARCH64_SHARED_C_SRCS = kernel/usb.c \
 	kernel/task.c kernel/sched.c kernel/wait.c \
 	kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c \
 	kernel/fs.c kernel/elf.c kernel/task_exec.c kernel/task_fork.c \
-	kernel/linux_syscall.c kernel/sys_fs.c \
+	kernel/linux_syscall.c kernel/sys_fs.c kernel/sys_mmap.c \
 	kernel/net.c kernel/net_socket.c kernel/lwip_port.c kernel/cstdlib.c
 AARCH64_ASM_SRCS = kernel/aarch64/start.S kernel/aarch64/vectors.S \
 	kernel/aarch64/entry.S kernel/aarch64/user_blob.S kernel/aarch64/switch.S

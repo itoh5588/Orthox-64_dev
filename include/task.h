@@ -34,11 +34,13 @@
 #define USER_MMAP_TOP_VADDR    0x0000003F00000000ULL
 #else
 #define USER_STACK_TOP_VADDR   0x7FFFFFFFF000ULL
-#define USER_MMAP_BASE_VADDR   0x4000000000ULL
-/* **x86 は kernel/x86_64/sys_vm.c が別に MMAP_BASE_ADDR / MMAP_TOP_ADDR を
- * 持っており、そちらが本家。**上はここと違う値 (0x200000000000) で、
- * find_mmap_gap が切り上げるため USER_MMAP_BASE_VADDR は mmap の配置に
- * 効いていない。**揃えるのは mmap を統合するときにする。** */
+/* **sys_vm.c の MMAP_BASE_ADDR に揃えた (2026-09-11)。**ここは
+ * 0x4000000000 だったが、mmap の下端は kernel/x86_64/sys_vm.c の
+ * MMAP_BASE_ADDR (0x200000000000) が本家で、find_mmap_gap が切り上げて
+ * いたため **宣言と実際がずれていた。**mmap を共有層へ出すにあたって
+ * 実際のほうに合わせる。mmap_end の初期値が変わるだけで、切り上げに
+ * よって配置はこれまでと同じ */
+#define USER_MMAP_BASE_VADDR   0x0000200000000000ULL
 #define USER_MMAP_TOP_VADDR    0x00007F0000000000ULL
 #endif
 

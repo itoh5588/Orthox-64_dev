@@ -1331,128 +1331,12 @@ __attribute__((weak)) int64_t sys_pread64(int fd, void* buf, size_t count, int64
     return -1;
 }
 
-/* ページ 1 枚をファイルから読んで埋める。**private マップなので写しでよい** —
- * 書き戻しは要らないし、他のプロセスと共有もしない (x86 の
- * copy_mmap_file_page と同じ作り)。
- * **pread を使うので fd の現在位置は動かない。**musl は同じ fd で
- * ヘッダを読みながらセグメントを貼るので、位置を動かすと壊れる */
-static int linux_mmap_fill_from_file(uint8_t* dest, int fd, uint64_t file_off) {
-    if (!dest || fd < 0) return -1;
-    return (sys_pread64(fd, dest, PAGE_SIZE, (int64_t)file_off) < 0) ? -1 : 0;
-}
-
-/* mmap(2)。
- *
- * **2026-08-29 に file-backed / MAP_FIXED / PROT_EXEC を足した。**
- * それまでは無名 private だけで、共有ライブラリを 1 つも開けなかった。
- * musl の動的リンカ (ldso/dynlink.c:map_library) は
- *
- *   1. まず PROT_NONE で全体を予約する (無名)
- *   2. その中へ MAP_FIXED でセグメントをファイルから貼る
- *
- * という順で使うので、**3 つとも無いと "Invalid argument" で止まる**
- * (aarch64 で実測)。とくに PROT_EXEC は、無いとテキストが実行不可の
- * まま貼られて、開けても呼んだ瞬間に落ちる。
- *
- * x86 は kernel/sys_vm.c の sys_mmap が別に持っている (そちらが本家)。 */
-/* この機械でファイルを貼る mmap が使えるか。弱い既定が選ばれていれば使えない */
-static int linux_mmap_can_map_file(void) {
-    /* pread が -1 を返すだけの既定かどうかは呼んでみないと分からないので、
-     * 明らかに不正な fd で 1 回試す。本物は EBADF を返し、既定も -1 を
-     * 返すため区別できない —— そこで **アーキで直に分ける** */
-#if defined(__riscv)
-    return 0;
-#else
-    return 1;
-#endif
-}
-
-static void* linux_bootstrap_sys_mmap(void* addr, size_t length, int prot, int flags, int fd, int64_t offset) {
-    struct task* current = get_current_task();
-    arch_address_space_t address_space;
-    uint64_t base;
-    /* ユーザー VA の上限。アーキごとの値は kernel/task_internal.h に
-     * 置いてある (riscv64 / aarch64 は Sv39 の 2^38 で、スタック領域
-     * 0x3FFFFxxxxx の手前まで) */
-    uint64_t limit = USER_MMAP_TOP_VADDR;
-    uint64_t size;
-    uint64_t map_flags;
-    int is_anonymous;
-
-    if (!current) return linux_mmap_err(LINUX_ESRCH);
-    if (length == 0) return linux_mmap_err(LINUX_EINVAL);
-    if ((flags & MAP_PRIVATE) == 0) return linux_mmap_err(LINUX_EINVAL);
-    if (offset < 0 || (offset & (PAGE_SIZE - 1)) != 0) return linux_mmap_err(LINUX_EINVAL);
-
-    is_anonymous = (flags & MAP_ANONYMOUS) != 0;
-    if (is_anonymous) {
-        if (fd != -1 && fd != 0) return linux_mmap_err(LINUX_EINVAL);
-    } else {
-        if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return linux_mmap_err(LINUX_EBADF);
-        /* **貼れないなら先に断る。**途中まで貼ってから諦めると後始末が要る */
-        /* **ENOSYS で返す。**「この機械では実装が無い」の意味そのもので、
-         * musl は静的な道へ退くか、意味の分かる文言を出せる */
-        if (linux_mmap_can_map_file() == 0) return linux_mmap_err(LINUX_ENOSYS);
-    }
-
-    size = linux_align_up_page((uint64_t)length);
-    if (!size) return linux_mmap_err(LINUX_EINVAL);
-
-    address_space = arch_task_context_get_address_space(&current->ctx);
-
-    if (flags & MAP_FIXED) {
-        /* **要求された番地にそのまま貼る。**musl は 1 の予約で得た範囲の
-         * 中を指してくるので、既に張られていれば置き換える */
-        base = (uint64_t)(uintptr_t)addr;
-        if (base & (PAGE_SIZE - 1)) return linux_mmap_err(LINUX_EINVAL);
-        if (base == 0 || base + size < base) return linux_mmap_err(LINUX_EINVAL);
-    } else {
-        base = current->mmap_end;
-        if (base < USER_MMAP_BASE_VADDR) base = USER_MMAP_BASE_VADDR;
-        base = linux_align_up_page(base);
-        while (base + size <= limit) {
-            uint64_t off = 0;
-            int occupied = 0;
-            while (off < size) {
-                if (arch_vm_get_phys(address_space, base + off) != 0) {
-                    occupied = 1;
-                    break;
-                }
-                off += PAGE_SIZE;
-            }
-            if (!occupied) break;
-            base += PAGE_SIZE;
-        }
-        /* ユーザー VA を使い切った */
-        if (base + size > limit) return linux_mmap_err(LINUX_ENOMEM);
-    }
-
-    map_flags = arch_vm_user_page_flags((prot & PROT_WRITE) != 0,
-                                        (prot & PROT_EXEC) != 0);
-    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        uint64_t phys;
-        /* MAP_FIXED で既に張られている枠は、いったん剥がさず上書きする。
-         * 元の物理ページは予約 (無名) のものなので使い回してよい */
-        phys = (flags & MAP_FIXED) ? arch_vm_get_phys(address_space, base + off) : 0;
-        if (!phys) {
-            phys = linux_alloc_zeroed_user_page();
-            if (!phys) return linux_mmap_err(LINUX_ENOMEM);
-        } else {
-            memset((void*)(uintptr_t)PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
-        }
-        if (!is_anonymous) {
-            (void)linux_mmap_fill_from_file((uint8_t*)(uintptr_t)PHYS_TO_VIRT(phys),
-                                            fd, (uint64_t)offset + off);
-        }
-        arch_vm_map_page(address_space, base + off, phys, map_flags);
-    }
-    if (base + size > current->mmap_end) current->mmap_end = base + size;
-    arch_syscall_flush_tlb();
-    /* **貼ったばかりのテキストを実行させる前に命令キャッシュを揃える。**
-     * aarch64 は I/D が一貫していないので、揃えないと古い中身を実行しうる */
-    if (prot & PROT_EXEC) arch_sync_icache_range((void*)(uintptr_t)base, size);
-    return (void*)(uintptr_t)base;
-}
+/* **mmap(2) は kernel/sys_mmap.c へ移した (2026-09-11)。**
+ * x86 (kernel/x86_64/sys_vm.c) と 2 実装あり、**重複ではなく動作が
+ * 違っていた** (MAP_SHARED / 失敗時の後始末 / PIPE の検査)。
+ * **x86 側に寄せた** —— musl が MAP_SHARED を使うため。
+ * 経緯と対照表は kernel/sys_mmap.c の冒頭にある */
+void* sys_mmap(void* addr, size_t length, int prot, int flags, int fd, int64_t offset);
 
 /* N-6 (2026-08-31): mremap (216)。**未実装のままだと musl の realloc が
  * malloc+memcpy+free に退く。**動きは正しいが、ld の起動時など大きい
@@ -1526,7 +1410,7 @@ static void* linux_bootstrap_sys_mremap(void* old_addr, size_t old_len, size_t n
 
     /* 直後に空きが無い: 新しい範囲を作り、中身を写してから古い方を外す */
     {
-        void* mapped = linux_bootstrap_sys_mmap((flags & LINUX_MREMAP_FIXED) ? new_addr : 0,
+        void* mapped = sys_mmap((flags & LINUX_MREMAP_FIXED) ? new_addr : 0,
                                                  (size_t)new_size, PROT_READ | PROT_WRITE,
                                                  MAP_PRIVATE | MAP_ANONYMOUS |
                                                  ((flags & LINUX_MREMAP_FIXED) ? MAP_FIXED : 0),
@@ -1822,7 +1706,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_MMAP:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(uintptr_t)linux_bootstrap_sys_mmap((void*)(uintptr_t)arch_syscall_arg0(frame),
+                                    (uint64_t)(uintptr_t)sys_mmap((void*)(uintptr_t)arch_syscall_arg0(frame),
                                                                                     (size_t)arch_syscall_arg1(frame),
                                                                                     (int)arch_syscall_arg2(frame),
                                                                                     (int)arch_syscall_arg3(frame),

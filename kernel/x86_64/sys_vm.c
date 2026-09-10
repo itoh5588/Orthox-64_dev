@@ -109,25 +109,6 @@ static int is_range_unmapped(uint64_t* pml4, uint64_t vaddr, uint64_t size) {
     return 1;
 }
 
-static uint64_t find_mmap_gap_from(uint64_t* pml4, uint64_t size, uint64_t start, uint64_t end) {
-    if (start < MMAP_BASE_ADDR) start = MMAP_BASE_ADDR;
-    start = align_up_page(start);
-    for (uint64_t base = start; base + size <= end; base += PAGE_SIZE) {
-        if (is_range_unmapped(pml4, base, size)) return base;
-    }
-    return 0;
-}
-
-static uint64_t find_mmap_gap(uint64_t* pml4, uint64_t size, uint64_t hint) {
-    if (!pml4 || size == 0 || size > (MMAP_TOP_ADDR - MMAP_BASE_ADDR)) return 0;
-    if (hint < MMAP_BASE_ADDR || hint >= MMAP_TOP_ADDR) hint = MMAP_BASE_ADDR;
-
-    uint64_t base = find_mmap_gap_from(pml4, size, hint, MMAP_TOP_ADDR);
-    if (base != 0) return base;
-    if (hint > MMAP_BASE_ADDR) return find_mmap_gap_from(pml4, size, MMAP_BASE_ADDR, hint);
-    return 0;
-}
-
 static void unmap_one_page(uint64_t* pml4, uint64_t vaddr) {
     if (!(pml4[PML4_IDX(vaddr)] & PTE_PRESENT)) return;
     uint64_t* pdp = (uint64_t*)PHYS_TO_VIRT(pml4[PML4_IDX(vaddr)] & PTE_ADDR_MASK);
@@ -154,12 +135,6 @@ static uint64_t* lookup_user_pte(uint64_t* pml4, uint64_t vaddr) {
     if (pd[PD_IDX(vaddr)] & PTE_HUGE) return 0;
     uint64_t* pt = (uint64_t*)PHYS_TO_VIRT(pd[PD_IDX(vaddr)] & PTE_ADDR_MASK);
     return &pt[PT_IDX(vaddr)];
-}
-
-static void rollback_mmap(uint64_t* pml4, uint64_t base, uint64_t mapped_size) {
-    for (uint64_t off = 0; off < mapped_size; off += PAGE_SIZE) {
-        unmap_one_page(pml4, base + off);
-    }
 }
 
 void* sys_mmap(void* addr, size_t length, int prot, int flags, int fd, int64_t offset);
@@ -317,109 +292,6 @@ void* sys_mremap(void* old_addr, size_t old_len, size_t new_len, int flags, void
     return mapped;
 }
 
-static void copy_mmap_file_page(uint8_t* dest, int fd, uint64_t file_off) {
-    if (!dest || fd < 0) return;
-    int64_t old = fs_lseek(fd, 0, 1);
-    if (old < 0) return;
-    if (fs_lseek(fd, (int64_t)file_off, 0) >= 0) {
-        int64_t n = fs_read(fd, dest, PAGE_SIZE);
-        (void)n;
-    }
-    (void)fs_lseek(fd, old, 0);
-}
-
-// File-backed mappings are an eager per-process copy made at map time;
-// MAP_SHARED is accepted but behaves like MAP_PRIVATE (no write-back, no
-// cross-process visibility).
-void* sys_mmap(void* addr, size_t length, int prot, int flags, int fd, int64_t offset) {
-    struct task* current = get_current_task();
-    if (!current || length == 0) return (void*)-22;
-    if (!(flags & (MAP_PRIVATE | MAP_SHARED))) return (void*)-22;
-    if (offset < 0) return (void*)-22;
-    if ((offset & (PAGE_SIZE - 1)) != 0) return (void*)-22;
-
-    uint64_t* pml4 = (uint64_t*)PHYS_TO_VIRT(current->ctx.cr3);
-    uint64_t size = align_up_page((uint64_t)length);
-    if (size == 0) return (void*)-22;
-
-    file_descriptor_t* backing_fd = 0;
-    int is_anonymous = (flags & MAP_ANONYMOUS) != 0;
-    if (is_anonymous) {
-        if (fd != -1 && fd != 0) return (void*)-22;
-        if (offset != 0) return (void*)-22;
-    } else {
-        if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return (void*)-9;
-        backing_fd = &current->fds[fd];
-        if (fs_fd_type(backing_fd) == FT_PIPE) return (void*)-19;
-    }
-
-    uint64_t base = align_up_page((uint64_t)addr);
-    if (base == 0 || !(flags & MAP_FIXED)) {
-        base = find_mmap_gap(pml4, size, current->mmap_end);
-        if (base == 0) return (void*)-12;
-        current->mmap_end = align_up_page(base + size);
-    } else {
-        if ((uint64_t)addr != base) return (void*)-22;
-        if (!is_user_mmap_range_valid(base, size)) return (void*)-22;
-        if (!is_range_unmapped(pml4, base, size)) {
-            // Linux MAP_FIXED replaces overlapping mapping; keep same behavior.
-            for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-                unmap_one_page(pml4, base + off);
-            }
-        }
-    }
-
-    if (!is_user_mmap_range_valid(base, size)) return (void*)-22;
-
-    uint64_t map_flags = PTE_PRESENT | PTE_USER;
-    if (prot & PROT_WRITE) map_flags |= PTE_WRITABLE;
-    if (!(prot & PROT_EXEC)) map_flags |= PTE_NX;
-
-    uint64_t mapped = 0;
-    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        void* phys = pmm_alloc(1);
-        if (!phys) {
-            rollback_mmap(pml4, base, mapped);
-            return (void*)-12;
-        }
-        kernel_memset(PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
-        if (!is_anonymous) {
-            copy_mmap_file_page((uint8_t*)PHYS_TO_VIRT(phys), fd, (uint64_t)offset + off);
-        }
-        vmm_map_page(pml4, base + off, (uint64_t)phys, map_flags);
-        mapped += PAGE_SIZE;
-    }
-
-    return (void*)base;
-}
-
-int sys_munmap(void* addr, size_t length) {
-    struct task* current = get_current_task();
-    if (!current || length == 0) return -22;
-
-    uint64_t base = (uint64_t)addr;
-    if (base & (PAGE_SIZE - 1)) return -22;
-    uint64_t size = align_up_page((uint64_t)length);
-    if (!is_user_mmap_range_valid(base, size)) return -22;
-
-    /* **arch hook で外し、返すのはこちらでやる (2026-09-10)。**
-     * kernel/linux_syscall.c:738 の munmap と同じ形。共有層の契約は
-     * 「arch_vm_unmap_page は写像を外すだけで持ち主を変えない」で、
-     * そこへ寄せていく途中。動作は unmap_one_page と同じ。
-     *
-     * **外れたことを確かめてから返す。**vmm_get_phys は 2MB ページでも
-     * 番地を返すが (kernel/x86_64/vmm.c:187)、arch_vm_unmap_page は
-     * 2MB を触らずに戻る。確かめずに返すと、**まだ写像されているページを
-     * 取り上げる。**mmap は 2MB を作らないので普段は通らない道だが、
-     * unmap_one_page が持っていた PTE_HUGE の番人をここでも残す。 */
-    arch_address_space_t address_space = arch_task_context_get_address_space(&current->ctx);
-    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        uint64_t va = base + off;
-        uint64_t phys = arch_vm_get_phys(address_space, va);
-        arch_vm_unmap_page(address_space, va);
-        if (phys && arch_vm_get_phys(address_space, va) == 0) {
-            pmm_free((void*)(uintptr_t)(phys & ~(PAGE_SIZE - 1ULL)), 1);
-        }
-    }
-    return 0;
-}
+/* **sys_mmap / sys_munmap は kernel/sys_mmap.c へ移した (2026-09-11)。**
+ * aarch64 / riscv64 の linux_syscall.c 側と 2 実装あったものを 1 つにした。
+ * 同じファイルに残っている mremap / mprotect / brk はまだ x86 だけの実装 */

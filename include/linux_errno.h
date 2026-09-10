@@ -24,6 +24,9 @@
 #define LINUX_ENOMEM      12
 #define LINUX_EFAULT      14
 #define LINUX_EEXIST      17
+/* パイプを mmap しようとしたとき (kernel/sys_mmap.c)。x86 が生の -19 で
+ * 返していたものに名前を付けた */
+#define LINUX_ENODEV      19
 #define LINUX_ENOTDIR     20
 #define LINUX_EISDIR      21
 #define LINUX_EINVAL      22
