@@ -280,12 +280,21 @@ uint64_t riscv64_vm_get_phys(uint64_t root_pa, uint64_t virt_addr) {
     return riscv64_sv39_pte_phys(entry) | (virt_addr & (RISCV64_PAGE_SIZE - 1ULL));
 }
 
+/* **写像を外すだけ。物理ページは返さない (2026-09-10)。**
+ *
+ * ここは `PTE_U` のページを pmm_free していたが、**呼び手は 3 箇所とも
+ * 自分で解放していた** —— kernel/linux_syscall.c:721 に
+ * 「arch_vm_unmap_page は写像を外すだけで持ち主を変えない」と契約が
+ * 明記してあり (実測でカーネル 1 本ビルドごとに 18MB 漏れた件の直し)、
+ * aarch64 の arch_vm_unmap_page もそれに従っている。
+ *
+ * **riscv64 だけが二重に減らしていた。**参照カウント 1 のページは
+ * pmm_free の `if (refcount > 0)` で 2 回目が空振りするので助かるが、
+ * **fork の COW など参照カウントが 2 以上のページは、まだ他プロセスが
+ * 写像したまま解放される。** */
 void riscv64_vm_unmap_page(uint64_t root_pa, uint64_t virt_addr) {
     uint64_t* pte = riscv64_sv39_walk_leaf(riscv64_vm_root_ptr(root_pa), virt_addr);
     if (!pte || (*pte & RISCV64_SV39_PTE_V) == 0) return;
-    if (*pte & RISCV64_SV39_PTE_U) {
-        pmm_free((void*)(uintptr_t)riscv64_sv39_pte_phys(*pte), 1);
-    }
     *pte = 0;
     riscv64_sfence_vma();
 }
