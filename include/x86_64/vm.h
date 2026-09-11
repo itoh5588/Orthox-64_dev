@@ -57,7 +57,7 @@ static inline uint64_t arch_vm_get_phys(arch_address_space_t address_space, uint
 
 /* **写像を外すだけ。物理ページは返さない (2026-09-10)。**
  *
- * 契約は kernel/linux_syscall.c:721 に明記してある —— 呼び手が
+ * 契約は kernel/sys_mmap.c の mmap_drop_page に明記してある —— 呼び手が
  * arch_vm_get_phys してから自分で pmm_free する。aarch64 も riscv64 も
  * これに従う (riscv64 は 2026-09-10 まで外れていた)。
  *

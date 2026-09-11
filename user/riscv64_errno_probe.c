@@ -144,6 +144,38 @@ int main(void) {
     check("munmap-zero-len", munmap((void*)0x2000, 0) < 0, errno, EINVAL);
 
     errno = 0;
+    /* カーネルの先頭 (scripts/kernel-riscv64.ld の 0x80200000)。riscv64 は
+     * カーネルが下位半分に居て、ユーザーの表は下の段をカーネルと共有している。
+     * **範囲を見ない munmap はここを外せてしまい、全プロセスからカーネルの
+     * .text が消える** (このページには uart の出力関数が載っているので、
+     * 次の write で止まる) */
+    check("munmap-kernel", munmap((void*)0x80200000, 4096) < 0, errno, EINVAL);
+
+    /* 逆向き: **mmap で取った範囲は外せること。**munmap-kernel は範囲検査で
+     * 断っているので、その検査が mmap の返す番地まで断っていないかを見る
+     * (失敗経路だけ並べると、全部断る実装でも緑になる) */
+    {
+        volatile char* p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        int r = -1;
+        if (p != MAP_FAILED) {
+            p[0] = 1;
+            errno = 0;
+            r = munmap((void*)p, 4096);
+        }
+        put_str("ERRNO munmap-own ret=");
+        put_int(r);
+        put_str(" errno=");
+        put_int(errno);
+        if (r == 0) {
+            put_str(" ok\n");
+        } else {
+            put_str(" BAD\n");
+            g_bad++;
+        }
+    }
+
+    errno = 0;
     {
         struct timespec ts;
         check("clock_gettime-badclock", clock_gettime(99, &ts) < 0, errno, EINVAL);

@@ -76,7 +76,19 @@ static int mmap_range_unmapped(arch_address_space_t as, uint64_t base, uint64_t 
 }
 
 /* **写像を外して物理ページを返す。**arch_vm_unmap_page は写像を外すだけで
- * 持ち主を変えない約束なので (kernel/linux_syscall.c:721)、返すのはこちら。
+ * 持ち主を変えない約束なので、返すのはこちら。
+ *
+ * 外しただけだと **そのページは誰の物でもなくなり、参照カウントが 1 の
+ * まま二度と配られない。**musl の malloc は大きい塊を mmap / munmap で
+ * 扱うので、cc1 のように確保と解放を繰り返すプログラムで積み上がる。
+ * 実測では OS の中でカーネルを 1 本コンパイルするたびに約 18MB 漏れ、
+ * 512MB を 15 本で使い切っていた (もとは linux_syscall.c の munmap に
+ * 書いてあった説明。2026-09-11 に munmap が 3 アーキ共通になって移した)。
+ *
+ * pmm_free は参照カウントを見るので、共有されているページ (fork の COW) を
+ * 返しても取り上げてしまうことはない。get_phys はページ内オフセットを
+ * OR して返すアーキがあるので、**下位ビットを落としてから渡す。**
+ *
  * **外れたことを確かめてから返す** —— get_phys は 2MB ページでも番地を
  * 返すが arch_vm_unmap_page は 2MB を触らない。確かめずに返すと
  * まだ写像されているページを取り上げる */
@@ -223,6 +235,12 @@ int sys_munmap(void* addr, size_t length) {
     base = (uint64_t)(uintptr_t)addr;
     if (base & (PAGE_SIZE - 1ULL)) return -LINUX_EINVAL;
     size = mmap_align_up((uint64_t)length);
+    /* **範囲の外は断る。**mmap が貼るのはこの範囲だけなので、外せる範囲も
+     * それに揃える。riscv64 はカーネルが下位半分 (0x80200000〜) に居て、
+     * ユーザーの表は下の段をカーネルと共有しているため、ここを見ないと
+     * **ユーザーから全プロセスのカーネルの写像を外せた** (aarch64 / riscv64
+     * の linux 側 munmap がそうだった。user/riscv64_errno_probe.c の
+     * munmap-kernel で、次の write でカーネルが止まるのを確かめた) */
     if (!mmap_range_valid(base, size)) return -LINUX_EINVAL;
 
     as = arch_task_context_get_address_space(&current->ctx);

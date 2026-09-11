@@ -283,7 +283,7 @@ uint64_t riscv64_vm_get_phys(uint64_t root_pa, uint64_t virt_addr) {
 /* **写像を外すだけ。物理ページは返さない (2026-09-10)。**
  *
  * ここは `PTE_U` のページを pmm_free していたが、**呼び手は 3 箇所とも
- * 自分で解放していた** —— kernel/linux_syscall.c:721 に
+ * 自分で解放していた** —— kernel/sys_mmap.c の mmap_drop_page に
  * 「arch_vm_unmap_page は写像を外すだけで持ち主を変えない」と契約が
  * 明記してあり (実測でカーネル 1 本ビルドごとに 18MB 漏れた件の直し)、
  * aarch64 の arch_vm_unmap_page もそれに従っている。

@@ -705,42 +705,10 @@ static uint64_t linux_bootstrap_sys_brk(uint64_t addr) {
     return current->heap_break;
 }
 
-static int linux_bootstrap_sys_munmap(void* addr, size_t length) {
-    struct task* current = get_current_task();
-    uint64_t base = (uint64_t)(uintptr_t)addr;
-    uint64_t size = linux_align_up_page((uint64_t)length);
-    arch_address_space_t address_space;
-
-    if (!current) return -LINUX_ESRCH;
-    /* Linux の munmap は addr がページ境界でない / length が 0 を EINVAL とする */
-    if (!addr || length == 0) return -LINUX_EINVAL;
-    if ((base & (PAGE_SIZE - 1ULL)) != 0) return -LINUX_EINVAL;
-
-    address_space = arch_task_context_get_address_space(&current->ctx);
-    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        /* **外す前に物理ページを取って返すこと。**
-         *
-         * arch_vm_unmap_page は名前のとおり「写像を外す」だけで、物理ページの
-         * 持ち主を変えない。外しただけだと **そのページは誰の物でもなくなり、
-         * 参照カウントが 1 のまま二度と配られない**。
-         *
-         * musl の malloc は大きい塊を mmap / munmap で扱うので、cc1 のように
-         * 確保と解放を繰り返すプログラムで積み上がる。実測では OS の中で
-         * カーネルを 1 本コンパイルするたびに約 18MB 漏れ、512MB を
-         * 15 本で使い切っていた。
-         *
-         * pmm_free は参照カウントを見るので、共有されているページを
-         * ここで返しても取り上げてしまうことはない。
-         *
-         * get_phys はページ内オフセットを OR して返すアーキがあるので、
-         * **下位ビットを落としてから渡す** */
-        uint64_t phys = arch_vm_get_phys(address_space, base + off);
-        arch_vm_unmap_page(address_space, base + off);
-        if (phys) pmm_free((void*)(uintptr_t)(phys & ~(PAGE_SIZE - 1ULL)), 1);
-    }
-    arch_syscall_flush_tlb();
-    return 0;
-}
+/* munmap は kernel/sys_mmap.c の sys_munmap (3 アーキ共通, 2026-09-11)。
+ * ここに在った版は範囲を見ておらず、riscv64 ではユーザーからカーネルの
+ * 写像を外せた。物理ページを返す理由の説明は sys_mmap.c の mmap_drop_page へ
+ * 移した */
 
 static int linux_bootstrap_sys_set_tid_address(int* tidptr) {
     struct task* current = get_current_task();
@@ -1427,7 +1395,7 @@ static void* linux_bootstrap_sys_mremap(void* old_addr, size_t old_len, size_t n
                        (void*)(uintptr_t)PHYS_TO_VIRT(old_phys & ~(PAGE_SIZE - 1ULL)), PAGE_SIZE);
             }
         }
-        (void)linux_bootstrap_sys_munmap(old_addr, old_len);
+        (void)sys_munmap(old_addr, old_len);
         return (void*)(uintptr_t)new_base;
     }
 }
@@ -1715,8 +1683,8 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_MUNMAP:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_munmap((void*)(uintptr_t)arch_syscall_arg0(frame),
-                                                                                     (size_t)arch_syscall_arg1(frame)));
+                                    (uint64_t)(int64_t)sys_munmap((void*)(uintptr_t)arch_syscall_arg0(frame),
+                                                                  (size_t)arch_syscall_arg1(frame)));
             return;
         case LINUX_SYS_MREMAP:
             arch_syscall_set_return(frame,
