@@ -1094,6 +1094,24 @@ uint64_t arch_vm_get_phys(arch_address_space_t address_space, uint64_t vaddr) {
     return aarch64_vm_translate_in(address_space, vaddr);
 }
 
+/* **EL0 から触れるページか。**AP[1] (bit 6) が「EL0 にも見せる」で、
+ * AARCH64_PTE_AP_RW_EL0 (01) と AARCH64_PTE_AP_RO_EL0 (11) の両方で立つ。
+ * 見るのは L3 の 4KB ページだけで、ブロックはユーザーに貼らないので 0。
+ * mprotect が「貼られているか」ではなく「ユーザーの物か」を見るために
+ * 使う (riscv64 ではカーネルのページも get_phys が返すため。aarch64 は
+ * 表が分かれているが、同じ約束にそろえる) */
+int arch_vm_is_user_page(arch_address_space_t address_space, uint64_t vaddr) {
+    uint64_t l2_pa, l3_pa, entry;
+
+    if (!address_space) return 0;
+    l2_pa = aarch64_vm_walk_existing(address_space, vaddr, 1);
+    if (!l2_pa) return 0;
+    l3_pa = aarch64_vm_walk_existing(l2_pa, vaddr, 2);
+    if (!l3_pa) return 0;
+    entry = aarch64_vm_table_ptr(l3_pa)[aarch64_vm_index(vaddr, 3)];
+    return (entry & AARCH64_PTE_VALID) != 0 && (entry & (1ULL << 6)) != 0;
+}
+
 /* L3 の descriptor を無効にする。**TLB を捨てるところまでやる。**
  * 捨てないと、外したはずのページが読めたままになる */
 void arch_vm_unmap_page(arch_address_space_t address_space, uint64_t vaddr) {

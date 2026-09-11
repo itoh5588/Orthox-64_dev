@@ -68,6 +68,17 @@ int main(void) {
     if (memcmp(map, "OK", 2) != 0) return 22;
     if (write_all(1, "MAP\n", 4) < 0) return 23;
 
+    /* 同じページに mprotect と munmap が効くこと。
+     *
+     * どちらも「断る側」の検査を足した (2026-09-11: mprotect は
+     * arch_vm_is_user_page でユーザーのページか、munmap は mmap の範囲かを
+     * 見る)。**断る側だけ確かめると、全部断る実装でも緑になる。**aarch64 で
+     * mprotect / munmap を成功させるのはこのプローブしか無い */
+    if (mprotect(map, 4096, PROT_READ) != 0) return 50;
+    if (memcmp(map, "OK", 2) != 0) return 51;
+    if (munmap(map, 4096) != 0) return 52;
+    if (write_all(1, "MPROT-MUNMAP\n", 13) < 0) return 53;
+
     /* 1 回の write で xv6fs のログ容量 (126 ブロック) を超える。
      *
      * xv6fs_write_file が書き込みを分割していないと

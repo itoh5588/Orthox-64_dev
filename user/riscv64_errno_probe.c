@@ -175,6 +175,49 @@ int main(void) {
         }
     }
 
+    /* RAM の上端近く (DTB の 0x9fe00000 より手前、pmm は下から配るので空き)。
+     * riscv64 のカーネルは RAM 全体を下位半分に恒等写像しているので、
+     * **ユーザーの写像かどうかを見ない mprotect は、ここをユーザーに見える
+     * ページとして貼り直せてしまう。**Linux / x86 と同じく ENOMEM を期待する。
+     * 通ってしまったら 1 バイト読んで、本当に読めることを報告する
+     * (書くと何かを壊しうるので読むだけ) */
+    {
+        volatile unsigned char* kp = (volatile unsigned char*)0x9f000000UL;
+        int r;
+        errno = 0;
+        r = mprotect((void*)kp, 4096, PROT_READ);
+        if (r == 0) {
+            put_str("ERRNO mprotect-kernel-ram readable byte=");
+            put_int(kp[0]);
+            put_str("\n");
+        }
+        check("mprotect-kernel-ram", r < 0, errno, ENOMEM);
+    }
+
+    /* 逆向き: mmap で取ったページは mprotect できること (munmap-own と同じ理由) */
+    {
+        void* p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        int r = -1;
+        int e = 0;
+        if (p != MAP_FAILED) {
+            errno = 0;
+            r = mprotect(p, 4096, PROT_READ);
+            e = errno;
+            (void)munmap(p, 4096);
+        }
+        put_str("ERRNO mprotect-own ret=");
+        put_int(r);
+        put_str(" errno=");
+        put_int(e);
+        if (r == 0) {
+            put_str(" ok\n");
+        } else {
+            put_str(" BAD\n");
+            g_bad++;
+        }
+    }
+
     errno = 0;
     {
         struct timespec ts;

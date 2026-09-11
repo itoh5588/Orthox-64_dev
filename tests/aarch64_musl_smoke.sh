@@ -146,6 +146,8 @@ grep -aq "MUSL:/" "$LOG"
 grep -aqE "^ELF$" "$LOG"
 # 匿名 mmap に書いて読み返せた
 grep -aqE "^MAP$" "$LOG"
+# そのページに mprotect と munmap が効いた (断る側の検査が断りすぎていない)
+grep -aqE "^MPROT-MUNMAP$" "$LOG"
 # **ディスクへの新規作成 (O_CREAT) が返ってくること。**
 #
 # ここは調査用に足した段階マーカーをそのまま検査に残したもの。

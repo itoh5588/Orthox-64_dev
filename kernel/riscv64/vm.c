@@ -496,6 +496,18 @@ uint64_t arch_vm_get_phys(arch_address_space_t address_space, uint64_t vaddr) {
     return riscv64_vm_get_phys((uint64_t)address_space, vaddr);
 }
 
+/* **ユーザーから見えるページか (V と U の両方)。**get_phys では足りない ——
+ * カーネルは RAM 全体を下位半分に恒等写像しており、ユーザーの表は下の段を
+ * それと共有しているので、get_phys はカーネルのページにも番地を返す。
+ * これを「貼られている」とみなした mprotect は、RAM の任意のページを
+ * ユーザーに見えるページとして貼り直せた (2026-09-11) */
+int arch_vm_is_user_page(arch_address_space_t address_space, uint64_t vaddr) {
+    uint64_t* pte = riscv64_sv39_walk_leaf(riscv64_vm_root_ptr((uint64_t)address_space), vaddr);
+    if (!pte) return 0;
+    return (*pte & (RISCV64_SV39_PTE_V | RISCV64_SV39_PTE_U)) ==
+           (RISCV64_SV39_PTE_V | RISCV64_SV39_PTE_U);
+}
+
 void arch_vm_unmap_page(arch_address_space_t address_space, uint64_t vaddr) {
     riscv64_vm_unmap_page((uint64_t)address_space, vaddr);
 }

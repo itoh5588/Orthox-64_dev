@@ -55,6 +55,12 @@ static inline uint64_t arch_vm_get_phys(arch_address_space_t address_space, uint
     return vmm_get_phys(arch_vm_address_space_root(address_space), vaddr);
 }
 
+/* arch_vm_is_user_page は **x86 にはまだ無い** (aarch64 / riscv64 は在る)。
+ * 呼び手は linux 側の mprotect だけで、x86 はそれを組み込まず、
+ * kernel/x86_64/sys_vm.c の sys_mprotect が PTE_USER を自分で見ている。
+ * 呼び手の無い実装は一度も動かないので、mprotect を 3 アーキ共通に
+ * するときに足す */
+
 /* **写像を外すだけ。物理ページは返さない (2026-09-10)。**
  *
  * 契約は kernel/sys_mmap.c の mmap_drop_page に明記してある —— 呼び手が

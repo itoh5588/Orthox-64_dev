@@ -1419,10 +1419,16 @@ static int linux_bootstrap_sys_mprotect(void* addr, size_t length, int prot) {
     flags = arch_vm_user_page_flags((prot & PROT_WRITE) != 0,
                                     (prot & PROT_EXEC) != 0);
 
-    /* **先に全域が張られていることを確かめる。**途中まで書き換えてから
-     * 穴に当たると、成功した分が戻せない。Linux も穴があれば ENOMEM */
+    /* **先に全域がユーザーのページであることを確かめる。**途中まで書き換えて
+     * から穴に当たると、成功した分が戻せない。Linux も穴があれば ENOMEM。
+     *
+     * **get_phys != 0 で見てはいけない (2026-09-11)。**riscv64 はカーネルが
+     * RAM 全体を下位半分に恒等写像しており、get_phys はそのページにも番地を
+     * 返す。そう見ていた頃は mprotect(0x9f000000, 4096, PROT_READ) が通り、
+     * **ユーザーがカーネルの RAM を読めた** (user/riscv64_errno_probe.c の
+     * mprotect-kernel-ram)。x86 の sys_mprotect も PTE_USER を見ている */
     for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        if (arch_vm_get_phys(address_space, base + off) == 0) return -LINUX_ENOMEM;
+        if (!arch_vm_is_user_page(address_space, base + off)) return -LINUX_ENOMEM;
     }
     for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
         uint64_t phys = arch_vm_get_phys(address_space, base + off);
