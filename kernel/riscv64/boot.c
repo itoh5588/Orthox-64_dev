@@ -869,8 +869,6 @@ static struct task* riscv64_find_task_by_pid(int pid) {
     return 0;
 }
 
-#define RISCV64_USER_MMAP_BASE_VADDR 0x0000002000000000ULL
-
 static uint64_t riscv64_align_up_page(uint64_t value) {
     return (value + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
 }
@@ -879,7 +877,14 @@ static uint64_t riscv64_test_user_map_page(const char* fail_prefix) {
     struct task* current = get_current_task();
     uint64_t base;
     uint64_t phys;
-    uint64_t limit = 0x00007F0000000000ULL;
+    /* 上限は include/task.h の USER_MMAP_TOP_VADDR (2026-09-11)。
+     * ここは x86 の 0x7F0000000000 を直書きしていた。Sv39 のユーザー
+     * 空間は 0x4000000000 未満で、根の表の添字は (va >> 30) & 0x1ff —
+     * **越えると 0x4000000000 からは表の上半分 (カーネル側) を、
+     * 0x8000000000 からは上位ビットが落ちて下の番地と同じ表を引く。**
+     * 空きが尽きても「no free user va」にならなかった。自己テストは
+     * 下端のすぐ上で空きを見つけるので、実際には踏んでいない */
+    uint64_t limit = USER_MMAP_TOP_VADDR;
 
     if (!current) {
         riscv64_uart_puts(fail_prefix);
@@ -888,8 +893,8 @@ static uint64_t riscv64_test_user_map_page(const char* fail_prefix) {
     }
 
     base = current->mmap_end;
-    if (base < RISCV64_USER_MMAP_BASE_VADDR) {
-        base = RISCV64_USER_MMAP_BASE_VADDR;
+    if (base < USER_MMAP_BASE_VADDR) {
+        base = USER_MMAP_BASE_VADDR;
     }
     base = riscv64_align_up_page(base);
     while (base < limit && arch_vm_get_phys(arch_task_context_get_address_space(&current->ctx), base) != 0) {
