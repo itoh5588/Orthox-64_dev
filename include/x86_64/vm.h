@@ -93,11 +93,38 @@ static inline void arch_vm_unmap_page(arch_address_space_t address_space, uint64
     __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
 }
 
+/* **属性だけ差し替える。物理アドレスはそのまま (2026-09-12)。**
+ *
+ * ここは「vmm.c に直の API が無い」としてスタブだった。**呼び手は在る** ——
+ * kernel/elf.c は 3 アーキとも組んでいるので、段が同じページを跨いだとき、
+ * **x86 だけ何もせず先に触った段の権限が残り**、aarch64 / riscv64 は後の段で
+ * 上書きされていた。**3 アーキが 3 通りに振る舞っていた。**
+ *
+ * 呼び手は権限の和を渡してくる (kernel/elf.c の elf_page_vmm_flags) ので、
+ * ここは名前のとおり置き換えるだけでよい。aarch64 / riscv64 の実装と同じ。
+ *
+ * **ソフトウェアのビット (PTE_COW) は残らない。**aarch64 の実装も同じで、
+ * 呼び手は exec が組み立て中の新しいアドレス空間しか触らないので COW は
+ * 立っていない。2MB ページは触らない (arch_vm_unmap_page と同じ) */
 static inline void arch_vm_update_page_flags(arch_address_space_t address_space, uint64_t vaddr, uint64_t new_flags) {
-    /* vmm.c handles flag updates through remap paths; no direct API. Stub. */
-    (void)address_space;
-    (void)vaddr;
-    (void)new_flags;
+    uint64_t* pml4 = arch_vm_address_space_root(address_space);
+    uint64_t* pdp;
+    uint64_t* pd;
+    uint64_t* pt;
+    uint64_t* pte;
+
+    if (!pml4) return;
+    if (!(pml4[PML4_IDX(vaddr)] & PTE_PRESENT)) return;
+    pdp = (uint64_t*)PHYS_TO_VIRT(pml4[PML4_IDX(vaddr)] & PTE_ADDR_MASK);
+    if (!(pdp[PDP_IDX(vaddr)] & PTE_PRESENT)) return;
+    pd = (uint64_t*)PHYS_TO_VIRT(pdp[PDP_IDX(vaddr)] & PTE_ADDR_MASK);
+    if (!(pd[PD_IDX(vaddr)] & PTE_PRESENT)) return;
+    if (pd[PD_IDX(vaddr)] & PTE_HUGE) return;
+    pt = (uint64_t*)PHYS_TO_VIRT(pd[PD_IDX(vaddr)] & PTE_ADDR_MASK);
+    pte = &pt[PT_IDX(vaddr)];
+    if (!(*pte & PTE_PRESENT)) return;
+    *pte = (*pte & PTE_ADDR_MASK) | new_flags;
+    __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
 }
 
 #endif

@@ -36,7 +36,50 @@ static uint64_t elf_flags_to_vmm(uint32_t p_flags) {
     return arch_vm_user_page_flags((p_flags & PF_W) != 0, (p_flags & PF_X) != 0);
 }
 
-// ページエントリのフラグを更新（arch_vm 経由で既存の権限とマージ）
+/* **1 ページを覆う PT_LOAD 全部の権限を束ねる (2026-09-12)。**
+ *
+ * 段の境目は同じページに乗りうる (リンカが -z noseparate-code 相当で詰めた
+ * 場合)。そのページの権限は**和**でなければならない —— .text (R+X) と
+ * .data (R+W) が同居していたら、
+ *
+ *   後勝ち  R+W になり、**そのページの命令が実行できない**
+ *   先勝ち  R+X になり、**そのページのデータに書けない**
+ *
+ * どちらも動かない。和 (R+W+X) だけが動く。
+ *
+ * **和は ELF の段階で取る。**arch_vm_update_page_flags に「マージしろ」と
+ * 言わせると、x86 の PTE_NX / aarch64 の AP[2]・UXN が**負のビット**なので
+ * ビット OR では正しくならず、3 アーキそれぞれで極性を間違えうる
+ * (2026-09-11 §3 の「x86 だけ NX を立てていなかった」と同じ形)。PF_W / PF_X
+ * は 3 アーキ共通の正のビットなので、ここで束ねれば 1 箇所で済む。
+ *
+ * 段の数は 10 前後なので、ページごとに全段を見ても、同じループが既にやって
+ * いる 4KB の memset / memcpy に比べれば無視できる。phdr の並び順にも
+ * 依存しない。
+ *
+ * **現に読んでいる ELF に跨ぎは無い** (out/ と ports/ の全 ELF を調べた。
+ * 跨ぐのはカーネル自身の ELF だけで、あれは elf.c が読むものではない)。
+ * 起きたときに初めて壊れる類なので、起きない側に倒しておく。 */
+static uint64_t elf_page_vmm_flags(Elf64_Phdr* phdr, uint16_t phnum,
+                                   uint64_t page_base, uint64_t load_bias) {
+    uint32_t merged = 0;
+    for (uint16_t i = 0; i < phnum; i++) {
+        uint64_t start, end;
+        if (phdr[i].p_type != PT_LOAD) continue;
+        if (phdr[i].p_memsz == 0) continue;
+        start = phdr[i].p_vaddr + load_bias;
+        end = start + phdr[i].p_memsz;
+        if (end <= page_base || start >= page_base + PAGE_SIZE) continue;
+        merged |= phdr[i].p_flags;
+    }
+    return elf_flags_to_vmm(merged);
+}
+
+/* ページエントリのフラグを更新する。**hook は置き換える** (名前のとおり。
+ * aarch64 / riscv64 の実装がそう。x86 は 2026-09-12 まで何もしないスタブで、
+ * **3 アーキが 3 通りに振る舞っていた** —— x86 は先に触った段の権限が残り、
+ * 他の 2 つは後の段で上書きされた)。和は呼ぶ側 (elf_page_vmm_flags) で
+ * 取ってあるので、置き換えで正しい */
 static void update_page_flags(arch_address_space_t address_space, uint64_t vaddr, uint64_t new_flags) {
     arch_vm_update_page_flags(address_space, vaddr, new_flags);
 }
@@ -100,19 +143,23 @@ struct elf_info elf_load(arch_address_space_t address_space, void* elf_data, uin
                 uint64_t phys_addr = arch_vm_get_phys(address_space, page_base);
 
                 if (phys_addr == 0) {
-                    // まだマップされていないページ
+                    // まだマップされていないページ。この段の権限で貼る
                     void* new_page = pmm_alloc(1);
                     if (!new_page) {
                         puts("ELF: PMM alloc failed\r\n");
                         return info;
                     }
                     kernel_memset(PHYS_TO_VIRT(new_page), 0, PAGE_SIZE);
-                    // 最初は現在のセグメントの権限でマップ
                     arch_vm_map_page(address_space, page_base, (uint64_t)new_page, vmm_flags);
                     phys_addr = (uint64_t)new_page;
                 } else {
-                    // 既にマップされている場合は権限をマージ
-                    update_page_flags(address_space, page_base, vmm_flags);
+                    /* **既に貼られている = 段がこのページを跨いだ。**
+                     * このページを覆う段全部の権限の和に置き換える。
+                     * 和は段の処理順に依らないので、最後に覆った段を
+                     * 処理し終えた時点で必ず和になっている */
+                    update_page_flags(address_space, page_base,
+                                      elf_page_vmm_flags(phdr, ehdr->e_phnum,
+                                                         page_base, load_bias));
                 }
 
                 // コピー範囲の計算

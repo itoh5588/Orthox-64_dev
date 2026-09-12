@@ -102,6 +102,7 @@ RISCV64_PREEMPT_PROBE_ELF = out/riscv64-preempt-probe.elf
 RISCV64_SLEEP_PROBE_ELF = out/riscv64-sleep-probe.elf
 RISCV64_ERRNO_PROBE_ELF = out/riscv64-errno-probe.elf
 RISCV64_OFFSET_PROBE_ELF = out/riscv64-offset-probe.elf
+RISCV64_STRADDLE_PROBE_ELF = out/riscv64-straddle-probe.elf
 RISCV64_BOOTSTRAP_USER_BUILD_ELF = out/bootstrap-user-riscv64-default.elf
 # 埋め込み対象の外部ユーザー ELF (差し替え可能)
 RISCV64_BOOTSTRAP_USER_SRC_ELF ?= $(RISCV64_BOOTSTRAP_USER_BUILD_ELF)
@@ -287,7 +288,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: aarch64-socket-probe aarch64-socket-smoke aarch64-httpsfetch aarch64-https-smoke aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-usb-kbd-smoke aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-netboot aarch64-pi4-smoke aarch64-pi4-qemu-boot aarch64-pi4-sd-smoke aarch64-smp-load riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: aarch64-socket-probe aarch64-socket-smoke aarch64-httpsfetch aarch64-https-smoke aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-usb-kbd-smoke aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-netboot aarch64-pi4-smoke aarch64-pi4-qemu-boot aarch64-pi4-sd-smoke aarch64-smp-load riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-straddle-probe riscv64-straddle-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -1280,6 +1281,18 @@ riscv64-offset-smoke: $(RISCV64_OFFSET_PROBE_ELF)
 riscv64-errno-smoke: $(RISCV64_ERRNO_PROBE_ELF)
 	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_ERRNO_PROBE_ELF)
 	bash ./tests/riscv64_errno_smoke.sh
+
+# **段が同じページを跨ぐ ELF** を読ませる (kernel/elf.c の権限の和の検査)。
+# 普通のツールチェインはここを 1 ページ空けるので、専用の台本で作る
+$(RISCV64_STRADDLE_PROBE_ELF): $(BUILD_DIR)/riscv64/user/riscv64_straddle_probe.o scripts/user-riscv64-straddle.ld
+	@mkdir -p $(@D)
+	$(LD) -nostdlib -static -m elf64lriscv -T scripts/user-riscv64-straddle.ld $< -o $@
+
+riscv64-straddle-probe: $(RISCV64_STRADDLE_PROBE_ELF)
+
+riscv64-straddle-smoke: $(RISCV64_STRADDLE_PROBE_ELF)
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_STRADDLE_PROBE_ELF)
+	bash ./tests/riscv64_straddle_smoke.sh
 
 # -smp 4 で副 hart が idle まで上がり、ユーザーランドが完走するかの検証
 riscv64-smp-smoke: $(RISCV64_PREEMPT_PROBE_ELF)
