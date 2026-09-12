@@ -1424,3 +1424,17 @@ uint64_t aarch64_vm_map_fb_user(arch_address_space_t as, uint64_t uva) {
     WITH_ROOT(as, aarch64_vm_map_pages(uva, fb->base, size, VM_USER_FB));
     return uva;
 }
+
+/* **保護属性だけ変える (2026-09-12)。**mprotect を 3 アーキ共通にしたときの hook。
+ *
+ * ここは物理アドレスを取り直して貼り直すだけでよい。**x86 だけは COW の
+ * ページを書き込み可にしてはいけない**ので専用の実装を持つが、
+ * このアーキは fork の時点でページを写しており COW が無い
+ * (arch_vm_clone_address_space)。 */
+void arch_vm_protect_page(arch_address_space_t address_space, uint64_t vaddr,
+                          int writable, int executable) {
+    uint64_t phys = arch_vm_get_phys(address_space, vaddr);
+    if (!phys) return;
+    arch_vm_map_page(address_space, vaddr, phys & ~(uint64_t)(PAGE_SIZE - 1),
+                     aarch64_vm_user_page_attr(writable, executable));
+}

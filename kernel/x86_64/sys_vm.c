@@ -178,31 +178,9 @@ int sys_madvise(void* addr, size_t len, int advice) {
     return 0;
 }
 
-int sys_mprotect(void* addr, size_t length, int prot) {
-    struct task* current = get_current_task();
-    if (!current || length == 0) return -22;
-
-    uint64_t base = (uint64_t)addr & ~(PAGE_SIZE - 1);
-    uint64_t end = align_up_page((uint64_t)addr + (uint64_t)length);
-    if (end <= base) return -22;
-    if (!is_user_page_range_valid(base, end - base)) return -22;
-
-    uint64_t* pml4 = (uint64_t*)PHYS_TO_VIRT(current->ctx.cr3);
-    for (uint64_t vaddr = base; vaddr < end; vaddr += PAGE_SIZE) {
-        uint64_t* pte = lookup_user_pte(pml4, vaddr);
-        if (!pte || !(*pte & PTE_PRESENT) || !(*pte & PTE_USER)) {
-            return -12;
-        }
-
-        *pte &= ~(PTE_WRITABLE | PTE_NX);
-        // COW pages must stay read-only even for PROT_WRITE; the COW fault
-        // handler grants write access after resolving the shared page.
-        if ((prot & PROT_WRITE) && !(*pte & PTE_COW)) *pte |= PTE_WRITABLE;
-        if (!(prot & PROT_EXEC)) *pte |= PTE_NX;
-        __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
-    }
-    return 0;
-}
+/* **sys_mprotect は kernel/sys_mmap.c へ移した (2026-09-12)。**
+ * COW を保つ部分は include/x86_64/vm.h の arch_vm_protect_page に移してある
+ * (aarch64 / riscv64 は fork でページを写すので COW が無い) */
 
 static void copy_user_range(uint64_t* pml4, uint64_t dst_base, uint64_t src_base, uint64_t length) {
     uint64_t done = 0;

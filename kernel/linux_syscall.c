@@ -1427,45 +1427,10 @@ static void* linux_bootstrap_sys_mremap(void* old_addr, size_t old_len, size_t n
     }
 }
 
-static int linux_bootstrap_sys_mprotect(void* addr, size_t length, int prot) {
-    struct task* current = get_current_task();
-    arch_address_space_t address_space;
-    uint64_t base = (uint64_t)(uintptr_t)addr;
-    uint64_t size;
-    uint64_t flags;
-
-    if (!current) return -LINUX_ESRCH;
-    /* Linux は addr がページ境界でないと EINVAL。length 0 は成功 */
-    if (base & (PAGE_SIZE - 1)) return -LINUX_EINVAL;
-    if (length == 0) return 0;
-
-    size = linux_align_up_page((uint64_t)length);
-    if (!size || base + size < base) return -LINUX_EINVAL;
-
-    address_space = arch_task_context_get_address_space(&current->ctx);
-    flags = arch_vm_user_page_flags((prot & PROT_WRITE) != 0,
-                                    (prot & PROT_EXEC) != 0);
-
-    /* **先に全域がユーザーのページであることを確かめる。**途中まで書き換えて
-     * から穴に当たると、成功した分が戻せない。Linux も穴があれば ENOMEM。
-     *
-     * **get_phys != 0 で見てはいけない (2026-09-11)。**riscv64 はカーネルが
-     * RAM 全体を下位半分に恒等写像しており、get_phys はそのページにも番地を
-     * 返す。そう見ていた頃は mprotect(0x9f000000, 4096, PROT_READ) が通り、
-     * **ユーザーがカーネルの RAM を読めた** (user/riscv64_errno_probe.c の
-     * mprotect-kernel-ram)。x86 の sys_mprotect も PTE_USER を見ている */
-    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        if (!arch_vm_is_user_page(address_space, base + off)) return -LINUX_ENOMEM;
-    }
-    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        uint64_t phys = arch_vm_get_phys(address_space, base + off);
-        arch_vm_map_page(address_space, base + off, phys, flags);
-    }
-    arch_syscall_flush_tlb();
-    /* 実行可にしたなら、命令キャッシュを揃えないと古い中身を実行しうる */
-    if (prot & PROT_EXEC) arch_sync_icache_range((void*)(uintptr_t)base, size);
-    return 0;
-}
+/* **mprotect(2) は kernel/sys_mmap.c へ移した (2026-09-12)。**
+ * x86 (kernel/x86_64/sys_vm.c) と 2 実装あり、**COW の扱いが違っていた。**
+ * 経緯と対照表は kernel/sys_mmap.c の sys_mprotect の冒頭にある */
+int sys_mprotect(void* addr, size_t length, int prot);
 
 static int64_t linux_bootstrap_sys_wait4(int pid, int* wstatus, int options) {
     struct task* current = get_current_task();
@@ -1732,7 +1697,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_MPROTECT:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_mprotect((void*)(uintptr_t)arch_syscall_arg0(frame),
+                                    (uint64_t)(int64_t)sys_mprotect((void*)(uintptr_t)arch_syscall_arg0(frame),
                                                                                        (size_t)arch_syscall_arg1(frame),
                                                                                        (int)arch_syscall_arg2(frame)));
             return;

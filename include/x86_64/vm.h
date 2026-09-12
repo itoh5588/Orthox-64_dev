@@ -55,11 +55,54 @@ static inline uint64_t arch_vm_get_phys(arch_address_space_t address_space, uint
     return vmm_get_phys(arch_vm_address_space_root(address_space), vaddr);
 }
 
-/* arch_vm_is_user_page は **x86 にはまだ無い** (aarch64 / riscv64 は在る)。
- * 呼び手は linux 側の mprotect だけで、x86 はそれを組み込まず、
- * kernel/x86_64/sys_vm.c の sys_mprotect が PTE_USER を自分で見ている。
- * 呼び手の無い実装は一度も動かないので、mprotect を 3 アーキ共通に
- * するときに足す */
+/* **ページの葉を引く。**以下の 3 つが共通で使う。
+ * 2MB ページは触らない (mmap / mprotect が作らないので葉だけ見ればよい) */
+static inline uint64_t* x86_user_pte(arch_address_space_t address_space, uint64_t vaddr) {
+    uint64_t* pml4 = arch_vm_address_space_root(address_space);
+    uint64_t* pdp;
+    uint64_t* pd;
+    uint64_t* pt;
+
+    if (!pml4) return 0;
+    if (!(pml4[PML4_IDX(vaddr)] & PTE_PRESENT)) return 0;
+    pdp = (uint64_t*)PHYS_TO_VIRT(pml4[PML4_IDX(vaddr)] & PTE_ADDR_MASK);
+    if (!(pdp[PDP_IDX(vaddr)] & PTE_PRESENT)) return 0;
+    pd = (uint64_t*)PHYS_TO_VIRT(pdp[PDP_IDX(vaddr)] & PTE_ADDR_MASK);
+    if (!(pd[PD_IDX(vaddr)] & PTE_PRESENT)) return 0;
+    if (pd[PD_IDX(vaddr)] & PTE_HUGE) return 0;
+    pt = (uint64_t*)PHYS_TO_VIRT(pd[PD_IDX(vaddr)] & PTE_ADDR_MASK);
+    return &pt[PT_IDX(vaddr)];
+}
+
+/* **このプロセスのページか (2026-09-12 に x86 にも足した)。**
+ * 2026-09-11 の時点では「呼び手が無いので足さない」としていたが、
+ * mprotect を 3 アーキ共通にしたので呼び手が出来た */
+static inline int arch_vm_is_user_page(arch_address_space_t address_space, uint64_t vaddr) {
+    uint64_t* pte = x86_user_pte(address_space, vaddr);
+    if (!pte) return 0;
+    return (*pte & PTE_PRESENT) && (*pte & PTE_USER) ? 1 : 0;
+}
+
+/* **保護属性だけ変える。物理アドレスとソフトウェアのビットは残す。**
+ *
+ * ★ **COW のページを書き込み可にしてはいけない (x86 だけの話)。**
+ * x86 の fork は COW (PTE_COW) で、aarch64 / riscv64 は fork の時点で
+ * ページを写してしまうので COW が無い。そのため共通版が
+ * arch_vm_map_page(as, va, phys, 新しい flags) で貼り直すと、
+ * **x86 では COW のページが両プロセスから書けるようになる。**
+ * ここを通せばその心配が無い —— 書き込み可にするのは COW でないときだけで、
+ * COW のページは読み取り専用のまま残り、書いた瞬間に COW のフォルト処理が
+ * 写してから許可する (もとの kernel/x86_64/sys_vm.c の sys_mprotect と同じ)。 */
+static inline void arch_vm_protect_page(arch_address_space_t address_space, uint64_t vaddr,
+                                        int writable, int executable) {
+    uint64_t* pte = x86_user_pte(address_space, vaddr);
+    if (!pte || !(*pte & PTE_PRESENT)) return;
+    *pte &= ~(PTE_WRITABLE | PTE_NX);
+    if (writable && !(*pte & PTE_COW)) *pte |= PTE_WRITABLE;
+    if (!executable) *pte |= PTE_NX;
+    __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
+}
+
 
 /* **写像を外すだけ。物理ページは返さない (2026-09-10)。**
  *

@@ -515,3 +515,19 @@ void arch_vm_unmap_page(arch_address_space_t address_space, uint64_t vaddr) {
 void arch_vm_update_page_flags(arch_address_space_t address_space, uint64_t vaddr, uint64_t flags) {
     riscv64_vm_update_page_flags((uint64_t)address_space, vaddr, flags);
 }
+
+/* **保護属性だけ変える (2026-09-12)。**mprotect を 3 アーキ共通にしたときの hook。
+ *
+ * ここは物理アドレスを取り直して貼り直すだけでよい。**x86 だけは COW の
+ * ページを書き込み可にしてはいけない**ので専用の実装を持つが、
+ * このアーキは fork の時点でページを写しており COW が無い
+ * (arch_vm_clone_address_space)。 */
+void arch_vm_protect_page(arch_address_space_t address_space, uint64_t vaddr,
+                          int writable, int executable) {
+    uint64_t phys = arch_vm_get_phys(address_space, vaddr);
+    if (!phys) return;
+    arch_vm_map_page(address_space, vaddr, phys & ~(uint64_t)(PAGE_SIZE - 1),
+                     RISCV64_VM_PAGE_R | RISCV64_VM_PAGE_U |
+                     (writable ? RISCV64_VM_PAGE_W : 0) |
+                     (executable ? RISCV64_VM_PAGE_X : 0));
+}

@@ -250,3 +250,66 @@ int sys_munmap(void* addr, size_t length) {
     arch_syscall_flush_tlb();
     return 0;
 }
+
+/* ---- mprotect (3 アーキ共通) ----------------------------------------------
+ *
+ * **別実装 29 組のうちの 1 組を畳んだもの (2026-09-12)。**もとは
+ *
+ *     x86              kernel/x86_64/sys_vm.c の sys_mprotect
+ *     aarch64/riscv64  kernel/linux_syscall.c の linux_bootstrap_sys_mprotect
+ *
+ * の 2 つで、**動作が違っていた:**
+ *
+ * | | x86 | linux 側 |
+ * |---|---|---|
+ * | 境界でない addr | 切り下げて続ける | EINVAL |
+ * | length == 0     | EINVAL           | 成功 (0) |
+ * | COW のページ    | **書き込み可にしない** | 素通りで書き込み可になる |
+ * | icache          | 揃えない | PROT_EXEC なら揃える |
+ *
+ * **引数の扱いは linux 側に寄せた** —— Linux がそう振る舞うため
+ * (境界でない addr は EINVAL、length 0 は成功)。musl はページ境界で呼ぶので
+ * 呼び手には影響しない。
+ *
+ * **COW は x86 側に寄せた。**x86 の fork は COW で、共有ページを
+ * 書き込み可にすると**両プロセスから同じページに書けてしまう。**
+ * aarch64 / riscv64 は fork の時点でページを写すので COW が無い。
+ * この差は arch_vm_protect_page に閉じ込めてある。
+ *
+ * icache も残した (実行可にしたのに古い命令が見えるのを防ぐ)。 */
+int sys_mprotect(void* addr, size_t length, int prot) {
+    struct task* current = get_current_task();
+    arch_address_space_t as;
+    uint64_t base = (uint64_t)(uintptr_t)addr;
+    uint64_t size;
+
+    if (!current) return -LINUX_ESRCH;
+    /* Linux は addr がページ境界でないと EINVAL。length 0 は成功 */
+    if (base & (PAGE_SIZE - 1ULL)) return -LINUX_EINVAL;
+    if (length == 0) return 0;
+
+    size = mmap_align_up((uint64_t)length);
+    if (!size || base + size < base) return -LINUX_EINVAL;
+
+    as = arch_task_context_get_address_space(&current->ctx);
+
+    /* **先に全域がユーザーのページであることを確かめる。**途中まで書き換えて
+     * から穴に当たると、成功した分が戻せない。Linux も穴があれば ENOMEM。
+     *
+     * **get_phys != 0 で見てはいけない (2026-09-11)。**riscv64 はカーネルが
+     * RAM 全体を下位半分に恒等写像しており、get_phys はそのページにも番地を
+     * 返す。そう見ていた頃は mprotect(0x9f000000, 4096, PROT_READ) が通り、
+     * **ユーザーがカーネルの RAM を読めた** (user/riscv64_errno_probe.c の
+     * mprotect-kernel-ram) */
+    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
+        if (!arch_vm_is_user_page(as, base + off)) return -LINUX_ENOMEM;
+    }
+    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
+        arch_vm_protect_page(as, base + off, (prot & PROT_WRITE) != 0,
+                             (prot & PROT_EXEC) != 0);
+    }
+    arch_syscall_flush_tlb();
+    /* 実行可にしたなら、命令キャッシュを揃えないと古い中身を実行しうる */
+    if (prot & PROT_EXEC) arch_sync_icache_range((void*)(uintptr_t)base, size);
+    return 0;
+}
