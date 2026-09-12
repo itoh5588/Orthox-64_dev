@@ -184,7 +184,24 @@ static void vblk_fail(const char* msg) {
     puts("\r\n");
 }
 
+/* **タイムアウトしたら装置を止める。**
+ *
+ * g_vblk_ready = 0 / IRQ 線をマスク / 装置の status に FAILED を書く。
+ * 以後の read / write は全部 -1 になる。
+ *
+ * **一見やり過ぎに見えるが、放置して先へ進むほうが危ない (2026-09-12 に実測)。**
+ * 待つのをやめても **その要求の記述子とバッファは装置がまだ持っている。**
+ * 回収せずに次の要求で使い回すと、装置が後から書き込んで別の要求の結果を壊す。
+ * 「装置は生かして待ち方だけポーリングに落とす」形を実際に試したところ、
+ * 停止した要求を待つ無限ループに落ちて **カーネルごと固まった**
+ * (進捗も誤り報告も出ない。前の「以後 -1 で返る」より悪い)。
+ *
+ * **正しい復旧は装置のリセットと仮想キューの組み直し**で、そこまでやらないと
+ * 先へ進んではいけない (日報2026-09-12 追2-7 の 1 番に残す)。 */
 static void vblk_disable_after_timeout(void) {
+    /* **報告は 1 回だけ。**同時に待っていた要求がそれぞれ 5 秒後に
+     * ここへ来るので、素直に書くと同じ行が並ぶ (実測 4 回) */
+    if (!g_vblk_ready) return;
     g_vblk_ready = 0;
     if (g_vblk_irq_line >= 0) {
         pic_mask_irq(g_vblk_irq_line);
@@ -293,11 +310,25 @@ static int virtio_blk_irq(int irq, void* ctx) {
     } else if (irq != g_vblk_irq_line) {
         return 0;
     }
+    /* **ISR は読むこと自体が INTx の解除。値で取り込みを止めてはいけない
+     * (2026-09-12)。**
+     *
+     * ここは `(isr & 1) == 0` なら何もせずに戻っていた。完了が 2 つ近接すると
+     *
+     *   割り込み A: ISR を読む → 1 (この読みで解除される) → 下半分を積む
+     *   割り込み B: ISR を読む → **0** (A が解除済み) → 何もせずに戻る
+     *
+     * となり、**B の完了は A の下半分が走ったあとに used リングへ載れば
+     * 誰も拾わない。**待ち手はそのまま 5 秒待って諦めていた。
+     * used リングを浚うのは空振りでも安いので、常に積む。
+     *
+     * 返り値は従来どおり ISR で決める —— レガシーな共有 IRQ 線では
+     * 「自分宛だったか」の判断がこれしかない */
     isr = inb((uint16_t)(g_vblk_iobase + VIRTIO_PCI_ISR));
-    if ((isr & 0x1U) == 0) return 1;
     if (bottom_half_enqueue(vblk_complete_bottom_half, 0) < 0) {
         vblk_complete_bottom_half(0);
     }
+    if ((isr & 0x1U) == 0 && !g_vblk_msi_enabled && !g_vblk_msix_enabled) return 0;
     return 1;
 }
 
@@ -369,6 +400,16 @@ static int vblk_wait_request(struct vblk_request_ctx* req) {
                                                           VIRTIO_BLK_TIMEOUT_MS,
                                                           &status);
         if (wait_ret == 0) {
+            /* **諦める前に自分で 1 度浚う (2026-09-12)。**
+             *
+             * 割り込みは来ていたのに起こしを取りこぼしただけなら、ここで拾えて
+             * 装置を止めずに済む (virtio_blk_irq の ISR のコメント)。
+             * **本当に完了が来ていないときだけ装置を止める。** */
+            (void)vblk_reclaim_used();
+            if (req->completion.done != 0) {
+                puts("[vblk] completion was late (recovered without reset)\r\n");
+                return vblk_consume_completion_status(req);
+            }
             vblk_disable_after_timeout();
             return -1;
         }

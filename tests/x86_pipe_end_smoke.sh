@@ -61,7 +61,34 @@ WORK="$(mktemp -d)"
 ISO="$WORK/x86-pipe-end.iso"
 rm -f "$SERIAL_LOG"
 
+
+# **起動時の /etc/bootcmd を無害なものへ差し替える (2026-09-12)。**
+#
+# この台本はシェルに文字を打ち込んで判定する。ところがイメージ既定の
+# bootcmd は **OS 内でカーネルを丸ごと組む** (/etc/native_kernel_build_smoke.sh)
+# ので、/kbuild が空だと数分かかり、打ち込む前に持ち時間が尽きる
+# (Makefile の rootfs.img の注意書きを参照)。
+#
+# xv6fs を組み直さずにイメージの中身だけ差し替えられるので、それを使う。
+# **終わったら必ず戻す** —— x86-kernel-smoke は既定の bootcmd に依存している
+BOOTCMD_BACKUP_ORTH="$(mktemp)"
+BOOTCMD_NEUTRAL_ORTH="$(mktemp)"
+IMAGE_PATCHED_ORTH=0
+printf 'echo bootcmd-ready\n' > "${BOOTCMD_NEUTRAL_ORTH}"
+if python3 scripts/build_rootfs_xv6fs.py --extract /etc/bootcmd "${BOOTCMD_BACKUP_ORTH}" rootfs.img >/dev/null 2>&1 \
+   && python3 scripts/build_rootfs_xv6fs.py --replace /etc/bootcmd "${BOOTCMD_NEUTRAL_ORTH}" rootfs.img >/dev/null 2>&1; then
+    IMAGE_PATCHED_ORTH=1
+fi
+restore_bootcmd_orth() {
+    if [ "${IMAGE_PATCHED_ORTH}" = "1" ]; then
+        python3 scripts/build_rootfs_xv6fs.py --replace /etc/bootcmd "${BOOTCMD_BACKUP_ORTH}" rootfs.img >/dev/null 2>&1 || true
+        IMAGE_PATCHED_ORTH=0
+    fi
+    rm -f "${BOOTCMD_BACKUP_ORTH}" "${BOOTCMD_NEUTRAL_ORTH}"
+}
+
 cleanup() {
+    restore_bootcmd_orth
     kill "${QEMU_PID:-0}" 2>/dev/null || true
     wait "${QEMU_PID:-0}" 2>/dev/null || true
     rm -rf "$WORK"
