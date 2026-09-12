@@ -37,7 +37,7 @@ else
 fi
 
 SERIAL_LOG=LOGs/riscv64-musl-serial.log
-rm -f "$SERIAL_LOG"
+rm -f "$SERIAL_LOG" "$SERIAL_LOG.nocr"
 
 # rootfs があれば繋ぐ。probe の BIGWRITE (xv6fs のログ分割の退行検査) は
 # 書き込める FS が要るので、無い構成では probe 側が静かに飛ばす。
@@ -77,6 +77,21 @@ sleep 1
 echo "--- RISC-V musl Serial Output ---"
 cat "$SERIAL_LOG"
 echo "---------------------------------"
+
+# **判定は CR を除いたコピーに当てる。**
+#
+# カーネルは termios の ONLCR に従って LF を CRLF で出す (実機のシリアル端末は
+# LF だけでは行頭に戻らないため。日報2026-08-15 §12)。そのままだとユーザー
+# プロセスの出力が "ELF\r" になり、`^ELF$` のような**行末アンカーだけが
+# 当たらない** (アンカーの無い判定は通るので、台本は緑に見えていた)。
+# **表示は元のログ、判定はこちら。**aarch64 版は先に同じことをしている
+# (tests/aarch64_musl_smoke.sh の「判定は CR を除いたコピーに当てる」)。
+#
+# **対話シェルで grep を試して確かめないこと。** 環境によっては grep が
+# 別実装 (ugrep など) に置き換わっていて CR を無視して一致し、
+# 「手で試すと通るのにテストは落ちる」になる
+tr -d '\r' < "$SERIAL_LOG" > "$SERIAL_LOG.nocr"
+SERIAL_LOG="$SERIAL_LOG.nocr"
 
 grep -q "Orthox riscv64 early boot" "$SERIAL_LOG"
 grep -q "sv39 satp enabled" "$SERIAL_LOG"

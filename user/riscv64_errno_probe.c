@@ -24,6 +24,8 @@
 #include <unistd.h>
 
 static int g_bad;
+/* 書ける FS が無い (rootfs を繋がずに回している) */
+static int g_ro_fs;
 
 static int write_all(int fd, const char* buf, size_t len) {
     while (len > 0) {
@@ -73,6 +75,19 @@ static void check(const char* name, int failed, int got, int want) {
     }
 }
 
+/* 書き込み側の失敗経路。**書ける FS が無いと全部 EROFS で潰れる**ので、
+ * そのときだけ飛ばす。**EROFS 以外はいつもどおり判定する** —— 「環境が無い」を
+ * 「何を返しても緑」にすると退行が隠れる */
+static void check_w(const char* name, int failed, int got, int want) {
+    if (g_ro_fs && failed && got == EROFS) {
+        put_str("ERRNO ");
+        put_str(name);
+        put_str(" skipped (no writable fs)\n");
+        return;
+    }
+    check(name, failed, got, want);
+}
+
 int main(void) {
     struct stat st;
     char buf[8];
@@ -87,20 +102,28 @@ int main(void) {
     errno = 0;
     check("stat-missing", stat("/no-such-file", &st) < 0, errno, ENOENT);
 
+    /* **書ける FS があるか先に見る。**rootfs を繋がずに回すと、下の書き込み側
+     * 5 件は経路に入る前に EROFS で潰れる (make riscv64-rootfs には riscv64 の
+     * gcc が要る)。それを BAD にすると台本が常に赤くなり、**退行の門として
+     * 使えない** —— 実際、mmap-with-fd の期待が取り残されていたのに
+     * 気付けなかった (日報2026-09-12) */
     errno = 0;
-    check("unlink-missing", unlink("/no-such-file") < 0, errno, ENOENT);
+    if (unlink("/no-such-file") < 0 && errno == EROFS) g_ro_fs = 1;
 
     errno = 0;
-    check("rmdir-missing", rmdir("/no-such-dir") < 0, errno, ENOENT);
+    check_w("unlink-missing", unlink("/no-such-file") < 0, errno, ENOENT);
+
+    errno = 0;
+    check_w("rmdir-missing", rmdir("/no-such-dir") < 0, errno, ENOENT);
 
     errno = 0;
     check("chdir-missing", chdir("/no-such-dir") < 0, errno, ENOENT);
 
     errno = 0;
-    check("mkdir-existing", mkdir("/etc", 0755) < 0, errno, EEXIST);
+    check_w("mkdir-existing", mkdir("/etc", 0755) < 0, errno, EEXIST);
 
     errno = 0;
-    check("mkdir-no-parent", mkdir("/no-such-dir/x", 0755) < 0, errno, ENOENT);
+    check_w("mkdir-no-parent", mkdir("/no-such-dir/x", 0755) < 0, errno, ENOENT);
 
     errno = 0;
     check("read-badfd", read(99, buf, sizeof(buf)) < 0, errno, EBADF);
@@ -118,7 +141,7 @@ int main(void) {
     check("fstat-badfd", fstat(99, &st) < 0, errno, EBADF);
 
     errno = 0;
-    check("unlink-dir", unlink("/etc") < 0, errno, EISDIR);
+    check_w("unlink-dir", unlink("/etc") < 0, errno, EISDIR);
 
     /* ここから下は kernel/riscv64/syscall.c 側 (fs.c 以外) の失敗経路。
      * mmap は「戻り値そのものが -errno」なので -1 を返すと MAP_FAILED では
@@ -133,10 +156,37 @@ int main(void) {
           errno, EINVAL);
 
     errno = 0;
-    /* 無名マップ以外は未対応 (fd を渡した形) */
+    /* ファイルを貼る mmap (fd を渡した形)。**期待は ENOSYS (2026-09-12 に
+     * EINVAL から改めた)。**riscv64 は kernel/sys_fs.c を繋いでおらず
+     * sys_pread64 が弱い既定 (常に -1) なので貼れない。**黙って 0 埋めの
+     * ページを返さず ENOSYS で断る**という決め (日報2026-09-09 §3) が
+     * kernel/sys_mmap.c の mmap_can_map_file に入っている。この期待だけが
+     * 取り残されていた (ENOSYS になったのは 01616d4 から。
+     * 日報2026-09-11 追-6 は「共通化以降」と書いたが、それより前)。
+     *
+     * fd 0 はコンソール。**x86 は同じ呼びが成功する**ので、これは
+     * 「この機械には無い」であって「この呼びは不正」ではない */
     check("mmap-with-fd",
           mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, 0, 0) == MAP_FAILED,
-          errno, EINVAL);
+          errno, ENOSYS);
+
+    /* **ENOSYS が全部を飲み込んでいないこと。**PIPE の fd は貼れない種類の
+     * fd なので、機械の都合 (ENOSYS) より先に ENODEV で断る決めになっている
+     * (kernel/sys_mmap.c は FT_PIPE を can_map_file より前に見る)。
+     * 3 アーキとも同じ答えになる唯一の file-backed mmap の道 */
+    {
+        int pfd[2];
+        if (pipe(pfd) == 0) {
+            errno = 0;
+            check("mmap-pipe-fd",
+                  mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, pfd[0], 0) == MAP_FAILED,
+                  errno, ENODEV);
+            close(pfd[0]);
+            close(pfd[1]);
+        } else {
+            put_str("ERRNO mmap-pipe-fd skipped (pipe failed)\n");
+        }
+    }
 
     errno = 0;
     /* ページ境界でない addr */
