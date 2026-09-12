@@ -10,6 +10,8 @@
  * 期待どおりなら OK、違えば BAD を出す。printf は long double 経路
  * (__divtf3) を踏むので使わず、write と自前の 10 進変換だけで報告する。
  */
+/* mremap / MREMAP_MAYMOVE は musl では _GNU_SOURCE の中に居る */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
@@ -192,6 +194,62 @@ int main(void) {
             put_str("\n");
         }
         check("mprotect-kernel-ram", r < 0, errno, ENOMEM);
+    }
+
+    /* **mremap も同じ形の穴だった (2026-09-12)。**古い範囲を先頭 1 枚の
+     * get_phys != 0 でしか見ておらず、riscv64 では恒等写像のカーネルページが
+     * 通った。伸ばす側は直後が埋まっているので move へ落ち、**カーネルの RAM を
+     * 新しいユーザーページへ写して返す** (中身が読める)。
+     * 壊さないほうを先に置く —— 下の縮小はカーネルの .text を外す */
+    {
+        void* np;
+        errno = 0;
+        np = mremap((void*)0x80200000UL, 4096, 8192, MREMAP_MAYMOVE);
+        if (np != MAP_FAILED) {
+            /* 0x80200000 はカーネルの先頭 (_start)。中身が写っていれば
+             * 先頭バイトは 0xa1 = 161 になる。**0 埋めではないこと**まで見る */
+            put_str("ERRNO mremap-kernel-ram copied byte=");
+            put_int(((volatile unsigned char*)np)[0]);
+            put_str("\n");
+        }
+        check("mremap-kernel-ram", np == MAP_FAILED, errno, EINVAL);
+    }
+
+    /* 縮める側: はみ出した分を外して pmm へ返すので、**カーネルの .text が
+     * 全プロセスから消える** (munmap-kernel と同じ形)。0x80201000〜0x80204000
+     * には sys_write が載っているので、**通ると次の put_str で止まる** */
+    {
+        void* np;
+        errno = 0;
+        np = mremap((void*)0x80200000UL, 0x5000, 4096, 0);
+        check("mremap-kernel-shrink", np == MAP_FAILED, errno, EINVAL);
+    }
+
+    /* 逆向き: mmap で取った範囲は mremap で伸ばせること
+     * (断る側だけ並べると、全部断る実装でも緑になる) */
+    {
+        volatile char* p = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* np = MAP_FAILED;
+        int e = 0;
+        if (p != MAP_FAILED) {
+            p[0] = 7;
+            errno = 0;
+            np = mremap((void*)p, 4096, 8192, MREMAP_MAYMOVE);
+            e = errno;
+        }
+        put_str("ERRNO mremap-own ret=");
+        put_int(np == MAP_FAILED ? -1 : 0);
+        put_str(" errno=");
+        put_int(e);
+        if (np != MAP_FAILED && ((volatile char*)np)[0] == 7) {
+            ((volatile char*)np)[4096] = 1;   /* 伸ばした側も書けること */
+            put_str(" ok\n");
+            (void)munmap(np, 8192);
+        } else {
+            put_str(" BAD\n");
+            g_bad++;
+        }
     }
 
     /* 逆向き: mmap で取ったページは mprotect できること (munmap-own と同じ理由) */

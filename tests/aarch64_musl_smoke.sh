@@ -148,6 +148,8 @@ grep -aqE "^ELF$" "$LOG"
 grep -aqE "^MAP$" "$LOG"
 # そのページに mprotect と munmap が効いた (断る側の検査が断りすぎていない)
 grep -aqE "^MPROT-MUNMAP$" "$LOG"
+# mmap で取った範囲を mremap で伸ばせた (同上)
+grep -aqE "^MREMAP$" "$LOG"
 # **ディスクへの新規作成 (O_CREAT) が返ってくること。**
 #
 # ここは調査用に足した段階マーカーをそのまま検査に残したもの。

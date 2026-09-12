@@ -1335,7 +1335,26 @@ static void* linux_bootstrap_sys_mremap(void* old_addr, size_t old_len, size_t n
     new_size = linux_align_up_page((uint64_t)new_len);
     address_space = arch_task_context_get_address_space(&current->ctx);
 
-    if (!arch_vm_get_phys(address_space, old_base)) return linux_mmap_err(LINUX_EINVAL);
+    /* **古い範囲が全部このプロセスのページであることを先に確かめる
+     * (2026-09-12)。**もとは先頭 1 枚を get_phys != 0 で見るだけだった。
+     * riscv64 はカーネルが RAM 全体を下位半分に恒等写像しているので
+     * **カーネルのページがそこを通り**、
+     *
+     *   縮める  はみ出した分を外して pmm へ返す → **カーネルの .text が
+     *           全プロセスから消える** (user/riscv64_errno_probe.c の
+     *           mremap-kernel-shrink。sys_write のページを外して
+     *           次の write で命令ページフォルトになるのを確かめた)
+     *   伸ばす  直後が埋まっているので move へ落ち、**カーネルの RAM を
+     *           新しいユーザーページへ写して返す** (mremap-kernel-ram。
+     *           _start の先頭バイト 0xa1 が読めた)
+     *
+     * munmap (kernel/sys_mmap.c) は VA の範囲で断っているが、**mremap は
+     * mprotect と同じくページごとの U ビットで見る** —— Linux は ELF の段や
+     * スタックの mremap も認めるので、mmap の範囲に狭められない (2026-09-11
+     * §追-5 と同じ理由)。x86 の sys_mremap も lookup_user_pte で見ている */
+    for (uint64_t off = 0; off < old_size; off += PAGE_SIZE) {
+        if (!arch_vm_is_user_page(address_space, old_base + off)) return linux_mmap_err(LINUX_EINVAL);
+    }
 
     if (new_size == old_size) return old_addr;
 
@@ -1357,7 +1376,15 @@ static void* linux_bootstrap_sys_mremap(void* old_addr, size_t old_len, size_t n
         uint64_t off;
         int occupied = 0;
         uint64_t map_flags;
-        for (off = 0; off < grow; off += PAGE_SIZE) {
+        /* **その場で足せるのはユーザーの VA の中だけ。**越えたところへ貼ると
+         * Sv39 では添字が折り返してカーネル側の表を引く (2026-09-11 §追-1)。
+         * 越えていたら「その場では足せない」として move へ落とす
+         * (x86 の sys_mremap の is_user_mmap_range_valid と同じ扱い) */
+        if (end < USER_MMAP_BASE_VADDR || end + grow > USER_MMAP_TOP_VADDR ||
+            end + grow < end) {
+            occupied = 1;
+        }
+        for (off = 0; !occupied && off < grow; off += PAGE_SIZE) {
             if (arch_vm_get_phys(address_space, end + off) != 0) { occupied = 1; break; }
         }
         if (!occupied) {

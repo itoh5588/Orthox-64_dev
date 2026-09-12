@@ -13,6 +13,8 @@
  * 同じ方針)。自分自身を open できることが「ELF の読み込み経路が生きている」
  * ことの確認になる。
  */
+/* mremap / MREMAP_MAYMOVE は musl では _GNU_SOURCE の中に居る */
+#define _GNU_SOURCE
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -78,6 +80,22 @@ int main(void) {
     if (memcmp(map, "OK", 2) != 0) return 51;
     if (munmap(map, 4096) != 0) return 52;
     if (write_all(1, "MPROT-MUNMAP\n", 13) < 0) return 53;
+
+    /* mremap にも同じ形の検査を足した (2026-09-12: 古い範囲がこのプロセスの
+     * ページかをページごとに見る)。**断る側は riscv64 の errno プローブ
+     * (mremap-kernel-ram / mremap-kernel-shrink) が見るので、ここは通る側。**
+     * aarch64 で mremap を成功させるのはこのプローブしか無い */
+    {
+        char* grown = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (grown == MAP_FAILED) return 54;
+        memcpy(grown, "OK", 2);
+        grown = mremap(grown, 4096, 8192, MREMAP_MAYMOVE);
+        if (grown == MAP_FAILED) return 55;
+        if (memcmp(grown, "OK", 2) != 0) return 56;   /* 中身が持ち越されること */
+        grown[4096] = 'X';                            /* 伸ばした側も書けること */
+        if (munmap(grown, 8192) != 0) return 57;
+        if (write_all(1, "MREMAP\n", 7) < 0) return 58;
+    }
 
     /* 1 回の write で xv6fs のログ容量 (126 ブロック) を超える。
      *
