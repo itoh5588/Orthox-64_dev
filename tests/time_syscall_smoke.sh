@@ -55,7 +55,10 @@ kill "${QEMU_PID}" 2>/dev/null || true
 wait "${QEMU_PID}" 2>/dev/null || true
 QEMU_PID=""
 
-grep -q -- '--- Orthox-64 v0.3.0 Boot ---' "${SERIAL_LOG}"
+# **版番号は判定に入れない (2026-09-12)。**ここは v0.3.0 を直書きしていたが
+# カーネルは v0.6.0 を出しており、tick の判定が全部通っているのに
+# この 1 行だけで常に赤かった。起動したことだけ見る
+grep -qE -- '--- Orthox-64 v[0-9.]+ Boot ---' "${SERIAL_LOG}"
 grep -q 'tick0=' "${SERIAL_LOG}"
 grep -q 'tick1=' "${SERIAL_LOG}"
 grep -q 'tick2=' "${SERIAL_LOG}"

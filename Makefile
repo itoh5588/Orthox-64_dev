@@ -1413,6 +1413,12 @@ TEST_ELFS = $(MMAP_TEST_ELF) $(REAP_TEST_ELF) $(ROBUST_TEST_ELF) $(VRAM_TEST_ELF
 
 FORCE:
 
+# **動的リンカの実体を rootfs/lib/ld-musl-x86_64.so.1 に置く (2026-09-12)。**
+# ports/musl-install/lib/ の同名ファイルは別の機械の絶対パスを指す symlink
+# なので、libc.so をその名前でコピーする。ここが抜けていたため、
+# make rootfs.img だけでは動的リンク環境が再現できず、busybox.dyn などが
+# 「Exec: Interpreter not found: /lib/ld-musl-x86_64.so.1」で動かなかった
+# (dynlinkrealappsmoke)。
 $(ROOTFS_IMG): FORCE busybox-ash-musl-install $(ROOTFS_FILES) $(USER_BUILD_DIR)/crt0.o $(USER_BUILD_DIR)/syscalls.o $(UDP_ECHO_TEST_ELF) $(UDP_NB_TEST_ELF) $(HTTPS_FETCH_ELF) $(TIME_TEST_ELF) $(TICKRATE_TEST_ELF) $(SHOWCPU_ELF) $(RUNQSTAT_ELF) $(TCPHELLO_ELF) $(FORKCPU_TEST_ELF) $(FORKMODE_ELF) $(PIPE_STRESS_ELF) $(PIPEEND_PROBE_ELF) $(SMP_STRESS_ELF) $(SCHEDMIX_ELF) $(REAP_TEST_ELF) $(SIGNAL_TEST_ELF) $(SIGMASK_TEST_ELF) $(SIGACTION_TEST_ELF) $(STATERRNO_ELF) $(PYENC_CHECK_ELF) $(MUSL_DIRCHECK_ELF) $(MUSL_FORKPROBE_ELF) $(MUSL_EXECPROBE_ELF) $(MUSL_ENVSHOW_ELF) $(VBLK_TEST_ELF) $(VBLK_STRESS_ELF) $(SOUND_TEST_ELF) $(GCC_MUSL_ELF) $(CC1_MUSL_ELF) $(AS_MUSL_ELF) $(LD_MUSL_ELF) $(MAKE_MUSL_ELF) $(KILO_ELF) $(FILE_ELF) $(VMERRNO_TEST_ELF) $(COWTEST_ELF) $(FTRUNCSAVE_TEST_ELF) $(PREADPWRITE_TEST_ELF) $(XV6_SPARSE_TEST_ELF) $(XV6_RECLAIM_TEST_ELF) $(XV6_LARGEWRITE_TEST_ELF) $(HELLO_DYN_ELF) $(DYNLINK_LIB_A_SO) $(DYNLINK_LIB_B_SO) $(DYNLINK_PLUGIN_SO) $(DYNLINK_CPP_SO) $(DYNLINK_MULTI_TLS_ELF) $(DYNLINK_DLOPEN_ELF) $(DYNLINK_MALLOC_ELF) $(BUSYBOX_ASH_DYN_ELF) $(GCC_DYN_ELF)
 	@if [ "$(ROOTFS_REBUILD)" = "0" ] && [ -f "$(ROOTFS_IMG)" ]; then \
 		echo "Keeping existing $(ROOTFS_IMG) (ROOTFS_REBUILD=0)"; \
@@ -1489,6 +1495,8 @@ $(ROOTFS_IMG): FORCE busybox-ash-musl-install $(ROOTFS_FILES) $(USER_BUILD_DIR)/
 			cp $(DYNLINK_MALLOC_ELF) rootfs/bin/dynlink_malloc.elf; \
 			cp $(BUSYBOX_ASH_DYN_ELF) rootfs/bin/busybox.dyn; \
 			cp $(GCC_DYN_ELF) rootfs/bin/gcc.dyn; \
+			cp ports/musl-install/lib/libc.so rootfs/lib/ld-musl-x86_64.so.1; \
+			chmod +x rootfs/lib/ld-musl-x86_64.so.1; \
 			cp $(DYNLINK_LIB_A_SO) rootfs/lib/libdyn_a.so; \
 			cp $(DYNLINK_LIB_B_SO) rootfs/lib/libdyn_b.so; \
 			cp $(DYNLINK_PLUGIN_SO) rootfs/lib/libdyn_plugin.so; \

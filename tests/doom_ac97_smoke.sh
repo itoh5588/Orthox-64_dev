@@ -5,6 +5,9 @@ ISO="${1:-orthos.iso}"
 SERIAL_LOG="${SERIAL_LOG:-LOGs/doom-ac97-serial.log}"
 mkdir -p LOGs
 QEMU_OUT="${QEMU_OUT:-/tmp/doom-ac97-qemu.out}"
+# OVMF の場所は環境変数で差し替えられる (2026-09-12 に他の台本と揃えた)。
+# 既定の Web/wasabi/... が無い機械では OVMF=/usr/share/ovmf/OVMF.fd などを渡す
+OVMF="${OVMF:-Web/wasabi/third_party/ovmf/RELEASEX64_OVMF.fd}"
 BOOTCMD_PATH="rootfs/etc/bootcmd"
 BOOTCMD_BACKUP="$(mktemp)"
 QEMU_PID=""
@@ -35,7 +38,7 @@ qemu-system-x86_64 \
     -machine q35 \
     -cpu qemu64 \
     -m 2G \
-    -bios Web/wasabi/third_party/ovmf/RELEASEX64_OVMF.fd \
+    -bios "${OVMF}" \
     -cdrom "${ISO}" \
     -boot d \
     -display none \
