@@ -76,6 +76,37 @@ static void serial_irq_restore(uint64_t flags) {
     }
 }
 
+/* ---- コンソールの排他 (2026-09-12) --------------------------------------
+ *
+ * **1 回の puts は元から排他していたが、1 行は複数回の呼び出しで組み立てる。**
+ *
+ *     puts("[smp] started_cpus="); putdec(n); puts("\r\n");
+ *
+ * の合間に他の CPU が割り込むと行が混ざる。-smp 2 では BSP が init で
+ * この行を出している最中に、idle に落ちた副 CPU が kernel/sched.c から
+ * usb_hotplug_poll() を回して別の行を出し、
+ *
+ *     [usb] hotplug: entered ready=[smp] started_cpus=0 hub_slot=02 ports=
+ *
+ * になっていた (tests/irq_bottom_half_smp_stress_smoke.sh が
+ * `[smp] started_cpus=2` を読めずに落ちる。**揺らぎではなく毎回同じ**)。
+ *
+ * aarch64 は kernel/aarch64/boot.c に同じ仕掛けを持っている。x86 にも置く。
+ *
+ * **再入可能でなければならない。**外側で begin した CPU がその中で puts を
+ * 呼ぶので、素のロックでは自分を待って止まる。所有 CPU は **CPUID の
+ * 初期 APIC ID** で見る —— LAPIC の MMIO を設置する前や、共有層に載る前の
+ * 副コアからも呼ばれるため。 */
+static volatile int g_console_owner = -1;   /* 初期 APIC ID。-1 = 空き */
+static uint32_t g_console_depth;
+
+static inline int console_self(void) {
+    uint32_t eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                             : "a"(1), "c"(0));
+    return (int)(ebx >> 24);
+}
+
 static void serial_lock(void) {
     while (__atomic_exchange_n(&g_serial_lock, 1, __ATOMIC_ACQUIRE)) {
         __asm__ volatile("pause");
@@ -85,6 +116,34 @@ static void serial_lock(void) {
 static void serial_unlock(void) {
     __atomic_store_n(&g_serial_lock, 0, __ATOMIC_RELEASE);
 }
+
+/* **記帳のあいだだけ割り込みを閉じる。**区間そのものを丸ごと閉じると、
+ * usb.c のように長く囲む呼び手で tick を落としかねない (aarch64 と同じ判断) */
+void x86_console_begin(void) {
+    int me = console_self();
+    uint64_t flags = serial_irq_save();
+    /* **他の CPU の値と自分の番号は決して一致しない**ので、ロック外で
+     * 読んでよい。書くのは所有者だけ */
+    if (g_console_owner != me) {
+        serial_lock();
+        g_console_owner = me;
+    }
+    g_console_depth++;
+    serial_irq_restore(flags);
+}
+
+void x86_console_end(void) {
+    uint64_t flags = serial_irq_save();
+    if (g_console_depth > 0 && --g_console_depth == 0) {
+        g_console_owner = -1;
+        serial_unlock();
+    }
+    serial_irq_restore(flags);
+}
+
+/* kernel/usb.c の weak な空実装を上書きする (aarch64 は runtime.c:283 で同じこと) */
+void usb_arch_console_begin(void) { x86_console_begin(); }
+void usb_arch_console_end(void) { x86_console_end(); }
 
 static void init_serial(void) {
     outb(0x3f8 + 1, 0x00); // Disable all interrupts
@@ -97,36 +156,30 @@ static void init_serial(void) {
 }
 
 void puts(const char *s) {
-    uint64_t flags = serial_irq_save();
-    serial_lock();
+    x86_console_begin();
     for (size_t i = 0; s[i] != '\0'; i++) {
         if (s[i] == '\n') outb(0x3f8, '\r');
         outb(0x3f8, s[i]);
     }
-    serial_unlock();
-    serial_irq_restore(flags);
+    x86_console_end();
 }
 
 void puthex(uint64_t v) {
     const char *hex = "0123456789ABCDEF";
-    uint64_t flags = serial_irq_save();
-    serial_lock();
+    x86_console_begin();
     for (int i = 60; i >= 0; i -= 4) {
         outb(0x3f8, hex[(v >> i) & 0xF]);
     }
-    serial_unlock();
-    serial_irq_restore(flags);
+    x86_console_end();
 }
 
 static void putdec(uint64_t v) {
     char buf[21];
     int i = 0;
-    uint64_t flags = serial_irq_save();
-    serial_lock();
+    x86_console_begin();
     if (v == 0) {
         outb(0x3f8, '0');
-        serial_unlock();
-        serial_irq_restore(flags);
+        x86_console_end();
         return;
     }
     while (v && i < (int)sizeof(buf)) {
@@ -134,8 +187,7 @@ static void putdec(uint64_t v) {
         v /= 10;
     }
     while (i--) outb(0x3f8, buf[i]);
-    serial_unlock();
-    serial_irq_restore(flags);
+    x86_console_end();
 }
 
 static void enable_sse(void) {
@@ -293,9 +345,12 @@ void _start(void) {
         } else {
             puts("[smp] AP startup timeout\r\n");
         }
+        /* **3 回の呼び出しで 1 行。**囲まないと他の CPU の行と混ざる */
+        x86_console_begin();
         puts("[smp] started_cpus=");
         putdec(smp_get_started_cpu_count());
         puts("\r\n");
+        x86_console_end();
         smp_send_resched_ipi_selftest();
 
         if (module_request.response && module_request.response->module_count > 0) {

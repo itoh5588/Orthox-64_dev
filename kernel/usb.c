@@ -3483,6 +3483,9 @@ static void usb_hotplug_poll_owned(void) {
      * (2026-08-20 codex 相談 (d)) */
     if (!g_hub_poll_announced) {
         g_hub_poll_announced = 1;
+        /* **9 回の呼び出しで 1 行。**囲まないと他の CPU の行と混ざる
+         * (2026-09-12: -smp 2 で BSP の "[smp] started_cpus=" と割れていた) */
+        usb_arch_console_begin();
         puts("[usb] hotplug: entered ready=");
         putdec(g_usb_ready ? 1U : 0U);
         puts(" hub_slot=");
@@ -3492,6 +3495,7 @@ static void usb_hotplug_poll_owned(void) {
         puts(" dev_port=");
         putdec(g_hub_dev_port);
         puts("\r\n");
+        usb_arch_console_end();
     }
 
     if (!g_usb_ready || g_hub_slot_id == 0 || g_hub_nbr_ports == 0) {
