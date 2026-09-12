@@ -46,38 +46,50 @@ $(MAKE_MUSL_ELF): $(USER_BUILD_DIR)/crt0.o $(USER_BUILD_DIR)/syscalls.o $(USER_B
 
 toolchain-musl: $(CC1_MUSL_ELF) $(AS_MUSL_ELF) $(LD_MUSL_ELF) $(MAKE_MUSL_ELF)
 
-$(HELLO_DYN_ELF): user/hello_dyn.c ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(USER_LIBDIR)/libc.so
+# **musl-clang が埋め込むパスを、この作業ツリーに合わせ直してから使う。**
+# ports/musl-install/ は別の機械で作ったものを持ち回ることがあり、その場合
+# 存在しない絶対パスが残る。動的リンクの実行ファイルには、それが
+# PT_INTERP としてそのまま焼き付く (2026-09-12 に user/hello_dyn.elf で実測)。
+# 詳細は scripts/fix_musl_clang_paths.sh の冒頭
+MUSL_CLANG_STAMP = $(BUILD_DIR)/musl/musl-clang-paths.stamp
+
+$(MUSL_CLANG_STAMP): scripts/fix_musl_clang_paths.sh ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang
+	@mkdir -p $(@D)
+	bash scripts/fix_musl_clang_paths.sh
+	@touch $@
+
+$(HELLO_DYN_ELF): user/hello_dyn.c ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(MUSL_CLANG_STAMP) $(USER_LIBDIR)/libc.so
 	ports/musl-install/bin/musl-clang -fPIE $< -o $@
 
-$(DYNLINK_LIB_A_SO): user/dynlink_lib_a.c ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(USER_LIBDIR)/libc.so
+$(DYNLINK_LIB_A_SO): user/dynlink_lib_a.c ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(MUSL_CLANG_STAMP) $(USER_LIBDIR)/libc.so
 	ports/musl-install/bin/musl-clang -fPIC -shared $< -Wl,-soname,libdyn_a.so -o $@
 
-$(DYNLINK_LIB_B_SO): user/dynlink_lib_b.c $(DYNLINK_LIB_A_SO) ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(USER_LIBDIR)/libc.so
+$(DYNLINK_LIB_B_SO): user/dynlink_lib_b.c $(DYNLINK_LIB_A_SO) ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(MUSL_CLANG_STAMP) $(USER_LIBDIR)/libc.so
 	ports/musl-install/bin/musl-clang -fPIC -shared $< -Luser -ldyn_a -Wl,-soname,libdyn_b.so -o $@
 
-$(DYNLINK_MULTI_TLS_ELF): user/dynlink_multi_tls.c $(DYNLINK_LIB_A_SO) $(DYNLINK_LIB_B_SO) ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(USER_LIBDIR)/libc.so
+$(DYNLINK_MULTI_TLS_ELF): user/dynlink_multi_tls.c $(DYNLINK_LIB_A_SO) $(DYNLINK_LIB_B_SO) ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(MUSL_CLANG_STAMP) $(USER_LIBDIR)/libc.so
 	ports/musl-install/bin/musl-clang -fPIE $< -Luser -ldyn_b -ldyn_a -o $@
 
-$(DYNLINK_PLUGIN_SO): user/dynlink_plugin.c $(DYNLINK_LIB_A_SO) $(DYNLINK_LIB_B_SO) ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(USER_LIBDIR)/libc.so
+$(DYNLINK_PLUGIN_SO): user/dynlink_plugin.c $(DYNLINK_LIB_A_SO) $(DYNLINK_LIB_B_SO) ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(MUSL_CLANG_STAMP) $(USER_LIBDIR)/libc.so
 	ports/musl-install/bin/musl-clang -fPIC -shared $< -Luser -ldyn_b -Wl,-soname,libdyn_plugin.so -o $@
 
 $(BUILD_DIR)/musl/dynlink_cpp_runtime.o: user/dynlink_cpp_runtime.cc
 	@mkdir -p $(@D)
 	clang++ -target x86_64-linux-musl -ffreestanding -fPIC -fno-exceptions -fno-rtti -nostdinc -isystem $(MUSL_SYSROOT)/include -c $< -o $@
 
-$(DYNLINK_CPP_SO): $(BUILD_DIR)/musl/dynlink_cpp_runtime.o ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(USER_LIBDIR)/libc.so
+$(DYNLINK_CPP_SO): $(BUILD_DIR)/musl/dynlink_cpp_runtime.o ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(MUSL_CLANG_STAMP) $(USER_LIBDIR)/libc.so
 	ports/musl-install/bin/musl-clang -shared $< -Wl,-soname,libdyn_cpp.so -o $@
 
-$(DYNLINK_DLOPEN_ELF): user/dynlink_dlopen.c $(DYNLINK_PLUGIN_SO) $(DYNLINK_CPP_SO) ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(USER_LIBDIR)/libc.so
+$(DYNLINK_DLOPEN_ELF): user/dynlink_dlopen.c $(DYNLINK_PLUGIN_SO) $(DYNLINK_CPP_SO) ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(MUSL_CLANG_STAMP) $(USER_LIBDIR)/libc.so
 	ports/musl-install/bin/musl-clang -fPIE $< -ldl -o $@
 
-$(DYNLINK_MALLOC_ELF): user/dynlink_malloc.c ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(USER_LIBDIR)/libc.so
+$(DYNLINK_MALLOC_ELF): user/dynlink_malloc.c ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(MUSL_CLANG_STAMP) $(USER_LIBDIR)/libc.so
 	ports/musl-install/bin/musl-clang -fPIE $< -o $@
 
-$(BUSYBOX_ASH_DYN_ELF): ports/build_busybox_ash.sh ports/busybox-ash-dyn.config ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(USER_LIBDIR)/libc.so
+$(BUSYBOX_ASH_DYN_ELF): ports/build_busybox_ash.sh ports/busybox-ash-dyn.config ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(MUSL_CLANG_STAMP) $(USER_LIBDIR)/libc.so
 	ORTHOS_BUSYBOX_DYNAMIC=1 ORTHOS_BUSYBOX_CONFIG=$(abspath ports/busybox-ash-dyn.config) ./ports/build_busybox_ash.sh $(abspath ports/busybox) $(abspath $(BUSYBOX_ASH_DYN_ELF))
 
-$(GCC_DYN_ELF): user/gcc.c ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(USER_LIBDIR)/libc.so
+$(GCC_DYN_ELF): user/gcc.c ports/musl-install/bin/musl-clang ports/musl-install/bin/ld.musl-clang $(MUSL_CLANG_STAMP) $(USER_LIBDIR)/libc.so
 	ports/musl-install/bin/musl-clang -fPIE $< -o $@
 
 $(BUSYBOX_ASH_MUSL_ELF): $(USER_BUILD_DIR)/syscalls.o $(USER_BUILD_DIR)/tls.o $(USER_BUILD_DIR)/syscall_wrap.o ports/build_busybox_ash.sh ports/busybox-ash.config
