@@ -105,7 +105,22 @@ static inline void arch_vm_unmap_page(arch_address_space_t address_space, uint64
  *
  * **ソフトウェアのビット (PTE_COW) は残らない。**aarch64 の実装も同じで、
  * 呼び手は exec が組み立て中の新しいアドレス空間しか触らないので COW は
- * 立っていない。2MB ページは触らない (arch_vm_unmap_page と同じ) */
+ * 立っていない。2MB ページは触らない (arch_vm_unmap_page と同じ)。
+ *
+ * ★ **葉だけ書いても効かない (2026-09-12 に実機で踏んだ)。**x86 の実効権限は
+ * PML4E / PDPE / PDE / PTE の **AND** なので、先に貼った段の権限で作られた
+ * 中間段が W を持っていなければ、葉に PTE_WRITABLE を立てても読み取り専用の
+ * ままになる。最初に書いた実装は葉だけを書いており、
+ *
+ *     DBG pte before=0000000022109005   ← P|U
+ *     DBG pte after =0000000022109007   ← P|U|W  (葉は直っている)
+ *     #PF(User): write-to-nonwritable at 0x00000000004009B0
+ *
+ * と、**PTE は直っているのに書けなかった** (tests/x86_straddle_smoke.sh)。
+ * vmm_map_page は get_next_level が既存の中間段にも PTE_USER / PTE_WRITABLE を
+ * 足すので、**葉の物理アドレスを取り直して vmm_map_page に渡す。**
+ * aarch64 / riscv64 に同じ話は無い —— riscv64 の非葉 PTE は R=W=X=0 で
+ * 権限を持たず、aarch64 の表記述子も既定 (APTable=0) が最も緩い */
 static inline void arch_vm_update_page_flags(arch_address_space_t address_space, uint64_t vaddr, uint64_t new_flags) {
     uint64_t* pml4 = arch_vm_address_space_root(address_space);
     uint64_t* pdp;
@@ -123,8 +138,8 @@ static inline void arch_vm_update_page_flags(arch_address_space_t address_space,
     pt = (uint64_t*)PHYS_TO_VIRT(pd[PD_IDX(vaddr)] & PTE_ADDR_MASK);
     pte = &pt[PT_IDX(vaddr)];
     if (!(*pte & PTE_PRESENT)) return;
-    *pte = (*pte & PTE_ADDR_MASK) | new_flags;
-    __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
+    /* 中間段を広げるのは vmm_map_page に任せる。invlpg もあちらが撃つ */
+    vmm_map_page(pml4, vaddr, *pte & PTE_ADDR_MASK, new_flags);
 }
 
 #endif
