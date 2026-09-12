@@ -1438,3 +1438,23 @@ void arch_vm_protect_page(arch_address_space_t address_space, uint64_t vaddr,
     arch_vm_map_page(address_space, vaddr, phys & ~(uint64_t)(PAGE_SIZE - 1),
                      aarch64_vm_user_page_attr(writable, executable));
 }
+
+/* **今の保護属性を読む (2026-09-12)。**mremap を 3 アーキ共通にしたときの hook。
+ * 伸ばした分や移した先に **元と同じ保護を引き継ぐ**のに要る
+ * (引き継がないと、実行可の範囲を mremap した瞬間に実行できなくなる)。 */
+int arch_vm_get_page_prot(arch_address_space_t address_space, uint64_t vaddr,
+                          int* writable, int* executable) {
+    uint64_t l2_pa, l3_pa, entry;
+
+    if (!address_space) return -1;
+    l2_pa = aarch64_vm_walk_existing(address_space, vaddr, 1);
+    if (!l2_pa) return -1;
+    l3_pa = aarch64_vm_walk_existing(l2_pa, vaddr, 2);
+    if (!l3_pa) return -1;
+    entry = aarch64_vm_table_ptr(l3_pa)[aarch64_vm_index(vaddr, 3)];
+    if ((entry & AARCH64_PTE_VALID) == 0) return -1;
+    /* AP[7] が立っていれば読み取り専用 (AP=11)。UXN が立っていれば EL0 実行不可 */
+    if (writable) *writable = (entry & (1ULL << 7)) == 0;
+    if (executable) *executable = (entry & AARCH64_PTE_UXN) == 0;
+    return 0;
+}

@@ -1281,12 +1281,6 @@ static int64_t linux_bootstrap_sys_waitid(int idtype, int id, struct linux_sigin
     return 0;
 }
 
-/* mmap(2) の失敗は「戻り値そのもの」が -errno になる (musl の __syscall_ret は
- * -4096 < ret < 0 を errno へ写す)。(void*)-1 を返すと MAP_FAILED ではなく
- * -EPERM を返したことになり、ユーザーには "Operation not permitted" として出る */
-static void* linux_mmap_err(int err) {
-    return (void*)(intptr_t)(-err);
-}
 
 /* **riscv64 は kernel/sys_fs.c を繋いでいない** (自前の kernel/riscv64/fs.c を
  * 使っており、sys_pread64 を持たない)。共有の mmap が file-backed を扱うのに
@@ -1318,114 +1312,11 @@ void* sys_mmap(void* addr, size_t length, int prot, int flags, int fd, int64_t o
 #define LINUX_MREMAP_MAYMOVE 1
 #define LINUX_MREMAP_FIXED   2
 
-static void* linux_bootstrap_sys_mremap(void* old_addr, size_t old_len, size_t new_len,
-                                        int flags, void* new_addr) {
-    struct task* current = get_current_task();
-    arch_address_space_t address_space;
-    uint64_t old_base = (uint64_t)(uintptr_t)old_addr;
-    uint64_t old_size, new_size;
-
-    if (!current) return linux_mmap_err(LINUX_ESRCH);
-    if (!old_base || !old_len || !new_len) return linux_mmap_err(LINUX_EINVAL);
-    if ((old_base & (PAGE_SIZE - 1)) != 0) return linux_mmap_err(LINUX_EINVAL);
-    if (flags & ~(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED)) return linux_mmap_err(LINUX_EINVAL);
-    if ((flags & LINUX_MREMAP_FIXED) && !(flags & LINUX_MREMAP_MAYMOVE)) return linux_mmap_err(LINUX_EINVAL);
-
-    old_size = linux_align_up_page((uint64_t)old_len);
-    new_size = linux_align_up_page((uint64_t)new_len);
-    address_space = arch_task_context_get_address_space(&current->ctx);
-
-    /* **古い範囲が全部このプロセスのページであることを先に確かめる
-     * (2026-09-12)。**もとは先頭 1 枚を get_phys != 0 で見るだけだった。
-     * riscv64 はカーネルが RAM 全体を下位半分に恒等写像しているので
-     * **カーネルのページがそこを通り**、
-     *
-     *   縮める  はみ出した分を外して pmm へ返す → **カーネルの .text が
-     *           全プロセスから消える** (user/riscv64_errno_probe.c の
-     *           mremap-kernel-shrink。sys_write のページを外して
-     *           次の write で命令ページフォルトになるのを確かめた)
-     *   伸ばす  直後が埋まっているので move へ落ち、**カーネルの RAM を
-     *           新しいユーザーページへ写して返す** (mremap-kernel-ram。
-     *           _start の先頭バイト 0xa1 が読めた)
-     *
-     * munmap (kernel/sys_mmap.c) は VA の範囲で断っているが、**mremap は
-     * mprotect と同じくページごとの U ビットで見る** —— Linux は ELF の段や
-     * スタックの mremap も認めるので、mmap の範囲に狭められない (2026-09-11
-     * §追-5 と同じ理由)。x86 の sys_mremap も lookup_user_pte で見ている */
-    for (uint64_t off = 0; off < old_size; off += PAGE_SIZE) {
-        if (!arch_vm_is_user_page(address_space, old_base + off)) return linux_mmap_err(LINUX_EINVAL);
-    }
-
-    if (new_size == old_size) return old_addr;
-
-    /* 縮める: はみ出した分を外すだけ (munmap と同じ後始末) */
-    if (new_size < old_size) {
-        for (uint64_t off = new_size; off < old_size; off += PAGE_SIZE) {
-            uint64_t phys = arch_vm_get_phys(address_space, old_base + off);
-            arch_vm_unmap_page(address_space, old_base + off);
-            if (phys) pmm_free((void*)(uintptr_t)(phys & ~(PAGE_SIZE - 1ULL)), 1);
-        }
-        arch_syscall_flush_tlb();
-        return old_addr;
-    }
-
-    /* 伸ばす: 直後が空いていればその場で足す (move 不要) */
-    {
-        uint64_t end = old_base + old_size;
-        uint64_t grow = new_size - old_size;
-        uint64_t off;
-        int occupied = 0;
-        uint64_t map_flags;
-        /* **その場で足せるのはユーザーの VA の中だけ。**越えたところへ貼ると
-         * Sv39 では添字が折り返してカーネル側の表を引く (2026-09-11 §追-1)。
-         * 越えていたら「その場では足せない」として move へ落とす
-         * (x86 の sys_mremap の is_user_mmap_range_valid と同じ扱い) */
-        if (end < USER_MMAP_BASE_VADDR || end + grow > USER_MMAP_TOP_VADDR ||
-            end + grow < end) {
-            occupied = 1;
-        }
-        for (off = 0; !occupied && off < grow; off += PAGE_SIZE) {
-            if (arch_vm_get_phys(address_space, end + off) != 0) { occupied = 1; break; }
-        }
-        if (!occupied) {
-            /* musl の realloc はヒープにしか使わない。読み書き可・実行不可を仮定する
-             * (arch_vm_* に既存範囲の保護属性を取り直す手段が無い) */
-            map_flags = arch_vm_user_page_flags(1, 0);
-            for (off = 0; off < grow; off += PAGE_SIZE) {
-                uint64_t phys = linux_alloc_zeroed_user_page();
-                if (!phys) return linux_mmap_err(LINUX_ENOMEM);
-                arch_vm_map_page(address_space, end + off, phys, map_flags);
-            }
-            arch_syscall_flush_tlb();
-            return old_addr;
-        }
-    }
-
-    if (!(flags & LINUX_MREMAP_MAYMOVE)) return linux_mmap_err(LINUX_ENOMEM);
-
-    /* 直後に空きが無い: 新しい範囲を作り、中身を写してから古い方を外す */
-    {
-        void* mapped = sys_mmap((flags & LINUX_MREMAP_FIXED) ? new_addr : 0,
-                                                 (size_t)new_size, PROT_READ | PROT_WRITE,
-                                                 MAP_PRIVATE | MAP_ANONYMOUS |
-                                                 ((flags & LINUX_MREMAP_FIXED) ? MAP_FIXED : 0),
-                                                 -1, 0);
-        uint64_t new_base;
-        uint64_t off;
-        if ((int64_t)(intptr_t)mapped < 0 && (int64_t)(intptr_t)mapped > -4096) return mapped;
-        new_base = (uint64_t)(uintptr_t)mapped;
-        for (off = 0; off < old_size && off < new_size; off += PAGE_SIZE) {
-            uint64_t old_phys = arch_vm_get_phys(address_space, old_base + off);
-            uint64_t new_phys = arch_vm_get_phys(address_space, new_base + off);
-            if (old_phys && new_phys) {
-                memcpy((void*)(uintptr_t)PHYS_TO_VIRT(new_phys & ~(PAGE_SIZE - 1ULL)),
-                       (void*)(uintptr_t)PHYS_TO_VIRT(old_phys & ~(PAGE_SIZE - 1ULL)), PAGE_SIZE);
-            }
-        }
-        (void)sys_munmap(old_addr, old_len);
-        return (void*)(uintptr_t)new_base;
-    }
-}
+/* **mremap(2) は kernel/sys_mmap.c へ移した (2026-09-12)。**
+ * x86 (kernel/x86_64/sys_vm.c) と 2 実装あり、**保護の引き継ぎが違っていた**
+ * (linux 側は移した先を必ず rw・実行不可にしていた)。
+ * 経緯と対照表は kernel/sys_mmap.c の sys_mremap の冒頭にある */
+void* sys_mremap(void* old_addr, size_t old_len, size_t new_len, int flags, void* new_addr);
 
 /* **mprotect(2) は kernel/sys_mmap.c へ移した (2026-09-12)。**
  * x86 (kernel/x86_64/sys_vm.c) と 2 実装あり、**COW の扱いが違っていた。**
@@ -1686,7 +1577,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_MREMAP:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(uintptr_t)linux_bootstrap_sys_mremap((void*)(uintptr_t)arch_syscall_arg0(frame),
+                                    (uint64_t)(uintptr_t)sys_mremap((void*)(uintptr_t)arch_syscall_arg0(frame),
                                                                                      (size_t)arch_syscall_arg1(frame),
                                                                                      (size_t)arch_syscall_arg2(frame),
                                                                                      (int)arch_syscall_arg3(frame),

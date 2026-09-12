@@ -531,3 +531,14 @@ void arch_vm_protect_page(arch_address_space_t address_space, uint64_t vaddr,
                      (writable ? RISCV64_VM_PAGE_W : 0) |
                      (executable ? RISCV64_VM_PAGE_X : 0));
 }
+
+/* **今の保護属性を読む (2026-09-12)。**mremap を 3 アーキ共通にしたときの hook。
+ * aarch64 版と同じ役割 (kernel/aarch64/vm.c のコメントを参照)。 */
+int arch_vm_get_page_prot(arch_address_space_t address_space, uint64_t vaddr,
+                          int* writable, int* executable) {
+    uint64_t* pte = riscv64_sv39_walk_leaf(riscv64_vm_root_ptr((uint64_t)address_space), vaddr);
+    if (!pte || (*pte & RISCV64_SV39_PTE_V) == 0) return -1;
+    if (writable) *writable = (*pte & RISCV64_SV39_PTE_W) != 0;
+    if (executable) *executable = (*pte & RISCV64_SV39_PTE_X) != 0;
+    return 0;
+}

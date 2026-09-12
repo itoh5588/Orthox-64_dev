@@ -27,12 +27,6 @@ static void* kernel_memset(void* s, int c, size_t n) {
     return s;
 }
 
-static void* kernel_memcpy(void* dst, const void* src, size_t n) {
-    unsigned char* d = dst;
-    const unsigned char* s = src;
-    while (n--) *d++ = *s++;
-    return dst;
-}
 
 #if ORTHOX_MEM_TRACE
 static int kernel_streq(const char* a, const char* b) {
@@ -76,66 +70,11 @@ static void memtrace_brk(uint64_t requested, uint64_t old_brk, uint64_t new_brk,
 #endif
 }
 
-static uint64_t align_up_page(uint64_t v) {
-    return (v + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-}
 
-static int is_user_mmap_range_valid(uint64_t vaddr, uint64_t size) {
-    if (size == 0) return 0;
-    if ((vaddr & (PAGE_SIZE - 1)) != 0) return 0;
-    if (vaddr < MMAP_BASE_ADDR) return 0;
-    if (vaddr >= MMAP_TOP_ADDR) return 0;
-    if (vaddr + size < vaddr) return 0;
-    if (vaddr + size > MMAP_TOP_ADDR) return 0;
-    return 1;
-}
 
-static int is_user_page_range_valid(uint64_t vaddr, uint64_t size) {
-    if (size == 0) return 0;
-    if ((vaddr & (PAGE_SIZE - 1)) != 0) return 0;
-    if (vaddr < PAGE_SIZE) return 0;
-    if (vaddr >= USER_TOP_ADDR) return 0;
-    if (vaddr + size < vaddr) return 0;
-    if (vaddr + size > USER_TOP_ADDR) return 0;
-    return 1;
-}
 
-static int is_range_unmapped(uint64_t* pml4, uint64_t vaddr, uint64_t size) {
-    for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        if (vmm_get_phys(pml4, vaddr + off) != 0) {
-            return 0;
-        }
-    }
-    return 1;
-}
 
-static void unmap_one_page(uint64_t* pml4, uint64_t vaddr) {
-    if (!(pml4[PML4_IDX(vaddr)] & PTE_PRESENT)) return;
-    uint64_t* pdp = (uint64_t*)PHYS_TO_VIRT(pml4[PML4_IDX(vaddr)] & PTE_ADDR_MASK);
-    if (!(pdp[PDP_IDX(vaddr)] & PTE_PRESENT)) return;
-    uint64_t* pd = (uint64_t*)PHYS_TO_VIRT(pdp[PDP_IDX(vaddr)] & PTE_ADDR_MASK);
-    if (!(pd[PD_IDX(vaddr)] & PTE_PRESENT)) return;
-    if (pd[PD_IDX(vaddr)] & PTE_HUGE) return; // mmap() does not create huge pages here.
-    uint64_t* pt = (uint64_t*)PHYS_TO_VIRT(pd[PD_IDX(vaddr)] & PTE_ADDR_MASK);
-    uint64_t* pte = &pt[PT_IDX(vaddr)];
-    if (!(*pte & PTE_PRESENT)) return;
 
-    void* page_phys = (void*)(*pte & PTE_ADDR_MASK);
-    *pte = 0;
-    __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
-    pmm_free(page_phys, 1);
-}
-
-static uint64_t* lookup_user_pte(uint64_t* pml4, uint64_t vaddr) {
-    if (!(pml4[PML4_IDX(vaddr)] & PTE_PRESENT)) return 0;
-    uint64_t* pdp = (uint64_t*)PHYS_TO_VIRT(pml4[PML4_IDX(vaddr)] & PTE_ADDR_MASK);
-    if (!(pdp[PDP_IDX(vaddr)] & PTE_PRESENT)) return 0;
-    uint64_t* pd = (uint64_t*)PHYS_TO_VIRT(pdp[PDP_IDX(vaddr)] & PTE_ADDR_MASK);
-    if (!(pd[PD_IDX(vaddr)] & PTE_PRESENT)) return 0;
-    if (pd[PD_IDX(vaddr)] & PTE_HUGE) return 0;
-    uint64_t* pt = (uint64_t*)PHYS_TO_VIRT(pd[PD_IDX(vaddr)] & PTE_ADDR_MASK);
-    return &pt[PT_IDX(vaddr)];
-}
 
 void* sys_mmap(void* addr, size_t length, int prot, int flags, int fd, int64_t offset);
 int sys_munmap(void* addr, size_t length);
@@ -182,93 +121,9 @@ int sys_madvise(void* addr, size_t len, int advice) {
  * COW を保つ部分は include/x86_64/vm.h の arch_vm_protect_page に移してある
  * (aarch64 / riscv64 は fork でページを写すので COW が無い) */
 
-static void copy_user_range(uint64_t* pml4, uint64_t dst_base, uint64_t src_base, uint64_t length) {
-    uint64_t done = 0;
-    while (done < length) {
-        uint64_t src_v = src_base + done;
-        uint64_t dst_v = dst_base + done;
-        uint64_t src_off = src_v & (PAGE_SIZE - 1);
-        uint64_t dst_off = dst_v & (PAGE_SIZE - 1);
-        uint64_t src_phys = vmm_get_phys(pml4, src_v);
-        uint64_t dst_phys = vmm_get_phys(pml4, dst_v);
-
-        if (!src_phys || !dst_phys) break;
-
-        uint64_t src_rem = PAGE_SIZE - src_off;
-        uint64_t dst_rem = PAGE_SIZE - dst_off;
-        uint64_t rem = (src_rem < dst_rem) ? src_rem : dst_rem;
-        if (rem > (length - done)) rem = length - done;
-
-        kernel_memcpy((void*)(PHYS_TO_VIRT(dst_phys) + dst_off),
-                      (void*)(PHYS_TO_VIRT(src_phys) + src_off), rem);
-        done += rem;
-    }
-}
-
-void* sys_mremap(void* old_addr, size_t old_len, size_t new_len, int flags, void* new_addr) {
-    struct task* current = get_current_task();
-    uint64_t old_base = (uint64_t)old_addr;
-    uint64_t old_size = align_up_page((uint64_t)old_len);
-    uint64_t new_size = align_up_page((uint64_t)new_len);
-    uint64_t* pml4;
-    uint64_t end;
-    uint64_t grow_size;
-    uint64_t first_phys;
-    uint64_t* first_pte;
-    int prot = PROT_READ;
-    void* mapped;
-
-    if (!current || !old_base || !old_len || !new_len) return (void*)-22;
-    if ((old_base & (PAGE_SIZE - 1)) != 0) return (void*)-22;
-    if (flags & ~(1 | 2)) return (void*)-22;
-    if ((flags & 2) && !(flags & 1)) return (void*)-22;
-
-    pml4 = (uint64_t*)PHYS_TO_VIRT(current->ctx.cr3);
-    if (!is_user_mmap_range_valid(old_base, old_size)) return (void*)-22;
-    first_phys = vmm_get_phys(pml4, old_base);
-    first_pte = lookup_user_pte(pml4, old_base);
-    if (!first_phys || !first_pte) return (void*)-22;
-    // A COW page reads as non-writable but was originally writable.
-    if (*first_pte & (PTE_WRITABLE | PTE_COW)) prot |= PROT_WRITE;
-    if (!(*first_pte & PTE_NX)) prot |= PROT_EXEC;
-
-    if (new_size == old_size) return old_addr;
-
-    if (new_size < old_size) {
-        for (uint64_t off = new_size; off < old_size; off += PAGE_SIZE) {
-            uint64_t phys = vmm_get_phys(pml4, old_base + off);
-            if (phys) {
-                unmap_one_page(pml4, old_base + off);
-            }
-        }
-        return old_addr;
-    }
-
-    end = old_base + old_size;
-    grow_size = new_size - old_size;
-    if (is_user_mmap_range_valid(end, grow_size) && is_range_unmapped(pml4, end, grow_size)) {
-        for (uint64_t off = 0; off < grow_size; off += PAGE_SIZE) {
-            void* phys = pmm_alloc(1);
-            if (!phys) return (void*)-12;
-            kernel_memset(PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
-            uint64_t map_flags = PTE_PRESENT | PTE_USER;
-            if (prot & PROT_WRITE) map_flags |= PTE_WRITABLE;
-            if (!(prot & PROT_EXEC)) map_flags |= PTE_NX;
-            vmm_map_page(pml4, end + off, (uint64_t)phys, map_flags);
-        }
-        return old_addr;
-    }
-
-    if (!(flags & 1)) return (void*)-12;
-
-    mapped = sys_mmap((flags & 2) ? new_addr : 0, new_len, prot,
-                      MAP_PRIVATE | MAP_ANONYMOUS | ((flags & 2) ? MAP_FIXED : 0), -1, 0);
-    if ((int64_t)(uint64_t)mapped < 0) return mapped;
-
-    copy_user_range(pml4, (uint64_t)mapped, old_base, old_size);
-    (void)sys_munmap(old_addr, old_len);
-    return mapped;
-}
+/* **sys_mremap は kernel/sys_mmap.c へ移した (2026-09-12)。**
+ * 保護を引き継ぐ部分は include/x86_64/vm.h の arch_vm_get_page_prot に
+ * 移してある (COW のページを「書けた」と読む判断もあちら) */
 
 /* **sys_mmap / sys_munmap は kernel/sys_mmap.c へ移した (2026-09-11)。**
  * aarch64 / riscv64 の linux_syscall.c 側と 2 実装あったものを 1 つにした。

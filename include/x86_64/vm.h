@@ -93,6 +93,21 @@ static inline int arch_vm_is_user_page(arch_address_space_t address_space, uint6
  * ここを通せばその心配が無い —— 書き込み可にするのは COW でないときだけで、
  * COW のページは読み取り専用のまま残り、書いた瞬間に COW のフォルト処理が
  * 写してから許可する (もとの kernel/x86_64/sys_vm.c の sys_mprotect と同じ)。 */
+/* **今の保護属性を読む (2026-09-12)。**mremap が伸ばした分や移した先に
+ * 元と同じ保護を引き継ぐのに要る。
+ *
+ * ★ **COW のページは「書けない」と読めるが、元は書けた。**そのまま読むと
+ * mremap した瞬間に書き込み可を失う。PTE_COW が立っていれば writable と
+ * 見なす (もとの kernel/x86_64/sys_vm.c の sys_mremap と同じ判断)。 */
+static inline int arch_vm_get_page_prot(arch_address_space_t address_space, uint64_t vaddr,
+                                        int* writable, int* executable) {
+    uint64_t* pte = x86_user_pte(address_space, vaddr);
+    if (!pte || !(*pte & PTE_PRESENT)) return -1;
+    if (writable) *writable = (*pte & (PTE_WRITABLE | PTE_COW)) != 0;
+    if (executable) *executable = (*pte & PTE_NX) == 0;
+    return 0;
+}
+
 static inline void arch_vm_protect_page(arch_address_space_t address_space, uint64_t vaddr,
                                         int writable, int executable) {
     uint64_t* pte = x86_user_pte(address_space, vaddr);

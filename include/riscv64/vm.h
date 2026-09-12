@@ -56,6 +56,8 @@ uint64_t arch_vm_get_phys(arch_address_space_t address_space, uint64_t vaddr);
 int arch_vm_is_user_page(arch_address_space_t address_space, uint64_t vaddr);
 void arch_vm_protect_page(arch_address_space_t address_space, uint64_t vaddr,
                           int writable, int executable);
+int arch_vm_get_page_prot(arch_address_space_t address_space, uint64_t vaddr,
+                          int* writable, int* executable);
 void arch_vm_unmap_page(arch_address_space_t address_space, uint64_t vaddr);
 void arch_vm_update_page_flags(arch_address_space_t address_space, uint64_t vaddr, uint64_t flags);
 

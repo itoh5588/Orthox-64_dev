@@ -313,3 +313,142 @@ int sys_mprotect(void* addr, size_t length, int prot) {
     if (prot & PROT_EXEC) arch_sync_icache_range((void*)(uintptr_t)base, size);
     return 0;
 }
+
+/* ---- mremap (3 アーキ共通) ------------------------------------------------
+ *
+ * **別実装 29 組のうちの 1 組を畳んだもの (2026-09-12)。**もとは
+ *
+ *     x86              kernel/x86_64/sys_vm.c の sys_mremap
+ *     aarch64/riscv64  kernel/linux_syscall.c の linux_bootstrap_sys_mremap
+ *
+ * の 2 つで、**動作が違っていた:**
+ *
+ * | | x86 | linux 側 |
+ * |---|---|---|
+ * | 古い範囲の検査 | 先頭 1 枚だけ | **全ページ** (2026-09-12 に塞いだ穴) |
+ * | **保護の引き継ぎ** | **先頭 PTE から読む** | **固定で rw / 実行不可** |
+ * | 移動時の写し | バイト単位 (ページ跨ぎ対応) | ページ単位 |
+ *
+ * **保護の引き継ぎは x86 側へ寄せた。**linux 側は移した先を必ず rw・実行不可に
+ * していたので、**実行可の範囲を mremap した瞬間に実行できなくなる。**
+ * 読み出しは arch_vm_get_page_prot に閉じ込めてある (x86 は COW のページを
+ * 「書けた」と読む必要がある。あちらのコメントを参照)。
+ *
+ * **範囲の検査は linux 側 (新しいほう) へ寄せた。**先頭 1 枚しか見ないと、
+ * riscv64 ではカーネルのページを縮小・移動できた (a3abd59)。
+ *
+ * 写しはページ単位でよい —— ここへ来る番地はすべてページ境界に揃っている。 */
+#define MREMAP_MAYMOVE_FLAG 1
+#define MREMAP_FIXED_FLAG   2
+
+void* sys_mremap(void* old_addr, size_t old_len, size_t new_len, int flags, void* new_addr) {
+    struct task* current = get_current_task();
+    arch_address_space_t as;
+    uint64_t old_base = (uint64_t)(uintptr_t)old_addr;
+    uint64_t old_size, new_size;
+    int writable = 1, executable = 0;
+    int prot;
+
+    if (!current) return mmap_err(LINUX_ESRCH);
+    if (!old_base || !old_len || !new_len) return mmap_err(LINUX_EINVAL);
+    if ((old_base & (PAGE_SIZE - 1ULL)) != 0) return mmap_err(LINUX_EINVAL);
+    if (flags & ~(MREMAP_MAYMOVE_FLAG | MREMAP_FIXED_FLAG)) return mmap_err(LINUX_EINVAL);
+    if ((flags & MREMAP_FIXED_FLAG) && !(flags & MREMAP_MAYMOVE_FLAG)) return mmap_err(LINUX_EINVAL);
+
+    old_size = mmap_align_up((uint64_t)old_len);
+    new_size = mmap_align_up((uint64_t)new_len);
+    as = arch_task_context_get_address_space(&current->ctx);
+
+    /* **古い範囲が全部このプロセスのページであることを先に確かめる。**
+     * 先頭 1 枚を get_phys != 0 で見るだけだった頃は、riscv64 で
+     * カーネルのページを縮小・移動できた (user/riscv64_errno_probe.c の
+     * mremap-kernel-shrink / mremap-kernel-ram)。
+     *
+     * munmap は VA の範囲で断っているが、**mremap は mprotect と同じく
+     * ページごとの U ビットで見る** —— Linux は ELF の段やスタックの
+     * mremap も認めるので、mmap の範囲には狭められない */
+    for (uint64_t off = 0; off < old_size; off += PAGE_SIZE) {
+        if (!arch_vm_is_user_page(as, old_base + off)) return mmap_err(LINUX_EINVAL);
+    }
+
+    /* **元の保護を引き継ぐ。**読めなければ「読み書き・実行不可」に倒す
+     * (musl の realloc はヒープにしか使わないので、そこが既定) */
+    if (arch_vm_get_page_prot(as, old_base, &writable, &executable) < 0) {
+        writable = 1;
+        executable = 0;
+    }
+    prot = PROT_READ | (writable ? PROT_WRITE : 0) | (executable ? PROT_EXEC : 0);
+
+    if (new_size == old_size) return old_addr;
+
+    /* 縮める: はみ出した分を外すだけ (munmap と同じ後始末) */
+    if (new_size < old_size) {
+        for (uint64_t off = new_size; off < old_size; off += PAGE_SIZE) {
+            mmap_drop_page(as, old_base + off);
+        }
+        arch_syscall_flush_tlb();
+        return old_addr;
+    }
+
+    /* 伸ばす: 直後が空いていればその場で足す (move 不要) */
+    {
+        uint64_t end = old_base + old_size;
+        uint64_t grow = new_size - old_size;
+        uint64_t map_flags;
+        int in_place = 1;
+
+        /* **その場で足せるのはユーザーの VA の中だけ。**越えたところへ貼ると
+         * Sv39 では添字が折り返してカーネル側の表を引く */
+        if (!mmap_range_valid(end, grow) || !mmap_range_unmapped(as, end, grow)) {
+            in_place = 0;
+        }
+        if (in_place) {
+            uint64_t mapped = 0;
+            map_flags = arch_vm_user_page_flags(writable, executable);
+            for (uint64_t off = 0; off < grow; off += PAGE_SIZE) {
+                void* phys = pmm_alloc(1);
+                if (!phys) {
+                    /* **足した分を剥がしてから返す** (mmap の巻き戻しと同じ) */
+                    for (uint64_t back = 0; back < mapped; back += PAGE_SIZE) {
+                        mmap_drop_page(as, end + back);
+                    }
+                    arch_syscall_flush_tlb();
+                    return mmap_err(LINUX_ENOMEM);
+                }
+                memset(PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
+                arch_vm_map_page(as, end + off, (uint64_t)(uintptr_t)phys, map_flags);
+                mapped += PAGE_SIZE;
+            }
+            arch_syscall_flush_tlb();
+            return old_addr;
+        }
+    }
+
+    if (!(flags & MREMAP_MAYMOVE_FLAG)) return mmap_err(LINUX_ENOMEM);
+
+    /* 直後に空きが無い: 新しい範囲を作り、中身を写してから古い方を外す */
+    {
+        void* mapped = sys_mmap((flags & MREMAP_FIXED_FLAG) ? new_addr : 0,
+                                (size_t)new_size, prot,
+                                MAP_PRIVATE | MAP_ANONYMOUS |
+                                ((flags & MREMAP_FIXED_FLAG) ? MAP_FIXED : 0),
+                                -1, 0);
+        uint64_t new_base;
+        if ((int64_t)(intptr_t)mapped < 0 && (int64_t)(intptr_t)mapped > -4096) return mapped;
+        new_base = (uint64_t)(uintptr_t)mapped;
+        for (uint64_t off = 0; off < old_size && off < new_size; off += PAGE_SIZE) {
+            uint64_t old_phys = arch_vm_get_phys(as, old_base + off);
+            uint64_t new_phys = arch_vm_get_phys(as, new_base + off);
+            if (old_phys && new_phys) {
+                memcpy((void*)(uintptr_t)PHYS_TO_VIRT(new_phys & ~(PAGE_SIZE - 1ULL)),
+                       (void*)(uintptr_t)PHYS_TO_VIRT(old_phys & ~(PAGE_SIZE - 1ULL)),
+                       PAGE_SIZE);
+            }
+        }
+        /* **実行可なら命令キャッシュを揃える。**写したばかりのページを
+         * そのまま実行しうる */
+        if (executable) arch_sync_icache_range((void*)(uintptr_t)new_base, new_size);
+        (void)sys_munmap(old_addr, (size_t)old_size);
+        return (void*)(uintptr_t)new_base;
+    }
+}
