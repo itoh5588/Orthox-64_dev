@@ -77,18 +77,43 @@ static int check_ramfs_full_write(void) {
         }
     }
 
+    /* **1MB を越えても書けること (2026-09-12 に期待を改めた)。**
+     *
+     * ここは以前「1MB を越えた write は EFBIG」を期待していたが、**RAMFS は
+     * P-13 (2026-08-31) でページ単位の動的成長に変わり、上限は空きメモリ
+     * だけになった** (kernel/fs.c の struct ramfs_file のコメント。50MB の
+     * ファイルを扱うための変更)。カーネルに EFBIG を返す経路は 1 つも無く、
+     * 足りなくなったときは ramfs_grow が ENOSPC を返す。
+     *
+     * **古い期待のままでは、この台本は永久に赤く、退行の門にならない。**
+     * 越えて書けることと、その 1 バイトが読み戻せることを見る形にした
+     * (P-13 の退行検査にもなる)。 */
     errno = 0;
-    if (write(fd, &extra, 1) != -1 || errno != EFBIG) {
+    if (write(fd, &extra, 1) != 1) {
         close(fd);
-        return fail("full RAMFS write should set EFBIG");
+        return fail("RAMFS write past 1MB should succeed (P-13)");
     }
 
     iov.iov_base = &extra;
     iov.iov_len = 1;
     errno = 0;
-    if (writev(fd, &iov, 1) != -1 || errno != EFBIG) {
+    if (writev(fd, &iov, 1) != 1) {
         close(fd);
-        return fail("full RAMFS writev should set EFBIG");
+        return fail("RAMFS writev past 1MB should succeed (P-13)");
+    }
+
+    /* 書いた 2 バイトが読み戻せること。**書けたと言うだけでは、
+     * 伸ばした頁が繋がっているかまでは分からない** */
+    {
+        char back[2] = { 0, 0 };
+        if (lseek(fd, (off_t)(256 * (int)sizeof(block)), SEEK_SET) < 0) {
+            close(fd);
+            return fail("lseek past 1MB failed");
+        }
+        if (read(fd, back, 2) != 2 || back[0] != extra || back[1] != extra) {
+            close(fd);
+            return fail("RAMFS read back past 1MB failed");
+        }
     }
 
     close(fd);
