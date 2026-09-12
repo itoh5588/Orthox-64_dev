@@ -332,8 +332,8 @@ static int virtio_blk_irq(int irq, void* ctx) {
     return 1;
 }
 
-static void vblk_fill_descriptors(struct vblk_request_ctx* req, uint32_t type,
-                                  uint64_t sector, void* buf, uint32_t len) {
+static int vblk_fill_descriptors(struct vblk_request_ctx* req, uint32_t type,
+                                 uint64_t sector, void* buf, uint32_t len) {
     vblk_assert_request_ctx(req);
     KASSERT(buf != 0);
     KASSERT(len > 0);
@@ -343,7 +343,39 @@ static void vblk_fill_descriptors(struct vblk_request_ctx* req, uint32_t type,
     uint16_t status = (uint16_t)(head + 2U);
     uint64_t data_phys = vmm_get_phys(vmm_get_kernel_pml4(), (uint64_t)(uintptr_t)buf);
     if (data_phys == 0) {
-        data_phys = VIRT_TO_PHYS(buf);
+        /* ★ **VIRT_TO_PHYS は HHDM の中の番地にしか使えない (2026-09-12)。**
+         *
+         * ここは引けなければ無条件に VIRT_TO_PHYS へ落ちていた。**ユーザー
+         * 空間のバッファが降りてくると、引き算の結果はただのゴミになる。**
+         * 実測 (OS 内カーネルビルド):
+         *
+         *   buf=0x000020000026E280  walk=0x0  hhdm=0xFFFF800000000000
+         *   -> used=0x0000A0000026E280   (約 176TB。RAM は 2GB)
+         *
+         * その記述子を積むと QEMU が dma_memory_map に失敗して
+         * `virtio: bogus descriptor or out of resources` を出し、
+         * **virtio_error() が装置を停止させる。**以後すべての read / write が
+         * 失敗し、/bin/as すら読めなくなっていた。
+         *
+         * 降りてくる道は kernel/fs.c の fs_read -> xv6fs_readi ->
+         * **xv6bio_rw_run (キャッシュを迂回してバッファへ直接 DMA)。**
+         * あちらは呼び手のバッファをそのまま渡す (kernel/xv6fs.c:841)。
+         *
+         * **ここでは弾くだけにする。**黙ってゴミを積むより、その 1 件を
+         * I/O エラーにして装置を生かすほうがよい。呼び手を直すのは別件 */
+        if ((uint64_t)(uintptr_t)buf >= g_hhdm_offset) {
+            data_phys = VIRT_TO_PHYS(buf);
+        } else {
+            static int told;
+            if (told < 4) {
+                told++;
+                puts("[vblk] refusing non-kernel buffer: buf=0x");
+                puthex((uint64_t)(uintptr_t)buf);
+                puts(" len=0x"); puthex(len);
+                puts("\r\n");
+            }
+            return -1;
+        }
     }
     KASSERT(data_phys != 0);
 
@@ -366,6 +398,7 @@ static void vblk_fill_descriptors(struct vblk_request_ctx* req, uint32_t type,
     g_vblk_q.desc[status].len = 1;
     g_vblk_q.desc[status].flags = VRING_DESC_F_WRITE;
     g_vblk_q.desc[status].next = 0;
+    return 0;
 }
 
 static void vblk_submit_request(struct vblk_request_ctx* req) {
@@ -432,7 +465,11 @@ static int vblk_request(uint32_t type, uint64_t sector, void* buf, uint32_t len)
     req = vblk_acquire_request();
     if (!req) return -1;
 
-    vblk_fill_descriptors(req, type, sector, buf, len);
+    /* **積めない要求は積まない。**不正な物理アドレスを積むと QEMU が
+     * 装置ごと止める (vblk_fill_descriptors のコメントを参照) */
+    if (vblk_fill_descriptors(req, type, sector, buf, len) < 0) {
+        goto out;
+    }
     vblk_submit_request(req);
 
     if (vblk_wait_request(req) < 0) {
