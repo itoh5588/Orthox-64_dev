@@ -1,4 +1,10 @@
 # Orthox-64 カーネル ネイティブビルド Makefile
+#
+# **ソース一覧は host の Makefile の X86_64_SRCS / SYSCALL_SRCS / CORE_SRCS と
+# 同じものを並べる (2026-09-12 に合わせ直した)。**3 アーキ統合で x86 のファイルが
+# kernel/x86_64/ へ移ったのに、ここは平坦な kernel/ のままだった。そのため
+# OS 内ビルドは「No rule to make target '/kbuild/kernel/init.o'」で止まり、
+# x86-kernel-smoke の kernel-native-build: PASS が出せない状態が続いていた。
 # Orthox-64 上で実行: make -f /src/kernel-build/Makefile
 
 SRCDIR  ?= /src/kernel-build
@@ -27,23 +33,28 @@ CC1FLAGS = \
 KERNEL_LDFLAGS = -nostdlib -static -T $(SRCDIR)/scripts/kernel.ld
 
 KERNEL_C_SRCS = \
-    kernel/init.c kernel/kassert.c kernel/pmm.c kernel/elf.c kernel/gdt.c \
-    kernel/vmm.c kernel/idt.c kernel/lapic.c kernel/sound.c \
-    kernel/syscall.c kernel/sys_trace.c kernel/sys_time.c kernel/sys_signal.c kernel/sys_vm.c \
-    kernel/sys_proc.c kernel/sys_fs.c kernel/sys_device.c kernel/sys_random.c kernel/sys_net.c \
-    kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c \
-    kernel/wait.c kernel/bottom_half.c kernel/irq.c \
-    kernel/fs.c kernel/vfs.c kernel/storage.c kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c \
-    kernel/pic.c kernel/keyboard.c kernel/pci.c kernel/net.c \
-    kernel/net_socket.c kernel/virtio.c kernel/virtio_net.c \
-    kernel/virtio_blk.c kernel/lwip_port.c kernel/cstring.c \
-    kernel/cstdio.c kernel/cstdlib.c kernel/usb.c kernel/smp.c kernel/spinlock.c
+    kernel/x86_64/init.c kernel/x86_64/kassert.c kernel/x86_64/pmm.c \
+    kernel/x86_64/gdt.c kernel/x86_64/vmm.c kernel/x86_64/idt.c \
+    kernel/x86_64/lapic.c kernel/x86_64/pic.c kernel/x86_64/smp.c \
+    kernel/x86_64/spinlock.c kernel/x86_64/keyboard.c kernel/x86_64/pci.c \
+    kernel/x86_64/sound.c kernel/x86_64/uname.c kernel/x86_64/rng.c \
+    kernel/x86_64/pcstat.c kernel/x86_64/sys_vm.c kernel/x86_64/sys_time.c \
+    kernel/x86_64/sys_device.c kernel/x86_64/syscall_msr.c \
+    kernel/x86_64/virtio.c kernel/x86_64/virtio_net.c kernel/x86_64/virtio_blk.c \
+    kernel/syscall.c kernel/sys_trace.c kernel/sys_signal.c \
+    kernel/sys_proc.c kernel/sys_fs.c kernel/sys_random.c kernel/sys_net.c \
+    kernel/irq.c kernel/bottom_half.c \
+    kernel/elf.c kernel/task.c kernel/task_exec.c kernel/task_fork.c \
+    kernel/sys_mmap.c kernel/sched.c kernel/wait.c kernel/fs.c kernel/vfs.c \
+    kernel/storage.c kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c \
+    kernel/net.c kernel/net_socket.c kernel/lwip_port.c \
+    kernel/cstring.c kernel/cstdio.c kernel/cstdlib.c kernel/usb.c
 
 KERNEL_S_SRCS = \
-    kernel/gdt_flush.S \
-    kernel/interrupt.S \
-    kernel/syscall_entry.S \
-    kernel/task_switch.S
+    kernel/x86_64/gdt_flush.S \
+    kernel/x86_64/interrupt.S \
+    kernel/x86_64/syscall_entry.S \
+    kernel/x86_64/task_switch.S
 
 LWIP_SRCS = \
     ports/lwip/src/core/def.c \

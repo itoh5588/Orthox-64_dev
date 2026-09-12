@@ -1493,7 +1493,7 @@ $(ROOTFS_IMG): FORCE busybox-ash-musl-install $(ROOTFS_FILES) $(USER_BUILD_DIR)/
 			cp $(DYNLINK_LIB_B_SO) rootfs/lib/libdyn_b.so; \
 			cp $(DYNLINK_PLUGIN_SO) rootfs/lib/libdyn_plugin.so; \
 			cp $(DYNLINK_CPP_SO) rootfs/lib/libdyn_cpp.so; \
-			mkdir -p rootfs/kbuild/kernel rootfs/kbuild/lwip/core/ipv4 rootfs/kbuild/lwip/netif; \
+			mkdir -p rootfs/kbuild/kernel/x86_64 rootfs/kbuild/lwip/core/ipv4 rootfs/kbuild/lwip/netif; \
 			KBUILD=rootfs/src/kernel-build; \
 			rm -rf "$$KBUILD"; \
 			mkdir -p "$$KBUILD/ports/lwip/src"; \
