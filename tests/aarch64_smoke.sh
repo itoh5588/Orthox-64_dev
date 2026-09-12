@@ -521,12 +521,18 @@ self_test() {
     # check_one の中の 13 か所
     selftest_probe "bss zero  : BAD"               "  bss zero  : BAD"                    "$good_el1"
     selftest_probe "aarch64-dtb-BAD"               "aarch64-dtb-BAD"                      "$good_el1"
-    selftest_probe "(既定値)"                       "  uart      : 0x9000000  (既定値)"     "$good_el1"
+    # **注入する行はカーネルが実際に出す文字列にする (2026-09-12)。**ここは
+    # 日本語の「(既定値)」を注入していたが、kernel/aarch64/boot.c:405 が出すのは
+    # "  (default)" なので、判定 (must_not "(default)") が火を噴きようがなく
+    # **空振りしていた** —— 検査が死んでいることに気付けない形になっていた
+    selftest_probe "(default)"                     "  uart      : 0x9000000  (default)"    "$good_el1"
     selftest_probe "aarch64-timer-BAD"             "aarch64-timer-BAD"                    "$good_el1"
     selftest_probe "aarch64-mmu-BAD"               "aarch64-mmu-BAD"                      "$good_el1"
     selftest_probe "aarch64-shared-BAD"            "aarch64-shared-BAD"                   "$good_el1"
     selftest_probe "行の分断 ([EL0] が行頭でない)"  "  el0 ticks : 0x14  [EL0] resumed"     "$good_el1"
-    selftest_probe "BAD (前の空間の値が見えている)" "  marker : 0x1  BAD (前の空間の値が見えている)" "$good_el1"
+    # 同上。kernel/aarch64/usermode.c:450 が出すのは英語の
+    # "BAD (previous address space value is visible)"
+    selftest_probe "BAD (previous address space value is visible)" "  svc calls : 0x0000000000000005  marker    : 0x0000000000000001  BAD (previous address space value is visible)" "$good_el1"
     selftest_probe "aarch64-user-BAD"              "aarch64-user-BAD"                     "$good_el1"
     selftest_probe "aarch64-sched-BAD"             "aarch64-sched-BAD"                    "$good_el1"
     selftest_probe "aarch64-fs-BAD"                "aarch64-fs-BAD"                       "$good_el1"
