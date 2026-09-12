@@ -545,9 +545,6 @@ int arch_console_onlcr_enabled(void) {
     return (g_linux_console_termios.c_oflag & 0x00000001u) != 0;
 }
 
-static uint64_t linux_align_up_page(uint64_t value) {
-    return (value + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
-}
 
 static int64_t linux_bootstrap_sys_write(int fd, const void* buf, size_t count) {
     return sys_write(fd, buf, count);
@@ -657,53 +654,11 @@ static int64_t linux_bootstrap_sys_readv(int fd, const struct linux_iovec* iov, 
     return total;
 }
 
-/* ユーザーに配るページを 1 枚取って 0 で埋め、**物理アドレス**を返す。
- * 取れなければ 0。
- *
- * **pmm_alloc が返すのは物理アドレスなので、そのまま触ってはいけない。**
- * ここは元々 kernel/riscv64/syscall.c に居たコードで、riscv64 は
- * g_hhdm_offset が 0 (恒等) なため直書きでも動いていた。aarch64 は
- * 恒等マッピングを外して上位 VA だけで走るので、載せた瞬間に落ちる:
- *
- *   ESR=0x96000045  EC=0x25 (EL1 のデータアボート)
- *                   DFSC=0x05 translation fault level 1, WnR=1
- *   FAR=0x000000004036c000  (= 物理アドレスそのもの)
- *
- * **オフセット 0 を暗黙に前提にした共有コードだった。** brk と mmap が
- * 同じ書き方をしていたので 1 か所にまとめる */
-static uint64_t linux_alloc_zeroed_user_page(void) {
-    uint64_t phys = (uint64_t)(uintptr_t)pmm_alloc(1);
-    uint8_t* mapped;
-    if (!phys) return 0;
-    mapped = (uint8_t*)PHYS_TO_VIRT(phys);
-    for (uint64_t i = 0; i < PAGE_SIZE; i++) mapped[i] = 0;
-    return phys;
-}
 
-static uint64_t linux_bootstrap_sys_brk(uint64_t addr) {
-    struct task* current = get_current_task();
-    uint64_t current_page;
-    uint64_t target_page;
-    arch_address_space_t address_space;
-
-    if (!current) return 0;
-    if (addr == 0 || addr <= current->heap_break) return current->heap_break;
-
-    current_page = linux_align_up_page(current->heap_break);
-    target_page = linux_align_up_page(addr);
-    address_space = arch_task_context_get_address_space(&current->ctx);
-
-    while (current_page < target_page) {
-        uint64_t phys = linux_alloc_zeroed_user_page();
-        if (!phys) return current->heap_break;
-        arch_vm_map_page(address_space, current_page, phys, arch_vm_user_page_flags(1, 0));
-        current_page += PAGE_SIZE;
-    }
-
-    current->heap_break = addr;
-    arch_syscall_flush_tlb();
-    return current->heap_break;
-}
+/* **brk(2) は kernel/sys_mmap.c へ移した (2026-09-12)。**
+ * x86 (kernel/x86_64/sys_vm.c) と 2 実装あり、**ここには mmap の領域へ
+ * 食い込ませない番人が無かった。**経緯は kernel/sys_mmap.c の sys_brk の冒頭 */
+uint64_t sys_brk(uint64_t addr);
 
 /* munmap は kernel/sys_mmap.c の sys_munmap (3 アーキ共通, 2026-09-11)。
  * ここに在った版は範囲を見ておらず、riscv64 ではユーザーからカーネルの
@@ -1584,7 +1539,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                                                                      (void*)(uintptr_t)arch_syscall_arg4(frame)));
             return;
         case LINUX_SYS_BRK:
-            arch_syscall_set_return(frame, linux_bootstrap_sys_brk(arch_syscall_arg0(frame)));
+            arch_syscall_set_return(frame, sys_brk(arch_syscall_arg0(frame)));
             return;
         case LINUX_SYS_MPROTECT:
             arch_syscall_set_return(frame,

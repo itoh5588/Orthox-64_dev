@@ -452,3 +452,77 @@ void* sys_mremap(void* old_addr, size_t old_len, size_t new_len, int flags, void
         return (void*)(uintptr_t)new_base;
     }
 }
+
+/* ---- brk (3 アーキ共通) ----------------------------------------------------
+ *
+ * **別実装 29 組のうちの 1 組を畳んだもの (2026-09-12)。**もとは
+ *
+ *     x86              kernel/x86_64/sys_vm.c の sys_brk
+ *     aarch64/riscv64  kernel/linux_syscall.c の linux_bootstrap_sys_brk
+ *
+ * の 2 つで、**動作が違っていた:**
+ *
+ * | | x86 | linux 側 |
+ * |---|---|---|
+ * | mmap 領域へ食い込む brk | **断る** | **通る** |
+ * | TLB | vmm_map_page の invlpg 任せ | 一括で捨てる |
+ * | 追跡 | memtrace あり | 無し |
+ *
+ * **x86 側へ寄せた。**ヒープを伸ばし続けると mmap の下端に届く。断らないと
+ * **brk が mmap で貼った範囲を上書きする。**下端はどのアーキも
+ * USER_MMAP_BASE_VADDR に揃えてある (2026-09-11 に x86 の MMAP_BASE_ADDR と
+ * 一致させた)。
+ *
+ * **失敗の伝え方は brk(2) の流儀そのまま** —— 途中で足りなくなったら
+ * 古い break を返す。呼び手は「変わっていない」ことで失敗を知る。 */
+
+/* x86 だけが持つ追跡 (kernel/sys_trace.c の系)。他のアーキでは何もしない */
+__attribute__((weak)) void syscall_memtrace_brk(uint64_t requested, uint64_t old_brk,
+                                                uint64_t new_brk, uint64_t pages) {
+    (void)requested; (void)old_brk; (void)new_brk; (void)pages;
+}
+
+uint64_t sys_brk(uint64_t addr) {
+    struct task* current = get_current_task();
+    arch_address_space_t as;
+    uint64_t old_break;
+    uint64_t current_page;
+    uint64_t target_page;
+    uint64_t pages = 0;
+    uint64_t map_flags;
+
+    if (!current) return 0;
+    old_break = current->heap_break;
+
+    /* **mmap の領域へ食い込ませない。**変わらない break を返すのが brk の
+     * 失敗の伝え方 (もとの x86 の sys_brk と同じ) */
+    if (addr == 0 || addr <= old_break || addr >= USER_MMAP_BASE_VADDR) {
+        syscall_memtrace_brk(addr, old_break, old_break, 0);
+        return old_break;
+    }
+
+    current_page = mmap_align_up(old_break);
+    target_page = mmap_align_up(addr);
+    as = arch_task_context_get_address_space(&current->ctx);
+    map_flags = arch_vm_user_page_flags(1, 0);
+
+    while (current_page < target_page) {
+        void* phys = pmm_alloc(1);
+        if (!phys) {
+            /* **貼った分はそのまま残す。**break を伸ばさないので、
+             * ユーザーからは見えない範囲になるだけ (もとの両実装と同じ) */
+            arch_syscall_flush_tlb();
+            syscall_memtrace_brk(addr, old_break, old_break, pages);
+            return old_break;
+        }
+        memset(PHYS_TO_VIRT(phys), 0, PAGE_SIZE);
+        arch_vm_map_page(as, current_page, (uint64_t)(uintptr_t)phys, map_flags);
+        current_page += PAGE_SIZE;
+        pages++;
+    }
+
+    current->heap_break = addr;
+    arch_syscall_flush_tlb();
+    syscall_memtrace_brk(addr, old_break, current->heap_break, pages);
+    return current->heap_break;
+}

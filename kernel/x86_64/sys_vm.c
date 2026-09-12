@@ -21,11 +21,6 @@ void sys_brk_init(uint64_t initial_break) {
     (void)initial_break;
 }
 
-static void* kernel_memset(void* s, int c, size_t n) {
-    unsigned char* p = s;
-    while (n--) *p++ = (unsigned char)c;
-    return s;
-}
 
 
 #if ORTHOX_MEM_TRACE
@@ -79,35 +74,13 @@ static void memtrace_brk(uint64_t requested, uint64_t old_brk, uint64_t new_brk,
 void* sys_mmap(void* addr, size_t length, int prot, int flags, int fd, int64_t offset);
 int sys_munmap(void* addr, size_t length);
 
-uint64_t sys_brk(uint64_t addr) {
-    struct task* current = get_current_task();
-    uint64_t old_break;
-    uint64_t pages = 0;
-    if (!current) return 0;
-    old_break = current->heap_break;
-    // Refuse breaks that would run into the mmap region; the caller sees the
-    // unchanged break, which is how brk() reports failure.
-    if (addr == 0 || addr <= current->heap_break || addr >= MMAP_BASE_ADDR) {
-        memtrace_brk(addr, old_break, current->heap_break, 0);
-        return current->heap_break;
-    }
-    uint64_t current_page = (current->heap_break + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
-    uint64_t target_page = (addr + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
-    uint64_t* pml4 = (uint64_t*)PHYS_TO_VIRT(current->ctx.cr3);
-    while (current_page < target_page) {
-        void* phys_mem = pmm_alloc(1);
-        if (!phys_mem) {
-            puts("[sys_brk] pmm_alloc failed!\r\n");
-            return current->heap_break;
-        }
-        kernel_memset(PHYS_TO_VIRT(phys_mem), 0, PAGE_SIZE);
-        vmm_map_page(pml4, current_page, (uint64_t)phys_mem, PTE_PRESENT | PTE_WRITABLE | PTE_USER);
-        current_page += PAGE_SIZE;
-        pages++;
-    }
-    current->heap_break = addr;
-    memtrace_brk(addr, old_break, current->heap_break, pages);
-    return current->heap_break;
+/* **sys_brk は kernel/sys_mmap.c へ移した (2026-09-12)。**
+ * mmap の領域へ食い込ませない番人はあちらへ持って行った (linux 側には
+ * 無かった)。**追跡はここに残す** —— memtrace は x86 だけの仕掛けで、
+ * 共通版は weak な syscall_memtrace_brk を呼ぶだけにしてある */
+void syscall_memtrace_brk(uint64_t requested, uint64_t old_brk,
+                          uint64_t new_brk, uint64_t pages) {
+    memtrace_brk(requested, old_brk, new_brk, pages);
 }
 
 int sys_madvise(void* addr, size_t len, int advice) {
