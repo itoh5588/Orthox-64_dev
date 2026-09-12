@@ -829,7 +829,9 @@ AARCH64_MUSL_SYSROOT = ports/musl-install-aarch64
 # libc.so を作るのに要るコンパイラランタイム (__lttf2 等の binary128 ヘルパ)。
 # clang は compiler-rt の名前を答えるが aarch64 版が入っていないので、
 # 手持ちのクロス GCC のものを使う
-AARCH64_LIBGCC = ports/cross-aarch64/lib/gcc/aarch64-linux-musl/4.7.4/libgcc.a
+# クロス GCC を組んでいない機械では、compiler-rt から作った soft-float の
+# 組み込み関数に落ちる (scripts/build_softfloat_builtins.sh aarch64。2026-09-12)
+AARCH64_LIBGCC = $(shell if [ -f ports/cross-aarch64/lib/gcc/aarch64-linux-musl/4.7.4/libgcc.a ]; then printf %s ports/cross-aarch64/lib/gcc/aarch64-linux-musl/4.7.4/libgcc.a; else printf %s ports/builtins-aarch64/libgcc.a; fi)
 AARCH64_MUSL_CFLAGS = --target=aarch64-linux-musl -ffreestanding \
 	-fno-PIE -O2 -I$(AARCH64_MUSL_SYSROOT)/include -MMD -MP
 # **リンカスクリプトは使わない。** user-aarch64.ld は hello 専用で
@@ -1094,6 +1096,12 @@ aarch64-smoke-selftest: $(AARCH64_KERNEL_ELF) $(AARCH64_USER_HELLO)
 AARCH64_MUSL_CC_DRIVER ?= ports/orthos-aarch64-musl-gcc.sh
 AARCH64_CROSS_BIN ?= $(abspath ports/cross-aarch64/bin)
 AARCH64_CROSS_TOOL_PREFIX ?= $(AARCH64_CROSS_BIN)/aarch64-linux-musl-
+# **クロス GCC を組んでいない機械では LLVM の道具に落ちる (2026-09-12)。**
+# ar / ranlib / strip はどれもアーキ非依存 (llvm-ar は ELF なら何でも扱える)。
+# riscv64 は前から RISCV64_LLVM_AR などで同じことをしている
+AARCH64_BB_AR ?= $(shell if [ -x $(AARCH64_CROSS_BIN)/aarch64-linux-musl-ar ]; then printf %s $(AARCH64_CROSS_BIN)/aarch64-linux-musl-ar; else printf llvm-ar; fi)
+AARCH64_BB_RANLIB ?= $(shell if [ -x $(AARCH64_CROSS_BIN)/aarch64-linux-musl-ranlib ]; then printf %s $(AARCH64_CROSS_BIN)/aarch64-linux-musl-ranlib; else printf llvm-ranlib; fi)
+AARCH64_BB_STRIP ?= $(shell if [ -x $(AARCH64_CROSS_BIN)/aarch64-linux-musl-strip ]; then printf %s $(AARCH64_CROSS_BIN)/aarch64-linux-musl-strip; else printf llvm-strip; fi)
 AARCH64_BUSYBOX_ASH_MUSL_ELF = out/busybox-aarch64-musl.elf
 
 aarch64-busybox-musl: $(AARCH64_MUSL_SYSROOT)/lib/libc.a
@@ -1102,9 +1110,9 @@ aarch64-busybox-musl: $(AARCH64_MUSL_SYSROOT)/lib/libc.a
 	ORTHOS_SYSROOT=$(abspath $(AARCH64_MUSL_SYSROOT)) \
 	ORTHOS_INCLUDEDIR=$(abspath $(AARCH64_MUSL_SYSROOT))/include \
 	ORTHOS_EXTRA_CFLAGS="-DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_LINEEDIT_PTR_HACK=1 -DORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS=1" \
-	ORTHOS_AR="$(AARCH64_CROSS_TOOL_PREFIX)ar" \
-	ORTHOS_RANLIB="$(AARCH64_CROSS_TOOL_PREFIX)ranlib" \
-	ORTHOS_STRIP="$(AARCH64_CROSS_TOOL_PREFIX)strip" \
+	ORTHOS_AR="$(AARCH64_BB_AR)" \
+	ORTHOS_RANLIB="$(AARCH64_BB_RANLIB)" \
+	ORTHOS_STRIP="$(AARCH64_BB_STRIP)" \
 	./ports/build_busybox_ash.sh $(abspath ports/busybox) $(abspath $(AARCH64_BUSYBOX_ASH_MUSL_ELF))
 
 # 最初のユーザープロセスとして ash を exec する。

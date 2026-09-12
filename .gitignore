@@ -175,3 +175,6 @@ ports/.prereq-aarch64/
 out/aarch64-selfhost-fs/
 ports/make-4.4.1-aarch64/
 out/pi4-boot/
+
+# scripts/build_softfloat_builtins.sh が作る (ビルド成果物)
+ports/builtins-*/

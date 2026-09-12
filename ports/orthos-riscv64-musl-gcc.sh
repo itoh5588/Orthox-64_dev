@@ -35,17 +35,29 @@ if ! CLANG_BIN="$(pick_tool "${ORTHOS_RISCV64_CLANG:-}" \
     exit 1
 fi
 
-# riscv64 の gcc は libgcc.a の在処を引くためだけに使う
-if ! RVGCC_BIN="$(pick_tool "${ORTHOS_RISCV64_GCC:-}" \
+# riscv64 の gcc は libgcc.a の在処を引くためだけに使う。
+#
+# **gcc が無くても、足りない分だけ自前で組んであれば済む (2026-09-12)。**
+# clang は long double (binary128) の演算を libgcc / compiler-rt に外注するが、
+# この機械の clang にはクロスの builtins が入っていない。必要なのは
+# __addtf3 / __divtf3 / __extenddftf2 など **15 個だけ**だったので、
+# scripts/build_softfloat_builtins.sh が compiler-rt から作る。
+# これで **クロス GCC 4.7.4 を一式移植しなくても riscv64 の busybox が組める**
+# (あちらは ports/gcc-4.6.4-riscv というフォークの木を要求する)。
+OWN_BUILTINS="$ROOT/ports/builtins-riscv64/libgcc.a"
+if RVGCC_BIN="$(pick_tool "${ORTHOS_RISCV64_GCC:-}" \
         "$ROOT/ports/cross-riscv64/bin/riscv64-linux-musl-gcc" \
         riscv64-linux-musl-gcc riscv64-elf-gcc \
         /opt/homebrew/bin/riscv64-elf-gcc)"; then
-    echo "error: riscv64 の gcc が見つからない (libgcc.a の在処を引くのに要る)。" >&2
-    echo "       ports/build_gcc474_riscv_stage2.sh を通すか ORTHOS_RISCV64_GCC で指定すること" >&2
+    LIBGCC="$("$RVGCC_BIN" -march=rv64gc -mabi=lp64d -print-libgcc-file-name)"
+elif [ -f "$OWN_BUILTINS" ]; then
+    LIBGCC="$OWN_BUILTINS"
+else
+    echo "error: riscv64 の libgcc が無い。" >&2
+    echo "       scripts/build_softfloat_builtins.sh riscv64 を通すか、" >&2
+    echo "       ports/build_gcc474_riscv_stage2.sh / ORTHOS_RISCV64_GCC で指定すること" >&2
     exit 1
 fi
-
-LIBGCC="$("$RVGCC_BIN" -march=rv64gc -mabi=lp64d -print-libgcc-file-name)"
 LIBGCC_DIR="$(dirname "$LIBGCC")"
 
 raw_args=("$@")
