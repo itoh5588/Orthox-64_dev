@@ -61,7 +61,8 @@ void syscall_dispatch(arch_syscall_frame_t* frame) {
             frame->rax = (uint64_t)fs_readlinkat((int)frame->rdi, (const char*)frame->rsi, (char*)frame->rdx, (size_t)frame->r10);
             break;
         case SYS_FACCESSAT:
-            frame->rax = (uint64_t)sys_faccessat((int)frame->rdi, (const char*)frame->rsi, (int)frame->rdx, (int)frame->r10);
+            /* **引数は 3 つ。**r10 は flags ではない (kernel/sys_access.c の冒頭) */
+            frame->rax = (uint64_t)sys_faccessat((int)frame->rdi, (const char*)frame->rsi, (int)frame->rdx, 0);
             break;
         case SYS_UTIMENSAT:
             frame->rax = (uint64_t)sys_utimensat((int)frame->rdi, (const char*)frame->rsi,

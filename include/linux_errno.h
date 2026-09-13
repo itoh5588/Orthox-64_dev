@@ -22,6 +22,9 @@
 #define LINUX_ECHILD      10
 #define LINUX_EAGAIN      11
 #define LINUX_ENOMEM      12
+/* faccessat で実行ビットが無いとき (kernel/sys_access.c)。x86 の kernel/fs.c が
+ * 自前の EACCES を使っていたが、共有層から見える名前が無かった */
+#define LINUX_EACCES      13
 #define LINUX_EFAULT      14
 #define LINUX_EEXIST      17
 /* パイプを mmap しようとしたとき (kernel/sys_mmap.c)。x86 が生の -19 で

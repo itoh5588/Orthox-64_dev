@@ -207,5 +207,14 @@ struct linux_sysinfo {
 /* *at 系のディレクトリ fd。musl と同じ値 */
 #define LINUX_AT_FDCWD             (-100)
 #define LINUX_AT_EMPTY_PATH        0x1000
+/* faccessat / fstatat (kernel/sys_access.c)。値は musl / Linux 汎用 ABI と同じ。
+ * AT_EACCESS は AT_REMOVEDIR と同じ 0x200 だが、faccessat と unlinkat は
+ * 別々の flags を受け取るので衝突しない */
+#define LINUX_AT_SYMLINK_NOFOLLOW  0x100
+#define LINUX_AT_EACCESS           0x200
+#define LINUX_F_OK                 0
+#define LINUX_X_OK                 1
+#define LINUX_W_OK                 2
+#define LINUX_R_OK                 4
 
 #endif

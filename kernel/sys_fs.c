@@ -100,10 +100,6 @@ int sys_access(const char* path, int mode) {
     return fs_access(path, mode);
 }
 
-int sys_faccessat(int dirfd, const char* path, int mode, int flags) {
-    return fs_faccessat(dirfd, path, mode, flags);
-}
-
 int64_t sys_readlink(const char* path, char* buf, size_t bufsiz) {
     return fs_readlink(path, buf, bufsiz);
 }

@@ -1738,13 +1738,11 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                                 (unsigned int)arch_syscall_arg4(frame)));
             return;
         case LINUX_SYS_FACCESSAT:
-            {
-                struct kstat st;
-                int dirfd = (int)arch_syscall_arg0(frame);
-                const char* path = (const char*)(uintptr_t)arch_syscall_arg1(frame);
-                int rc = sys_fstatat(dirfd, path, &st, 0);
-                arch_syscall_set_return(frame, (uint64_t)(int64_t)(rc == 0 ? 0 : -2));
-            }
+            /* **引数は 3 つ。**第 4 レジスタは flags ではない (kernel/sys_access.c) */
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)sys_faccessat((int)arch_syscall_arg0(frame),
+                                                                     (const char*)(uintptr_t)arch_syscall_arg1(frame),
+                                                                     (int)arch_syscall_arg2(frame), 0));
             return;
         case LINUX_SYS_EXIT:
         case LINUX_SYS_EXIT_GROUP:
