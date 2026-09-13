@@ -70,6 +70,8 @@ int sys_setpgid(int pid, int pgid);
 int sys_setsid(void);
 int sys_tcgetpgrp(int fd);
 int sys_tcsetpgrp(int fd, int pgrp);
+void tty_pgrp_set(int pgrp);
+int tty_pgrp_peek(void);
 int sys_open(const char* path, int flags, int mode);
 int sys_openat(int dirfd, const char* path, int flags, int mode);
 int64_t sys_read(int fd, void* buf, size_t count);

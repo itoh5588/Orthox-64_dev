@@ -97,8 +97,6 @@ int sys_kill(int pid, int sig) {
     return 0;
 }
 
-static int g_tty_pgrp = 0;
-
 int sys_getpgrp(void) {
     struct task* current = get_current_task();
     return current ? current->pgid : -LINUX_ESRCH;
@@ -124,29 +122,6 @@ int sys_setsid(void) {
     if (current->pgid == current->pid) return -LINUX_EPERM;
     current->sid = current->pid;
     current->pgid = current->pid;
-    g_tty_pgrp = current->pgid;
+    tty_pgrp_set(current->pgid);
     return current->sid;
-}
-
-int sys_tcgetpgrp(int fd) {
-    (void)fd;
-    if (g_tty_pgrp == 0) {
-        struct task* current = get_current_task();
-        if (current) g_tty_pgrp = current->pgid;
-    }
-    return g_tty_pgrp;
-}
-
-int sys_tcsetpgrp(int fd, int pgrp) {
-    (void)fd;
-    g_tty_pgrp = pgrp;
-    return 0;
-}
-
-int tty_get_foreground_pgrp(void) {
-    if (g_tty_pgrp == 0) {
-        struct task* current = get_current_task();
-        if (current) g_tty_pgrp = current->pgid;
-    }
-    return g_tty_pgrp;
 }

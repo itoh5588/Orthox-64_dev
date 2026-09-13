@@ -97,28 +97,9 @@ int64_t sys_sleep_ms(uint64_t ms) {
     return 0;
 }
 
-/* ---- 端末のフォアグラウンドプロセスグループ ------------------------------
- *
- * kernel/sys_proc.c も x86 の MSR 操作を直書きしていて通らない。
- * 必要なのは tcgetpgrp / tcsetpgrp の 2 本だけなのでここに置く。
- * **ジョブ制御はまだ無い**ので、値を覚えるだけ (ash は取得できれば動く) */
-static int g_tty_pgrp;
-
-int sys_tcgetpgrp(int fd) {
-    (void)fd;
-    if (g_tty_pgrp == 0) {
-        struct task* cur = get_current_task();
-        g_tty_pgrp = cur ? cur->pgid : 1;
-    }
-    return g_tty_pgrp;
-}
-
-int sys_tcsetpgrp(int fd, int pgrp) {
-    (void)fd;
-    if (pgrp <= 0) return -22;   /* EINVAL */
-    g_tty_pgrp = pgrp;
-    return 0;
-}
+/* tcgetpgrp / tcsetpgrp は kernel/sys_tty.c (3 アーキ共有) に統合した。
+ * 以前は kernel/sys_proc.c が x86 の MSR 操作を直書きしていてリンクできず
+ * ここに複製していたが、sys_tty.c を独立させたことで共有できるようになった */
 
 /* ---- 私物 syscall (ORTH_SYS_*) -------------------------------------------
  *

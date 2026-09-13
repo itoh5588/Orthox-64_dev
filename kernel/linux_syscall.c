@@ -323,7 +323,6 @@ static int linux_sys_umask(int mask) {
 
 
 
-static int g_linux_tty_pgrp;
 static struct linux_termios g_linux_console_termios = {
     .c_iflag = 0x00000002u,
     .c_oflag = 0x00000001u,
@@ -376,7 +375,7 @@ int linux_console_is_intr_char(uint8_t ch) {
  * それぞれの子を片付ける。 */
 void linux_console_deliver_intr(uint8_t ch) {
     struct task* t = task_list;
-    int fg = g_linux_tty_pgrp;
+    int fg = tty_pgrp_peek();
     int sig = (ch == (uint8_t)g_linux_console_termios.c_cc[1]) ? LINUX_SIGQUIT : LINUX_SIGINT;
     int victim_pids[64];
     int nvictims = 0;
@@ -682,16 +681,11 @@ static int64_t linux_bootstrap_sys_ioctl(int fd, unsigned long request, uint64_t
             return 0;
         case LINUX_TIOCGPGRP:
             if (!arg) return -LINUX_EFAULT;
-            if (g_linux_tty_pgrp == 0) {
-                struct task* current = get_current_task();
-                if (current) g_linux_tty_pgrp = current->pgid;
-            }
-            *(int*)(uintptr_t)arg = g_linux_tty_pgrp;
+            *(int*)(uintptr_t)arg = sys_tcgetpgrp(fd);
             return 0;
         case LINUX_TIOCSPGRP:
             if (!arg) return -LINUX_EFAULT;
-            g_linux_tty_pgrp = *(const int*)(uintptr_t)arg;
-            return 0;
+            return sys_tcsetpgrp(fd, *(const int*)(uintptr_t)arg);
         case LINUX_TCGETS:
             if (!arg) return -LINUX_EFAULT;
             *(struct linux_termios*)(uintptr_t)arg = g_linux_console_termios;
@@ -701,7 +695,6 @@ static int64_t linux_bootstrap_sys_ioctl(int fd, unsigned long request, uint64_t
             g_linux_console_termios = *(const struct linux_termios*)(uintptr_t)arg;
             return 0;
         default:
-            (void)fd;
             /* コンソール以外の ioctl は無い。ENOTTY は musl/busybox が
              * 「tty ではない」と解釈して素通りできる唯一の値 */
             return -LINUX_ENOTTY;

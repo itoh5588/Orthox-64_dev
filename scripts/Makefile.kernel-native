@@ -46,6 +46,7 @@ KERNEL_C_SRCS = \
     kernel/sys_rlimit.c kernel/sys_uname.c kernel/sys_task.c kernel/sys_iov.c \
     kernel/sys_access.c \
     kernel/sys_lseek.c \
+    kernel/sys_tty.c \
     kernel/irq.c kernel/bottom_half.c \
     kernel/elf.c kernel/task.c kernel/task_exec.c kernel/task_fork.c \
     kernel/sys_mmap.c kernel/sched.c kernel/wait.c kernel/fs.c kernel/vfs.c \

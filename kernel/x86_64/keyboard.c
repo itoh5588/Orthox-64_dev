@@ -83,8 +83,8 @@ static char keyboard_ascii_from_scancode(uint8_t code, uint8_t extended) {
 
 static void send_sigint_to_foreground_pgrp(void) {
     struct task* t = task_list;
-    extern int tty_get_foreground_pgrp(void);
-    int fg = tty_get_foreground_pgrp();
+    extern int sys_tcgetpgrp(int fd);
+    int fg = sys_tcgetpgrp(0);
     while (t) {
         if (t->pgid == fg && t->pid != 1) {
             t->sig_pending |= (1ULL << 2);
