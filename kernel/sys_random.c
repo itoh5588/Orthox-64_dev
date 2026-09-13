@@ -15,7 +15,11 @@
  * **乱数源の無い機械でも「乱数を得た」と答えていた。**いまは
  * arch_random_bytes を使い、源が無ければ ENOSYS を返す ——
  * **適当な値を混ぜて長さだけ揃えると、呼んだ側は乱数を得たつもりで
- * 先へ進む。** */
+ * 先へ進む。**
+ *
+ * **2026-09-13 に 3 アーキ共通にした (別実装 29 組の 1 組)。**09-08 に
+ * 揃えた時点で linux 側の複製とは同じ中身になっていたので、このファイルを
+ * aarch64 / riscv64 の一覧にも入れ、linux_syscall.c の複製を外した。 */
 int64_t sys_getrandom(void* buf, size_t len, unsigned flags) {
     int64_t got;
     (void)flags;

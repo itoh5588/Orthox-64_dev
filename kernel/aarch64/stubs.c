@@ -41,23 +41,12 @@ uint64_t arch_time_now_ms(void);
 
 /* ---- 乱数 ----------------------------------------------------------------
  *
- * kernel/sys_random.c は rdrand / rdtsc を直書きしていて aarch64 では
- * コンパイルできない (`invalid output constraint '=a'`)。
- *
- * **2026-09-05 に本物を入れた** (kernel/aarch64/rng.c)。実機は BCM2711 の
- * RNG200、QEMU virt は virtio-rng。TLS が鍵の材料をここから取るので、
- * 予測できる値を返すわけにいかない。
- *
- * **源が無ければ -ENOSYS のまま。** 適当な値を返すと、呼ぶ側は乱数を
- * 得たつもりで進む。これは /dev/urandom (kernel/fs.c) の口でもある */
-int64_t sys_getrandom(void* buf, size_t len, unsigned flags) {
-    int64_t got;
-    (void)flags;
-    if (!buf) return -14;               /* EFAULT */
-    got = arch_random_bytes(buf, len);
-    if (got < 0) return -38;            /* ENOSYS: 源が無い */
-    return got;
-}
+ * **ここにあった sys_getrandom は外した (2026-09-13)。**置いた理由は
+ * 「kernel/sys_random.c が rdrand / rdtsc を直書きしていて aarch64 では
+ * コンパイルできない」だったが、09-07 に材料の作り方を arch_random_bytes へ
+ * 出したので、**その理由はもう成り立たない。**sys_random.c を 3 アーキ共通に
+ * したので、/dev/urandom (kernel/fs.c) の口もそちらを使う。
+ * 実物の乱数源は kernel/aarch64/rng.c (実機 RNG200 / QEMU virtio-rng) のまま */
 
 /* ---- USB -----------------------------------------------------------------
  *

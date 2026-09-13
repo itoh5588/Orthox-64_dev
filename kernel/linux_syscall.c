@@ -1111,17 +1111,6 @@ __attribute__((weak)) void arch_random_fill(void* buf, size_t len) {
     }
 }
 
-static int64_t linux_bootstrap_sys_getrandom(void* buf, size_t len, unsigned flags) {
-    int64_t got;
-    (void)flags;
-    if (!buf) return -LINUX_EFAULT;
-    if (len == 0) return 0;
-    got = arch_random_bytes(buf, len);
-    /* **足りない分を作らない。**「無い」なら無いと答える。適当な値を
-     * 混ぜて長さだけ揃えると、呼んだ側は乱数を得たつもりで先へ進む */
-    if (got < 0) return -LINUX_ENOSYS;   /* この機械に乱数源が無い */
-    return got;
-}
 
 static int64_t linux_bootstrap_sys_waitid(int idtype, int id, struct linux_siginfo* infop,
                                             int options) {
@@ -1618,7 +1607,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_GETRANDOM:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_getrandom((void*)(uintptr_t)arch_syscall_arg0(frame),
+                                    (uint64_t)(int64_t)sys_getrandom((void*)(uintptr_t)arch_syscall_arg0(frame),
                                                                                         (size_t)arch_syscall_arg1(frame),
                                                                                         (unsigned)arch_syscall_arg2(frame)));
             return;
