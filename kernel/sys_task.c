@@ -48,3 +48,23 @@ int sys_set_tid_address(int* tidptr) {
     (void)tidptr;
     return current ? current->pid : -LINUX_ESRCH;
 }
+
+/* ---- getpid 族 ------------------------------------------------------------
+ * **x86 の getpid だけ NULL 検査が無かった** (get_current_task()->pid を直に
+ * 引いていた)。linux 側は current が 0 なら 0 を返していたので、そちらに
+ * 寄せた。残りの 5 つは両側で同じだった。 */
+uint64_t sys_getpid(void) {
+    struct task* current = get_current_task();
+    return current ? (uint64_t)current->pid : 0;
+}
+
+uint64_t sys_getppid(void) {
+    struct task* current = get_current_task();
+    return current ? (uint64_t)current->ppid : 0;
+}
+
+/* **単一ユーザー (root 固定)。** /etc/passwd も root だけを持つ */
+uint64_t sys_getuid(void)  { return 0; }
+uint64_t sys_getgid(void)  { return 0; }
+uint64_t sys_geteuid(void) { return 0; }
+uint64_t sys_getegid(void) { return 0; }

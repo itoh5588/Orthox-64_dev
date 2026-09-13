@@ -13,31 +13,6 @@
 extern struct task* task_list;
 extern void puts(const char* s);
 
-uint64_t sys_getpid(void) {
-    return (uint64_t)get_current_task()->pid;
-}
-
-uint64_t sys_getppid(void) {
-    struct task* current = get_current_task();
-    return (uint64_t)(current ? current->ppid : 0);
-}
-
-uint64_t sys_getuid(void) {
-    return 0;
-}
-
-uint64_t sys_getgid(void) {
-    return 0;
-}
-
-uint64_t sys_geteuid(void) {
-    return 0;
-}
-
-uint64_t sys_getegid(void) {
-    return 0;
-}
-
 int sys_arch_prctl(int code, uint64_t addr) {
     struct task* current = get_current_task();
     if (!current) return -LINUX_ESRCH;

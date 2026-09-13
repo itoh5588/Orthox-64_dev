@@ -1300,11 +1300,8 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                 return;
             }
         case LINUX_SYS_GETPID:
-            {
-                struct task* current = get_current_task();
-                arch_syscall_set_return(frame, current ? (uint64_t)current->pid : 0);
-                return;
-            }
+            arch_syscall_set_return(frame, sys_getpid());
+            return;
         /* **機械のリセット。** 焼き直しのたびに電源を抜かなくて済むように
          * 入れた。Linux と同じで魔法の数を 2 つ揃えないと効かない —
          * **誤爆で機械が落ちるのが一番困る**ので、この検査は削らないこと。
@@ -1337,17 +1334,20 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                 for (;;) { }
             }
         case LINUX_SYS_GETPPID:
-            {
-                struct task* current = get_current_task();
-                arch_syscall_set_return(frame, current ? (uint64_t)current->ppid : 0);
-                return;
-            }
-        /* 単一ユーザー (root 固定)。/etc/passwd も root だけを持つ */
+            arch_syscall_set_return(frame, sys_getppid());
+            return;
+        /* 単一ユーザー (root 固定)。値は kernel/sys_task.c */
         case LINUX_SYS_GETUID:
+            arch_syscall_set_return(frame, sys_getuid());
+            return;
         case LINUX_SYS_GETEUID:
+            arch_syscall_set_return(frame, sys_geteuid());
+            return;
         case LINUX_SYS_GETGID:
+            arch_syscall_set_return(frame, sys_getgid());
+            return;
         case LINUX_SYS_GETEGID:
-            arch_syscall_set_return(frame, 0);
+            arch_syscall_set_return(frame, sys_getegid());
             return;
         case LINUX_SYS_OPENAT:
             arch_syscall_set_return(frame,
