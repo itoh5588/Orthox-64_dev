@@ -3,6 +3,7 @@
 #include "sys_internal.h"
 #include "task.h"
 #include "lapic.h"
+#include "arch_time.h"   /* arch_rtc_seconds */
 #include "version.h"
 #include "linux_errno.h"
 #include "linux_syscall.h"   /* arch_uname_machine / arch_uname_version */
@@ -53,7 +54,8 @@ static int cmos_bcd_to_bin(int value) {
     return ((value >> 4) * 10) + (value & 0x0F);
 }
 
-static uint64_t sys_realtime_seconds(void) {
+/* include/arch_time.h の arch_rtc_seconds。CMOS の RTC を Unix 秒で読む */
+uint64_t arch_rtc_seconds(void) {
     int second;
     int minute;
     int hour;
@@ -96,25 +98,15 @@ static uint64_t sys_realtime_seconds(void) {
         + (uint64_t)second;
 }
 
+/* **clock_gettime(CLOCK_REALTIME) から作る (2026-09-13)。**別々に時計を
+ * 読むと time() と gettimeofday() がずれる。aarch64 / riscv64 には
+ * gettimeofday の口が無い (musl が clock_gettime で代用する) */
 int sys_gettimeofday(struct linux_timeval* tv) {
+    struct linux_timespec ts;
     if (!tv) return -LINUX_EFAULT;
-    tv->tv_sec = (int64_t)sys_realtime_seconds();
-    tv->tv_usec = 0;
-    return 0;
-}
-
-int sys_clock_gettime(int clock_id, struct linux_timespec* ts) {
-    uint64_t ms;
-    if (!ts) return -LINUX_EFAULT;
-    if (clock_id == 0) {
-        ts->tv_sec = (int64_t)sys_realtime_seconds();
-        ts->tv_nsec = 0;
-        return 0;
-    }
-    if (clock_id != 1) return -LINUX_EINVAL;
-    ms = lapic_get_ticks_ms();
-    ts->tv_sec = (int64_t)(ms / 1000ULL);
-    ts->tv_nsec = (int64_t)((ms % 1000ULL) * 1000000ULL);
+    (void)sys_clock_gettime(0, &ts);
+    tv->tv_sec = ts.tv_sec;
+    tv->tv_usec = ts.tv_nsec / 1000;
     return 0;
 }
 

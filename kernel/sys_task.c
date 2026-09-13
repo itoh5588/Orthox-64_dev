@@ -19,6 +19,7 @@
 #include "pmm.h"             /* PAGE_SIZE / pmm_get_*_pages */
 #include "arch_time.h"       /* arch_time_now_ms */
 #include "linux_syscalls.h"  /* struct linux_sysinfo */
+#include "xv6fs.h"           /* xv6fs_now_sec */
 
 /* ---- futex ----------------------------------------------------------------
  * **待ちは実装していない。**値が合っているかだけを見る (単一スレッド前提)。
@@ -179,6 +180,55 @@ int sys_nanosleep(const struct linux_timespec* req, struct linux_timespec* rem) 
     while (arch_time_now_ms() < deadline) {
         task_mark_io_wait_until(current, deadline);
         kernel_yield();
+    }
+    return 0;
+}
+
+/* ---- clock_gettime --------------------------------------------------------
+ * **REALTIME の時計の出どころが x86 と linux 側で違っていた (2026-09-13 に畳んだ)。**
+ *
+ * | | x86 | linux 側 |
+ * |---|---|---|
+ * | REALTIME の秒  | CMOS の RTC | SNTP で合っていればそれ、無ければ xv6fs の通し番号 |
+ * | REALTIME の nsec | **常に 0** | ミリ秒から |
+ * | MONOTONIC      | lapic の tick | arch_time_now_ms (x86 では同じ lapic) |
+ *
+ * **3 つを順に見る形にした: SNTP -> RTC -> xv6fs の通し番号。**
+ *
+ *   - SNTP が一番正しい (aarch64 は起動時に合わせる。riscv64 には網が無い)
+ *   - RTC は x86 にだけある。SNTP が合っていないときの退き先として、
+ *     通し番号より良い
+ *   - **xv6fs_now_sec() は壁時計ではない。**xv6fs.c 自身が「単調に増える通し
+ *     番号を秒の形で持っているだけ」と書いており、マウントのたびに 86400 秒
+ *     進む。実機では実時刻より +39 日進み、起動ごとに +1 日離れていた
+ *     (2026-09-05 実測)。TLS が証明書の有効期限をこれで見るので、最後の
+ *     手段にとどめる (ファイルの前後関係だけは保たれる)
+ *
+ * aarch64 / riscv64 は RTC が 0 なので答えは変わらない。x86 は SNTP で
+ * 合っていればそちらを使い、nsec が入るようになる */
+
+/* SNTP で合わせた壁時計 (Unix 秒)。まだなら 0。**riscv64 には lwIP が無い**ので
+ * 弱いシンボルで「無い」を既定にする (x86 / aarch64 は kernel/lwip_port.c の
+ * 強いものが選ばれる) */
+uint32_t lwip_port_wallclock_sec(void);
+__attribute__((weak)) uint32_t lwip_port_wallclock_sec(void) { return 0; }
+
+/* RTC を持たない機械の既定 (include/arch_time.h) */
+__attribute__((weak)) uint64_t arch_rtc_seconds(void) { return 0; }
+
+int sys_clock_gettime(int clock_id, struct linux_timespec* ts) {
+    uint64_t ms;
+    if (!ts) return -LINUX_EFAULT;
+    if (clock_id != 0 && clock_id != 1) return -LINUX_EINVAL;
+    ms = arch_time_now_ms();
+    ts->tv_nsec = (int64_t)((ms % 1000ULL) * 1000000ULL);
+    if (clock_id == 0) {
+        uint64_t sec = lwip_port_wallclock_sec();
+        if (sec == 0) sec = arch_rtc_seconds();
+        if (sec == 0) sec = xv6fs_now_sec();
+        ts->tv_sec = (int64_t)sec;
+    } else {
+        ts->tv_sec = (int64_t)(ms / 1000ULL);
     }
     return 0;
 }

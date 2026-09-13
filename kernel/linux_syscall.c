@@ -552,36 +552,6 @@ uint64_t sys_brk(uint64_t addr);
  *
  * MONOTONIC のほうは起動からの経過でよい。むしろ土台を混ぜてはいけない
  * (mount のたびに飛ぶので単調でなくなる)。 */
-/* SNTP で合わせた壁時計 (Unix 秒)。まだなら 0。
- * **riscv64 には lwIP が無い**ので弱いシンボルで「無い」を既定にする
- * (aarch64/x86 は kernel/lwip_port.c の強いものが選ばれる) */
-__attribute__((weak)) uint32_t lwip_port_wallclock_sec(void) { return 0; }
-
-static int linux_bootstrap_sys_clock_gettime(int clock_id, struct linux_timespec* ts) {
-    uint64_t ms;
-    if (!ts) return -LINUX_EFAULT;
-    if (clock_id != 0 && clock_id != 1) return -LINUX_EINVAL;
-    ms = arch_time_now_ms();
-    ts->tv_nsec = (int64_t)((ms % 1000ULL) * 1000000ULL);
-    if (clock_id == 0) {
-        /* ---- CLOCK_REALTIME (2026-09-05 に直した) --------------------
-         *
-         * **xv6fs_now_sec() は壁時計ではない。**xv6fs.c 自身が
-         * 「単調に増える通し番号を秒の形で持っているだけ」と書いており、
-         * マウントのたびに 86400 秒進む。実機では実時刻より +39 日進み、
-         * 起動ごとに +1 日離れていた (2026-09-05 実測)。TLS が証明書の
-         * 有効期限をこれで見るので、**そのままでは正しい証明書を
-         * 期限切れとして弾くようになる**。
-         *
-         * SNTP で合っていればそちらを使い、合っていなければ従来どおり
-         * 通し番号に退く (ファイルの前後関係だけは保たれる) */
-        uint32_t wall = lwip_port_wallclock_sec();
-        ts->tv_sec = wall ? (int64_t)wall : (int64_t)xv6fs_now_sec();
-    } else {
-        ts->tv_sec = (int64_t)(ms / 1000ULL);
-    }
-    return 0;
-}
 
 /* nanosleep(2)。ms 解像度しか無いので端数は切り上げる (0 を要求されない限り
  * 必ず 1 tick 以上眠らせる)。既存の sleep 機構 (task_mark_io_wait_until +
@@ -1439,7 +1409,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_CLOCK_GETTIME:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_clock_gettime((int)arch_syscall_arg0(frame),
+                                    (uint64_t)(int64_t)sys_clock_gettime((int)arch_syscall_arg0(frame),
                                                                                             (struct linux_timespec*)(uintptr_t)arch_syscall_arg1(frame)));
             return;
         case LINUX_SYS_RT_SIGACTION:
