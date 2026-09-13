@@ -211,6 +211,7 @@ SYSCALL_SRCS = kernel/syscall.c kernel/sys_trace.c kernel/sys_signal.c \
 	kernel/sys_proc.c kernel/sys_fs.c kernel/sys_random.c kernel/sys_net.c \
 	kernel/sys_rlimit.c kernel/sys_uname.c kernel/sys_task.c kernel/sys_iov.c \
 	kernel/sys_access.c \
+	kernel/sys_lseek.c \
 	kernel/irq.c kernel/bottom_half.c
 
 # ---- アーキに依らない層 ----------------------------------------------------
@@ -233,6 +234,7 @@ RISCV64_SHARED_C_SRCS = kernel/task.c kernel/task_exec.c kernel/task_fork.c kern
 	kernel/linux_syscall.c kernel/sys_mmap.c kernel/sys_rlimit.c kernel/sys_uname.c \
 	kernel/sys_task.c kernel/sys_random.c kernel/sys_signal.c kernel/sys_iov.c \
 	kernel/sys_access.c \
+	kernel/sys_lseek.c \
 	kernel/wait.c kernel/elf.c kernel/cstring.c kernel/cstdio.c \
 	kernel/storage.c kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c
 RISCV64_ASM_SRCS = kernel/riscv64/start.S kernel/riscv64/trap.S kernel/riscv64/entry.S
@@ -381,7 +383,7 @@ AARCH64_SHARED_C_SRCS = kernel/usb.c \
 	kernel/fs.c kernel/elf.c kernel/task_exec.c kernel/task_fork.c \
 	kernel/linux_syscall.c kernel/sys_fs.c kernel/sys_mmap.c kernel/sys_rlimit.c \
 	kernel/sys_uname.c kernel/sys_task.c kernel/sys_random.c kernel/sys_signal.c \
-	kernel/sys_iov.c kernel/sys_access.c \
+	kernel/sys_iov.c kernel/sys_access.c kernel/sys_lseek.c \
 	kernel/net.c kernel/net_socket.c kernel/lwip_port.c kernel/cstdlib.c
 AARCH64_ASM_SRCS = kernel/aarch64/start.S kernel/aarch64/vectors.S \
 	kernel/aarch64/entry.S kernel/aarch64/user_blob.S kernel/aarch64/switch.S

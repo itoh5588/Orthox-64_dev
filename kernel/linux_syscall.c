@@ -445,66 +445,6 @@ int arch_console_onlcr_enabled(void) {
 
 
 
-static int64_t linux_bootstrap_sys_lseek(int fd, int64_t offset, int whence) {
-    struct task* current = get_current_task();
-    file_descriptor_t* f;
-    int64_t base;
-    int64_t next;
-
-    /* 戻り値は -errno 規約。-1 は EPERM として顕在化するので使わない */
-    if (!current) return -LINUX_ESRCH;
-    if (fd < 0 || fd >= MAX_FDS || !current->fds[fd].in_use) return -LINUX_EBADF;
-    f = &current->fds[fd];
-    if (f->type == FT_DIR) return -LINUX_ESPIPE;
-    /* offset / size は共有 open file description (fd->file) 側にある。
-     * dup / fork した相方の書き込みがここに見えるのはそのため。
-     * 別々に open した fd は別の file を持つので、xv6fs は inode から
-     * 取り直す (arch_fs_refresh_size) */
-    arch_fs_refresh_size(f);
-
-    switch (whence) {
-        case 0:
-            base = 0;
-            break;
-        case 1:
-            base = (int64_t)fs_fd_offset(f);
-            break;
-        case 2:
-            base = (int64_t)fs_fd_size(f);
-            break;
-        default:
-            return -LINUX_EINVAL;
-    }
-
-    next = base + offset;
-    if (next < 0) return -LINUX_EINVAL;
-    /* **書き込み用に開いたファイルは EOF 越えのシークを許す (穴あき書き込み)。**
-     *
-     * **ramfs を外していて壊れた (P-9、2026-08-29)。** /tmp を ramfs に置いた
-     * 途端に `gcc -static` が落ちた:
-     *
-     *   as: can't write 56 bytes to section .text of /tmp/ccYYYY.o:
-     *       'file truncated'   (BFD assertion fail bfd/elf.c:3663)
-     *
-     * as はセクションを置くために EOF より先へ seek してから書く。ここで
-     * EINVAL を返すと **offset が動かないまま write が通る**ので、中身が
-     * 別の場所に落ちて、呼び出し側からは「短いファイル」に見える。
-     * **失敗の形が seek ではなく write 側に出るので分かりにくい。**
-     *
-     * 最小再現 (日報2026-08-29 §24):
-     *   lseek(fd,3000,SEEK_SET) が /tmp では -1、xv6fs 上では 3000
-     *
-     * ramfs の書き込みは ramfs_grow(off + count) で伸ばし、**新しい領域を
-     * 0 で埋める**ので、穴は正しく 0 として読める。 */
-    if ((uint64_t)next > fs_fd_size(f) &&
-        !((f->type == FT_XV6FS || f->type == FT_RAMFS) &&
-          ((f->flags & 3) == O_WRONLY || (f->flags & 3) == O_RDWR))) {
-        return -LINUX_EINVAL;
-    }
-    fs_fd_set_offset(f, (size_t)next);
-    return next;
-}
-
 static int linux_bootstrap_sys_fchmodat(int dirfd, const char* path, uint32_t mode) {
     if (!path) return -LINUX_EFAULT;
     if (path[0] == '\0') return -LINUX_ENOENT;
@@ -1446,7 +1386,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_LSEEK:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_lseek((int)arch_syscall_arg0(frame),
+                                    (uint64_t)(int64_t)sys_lseek((int)arch_syscall_arg0(frame),
                                                                                    (int64_t)arch_syscall_arg1(frame),
                                                                                    (int)arch_syscall_arg2(frame)));
             return;

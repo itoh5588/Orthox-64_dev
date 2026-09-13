@@ -104,10 +104,6 @@ int64_t sys_readlink(const char* path, char* buf, size_t bufsiz) {
     return fs_readlink(path, buf, bufsiz);
 }
 
-int64_t sys_lseek(int fd, int64_t offset, int whence) {
-    return fs_lseek(fd, offset, whence);
-}
-
 int sys_getdents(int fd, struct orth_dirent* dirp, size_t count) {
     return fs_getdents(fd, dirp, count);
 }
