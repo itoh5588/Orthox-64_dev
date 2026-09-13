@@ -62,22 +62,6 @@ int sys_arch_prctl(int code, uint64_t addr) {
  * -11 の直書きだった。aarch64 / riscv64 側 (linux_syscall.c) は同じロジックで
  * 正しい errno を返しており、**musl は futex の errno を見て動きを変える**ので
  * x86 だけ EPERM を返す理由が無い。 */
-int sys_futex(volatile int* uaddr, int op, int val) {
-    int cmd = op & ~FUTEX_PRIVATE;
-    if (!uaddr) return -LINUX_EFAULT;
-
-    switch (cmd) {
-        case FUTEX_WAIT:
-            /* Single-threaded for now: only validate the expected value. */
-            return (*uaddr == val) ? 0 : -LINUX_EAGAIN;
-        case FUTEX_WAKE:
-            return 0;
-        default:
-            /* 未対応の futex 操作。EPERM だと呼び出し側が「権限が無い」と
-             * 誤解するので、実装が無いことを ENOSYS で伝える */
-            return -LINUX_ENOSYS;
-    }
-}
 
 int sys_set_robust_list(const void* head, size_t len) {
     (void)head;
@@ -85,13 +69,6 @@ int sys_set_robust_list(const void* head, size_t len) {
     return 0;
 }
 
-int sys_set_tid_address(int* tidptr) {
-    struct task* current = get_current_task();
-    (void)tidptr;
-    /* current が 0 はカーネル内部の異常で、ここには来ない。値は
-     * linux_syscall.c 側に合わせた (以前は -1 = EPERM) */
-    return current ? current->pid : -LINUX_ESRCH;
-}
 
 static struct task* find_task_by_pid_locked(int pid) {
     if (!kernel_lock_held()) {

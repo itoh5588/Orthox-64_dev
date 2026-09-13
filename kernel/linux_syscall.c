@@ -591,26 +591,7 @@ uint64_t sys_brk(uint64_t addr);
  * 写像を外せた。物理ページを返す理由の説明は sys_mmap.c の mmap_drop_page へ
  * 移した */
 
-static int linux_bootstrap_sys_set_tid_address(int* tidptr) {
-    struct task* current = get_current_task();
-    (void)tidptr;
-    return current ? current->pid : -LINUX_ESRCH;
-}
 
-static int linux_bootstrap_sys_futex(volatile int* uaddr, int op, int val) {
-    int cmd = op & ~FUTEX_PRIVATE;
-    if (!uaddr) return -LINUX_EFAULT;
-    switch (cmd) {
-        case FUTEX_WAIT:
-            return (*uaddr == val) ? 0 : -LINUX_EAGAIN;
-        case FUTEX_WAKE:
-            return 0;
-        default:
-            /* 未対応の futex 操作。EPERM だと呼び出し側が「権限が無い」と
-             * 誤解するので、実装が無いことを ENOSYS で伝える */
-            return -LINUX_ENOSYS;
-    }
-}
 
 /* CLOCK_REALTIME (0) と CLOCK_MONOTONIC (1)。
  *
@@ -1602,11 +1583,11 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_SET_TID_ADDRESS:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_set_tid_address((int*)(uintptr_t)arch_syscall_arg0(frame)));
+                                    (uint64_t)(int64_t)sys_set_tid_address((int*)(uintptr_t)arch_syscall_arg0(frame)));
             return;
         case LINUX_SYS_FUTEX:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_futex((volatile int*)(uintptr_t)arch_syscall_arg0(frame),
+                                    (uint64_t)(int64_t)sys_futex((volatile int*)(uintptr_t)arch_syscall_arg0(frame),
                                                                                     (int)arch_syscall_arg1(frame),
                                                                                     (int)arch_syscall_arg2(frame)));
             return;
