@@ -44,8 +44,11 @@ int sys_clock_gettime(int clock_id, struct linux_timespec* ts);
 int sys_sched_yield(void);
 int sys_nanosleep(const struct linux_timespec* req, struct linux_timespec* rem);
 int sys_uname(struct linux_utsname* buf);
-int sys_getrlimit(unsigned resource, struct linux_rlimit* rlim);
-int sys_prlimit64(int pid, unsigned resource, const struct linux_rlimit* new_limit,
+/* kernel/sys_rlimit.c (3 アーキ共通)。**resource は int。**範囲外を
+ * EINVAL で断るので、符号なしにすると負が巨大値に化けて検査が効かない */
+int sys_getrlimit(int resource, struct linux_rlimit* rlim);
+int sys_setrlimit(int resource, const struct linux_rlimit* rlim);
+int sys_prlimit64(int pid, int resource, const struct linux_rlimit* new_limit,
                   struct linux_rlimit* old_limit);
 int sys_sysinfo(struct linux_sysinfo_k* info);
 int sys_sleep_ms(uint64_t ms);

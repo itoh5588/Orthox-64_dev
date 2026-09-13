@@ -268,7 +268,7 @@ void syscall_dispatch(arch_syscall_frame_t* frame) {
             frame->rax = (uint64_t)sys_uname((struct linux_utsname*)frame->rdi);
             break;
         case SYS_GETRLIMIT:
-            frame->rax = (uint64_t)sys_getrlimit((unsigned)frame->rdi, (struct linux_rlimit*)frame->rsi);
+            frame->rax = (uint64_t)sys_getrlimit((int)frame->rdi, (struct linux_rlimit*)frame->rsi);
             break;
         case SYS_GETTIMEOFDAY:
             frame->rax = (uint64_t)sys_gettimeofday((struct linux_timeval*)frame->rdi);
@@ -379,7 +379,7 @@ void syscall_dispatch(arch_syscall_frame_t* frame) {
             frame->rax = (uint64_t)sys_set_tid_address((int*)frame->rdi);
             break;
         case SYS_PRLIMIT64:
-            frame->rax = (uint64_t)sys_prlimit64((int)frame->rdi, (unsigned)frame->rsi,
+            frame->rax = (uint64_t)sys_prlimit64((int)frame->rdi, (int)frame->rsi,
                                                  (const struct linux_rlimit*)frame->rdx,
                                                  (struct linux_rlimit*)frame->r10);
             break;

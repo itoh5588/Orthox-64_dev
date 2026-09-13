@@ -166,23 +166,6 @@ int sys_uname(struct linux_utsname* buf) {
     return 0;
 }
 
-int sys_getrlimit(unsigned resource, struct linux_rlimit* rlim) {
-    (void)resource;
-    if (!rlim) return -LINUX_EFAULT;
-    rlim->rlim_cur = ~0ULL;
-    rlim->rlim_max = ~0ULL;
-    return 0;
-}
-
-int sys_prlimit64(int pid, unsigned resource, const struct linux_rlimit* new_limit,
-                  struct linux_rlimit* old_limit) {
-    struct task* current = get_current_task();
-    /* **自分以外の上限は扱えない。**Linux は権限が無いとき EPERM を返す */
-    if (pid != 0 && (!current || pid != current->pid)) return -LINUX_EPERM;
-    (void)new_limit;
-    return sys_getrlimit(resource, old_limit);
-}
-
 int sys_sysinfo(struct linux_sysinfo_k* info) {
     struct limine_memmap_response* memmap;
     uint64_t totalram = 0;

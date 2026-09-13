@@ -295,70 +295,11 @@ static int linux_sys_uname(struct linux_utsname* out) {
 
 /* ---- 資源の上限 (getrlimit / setrlimit / prlimit64) ----------------------
  *
- * **実測で ENOSYS が出たので埋めた (2026-08-11)。** Orthox の中で gcc / ld を
- * 動かすと呼ばれる。Orthox には資源制限の仕組みが無いので、**答えるだけで
- * 記憶しない**。設定側 (setrlimit / prlimit64 の new) は黙って受ける —
- * ここで EPERM を返すと、上限を下げようとする側が異常終了することがある。
- *
- * **無限で答えてよいものと、実際の値を答えるべきものがある。**
- *   NOFILE  MAX_FDS を答える。無限にすると、呼び手が上限まで
- *           close() を回して大量に空振りする
- *   STACK   実際に張っている大きさ。無限だと alloca を使う側が踏み外す */
-static void linux_rlimit_for(int resource, struct linux_rlimit* out) {
-    struct task* current = get_current_task();
-    out->rlim_cur = LINUX_RLIM_INFINITY;
-    out->rlim_max = LINUX_RLIM_INFINITY;
-    switch (resource) {
-        case LINUX_RLIMIT_NOFILE:
-            out->rlim_cur = MAX_FDS;
-            out->rlim_max = MAX_FDS;
-            break;
-        case LINUX_RLIMIT_STACK:
-            /* **実際に張ってある大きさを答える。** USER_STACK_PAGES は
-             * kernel/task_internal.h にあり共有層からは見えないので、
-             * タスクが持っている上端と下端の差から出す */
-            if (current && current->user_stack_top > current->user_stack_bottom) {
-                out->rlim_cur = current->user_stack_top - current->user_stack_bottom;
-            } else {
-                out->rlim_cur = 64ULL * PAGE_SIZE;   /* 張る前に聞かれたとき */
-            }
-            out->rlim_max = out->rlim_cur;
-            break;
-        case LINUX_RLIMIT_CORE:
-            /* コアダンプは出さない */
-            out->rlim_cur = 0;
-            out->rlim_max = 0;
-            break;
-        default:
-            break;
-    }
-}
-
-static int linux_sys_getrlimit(int resource, struct linux_rlimit* rlim) {
-    if (resource < 0 || resource >= LINUX_RLIMIT_NLIMITS) return -LINUX_EINVAL;
-    if (!rlim) return -LINUX_EFAULT;
-    linux_rlimit_for(resource, rlim);
-    return 0;
-}
-
-/* 上限は記憶しないが、**成功を返す**。失敗にすると呼び手が落ちる */
-static int linux_sys_setrlimit(int resource, const struct linux_rlimit* rlim) {
-    if (resource < 0 || resource >= LINUX_RLIMIT_NLIMITS) return -LINUX_EINVAL;
-    if (!rlim) return -LINUX_EFAULT;
-    return 0;
-}
-
-static int linux_sys_prlimit64(int pid, int resource,
-                               const struct linux_rlimit* new_limit,
-                               struct linux_rlimit* old_limit) {
-    struct task* current = get_current_task();
-    if (resource < 0 || resource >= LINUX_RLIMIT_NLIMITS) return -LINUX_EINVAL;
-    /* pid 0 は自分。他プロセスは見ない */
-    if (pid != 0 && current && pid != current->pid) return -LINUX_EPERM;
-    if (old_limit) linux_rlimit_for(resource, old_limit);
-    (void)new_limit;   /* 記憶しない (上のコメント) */
-    return 0;
-}
+ * **kernel/sys_rlimit.c へ移した (2026-09-13、別実装 29 組の 1 組)。**
+ * x86 は全部 無限で答えていたので、共通化でそちらが直る側になる。
+ * 経緯 (実測で ENOSYS が出たので 2026-08-11 に埋めた / 答えるだけで
+ * 記憶しない / NOFILE と STACK は実際の値を答える理由) は移した先の
+ * 冒頭に書いてある。 */
 
 /* **中身は 0 でよい。** 呼び手は「取れたかどうか」しか見ない。
  * 0 を返さずに ENOSYS にすると、gcc が時間計測を諦めずに落ちることがある */
@@ -1842,19 +1783,19 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_GETRLIMIT:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_sys_getrlimit(
+                                    (uint64_t)(int64_t)sys_getrlimit(
                                         (int)arch_syscall_arg0(frame),
                                         (struct linux_rlimit*)(uintptr_t)arch_syscall_arg1(frame)));
             return;
         case LINUX_SYS_SETRLIMIT:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_sys_setrlimit(
+                                    (uint64_t)(int64_t)sys_setrlimit(
                                         (int)arch_syscall_arg0(frame),
                                         (const struct linux_rlimit*)(uintptr_t)arch_syscall_arg1(frame)));
             return;
         case LINUX_SYS_PRLIMIT64:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_sys_prlimit64(
+                                    (uint64_t)(int64_t)sys_prlimit64(
                                         (int)arch_syscall_arg0(frame),
                                         (int)arch_syscall_arg1(frame),
                                         (const struct linux_rlimit*)(uintptr_t)arch_syscall_arg2(frame),
