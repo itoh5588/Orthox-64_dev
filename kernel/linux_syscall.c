@@ -184,13 +184,6 @@ static void linux_syscall_trace_leave(const arch_syscall_frame_t* frame) { (void
 #define LINUX_TIOCSPGRP            0x5410UL
 #define LINUX_TIOCGWINSZ           0x5413UL
 
-struct linux_sigaction {
-    uint64_t sa_handler;
-    uint64_t sa_flags;
-    uint64_t sa_restorer;
-    uint64_t sa_mask;
-};
-
 struct linux_siginfo {
     int32_t si_signo;
     int32_t si_errno;
@@ -900,50 +893,7 @@ static int64_t linux_bootstrap_sys_ioctl(int fd, unsigned long request, uint64_t
     }
 }
 
-static int linux_bootstrap_sys_rt_sigprocmask(int how, const uint64_t* set, uint64_t* oldset, size_t sigsetsize) {
-    struct task* current = get_current_task();
-    uint64_t newmask;
-    if (!current) return -LINUX_ESRCH;
-    if (sigsetsize != sizeof(uint64_t)) return -LINUX_EINVAL;
-    if (oldset) *oldset = current->sig_mask;
-    if (!set) return 0;
-    newmask = *set;
-    switch (how) {
-        case LINUX_SIG_BLOCK:
-            current->sig_mask |= newmask;
-            break;
-        case LINUX_SIG_UNBLOCK:
-            current->sig_mask &= ~newmask;
-            break;
-        case LINUX_SIG_SETMASK:
-            current->sig_mask = newmask;
-            break;
-        default:
-            return -LINUX_EINVAL;
-    }
-    return 0;
-}
 
-static int linux_bootstrap_sys_rt_sigaction(int sig, const struct linux_sigaction* act,
-                                              struct linux_sigaction* oldact, size_t sigsetsize) {
-    struct task* current = get_current_task();
-    if (!current) return -LINUX_ESRCH;
-    if (sig <= 0 || sig >= 32) return -LINUX_EINVAL;
-    if (sigsetsize != sizeof(uint64_t)) return -LINUX_EINVAL;
-    if (oldact) {
-        oldact->sa_handler = current->sig_handlers[sig];
-        oldact->sa_flags = current->sig_action_flags[sig];
-        oldact->sa_restorer = 0;
-        oldact->sa_mask = current->sig_action_masks[sig];
-    }
-    if (act) {
-        current->sig_handlers[sig] = act->sa_handler;
-        current->sig_action_flags[sig] = (uint32_t)act->sa_flags;
-        current->sig_action_masks[sig] = act->sa_mask;
-        if (act->sa_handler == 1ULL) current->sig_pending &= ~(1ULL << sig);
-    }
-    return 0;
-}
 
 
 /* ---- sendmsg(2) / recvmsg(2) (2026-09-05、TLS の手3) ----------------------
@@ -1572,14 +1522,14 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_RT_SIGACTION:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_rt_sigaction((int)arch_syscall_arg0(frame),
-                                                                                           (const struct linux_sigaction*)(uintptr_t)arch_syscall_arg1(frame),
-                                                                                           (struct linux_sigaction*)(uintptr_t)arch_syscall_arg2(frame),
+                                    (uint64_t)(int64_t)sys_rt_sigaction((int)arch_syscall_arg0(frame),
+                                                                                           (const struct linux_rt_sigaction_k*)(uintptr_t)arch_syscall_arg1(frame),
+                                                                                           (struct linux_rt_sigaction_k*)(uintptr_t)arch_syscall_arg2(frame),
                                                                                            (size_t)arch_syscall_arg3(frame)));
             return;
         case LINUX_SYS_RT_SIGPROCMASK:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_rt_sigprocmask((int)arch_syscall_arg0(frame),
+                                    (uint64_t)(int64_t)sys_rt_sigprocmask((int)arch_syscall_arg0(frame),
                                                                                              (const uint64_t*)(uintptr_t)arch_syscall_arg1(frame),
                                                                                              (uint64_t*)(uintptr_t)arch_syscall_arg2(frame),
                                                                                              (size_t)arch_syscall_arg3(frame)));

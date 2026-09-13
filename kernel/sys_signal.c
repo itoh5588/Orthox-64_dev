@@ -1,3 +1,20 @@
+/* ---- シグナル系 syscall (3 アーキ共通) ------------------------------------
+ *
+ * **2026-09-13 にファイルごと 3 アーキ共通にした (別実装 29 組の 2 組)。**
+ * rt_sigaction / rt_sigprocmask は kernel/linux_syscall.c にも
+ * linux_bootstrap_sys_* として複製があり、判断 (番号 1〜31、SIG_IGN で保留を
+ * 落とす、how の 3 種) は同じだった。違いは次の 2 つだけ:
+ *
+ *   - rt_sigaction の sigsetsize: x86 は「8 以上」、linux 側は「8 ちょうど」
+ *     -> **Linux どおり 8 ちょうどに揃えた**
+ *   - 構造体: x86 は mask を uint32_t[2]、linux 側は uint64_t 1 つで持つ。
+ *     並び (handler, flags, restorer, mask) と大きさ (32 バイト) は同じで、
+ *     3 アーキとも little-endian なのでメモリ上は同一
+ *
+ * include は ISA に依らないものだけで、aarch64 / riscv64 に同名の定義は
+ * 無かった (sigaltstack / sigpending / sigaction は linux 側に口が無いので、
+ * 共有にしても使われないだけ)。 */
+
 #include <stddef.h>
 #include <stdint.h>
 #include "linux_abi.h"
@@ -86,7 +103,10 @@ int sys_rt_sigaction(int sig, const struct linux_rt_sigaction_k* act,
     struct orth_sigaction out_act;
     int ret;
 
-    if (sigsetsize < sizeof(uint64_t)) return -LINUX_EINVAL;
+    /* **sigsetsize は厳密に一致しないと EINVAL (2026-09-13)。**ここは
+     * 「8 以上なら通す」のままだった。rt_sigprocmask は 2026-09-08 に直して
+     * いたが、こちらだけ同じ穴が取り残されていた (linux 側は最初から != ) */
+    if (sigsetsize != sizeof(uint64_t)) return -LINUX_EINVAL;
     if (act) {
         in_act.sa_handler = act->handler;
         in_act.sa_mask = ((uint64_t)act->mask[1] << 32) | act->mask[0];
