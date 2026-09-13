@@ -43,6 +43,9 @@ KERNEL_C_SRCS = \
     kernel/x86_64/virtio.c kernel/x86_64/virtio_net.c kernel/x86_64/virtio_blk.c \
     kernel/syscall.c kernel/sys_trace.c kernel/sys_signal.c \
     kernel/sys_proc.c kernel/sys_fs.c kernel/sys_random.c kernel/sys_net.c \
+    kernel/sys_rlimit.c kernel/sys_uname.c kernel/sys_task.c kernel/sys_iov.c \
+    kernel/sys_access.c \
+    kernel/sys_lseek.c \
     kernel/irq.c kernel/bottom_half.c \
     kernel/elf.c kernel/task.c kernel/task_exec.c kernel/task_fork.c \
     kernel/sys_mmap.c kernel/sched.c kernel/wait.c kernel/fs.c kernel/vfs.c \
