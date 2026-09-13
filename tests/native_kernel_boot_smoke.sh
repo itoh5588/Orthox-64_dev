@@ -44,6 +44,18 @@ python3 scripts/build_rootfs_xv6fs.py --extract /etc/native_kernel_build_smoke.s
 # ─────────────────────────────────────────────────────────────────────────────
 echo "=== Phase 1: native build ==="
 
+# ★ **ゲスト側の台本は落とす前に必ず sync する (2026-09-13)。**
+# xv6log はログに余裕があるうちは commit を溜める作りで、write(2) から戻った
+# 時点ではまだディスクに載っていない (kernel/xv6log.c の P-6: 出すのは
+# begin_op が詰まったとき・sync(2)/fsync・ログ満杯の 3 つだけ)。
+# ここを通さずに QEMU を kill していたため、**最後に書いた /kernel.elf は
+# 6190 ブロック中 295 しか実体が無く、残りが穴**になっていた。ELF ヘッダは
+# ld が最後に書き戻すので丸ごとゼロになり、Phase 2 が起動しなかった。
+#
+# ★ **この台本は /etc/native_kernel_build_smoke.sh を in-place で置き換える。**
+# xv6fs に割り当て済みのブロック (1024 バイト) を超えると
+# 「replacement too large for allocated file blocks」で死ぬので、
+# **中に長いコメントを入れない。**説明はこちら側に書く。
 cat > "${BUILD_SCRIPT}" <<'EOF'
 export PATH=/bin:/usr/bin:/
 echo native-kernel-build-start
@@ -59,6 +71,8 @@ test -s /kernel.elf || {
     echo native-kernel-build-fail:no-kernel-elf
     exit 1
 }
+/bin/busybox sync
+echo native-kernel-build-sync-done
 echo native-kernel-build-pass
 echo native-kernel-build-end
 EOF
