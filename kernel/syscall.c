@@ -116,7 +116,7 @@ void syscall_dispatch(arch_syscall_frame_t* frame) {
             frame->rax = (uint64_t)sys_pipe_user((int*)frame->rdi);
             break;
         case SYS_PIPE2:
-            frame->rax = (uint64_t)sys_pipe2_user((int*)frame->rdi, (int)frame->rsi);
+            frame->rax = (uint64_t)sys_pipe2((int*)frame->rdi, (int)frame->rsi);
             break;
         case SYS_DUP2:
             frame->rax = (uint64_t)sys_dup2((int)frame->rdi, (int)frame->rsi);

@@ -37,6 +37,9 @@
 #define LINUX_ENOSPC      28
 #define LINUX_ESPIPE      29
 #define LINUX_EROFS       30
+/* getcwd でバッファが足りないとき (kernel/sys_task.c)。kernel/fs.c が
+ * 自前で ERANGE 34 を持っていたが、共有層から見える名前が無かった */
+#define LINUX_ERANGE      34
 #define LINUX_ENOSYS      38
 #define LINUX_ENOTEMPTY   39
 

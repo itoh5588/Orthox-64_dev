@@ -252,7 +252,6 @@ int fs_getdents(int fd, struct orth_dirent* dirp, size_t count);
 int fs_getdents64(int fd, void* dirp, size_t count);
 int fs_chdir(const char* path);
 int fs_fchdir(int fd);
-int fs_getcwd(char* buf, size_t size);
 int fs_truncate(const char* path, uint64_t length);
 int fs_ftruncate(int fd, uint64_t length);
 int fs_utimensat(int dirfd, const char* path, const void* times, int flags);

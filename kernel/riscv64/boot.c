@@ -609,8 +609,15 @@ static void riscv64_syscall_dispatch_selftest(void) {
 
     riscv64_syscall_dispatch(&frame);
 
+    /* **返り値は NUL 込みの長さ ("/" なら 2) (2026-09-13)。**ここは
+     * cwd_buf のポインタが返ることを期待していた。linux 側の getcwd が
+     * Linux の規約 (長さ / -ERANGE / -EFAULT) を守っておらずポインタを
+     * 返していたのを、この selftest がそのまま正解として固定していた。
+     * getcwd を kernel/sys_task.c へ畳んで規約どおりに直したので合わせる。
+     * musl の getcwd() は長さの返り値で正しく動く (riscv64-musl-smoke の
+     * MUSL:/ で確認) */
     if (frame.sepc != 0x0000000040002004ULL ||
-        frame.a0 != (uint64_t)(uintptr_t)cwd_buf ||
+        frame.a0 != 2 ||
         cwd_buf[0] != '/' ||
         cwd_buf[1] != '\0' ||
         ctx->user_frame.sepc != frame.sepc) {

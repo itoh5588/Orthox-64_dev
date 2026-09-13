@@ -1168,28 +1168,10 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                                                                     (size_t)arch_syscall_arg2(frame)));
             return;
         case LINUX_SYS_GETCWD:
-            {
-                struct task* task = get_current_task();
-                char* dst = (char*)(uintptr_t)arch_syscall_arg0(frame);
-                size_t dst_size = (size_t)arch_syscall_arg1(frame);
-                const char* cwd = (task && task->cwd[0]) ? task->cwd : "/";
-                size_t i = 0;
-                if (!dst || dst_size == 0) {
-                    arch_syscall_set_return(frame, 0);
-                    return;
-                }
-                while (cwd[i] && i + 1 < dst_size) {
-                    dst[i] = cwd[i];
-                    i++;
-                }
-                if (cwd[i] != '\0' && i + 1 >= dst_size) {
-                    arch_syscall_set_return(frame, 0);
-                    return;
-                }
-                dst[i] = '\0';
-                arch_syscall_set_return(frame, (uint64_t)(uintptr_t)dst);
-                return;
-            }
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)sys_getcwd((char*)(uintptr_t)arch_syscall_arg0(frame),
+                                                                  (size_t)arch_syscall_arg1(frame)));
+            return;
         case LINUX_SYS_GETPID:
             arch_syscall_set_return(frame, sys_getpid());
             return;
@@ -1555,12 +1537,9 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             }
             return;
         case LINUX_SYS_PIPE2:
-            {
-                extern int sys_pipe2(int* pipefd, int flags);
-                arch_syscall_set_return(frame,
-                                        (uint64_t)(int64_t)sys_pipe2((int*)(uintptr_t)arch_syscall_arg0(frame),
-                                                                     (int)arch_syscall_arg1(frame)));
-            }
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)sys_pipe2((int*)(uintptr_t)arch_syscall_arg0(frame),
+                                                                 (int)arch_syscall_arg1(frame)));
             return;
         case LINUX_SYS_DUP:
             {

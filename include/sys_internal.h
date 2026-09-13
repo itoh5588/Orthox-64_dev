@@ -121,7 +121,6 @@ int64_t sys_readv(int fd, const struct linux_iovec* iov, int iovcnt);
 int sys_mount_module_root(void);
 int sys_get_mount_status(char* buf, size_t size);
 int sys_pipe_user(int* user_pipefd);
-int sys_pipe2_user(int* user_pipefd, int flags);
 void sys_ls_private(void);
 int sys_get_video_info(struct video_info* info);
 uint64_t sys_map_framebuffer(void);

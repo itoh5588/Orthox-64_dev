@@ -72,6 +72,11 @@ int sys_pipe(int pipefd[2]) {
 }
 
 int sys_pipe2(int pipefd[2], int flags) {
+    /* **先に NULL を弾く (2026-09-13)。**fs_pipe は fd 2 つとパイプのページを
+     * 確保してから pipefd に書くので、NULL だとカーネルが落ちるうえ確保した
+     * ものが残る。x86 が通っていた sys_pipe2_user も成功後に検査なしで書いて
+     * いた。riscv64 の sys_pipe2 (kernel/riscv64/fs.c) は最初から冒頭で弾いている */
+    if (!pipefd) return -EFAULT;
     return fs_pipe2(pipefd, flags);
 }
 
@@ -121,10 +126,6 @@ int sys_chdir(const char* path) {
 
 int sys_fchdir(int fd) {
     return fs_fchdir(fd);
-}
-
-int sys_getcwd(char* buf, size_t size) {
-    return fs_getcwd(buf, size);
 }
 
 int sys_truncate(const char* path, uint64_t length) {
@@ -299,16 +300,6 @@ int sys_get_mount_status(char* buf, size_t size) {
 int sys_pipe_user(int* user_pipefd) {
     int pipefd[2];
     int ret = fs_pipe(pipefd);
-    if (ret == 0) {
-        user_pipefd[0] = pipefd[0];
-        user_pipefd[1] = pipefd[1];
-    }
-    return ret;
-}
-
-int sys_pipe2_user(int* user_pipefd, int flags) {
-    int pipefd[2];
-    int ret = fs_pipe2(pipefd, flags);
     if (ret == 0) {
         user_pipefd[0] = pipefd[0];
         user_pipefd[1] = pipefd[1];

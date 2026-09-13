@@ -3591,19 +3591,6 @@ int fs_fchdir(int fd) {
     return 0;
 }
 
-int fs_getcwd(char* buf, size_t size) {
-    struct task* current = get_current_task();
-    size_t i = 0;
-    if (!current || !buf || size == 0) return -EFAULT;
-    while (current->cwd[i] && i + 1 < size) {
-        buf[i] = current->cwd[i];
-        i++;
-    }
-    if (current->cwd[i] != '\0' && i + 1 >= size) return -ERANGE;
-    buf[i] = '\0';
-    return (int)(i + 1);
-}
-
 int fs_get_file_data(const char* path, void** data, size_t* size) {
     char resolved_path[256];
     resolve_task_path(path, resolved_path, sizeof(resolved_path));

@@ -105,3 +105,34 @@ int sys_sysinfo(struct linux_sysinfo* info) {
     info->procs    = 1;
     return 0;
 }
+
+/* ---- getcwd ---------------------------------------------------------------
+ * **linux 側は Linux の返り値の規約を守っていなかった (2026-09-13 に畳んだ)。**
+ *
+ * | | x86 (fs_getcwd) | linux 側 (その場で計算) |
+ * |---|---|---|
+ * | 成功        | NUL 込みの長さ | **buf のポインタ** |
+ * | 足りない    | -ERANGE        | **0** |
+ * | buf が NULL | -EFAULT        | **0** |
+ * | cwd が空    | "" を返す      | "/" を返す |
+ *
+ * musl の getcwd() は「ret < 0 なら失敗、**ret == 0 なら ENOENT**」と読む
+ * (ports/musl/src/unistd/getcwd.c)。linux 側はバッファ不足で 0 を返すので、
+ * **ERANGE ではなく ENOENT になり、足りなければ広げて呼び直す側が諦める。**
+ * 成功時のポインタは正の値なので偶然通っていた。
+ *
+ * **返り値は x86 (Linux の規約) に、空の cwd の救済は linux 側に寄せた。** */
+int sys_getcwd(char* buf, size_t size) {
+    struct task* current = get_current_task();
+    const char* cwd = (current && current->cwd[0]) ? current->cwd : "/";
+    size_t i = 0;
+    if (!buf) return -LINUX_EFAULT;
+    while (cwd[i] && i + 1 < size) {
+        buf[i] = cwd[i];
+        i++;
+    }
+    /* size が 0 のときもここに落ちる (1 文字も入らない) */
+    if (cwd[i] != '\0' || i >= size) return -LINUX_ERANGE;
+    buf[i] = '\0';
+    return (int)(i + 1);
+}
