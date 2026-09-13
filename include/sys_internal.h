@@ -85,7 +85,6 @@ int sys_fstatat(int dirfd, const char* path, struct kstat* st, int flags);
 int sys_access(const char* path, int mode);
 int sys_faccessat(int dirfd, const char* path, int mode, int flags);
 int64_t sys_readlink(const char* path, char* buf, size_t bufsiz);
-int64_t sys_readlinkat(int dirfd, const char* path, char* buf, size_t bufsiz);
 int64_t sys_lseek(int fd, int64_t offset, int whence);
 int sys_getdents(int fd, struct orth_dirent* dirp, size_t count);
 int sys_getdents64(int fd, void* dirp, size_t count);

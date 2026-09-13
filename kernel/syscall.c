@@ -58,7 +58,7 @@ void syscall_dispatch(arch_syscall_frame_t* frame) {
             frame->rax = (uint64_t)sys_readlink((const char*)frame->rdi, (char*)frame->rsi, (size_t)frame->rdx);
             break;
         case SYS_READLINKAT:
-            frame->rax = (uint64_t)sys_readlinkat((int)frame->rdi, (const char*)frame->rsi, (char*)frame->rdx, (size_t)frame->r10);
+            frame->rax = (uint64_t)fs_readlinkat((int)frame->rdi, (const char*)frame->rsi, (char*)frame->rdx, (size_t)frame->r10);
             break;
         case SYS_FACCESSAT:
             frame->rax = (uint64_t)sys_faccessat((int)frame->rdi, (const char*)frame->rsi, (int)frame->rdx, (int)frame->r10);

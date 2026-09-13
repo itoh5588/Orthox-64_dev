@@ -364,14 +364,6 @@ static int linux_sys_umask(int mask) {
 }
 
 
-/* N-6 (2026-08-31): xv6fs に本物のシンボリックリンクを実装したので、
- * fs_readlinkat にそのまま委ねる。戻り値は fs.c 側の errno 定数と
- * Linux の値が同じ番号を使っているのでそのまま渡してよい (どちらも
- * ENOENT=2 / EINVAL=22 など、fs.c 冒頭の #define がその前提で書かれている) */
-static int64_t linux_sys_readlinkat(int dirfd, const char* path, char* buf, size_t bufsiz) {
-    if (!path || !buf) return -LINUX_EFAULT;
-    return fs_readlinkat(dirfd, path, buf, bufsiz);
-}
 
 static int g_linux_tty_pgrp;
 static struct linux_termios g_linux_console_termios = {
@@ -1356,7 +1348,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_READLINKAT:
             arch_syscall_set_return(frame,
-                                    (uint64_t)linux_sys_readlinkat(
+                                    (uint64_t)fs_readlinkat(
                                         (int)arch_syscall_arg0(frame),
                                         (const char*)(uintptr_t)arch_syscall_arg1(frame),
                                         (char*)(uintptr_t)arch_syscall_arg2(frame),
