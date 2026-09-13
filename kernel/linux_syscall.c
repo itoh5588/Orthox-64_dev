@@ -273,25 +273,10 @@ static int linux_sys_fstatat_user(int dirfd, const char* path, struct linux_stat
     return rc;
 }
 
-static void linux_utsname_set(char* dst, const char* src) {
-    size_t i = 0;
-    for (; src[i] && i < 64; i++) dst[i] = src[i];
-    for (; i < 65; i++) dst[i] = '\0';
-}
 
-/* **名乗りは x86 側と同じ 1 組 (2026-09-09)。**それまでここだけが
- * sysname "Linux" / release "5.0.0-orthox" を返しており、**同じ OS が
- * アーキによって違う名前を名乗っていた** (include/version.h を参照)。 */
-static int linux_sys_uname(struct linux_utsname* out) {
-    if (!out) return -LINUX_EFAULT;
-    linux_utsname_set(out->sysname, ORTHOX_UNAME_SYSNAME);
-    linux_utsname_set(out->nodename, ORTHOX_UNAME_NODENAME);
-    linux_utsname_set(out->release, ORTHOX_KERNEL_RELEASE);
-    linux_utsname_set(out->version, arch_uname_version());
-    linux_utsname_set(out->machine, arch_uname_machine());
-    linux_utsname_set(out->domainname, ORTHOX_UNAME_DOMAINNAME);
-    return 0;
-}
+/* **uname は kernel/sys_uname.c へ移した (2026-09-13、別実装 29 組の 1 組)。**
+ * 名乗る値を x86 と揃えた経緯 (2026-09-09) も移した先に書いてある。 */
+
 
 /* ---- 資源の上限 (getrlimit / setrlimit / prlimit64) ----------------------
  *
@@ -1778,7 +1763,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_UNAME:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_sys_uname(
+                                    (uint64_t)(int64_t)sys_uname(
                                         (struct linux_utsname*)(uintptr_t)arch_syscall_arg0(frame)));
             return;
         case LINUX_SYS_GETRLIMIT:

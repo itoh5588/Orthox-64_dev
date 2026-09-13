@@ -120,20 +120,6 @@ int sys_clock_gettime(int clock_id, struct linux_timespec* ts) {
     return 0;
 }
 
-static void copy_cstr_fixed(char* dst, size_t dst_size, const char* src) {
-    size_t i = 0;
-    if (!dst || dst_size == 0) return;
-    if (!src) {
-        dst[0] = '\0';
-        return;
-    }
-    while (i + 1 < dst_size && src[i] != '\0') {
-        dst[i] = src[i];
-        i++;
-    }
-    dst[i] = '\0';
-}
-
 int sys_sched_yield(void) {
     kernel_yield();
     return 0;
@@ -153,17 +139,6 @@ int sys_nanosleep(const struct linux_timespec* req, struct linux_timespec* rem) 
         rem->tv_nsec = 0;
     }
     return sys_sleep_ms(ms);
-}
-
-int sys_uname(struct linux_utsname* buf) {
-    if (!buf) return -LINUX_EFAULT;
-    copy_cstr_fixed(buf->sysname, sizeof(buf->sysname), ORTHOX_UNAME_SYSNAME);
-    copy_cstr_fixed(buf->nodename, sizeof(buf->nodename), ORTHOX_UNAME_NODENAME);
-    copy_cstr_fixed(buf->release, sizeof(buf->release), ORTHOX_KERNEL_RELEASE);
-    copy_cstr_fixed(buf->version, sizeof(buf->version), arch_uname_version());
-    copy_cstr_fixed(buf->machine, sizeof(buf->machine), arch_uname_machine());
-    copy_cstr_fixed(buf->domainname, sizeof(buf->domainname), ORTHOX_UNAME_DOMAINNAME);
-    return 0;
 }
 
 int sys_sysinfo(struct linux_sysinfo_k* info) {
