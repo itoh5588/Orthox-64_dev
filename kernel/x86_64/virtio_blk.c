@@ -11,6 +11,7 @@
 #include "task.h"
 #include "bottom_half.h"
 #include "irq.h"
+#include "string.h"
 
 void puts(const char* s);
 void puthex(uint64_t v);
@@ -19,6 +20,10 @@ void puthex(uint64_t v);
 #define VIRTIO_BLK_TIMEOUT_MS 5000ULL
 #define VIRTIO_BLK_MAX_REQUESTS 8
 #define VIRTIO_BLK_DESCS_PER_REQ 3
+/* 中継領域 1 枠分。**xv6fs の連続読みは実測で最大 9KB だった**ので 16KB あれば
+ * たいてい 1 回で運べる。足りなければ分割して回す */
+#define VIRTIO_BLK_BOUNCE_PAGES 4
+#define VIRTIO_BLK_BOUNCE_BYTES (VIRTIO_BLK_BOUNCE_PAGES * PAGE_SIZE)
 
 static struct virtio_queue g_vblk_q;
 static uint16_t g_vblk_iobase = 0;
@@ -40,6 +45,10 @@ struct vblk_request_ctx {
     uint64_t hdr_phys;
     uint8_t* status;
     uint64_t status_phys;
+    /* **DMA に使えないバッファ用の中継 (2026-09-12: A-1)。**枠は排他所有なので
+     * 追加のロックは要らない。大きさは VIRTIO_BLK_BOUNCE_BYTES */
+    uint8_t* bounce;
+    uint64_t bounce_phys;
 };
 
 static struct vblk_request_ctx g_vblk_requests[VIRTIO_BLK_MAX_REQUESTS];
@@ -168,6 +177,14 @@ static int vblk_init_request_pool(void) {
         g_vblk_requests[i].status = (uint8_t*)g_vblk_requests[i].hdr + sizeof(struct virtio_blk_req);
         g_vblk_requests[i].status_phys =
             g_vblk_requests[i].hdr_phys + sizeof(struct virtio_blk_req);
+        {
+            /* **連続した物理領域が要る** (記述子 1 本で運ぶため)。起動時なら
+             * 断片化していないので取れる */
+            void* bounce_phys = pmm_alloc(VIRTIO_BLK_BOUNCE_PAGES);
+            if (!bounce_phys) return -1;
+            g_vblk_requests[i].bounce = (uint8_t*)PHYS_TO_VIRT(bounce_phys);
+            g_vblk_requests[i].bounce_phys = (uint64_t)(uintptr_t)bounce_phys;
+        }
         init_completion(&g_vblk_requests[i].completion);
         KASSERT(g_vblk_requests[i].desc_head + VIRTIO_BLK_DESCS_PER_REQ <= g_vblk_q.queue_size);
     }
@@ -332,6 +349,26 @@ static int virtio_blk_irq(int irq, void* ctx) {
     return 1;
 }
 
+/* **DMA に使える物理アドレスを返す。使えなければ 0。**
+ *
+ * ★ **VIRT_TO_PHYS は HHDM の中の番地にしか使えない (2026-09-12)。**
+ * ここは引けなければ無条件に VIRT_TO_PHYS へ落ちていた。ユーザー空間の
+ * バッファが降りてくると引き算の結果はゴミになり、その記述子を積むと
+ * QEMU が dma_memory_map に失敗して
+ * `virtio: bogus descriptor or out of resources` を出し、
+ * **virtio_error() が装置を停止させる** (実測: buf=0x20000026E280 ->
+ * 0xA0000026E280 = 約 176TB。RAM は 2GB)。
+ *
+ * ユーザーのバッファが降りてくる道は kernel/fs.c の fs_read ->
+ * xv6fs_readi -> **xv6bio_rw_run** (キャッシュを迂回して直接 DMA)。
+ * 呼び手のバッファをそのまま渡す作りになっている (kernel/xv6fs.c:841)。 */
+static uint64_t vblk_dma_phys(const void* buf) {
+    uint64_t phys = vmm_get_phys(vmm_get_kernel_pml4(), (uint64_t)(uintptr_t)buf);
+    if (phys != 0) return phys;
+    if ((uint64_t)(uintptr_t)buf >= g_hhdm_offset) return VIRT_TO_PHYS(buf);
+    return 0;
+}
+
 static int vblk_fill_descriptors(struct vblk_request_ctx* req, uint32_t type,
                                  uint64_t sector, void* buf, uint32_t len) {
     vblk_assert_request_ctx(req);
@@ -341,41 +378,10 @@ static int vblk_fill_descriptors(struct vblk_request_ctx* req, uint32_t type,
     uint16_t head = req->desc_head;
     uint16_t data = (uint16_t)(head + 1U);
     uint16_t status = (uint16_t)(head + 2U);
-    uint64_t data_phys = vmm_get_phys(vmm_get_kernel_pml4(), (uint64_t)(uintptr_t)buf);
+    uint64_t data_phys = vblk_dma_phys(buf);
     if (data_phys == 0) {
-        /* ★ **VIRT_TO_PHYS は HHDM の中の番地にしか使えない (2026-09-12)。**
-         *
-         * ここは引けなければ無条件に VIRT_TO_PHYS へ落ちていた。**ユーザー
-         * 空間のバッファが降りてくると、引き算の結果はただのゴミになる。**
-         * 実測 (OS 内カーネルビルド):
-         *
-         *   buf=0x000020000026E280  walk=0x0  hhdm=0xFFFF800000000000
-         *   -> used=0x0000A0000026E280   (約 176TB。RAM は 2GB)
-         *
-         * その記述子を積むと QEMU が dma_memory_map に失敗して
-         * `virtio: bogus descriptor or out of resources` を出し、
-         * **virtio_error() が装置を停止させる。**以後すべての read / write が
-         * 失敗し、/bin/as すら読めなくなっていた。
-         *
-         * 降りてくる道は kernel/fs.c の fs_read -> xv6fs_readi ->
-         * **xv6bio_rw_run (キャッシュを迂回してバッファへ直接 DMA)。**
-         * あちらは呼び手のバッファをそのまま渡す (kernel/xv6fs.c:841)。
-         *
-         * **ここでは弾くだけにする。**黙ってゴミを積むより、その 1 件を
-         * I/O エラーにして装置を生かすほうがよい。呼び手を直すのは別件 */
-        if ((uint64_t)(uintptr_t)buf >= g_hhdm_offset) {
-            data_phys = VIRT_TO_PHYS(buf);
-        } else {
-            static int told;
-            if (told < 4) {
-                told++;
-                puts("[vblk] refusing non-kernel buffer: buf=0x");
-                puthex((uint64_t)(uintptr_t)buf);
-                puts(" len=0x"); puthex(len);
-                puts("\r\n");
-            }
-            return -1;
-        }
+        /* ここへ来るのは vblk_request の振り分けが漏れたときだけ */
+        return -1;
     }
     KASSERT(data_phys != 0);
 
@@ -458,15 +464,13 @@ static int vblk_wait_request(struct vblk_request_ctx* req) {
     return vblk_consume_completion_status(req);
 }
 
-static int vblk_request(uint32_t type, uint64_t sector, void* buf, uint32_t len) {
+static int vblk_request_direct(uint32_t type, uint64_t sector, void* buf, uint32_t len) {
     int ret = -1;
     struct vblk_request_ctx* req;
     if (!g_vblk_ready) return -1;
     req = vblk_acquire_request();
     if (!req) return -1;
 
-    /* **積めない要求は積まない。**不正な物理アドレスを積むと QEMU が
-     * 装置ごと止める (vblk_fill_descriptors のコメントを参照) */
     if (vblk_fill_descriptors(req, type, sector, buf, len) < 0) {
         goto out;
     }
@@ -480,6 +484,55 @@ static int vblk_request(uint32_t type, uint64_t sector, void* buf, uint32_t len)
 out:
     vblk_release_request(req);
     return ret;
+}
+
+/* **DMA に使えないバッファは枠の中継領域を経由して運ぶ (2026-09-12: A-1)。**
+ *
+ * 弾くだけ (2026-09-12 の前段) でも正しく動くが、xv6fs_readi の高速路が
+ * その都度キャッシュ経由へ退くため、**OS 内カーネルビルドで 2056 回**
+ * 退いていた。高速路の狙いは「連続した区間を 1 コマンドにまとめる」ことで
+ * コピーを省くことではない (kernel/xv6bio.c の xv6bio_rw_run のコメント)
+ * ので、**中継しても狙いは保てる。**
+ *
+ * 中継領域は枠ごとに持たせてある (枠は排他所有なので追加のロックが要らない)。
+ * 入りきらない要求は分割して回す。 */
+static int vblk_request_bounced(uint32_t type, uint64_t sector, void* buf, uint32_t len) {
+    uint8_t* user = (uint8_t*)buf;
+    uint32_t done = 0;
+
+    if (!g_vblk_ready) return -1;
+    if ((len % 512U) != 0) return -1;
+
+    while (done < len) {
+        struct vblk_request_ctx* req = vblk_acquire_request();
+        uint32_t chunk = len - done;
+        int ret = -1;
+        if (!req) return -1;
+        if (chunk > VIRTIO_BLK_BOUNCE_BYTES) chunk = VIRTIO_BLK_BOUNCE_BYTES;
+
+        if (type == VIRTIO_BLK_T_OUT) {
+            memcpy(req->bounce, user + done, chunk);
+        }
+        if (vblk_fill_descriptors(req, type, sector + (done / 512U),
+                                  req->bounce, chunk) == 0) {
+            vblk_submit_request(req);
+            if (vblk_wait_request(req) == 0) ret = 0;
+        }
+        if (ret == 0 && type == VIRTIO_BLK_T_IN) {
+            memcpy(user + done, req->bounce, chunk);
+        }
+        vblk_release_request(req);
+        if (ret < 0) return -1;
+        done += chunk;
+    }
+    return 0;
+}
+
+static int vblk_request(uint32_t type, uint64_t sector, void* buf, uint32_t len) {
+    if (vblk_dma_phys(buf) != 0) {
+        return vblk_request_direct(type, sector, buf, len);
+    }
+    return vblk_request_bounced(type, sector, buf, len);
 }
 
 int virtio_blk_read(uint64_t sector, void* buf, uint32_t count) {
