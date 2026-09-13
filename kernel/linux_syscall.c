@@ -795,39 +795,6 @@ static int64_t linux_bootstrap_sys_ppoll(struct linux_pollfd* fds, uint64_t nfds
     }
 }
 
-static int linux_bootstrap_sys_nanosleep(const struct linux_timespec* req,
-                                           struct linux_timespec* rem) {
-    struct task* current = get_current_task();
-    int64_t req_sec;
-    int64_t req_nsec;
-    uint64_t ms;
-    uint64_t deadline;
-
-    if (!req) return -LINUX_EFAULT;
-    /* musl の sleep() は nanosleep(&tv, &tv) と req と rem に同じポインタを渡す。
-     * rem を先に書くと要求時間を自分で潰すので、必ず req を退避してから触ること */
-    req_sec = req->tv_sec;
-    req_nsec = req->tv_nsec;
-    if (req_sec < 0 || req_nsec < 0 || req_nsec >= 1000000000L) return -LINUX_EINVAL;
-    if (rem) {
-        rem->tv_sec = 0;
-        rem->tv_nsec = 0;
-    }
-    ms = (uint64_t)req_sec * 1000ULL + ((uint64_t)req_nsec + 999999ULL) / 1000000ULL;
-    if (ms == 0 || !current) {
-        kernel_yield();
-        return 0;
-    }
-    deadline = arch_time_now_ms() + ms;
-    /* 早すぎる起床 (console 待ちの起床など、sleep_until_ms と無関係な経路から
-     * READY にされる) があり得るので、デッドラインを再確認して寝直す。
-     * 起床は sched.c の task_on_timer_tick() の走査が行う。 */
-    while (arch_time_now_ms() < deadline) {
-        task_mark_io_wait_until(current, deadline);
-        kernel_yield();
-    }
-    return 0;
-}
 
 static int64_t linux_bootstrap_sys_ioctl(int fd, unsigned long request, uint64_t arg) {
     switch (request) {
@@ -1466,7 +1433,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_NANOSLEEP:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_nanosleep(
+                                    (uint64_t)(int64_t)sys_nanosleep(
                                         (const struct linux_timespec*)(uintptr_t)arch_syscall_arg0(frame),
                                         (struct linux_timespec*)(uintptr_t)arch_syscall_arg1(frame)));
             return;

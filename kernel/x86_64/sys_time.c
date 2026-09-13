@@ -123,22 +123,6 @@ int sys_sched_yield(void) {
     return 0;
 }
 
-int sys_nanosleep(const struct linux_timespec* req, struct linux_timespec* rem) {
-    uint64_t ms;
-    if (!req) return -LINUX_EFAULT;
-    /* **時刻の指定が不正なら EINVAL。**Linux の規定 */
-    if (req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000LL) return -LINUX_EINVAL;
-    ms = (uint64_t)req->tv_sec * 1000ULL;
-    if (req->tv_nsec != 0) {
-        ms += (uint64_t)((req->tv_nsec + 999999LL) / 1000000LL);
-    }
-    if (rem) {
-        rem->tv_sec = 0;
-        rem->tv_nsec = 0;
-    }
-    return sys_sleep_ms(ms);
-}
-
 int sys_sleep_ms(uint64_t ms) {
     struct task* current = get_current_task();
     if (!current) return -LINUX_ESRCH;

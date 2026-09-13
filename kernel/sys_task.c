@@ -136,3 +136,49 @@ int sys_getcwd(char* buf, size_t size) {
     buf[i] = '\0';
     return (int)(i + 1);
 }
+
+/* ---- nanosleep ------------------------------------------------------------
+ * **x86 は期限前に戻りえた (2026-09-13 に畳んだ)。**
+ *
+ * | | x86 (sys_sleep_ms 経由) | linux 側 (採用) |
+ * |---|---|---|
+ * | 途中で起こされたとき | **そのまま戻る** | 期限を見て寝直す |
+ * | 0 ミリ秒             | 眠りに入る      | yield だけ |
+ * | 時計                 | lapic の tick   | arch_time_now_ms (x86 では同じ lapic) |
+ *
+ * 寝ている間に、期限と無関係な経路 (console 待ちの起床など) から READY に
+ * されることがある。x86 は TASK_SLEEPING でなくなった時点で戻っていた。
+ * 期限で起こすのは 3 アーキ共通の task_on_timer_tick -> task_poll_sleep_wakeups
+ * (kernel/sched.c) なので、linux 側の作りがそのまま x86 でも動く。
+ *
+ * **musl の sleep() は nanosleep(&tv, &tv) と req と rem に同じポインタを
+ * 渡す。**rem を先に書くと要求時間を自分で潰すので、必ず req を退避してから
+ * 触ること (riscv64-sleep-smoke がこの呼び方で回している) */
+int sys_nanosleep(const struct linux_timespec* req, struct linux_timespec* rem) {
+    struct task* current = get_current_task();
+    int64_t req_sec;
+    int64_t req_nsec;
+    uint64_t ms;
+    uint64_t deadline;
+
+    if (!req) return -LINUX_EFAULT;
+    req_sec = req->tv_sec;
+    req_nsec = req->tv_nsec;
+    /* **時刻の指定が不正なら EINVAL。**Linux の規定 */
+    if (req_sec < 0 || req_nsec < 0 || req_nsec >= 1000000000L) return -LINUX_EINVAL;
+    if (rem) {
+        rem->tv_sec = 0;
+        rem->tv_nsec = 0;
+    }
+    ms = (uint64_t)req_sec * 1000ULL + ((uint64_t)req_nsec + 999999ULL) / 1000000ULL;
+    if (ms == 0 || !current) {
+        kernel_yield();
+        return 0;
+    }
+    deadline = arch_time_now_ms() + ms;
+    while (arch_time_now_ms() < deadline) {
+        task_mark_io_wait_until(current, deadline);
+        kernel_yield();
+    }
+    return 0;
+}
