@@ -288,47 +288,6 @@ int sys_lstat(const char* path, struct kstat* st) {
     return fs_stat(path, st);
 }
 
-int64_t sys_writev(int fd, const struct linux_iovec* iov, int iovcnt) {
-    int64_t total = 0;
-    /* **条件で errno を分ける。**Linux は iovcnt が負なら EINVAL、
-     * iov が読めなければ EFAULT */
-    if (iovcnt < 0) return -EINVAL;
-    if (!iov) return -EFAULT;
-    for (int i = 0; i < iovcnt; i++) {
-        int64_t rc = fs_write(fd, iov[i].iov_base, iov[i].iov_len);
-        if (rc < 0) return (total > 0) ? total : rc;
-        total += rc;
-        if ((size_t)rc != iov[i].iov_len) break;
-    }
-#if ORTHOX_MEM_PROGRESS
-    {
-        struct task* current = get_current_task();
-        if (current && current->trace_progress && total > 0) {
-            current->trace_write_bytes += (uint64_t)total;
-            if ((uint64_t)total > current->trace_write_max) {
-                current->trace_write_max = (uint64_t)total;
-            }
-        }
-    }
-#endif
-    return total;
-}
-
-int64_t sys_readv(int fd, const struct linux_iovec* iov, int iovcnt) {
-    int64_t total = 0;
-    /* **条件で errno を分ける。**Linux は iovcnt が負なら EINVAL、
-     * iov が読めなければ EFAULT */
-    if (iovcnt < 0) return -EINVAL;
-    if (!iov) return -EFAULT;
-    for (int i = 0; i < iovcnt; i++) {
-        int64_t rc = fs_read(fd, (void*)iov[i].iov_base, iov[i].iov_len);
-        if (rc < 0) return (total > 0) ? total : rc;
-        total += rc;
-        if ((size_t)rc != iov[i].iov_len) break;
-    }
-    return total;
-}
-
 int sys_mount_module_root(void) {
     return fs_mount_module_root();
 }

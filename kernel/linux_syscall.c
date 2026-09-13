@@ -444,9 +444,6 @@ int arch_console_onlcr_enabled(void) {
 }
 
 
-static int64_t linux_bootstrap_sys_write(int fd, const void* buf, size_t count) {
-    return sys_write(fd, buf, count);
-}
 
 static int64_t linux_bootstrap_sys_lseek(int fd, int64_t offset, int whence) {
     struct task* current = get_current_task();
@@ -526,31 +523,7 @@ static int linux_bootstrap_sys_fchmod(int fd, uint32_t mode) {
     return sys_chmod(current->fds[fd].name, mode);
 }
 
-static int64_t linux_bootstrap_sys_writev(int fd, const struct linux_iovec* iov, int iovcnt) {
-    int64_t total = 0;
-    if (iovcnt < 0) return -LINUX_EINVAL;
-    if (iovcnt != 0 && !iov) return -LINUX_EFAULT;
-    for (int i = 0; i < iovcnt; i++) {
-        int64_t rc = linux_bootstrap_sys_write(fd, iov[i].iov_base, iov[i].iov_len);
-        if (rc < 0) return (total > 0) ? total : rc;
-        total += rc;
-        if ((size_t)rc != iov[i].iov_len) break;
-    }
-    return total;
-}
 
-static int64_t linux_bootstrap_sys_readv(int fd, const struct linux_iovec* iov, int iovcnt) {
-    int64_t total = 0;
-    if (iovcnt < 0) return -LINUX_EINVAL;
-    if (iovcnt != 0 && !iov) return -LINUX_EFAULT;
-    for (int i = 0; i < iovcnt; i++) {
-        int64_t rc = sys_read(fd, iov[i].iov_base, iov[i].iov_len);
-        if (rc < 0) return (total > 0) ? total : rc;
-        total += rc;
-        if ((size_t)rc != iov[i].iov_len) break;
-    }
-    return total;
-}
 
 
 /* **brk(2) は kernel/sys_mmap.c へ移した (2026-09-12)。**
@@ -1190,7 +1163,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
     switch (syscall_no) {
         case LINUX_SYS_WRITE:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_write((int)arch_syscall_arg0(frame),
+                                    (uint64_t)(int64_t)sys_write((int)arch_syscall_arg0(frame),
                                                                                     (const void*)(uintptr_t)arch_syscall_arg1(frame),
                                                                                     (size_t)arch_syscall_arg2(frame)));
             return;
@@ -1542,13 +1515,13 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_WRITEV:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_writev((int)arch_syscall_arg0(frame),
+                                    (uint64_t)(int64_t)sys_writev((int)arch_syscall_arg0(frame),
                                                                                     (const struct linux_iovec*)(uintptr_t)arch_syscall_arg1(frame),
                                                                                     (int)arch_syscall_arg2(frame)));
             return;
         case LINUX_SYS_READV:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_readv((int)arch_syscall_arg0(frame),
+                                    (uint64_t)(int64_t)sys_readv((int)arch_syscall_arg0(frame),
                                                                                    (const struct linux_iovec*)(uintptr_t)arch_syscall_arg1(frame),
                                                                                    (int)arch_syscall_arg2(frame)));
             return;
