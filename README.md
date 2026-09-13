@@ -49,6 +49,22 @@ make run
 - **ファイルシステム:** VFS + Read-Write な xv6fs（xv6-riscv から移植、triple-indirect ブロックで最大 ~16 GB/ファイル）。
 - **移植済み:** musl 1.2.5 / BusyBox 1.27 / Binutils 2.26 / GCC 4.7.4 / Python 3.12.3 / NumPy 1.26.4 / doomgeneric。
 
+## 3 アーキ間の syscall 実装統合
+
+x86-64 / aarch64 / riscv64 は元々 syscall 周りの実装系統が分かれており、
+同じ syscall が最大 3 通りに別実装されていた。共通する 60 種の syscall の
+うち、現在 **58 種を単一実装に統合済み**（残るは `ioctl` のみ。`fstat` は
+`struct stat` のフィールド並びが ISA ごとに異なる ABI 差のため対象外）。
+
+統合の過程で、アーキ間の食い違いに起因する実際の不具合も複数見つかり
+修正した。代表例:
+
+- `getcwd` の返り値が POSIX の規約（成功時は長さ、失敗時は `-errno`）に
+  反し、ポインタを返していた（musl 越しに `ENOENT` へ化ける不具合）
+- x86 の `nanosleep` が、指定した待ち時間より早く返ることがあった
+- x86 の RTC (`clock_gettime(CLOCK_REALTIME)`) が閏年の数え方の誤りで、
+  平年の日付を 1 日遅く計算していた
+
 ## Raspberry Pi 4 (aarch64) への移植
 
 x86-64 で作ったカーネルを **aarch64 へ移植**しました。**2026 年 8 月 15 日に Raspberry Pi 4 の実機で初めて起動**し、**2026 年 8 月 23 日、実機上でセルフホスティングのループを閉じました。**

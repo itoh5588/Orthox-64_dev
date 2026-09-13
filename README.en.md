@@ -49,6 +49,25 @@ Full details, macOS instructions, and the on-OS GCC 4.7.4 toolchain build are in
 - **Filesystem:** VFS + read-write xv6fs (ported from xv6-riscv, triple-indirect blocks up to ~16 GB per file).
 - **Ported:** musl 1.2.5 / BusyBox 1.27 / Binutils 2.26 / GCC 4.7.4 / Python 3.12.3 / NumPy 1.26.4 / doomgeneric.
 
+## Syscall implementation unification across the 3 ISAs
+
+x86-64 / aarch64 / riscv64 originally had separate syscall implementation
+lineages, so the same syscall could exist in up to 3 distinct
+implementations. Of the 60 syscalls common to all three, **58 are now
+unified into a single implementation** (only `ioctl` remains; `fstat` is
+intentionally excluded because the `struct stat` field layout differs by
+ABI across ISAs).
+
+The unification work surfaced several real cross-arch bugs, which were
+fixed along the way. Notable examples:
+
+- `getcwd` violated the POSIX return-value convention (length on success,
+  `-errno` on failure) and returned a raw pointer instead — this surfaced
+  through musl as a spurious `ENOENT`
+- x86's `nanosleep` could return before the requested duration had elapsed
+- x86's RTC (`clock_gettime(CLOCK_REALTIME)`) miscounted leap years and
+  was off by one day on every non-leap year
+
 ## Raspberry Pi 4 (aarch64) Port
 
 The kernel has been **ported to aarch64**. **On 15 August 2026 it booted on real Raspberry Pi 4 hardware for the first time**, and **on 23 August 2026 the self-hosting loop was closed on the real hardware.**
