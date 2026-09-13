@@ -9,23 +9,6 @@
 struct kstat;
 struct task;
 
-struct linux_sysinfo_k {
-    unsigned long uptime;
-    unsigned long loads[3];
-    unsigned long totalram;
-    unsigned long freeram;
-    unsigned long sharedram;
-    unsigned long bufferram;
-    unsigned long totalswap;
-    unsigned long freeswap;
-    unsigned short procs;
-    unsigned short pad;
-    unsigned long totalhigh;
-    unsigned long freehigh;
-    unsigned int mem_unit;
-    char __reserved[256];
-};
-
 struct linux_stack_t_k {
     void* ss_sp;
     int ss_flags;
@@ -50,7 +33,8 @@ int sys_getrlimit(int resource, struct linux_rlimit* rlim);
 int sys_setrlimit(int resource, const struct linux_rlimit* rlim);
 int sys_prlimit64(int pid, int resource, const struct linux_rlimit* new_limit,
                   struct linux_rlimit* old_limit);
-int sys_sysinfo(struct linux_sysinfo_k* info);
+struct linux_sysinfo;   /* include/linux_syscalls.h。実装は kernel/sys_task.c */
+int sys_sysinfo(struct linux_sysinfo* info);
 int sys_sleep_ms(uint64_t ms);
 int sys_sigaltstack(const struct linux_stack_t_k* ss, struct linux_stack_t_k* old_ss);
 int sys_sigprocmask(int how, const uint64_t* set, uint64_t* oldset);

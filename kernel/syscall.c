@@ -223,7 +223,7 @@ void syscall_dispatch(arch_syscall_frame_t* frame) {
             frame->rax = (uint64_t)sys_wait4((int)frame->rdi, (int*)frame->rsi, (int)frame->rdx);
             break;
         case SYS_SYSINFO:
-            frame->rax = (uint64_t)sys_sysinfo((struct linux_sysinfo_k*)frame->rdi);
+            frame->rax = (uint64_t)sys_sysinfo((struct linux_sysinfo*)frame->rdi);
             break;
         case SYS_GETCWD:
             frame->rax = (uint64_t)sys_getcwd((char*)frame->rdi, (size_t)frame->rsi);

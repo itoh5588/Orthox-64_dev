@@ -363,19 +363,6 @@ static int linux_sys_umask(int mask) {
     return old;
 }
 
-static int linux_sys_sysinfo(struct linux_sysinfo* info) {
-    uint8_t* p;
-    if (!info) return -LINUX_EFAULT;
-    p = (uint8_t*)info;
-    for (uint64_t i = 0; i < sizeof(*info); i++) p[i] = 0;
-    /* **mem_unit を 0 にしないこと。** 呼び手が totalram に掛けるので
-     * 0 だと「メモリ 0」に見え、確保をあきらめる側がいる */
-    info->mem_unit = PAGE_SIZE;
-    info->totalram = pmm_get_allocated_pages() + pmm_get_free_pages();
-    info->freeram  = pmm_get_free_pages();
-    info->procs    = 1;
-    return 0;
-}
 
 /* N-6 (2026-08-31): xv6fs に本物のシンボリックリンクを実装したので、
  * fs_readlinkat にそのまま委ねる。戻り値は fs.c 側の errno 定数と
@@ -1786,7 +1773,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_SYSINFO:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_sys_sysinfo(
+                                    (uint64_t)(int64_t)sys_sysinfo(
                                         (struct linux_sysinfo*)(uintptr_t)arch_syscall_arg0(frame)));
             return;
         case LINUX_SYS_TRUNCATE:

@@ -3,12 +3,10 @@
 #include "sys_internal.h"
 #include "task.h"
 #include "lapic.h"
-#include "limine.h"
 #include "version.h"
 #include "linux_errno.h"
 #include "linux_syscall.h"   /* arch_uname_machine / arch_uname_version */
 
-extern volatile struct limine_memmap_request memmap_request;
 
 static inline void outb_u8(uint16_t port, uint8_t value) {
     __asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
@@ -139,31 +137,6 @@ int sys_nanosleep(const struct linux_timespec* req, struct linux_timespec* rem) 
         rem->tv_nsec = 0;
     }
     return sys_sleep_ms(ms);
-}
-
-int sys_sysinfo(struct linux_sysinfo_k* info) {
-    struct limine_memmap_response* memmap;
-    uint64_t totalram = 0;
-
-    if (!info) return -LINUX_EFAULT;
-
-    memmap = memmap_request.response;
-    if (memmap) {
-        for (uint64_t i = 0; i < memmap->entry_count; i++) {
-            struct limine_memmap_entry* entry = memmap->entries[i];
-            if (entry->type == LIMINE_MEMMAP_USABLE) {
-                totalram += entry->length;
-            }
-        }
-    }
-
-    *info = (struct linux_sysinfo_k){0};
-    info->uptime = lapic_get_ticks_ms() / 1000ULL;
-    info->totalram = (unsigned long)totalram;
-    info->freeram = (unsigned long)totalram;
-    info->procs = 1;
-    info->mem_unit = 1;
-    return 0;
 }
 
 int sys_sleep_ms(uint64_t ms) {

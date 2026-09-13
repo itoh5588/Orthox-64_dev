@@ -16,6 +16,9 @@
 #include "syscall.h"        /* FUTEX_WAIT / FUTEX_WAKE / FUTEX_PRIVATE */
 #include "sys_internal.h"
 #include "task.h"
+#include "pmm.h"             /* PAGE_SIZE / pmm_get_*_pages */
+#include "arch_time.h"       /* arch_time_now_ms */
+#include "linux_syscalls.h"  /* struct linux_sysinfo */
 
 /* ---- futex ----------------------------------------------------------------
  * **待ちは実装していない。**値が合っているかだけを見る (単一スレッド前提)。
@@ -68,3 +71,37 @@ uint64_t sys_getuid(void)  { return 0; }
 uint64_t sys_getgid(void)  { return 0; }
 uint64_t sys_geteuid(void) { return 0; }
 uint64_t sys_getegid(void) { return 0; }
+
+/* ---- sysinfo --------------------------------------------------------------
+ * **x86 と linux 側で答える値が違っていた (2026-09-13 に畳んだ)。**
+ *
+ * | | x86 (旧) | linux 側 (採用) |
+ * |---|---|---|
+ * | totalram | limine の memmap の USABLE の合計 | pmm が管理するページ数 |
+ * | freeram  | **totalram と同じ (常に全部空き)** | pmm の空きページ数 |
+ * | mem_unit | 1 | PAGE_SIZE |
+ * | uptime   | 起動からの秒 | **入れていなかった (0)** |
+ * | 書く大きさ | 368 バイト (musl の __reserved まで) | 112 バイト (Linux の struct sysinfo) |
+ *
+ * **linux 側に寄せ、uptime だけ x86 から取った。**材料の memmap は x86 にしか
+ * 無いが、pmm_get_*_pages と arch_time_now_ms は 3 アーキにある。
+ *
+ * **mem_unit を 0 にしないこと。**呼び手が totalram に掛けるので 0 だと
+ * 「メモリ 0」に見え、確保をあきらめる側がいる。
+ *
+ * 書くのは 112 バイトだけ。musl の struct sysinfo は末尾に __reserved[256] を
+ * 持つ 368 バイトなので越えないが、Linux カーネルの定義より長く書く理由は無い */
+int sys_sysinfo(struct linux_sysinfo* info) {
+    uint8_t* p;
+    uint64_t freep;
+    if (!info) return -LINUX_EFAULT;
+    p = (uint8_t*)info;
+    for (size_t i = 0; i < sizeof(*info); i++) p[i] = 0;
+    freep = pmm_get_free_pages();
+    info->uptime   = (int64_t)(arch_time_now_ms() / 1000ULL);
+    info->mem_unit = PAGE_SIZE;
+    info->totalram = pmm_get_allocated_pages() + freep;
+    info->freeram  = freep;
+    info->procs    = 1;
+    return 0;
+}
