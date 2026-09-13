@@ -866,6 +866,24 @@ void task_wait_child_exit(int ppid, int want, uint64_t timeout_ms) {
     (void)wait_event_timeout(&g_child_exit_wq, task_child_zombie_ready, &w, timeout_ms);
 }
 
+/* pid からタスクを探す。**ロックを取らない。**
+ *
+ * x86 は同じ役目の find_task_by_pid_locked (kernel/sys_proc.c) を持つが、
+ * あちらは kernel_lock_held() を要求して警告を出す。x86 の syscall 入口は
+ * BKL を握るので問題ないが、aarch64 / riscv64 の syscall 入口 (SVC / ECALL)
+ * は BKL を取らずに割り込みだけ開けて処理する (kernel/aarch64/usermode.c,
+ * kernel/riscv64/trap.c) ので、そちらの経路で使うにはロック無しの版が要る。
+ * exit の親探しはどちらの経路からも呼ばれるので、ロック無しのこちらを使う
+ * (2026-09-13、別実装 29 組の exit/wait4 を畳んだときに用意した) */
+struct task* task_find_by_pid(int pid) {
+    struct task* t = task_list;
+    while (t) {
+        if (t->pid == pid) return t;
+        t = t->next;
+    }
+    return 0;
+}
+
 int task_reap(struct task* t) {
     int ret;
     uint64_t flags = spin_lock_irqsave(&g_task_lock);

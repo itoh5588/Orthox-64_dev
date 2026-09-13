@@ -212,6 +212,10 @@ struct linux_sysinfo {
  * 別々の flags を受け取るので衝突しない */
 #define LINUX_AT_SYMLINK_NOFOLLOW  0x100
 #define LINUX_AT_EACCESS           0x200
+
+/* wait4(2) の options (kernel/sys_task.c)。x86 は同じ値を ORTH_WNOHANG として
+ * 独自に定義していた (2026-09-13 に畳んで 1 つにした) */
+#define LINUX_WNOHANG              1
 #define LINUX_F_OK                 0
 #define LINUX_X_OK                 1
 #define LINUX_W_OK                 2

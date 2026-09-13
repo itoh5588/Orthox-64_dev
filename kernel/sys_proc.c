@@ -72,66 +72,6 @@ static void task_signal_add_locked(struct task* t, int sig) {
 }
 
 
-void sys_exit(int status) {
-    struct task* current = get_current_task();
-    // Ensure no speaker tone leaks when a user task exits abruptly.
-    sound_beep_stop();
-    for (int fd = 0; fd < MAX_FDS; fd++) {
-        if (current->fds[fd].in_use) {
-            (void)fs_close(fd);
-        }
-    }
-    /* **自分の子を始末してから zombie になる。**入っていなかったので、
-     * 親のいない zombie が溜まっていた (2026-09-08 に実測)。aarch64 /
-     * riscv64 は 2026-08-31 から同じことをしている */
-    task_reap_orphans_of(current->pid);
-    task_mark_zombie(current, status);
-    if (current->ppid > 0) {
-        struct task* parent = find_task_by_pid_locked(current->ppid);
-        if (parent) task_signal_add_locked(parent, LINUX_SIGCHLD);
-    }
-    /* **待ち行列で寝ている親を起こす (2026-09-09)。**これが無いと親は
-     * 時間切れ (TASK_CHILD_WAIT_POLL_MS) まで気づかない */
-    task_child_exit_wake();
-    while (1) kernel_yield();
-}
-
-#define ORTH_WNOHANG 1
-
-int64_t sys_wait4(int pid, int* wstatus, int options) {
-    struct task* current = get_current_task();
-    while (1) {
-        int found_child = 0;
-        struct task* curr = task_list;
-        while (curr) {
-            if (curr->ppid == current->pid) {
-                if (pid == -1 || curr->pid == pid) {
-                    found_child = 1;
-                    if (curr->state == TASK_ZOMBIE) {
-                        int child_pid = curr->pid;
-                        if (wstatus) *wstatus = curr->exit_status << 8;
-                        current->sig_pending &= ~(1ULL << LINUX_SIGCHLD);
-                        (void)task_reap(curr);
-                        return child_pid;
-                    }
-                }
-            }
-            curr = curr->next;
-        }
-        if (!found_child) return -LINUX_ECHILD;
-        /* WNOHANG: 生きている子はいるがゾンビ無し → ブロックせず 0。
-         * これを無視すると make -j の非ブロッキング reap が子の終了まで
-         * 眠り、並列ジョブ投入が完全に直列化する (実測で確認)。 */
-        if (options & ORTH_WNOHANG) return 0;
-        /* **焼かずに寝る (2026-09-09)。**ここは 2026-08-30 まで
-         * aarch64 / riscv64 と同じく kernel_yield() で回しており、
-         * **待っている親がコアを 1 本 100% 使っていた。**あちらだけ直って
-         * いたので、実装を kernel/task.c へ出して両方から呼ぶ。
-         * 子の exit で起こされるか、遅くとも時間切れで自力で起きる */
-        task_wait_child_exit(current->pid, pid, TASK_CHILD_WAIT_POLL_MS);
-    }
-}
-
 int sys_kill(int pid, int sig) {
     struct task* current = get_current_task();
     struct task* t = 0;

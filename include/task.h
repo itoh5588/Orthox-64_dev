@@ -174,6 +174,7 @@ int task_cancel_sleep(struct task* t);
 int task_mark_zombie(struct task* t, int exit_status);
 int task_wake(struct task* t);
 int task_reap(struct task* t);
+struct task* task_find_by_pid(int pid);
 /* 親が死ぬときに子を始末する (kernel/task.c のコメント参照) */
 void task_reap_orphans_of(int pid);
 

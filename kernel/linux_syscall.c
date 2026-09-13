@@ -24,45 +24,10 @@ extern int task_fork(arch_task_exec_frame_t* frame);
 extern int task_execve(arch_task_exec_frame_t* frame, const char* path,
                        char* const argv[], char* const envp[]);
 extern struct task* task_list;
-static int64_t linux_bootstrap_sys_wait4(int pid, int* wstatus, int options);
 
 /* シグナル番号は include/linux_abi.h に出した (2026-09-09)。
  * **x86 側 (sys_proc.c) が SIGCHLD に 20 を使っていた**ので、置き場を
  * 1 つにして揃えた。 */
-
-static struct task* linux_find_task_by_pid(int pid) {
-    struct task* task = task_list;
-    while (task) {
-        if (task->pid == pid) return task;
-        task = task->next;
-    }
-    return 0;
-}
-
-/* **wait4 の待ち行列は kernel/task.c に出した (2026-09-09)。**
- * ここにあった実装は 2026-08-30 に入れたもので、**x86 側 (sys_proc.c) には
- * 無く、あちらは kernel_yield() で回して待つ親がコアを 1 本焼いていた。**
- * 経緯と設計は kernel/task.c の task_child_exit_wake() のコメントを参照。 */
-
-/* WNOHANG。**以前は options を捨てていた**ので、子がまだ終わっていない
- * ときに 0 を返さず待ち続けていた */
-#define LINUX_WNOHANG 1
-
-/*
- * 子の終了は、zombie 化だけでは待機中の親へ伝わらない。特に BusyBox ash の
- * $(cmd | cmd) はブロッキング waitpid に入り得るため、親を起こさないと
- * TASK_SLEEPING のまま残る。pipe の close より先にこの通知を行う必要はなく、
- * 親が wait4 を再走査した時点で child の zombie 状態が見えていればよい。
- */
-static void linux_notify_parent_exit(struct task* child) {
-    struct task* parent;
-    if (!child || child->ppid <= 0) return;
-    task_child_exit_wake();
-    parent = linux_find_task_by_pid(child->ppid);
-    if (!parent) return;
-    parent->sig_pending |= (1ULL << LINUX_SIGCHLD);
-    if (parent->state == TASK_SLEEPING) (void)task_wake(parent);
-}
 
 /* 未実装の syscall を ENOSYS で返すとき、番号を 1 回だけ出す。
  * 黙って失敗値を返すと、呼び出し側が戻り値を見ていない場合に
@@ -901,7 +866,7 @@ static int64_t linux_bootstrap_sys_waitid(int idtype, int id, struct linux_sigin
     else if (idtype == 1) target = -1;
     else return -LINUX_EINVAL;
 
-    wait_pid = (int)linux_bootstrap_sys_wait4(target, &status, options);
+    wait_pid = (int)sys_wait4(target, &status, options);
     if (wait_pid < 0) return wait_pid;
     if (infop) {
         for (size_t i = 0; i < sizeof(*infop); i++) ((uint8_t*)infop)[i] = 0;
@@ -953,73 +918,9 @@ void* sys_mremap(void* old_addr, size_t old_len, size_t new_len, int flags, void
  * 経緯と対照表は kernel/sys_mmap.c の sys_mprotect の冒頭にある */
 int sys_mprotect(void* addr, size_t length, int prot);
 
-static int64_t linux_bootstrap_sys_wait4(int pid, int* wstatus, int options) {
-    struct task* current = get_current_task();
-
-    if (!current) return -LINUX_ESRCH;
-
-    while (1) {
-        int found_child = 0;
-        struct task* candidate = task_list;
-        while (candidate) {
-            if (candidate->ppid == current->pid && (pid == -1 || candidate->pid == pid)) {
-                found_child = 1;
-                if (candidate->state == TASK_ZOMBIE) {
-                    int child_pid = candidate->pid;
-                    if (wstatus) *wstatus = candidate->exit_status << 8;
-                    (void)task_reap(candidate);
-                    return child_pid;
-                }
-            }
-            candidate = candidate->next;
-        }
-        /* 待つべき子がいない。ash のジョブ回収は wait4 が ECHILD を返すまで
-         * 回すので、ここを EPERM にすると回収ループが止まらない */
-        if (!found_child) return -LINUX_ECHILD;
-        /* 子は居るがまだ終わっていない。WNOHANG なら 0 を返すのが POSIX */
-        if (options & LINUX_WNOHANG) return 0;
-        /* **焼かずに寝る。**子の exit で起こされるか、遅くとも
-         * TASK_CHILD_WAIT_POLL_MS で自力で起きる */
-        task_wait_child_exit(current->pid, pid, TASK_CHILD_WAIT_POLL_MS);
-    }
-}
-
-static void linux_bootstrap_sys_exit(int status);
-
-/* **ユーザーが落ちたときにも使う (S-1)。**アーキ側の例外ハンドラから
- * 呼べるよう外に出した。**戻らない。**
- *
- * 2026-08-22 の実機で、EL0 の命令アボートを起こしたプロセスが殺されず、
- * **同じ例外を毎秒 58 回上げ続けて電源断でしか止まらなかった。**
- * 落とすところまでを 1 か所に集める */
-void linux_task_kill_current(int status) {
-    linux_bootstrap_sys_exit(status);
-}
-
-static void linux_bootstrap_sys_exit(int status) {
-    struct task* current = get_current_task();
-
-    if (!current || current->ppid == 0) {
-        (void)status;
-        puts("  bootstrap user exit\n");
-        arch_halt_forever();
-    }
-
-    for (int fd = 0; fd < MAX_FDS; fd++) {
-        if (current->fds[fd].in_use) {
-            (void)sys_close(fd);
-        }
-    }
-
-    /* M-8 (2026-08-31): 自分の子を始末する (孤児 zombie が居座り続ける経緯を
-     * 断つ)。**実装は kernel/task.c に出した (2026-09-08)** —— x86 側に同じ
-     * ものが無く、実測で zombie が溜まっていたため。詳細はそちらのコメント */
-    task_reap_orphans_of(current->pid);
-
-    (void)task_mark_zombie(current, status);
-    linux_notify_parent_exit(current);
-    while (1) kernel_yield();
-}
+/* **exit / exit_group / wait4 / linux_task_kill_current は
+ * kernel/sys_task.c へ移した (2026-09-13、別実装 29 組を畳んだ)。**経緯・
+ * x86 との差分・bootstrap task の扱いは移した先の冒頭コメントを参照。 */
 
 /*
  * ディスパッチは riscv64 (asm-generic) の番号だけを見る。
@@ -1320,7 +1221,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_WAIT4:
             arch_syscall_set_return(frame,
-                                    (uint64_t)(int64_t)linux_bootstrap_sys_wait4((int)arch_syscall_arg0(frame),
+                                    (uint64_t)(int64_t)sys_wait4((int)arch_syscall_arg0(frame),
                                                                                     (int*)(uintptr_t)arch_syscall_arg1(frame),
                                                                                     (int)arch_syscall_arg2(frame)));
             return;
@@ -1623,7 +1524,7 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
             return;
         case LINUX_SYS_EXIT:
         case LINUX_SYS_EXIT_GROUP:
-            linux_bootstrap_sys_exit((int)arch_syscall_arg0(frame));
+            sys_exit((int)arch_syscall_arg0(frame));
             return;
         default:
             linux_report_unimplemented_syscall(arch_syscall_number(frame));

@@ -20,6 +20,10 @@
 #include "arch_time.h"       /* arch_time_now_ms */
 #include "linux_syscalls.h"  /* struct linux_sysinfo */
 #include "xv6fs.h"           /* xv6fs_now_sec */
+#include "linux_abi.h"       /* LINUX_SIGCHLD */
+#include "linux_syscall.h"   /* arch_halt_forever */
+#include "stdio.h"           /* puts */
+#include "sound.h"           /* sound_beep_stop */
 
 /* ---- futex ----------------------------------------------------------------
  * **待ちは実装していない。**値が合っているかだけを見る (単一スレッド前提)。
@@ -231,4 +235,129 @@ int sys_clock_gettime(int clock_id, struct linux_timespec* ts) {
         ts->tv_sec = (int64_t)(ms / 1000ULL);
     }
     return 0;
+}
+
+/* ---- exit / exit_group / wait4 --------------------------------------------
+ * **別実装 29 組のうちの 2 組を畳んだもの (2026-09-13)。**もとは
+ *
+ *     x86              kernel/sys_proc.c      の sys_exit / sys_wait4
+ *     aarch64/riscv64  kernel/linux_syscall.c の linux_bootstrap_sys_exit /
+ *                                                linux_bootstrap_sys_wait4
+ *
+ * の 2 つずつがあり、**どちらも他方に無い直しを持っていた。**
+ *
+ * exit:
+ * | | x86 (旧) | linux 側 |
+ * |---|---|---|
+ * | 親が居ない (ppid==0、起動直後のタスク) | **無限に zombie loop** し続ける | arch_halt_forever() で止める |
+ * | ビープ音   | sound_beep_stop() で止める | **止めていなかった** (DOOM がクラッシュ音を鳴らし続けうる) |
+ * | SIGCHLD が SIG_IGN のとき | pending を立てない | **無条件に立てる** |
+ *
+ * 3 つとも「x86 だけが正しい」でも「linux 側だけが正しい」でもなく、
+ * **両方の直しを合わせた。**bootstrap task (kernel が直接起こした最初の
+ * ユーザータスク。ppid は 0 で親が存在しない) が exit したときに x86 だけが
+ * 無限ループに陥っていたのは実害のある方の抜けなので、linux 側の
+ * arch_halt_forever() を採った。
+ *
+ * wait4:
+ * | | x86 (旧) | linux 側 (採用) |
+ * |---|---|---|
+ * | zombie を reap したとき | **自分の sig_pending の SIGCHLD ビットを落とす** | 落とさない |
+ *
+ * 子が複数いて 1 匹だけ reap したとき、x86 は SIGCHLD の pending ビットを
+ * 消してしまう。ビットは 1 本しかない (子ごとに個別の合図ではない) ので、
+ * まだ zombie の残りが居ても消える。signal ハンドラで待つ側 (wait4 を
+ * 呼ばない経路) がそこで気づき損ねる。linux 側は消さないので、そちらに
+ * 揃えた。busybox ash の待ち方 (wait4 を ECHILD まで回す) はどちらでも
+ * 変わらない。
+ *
+ * find_task_by_pid_locked (kernel/sys_proc.c) は BKL を要求して警告するが、
+ * aarch64 / riscv64 の syscall 入口は BKL を握らない (kernel/task.c の
+ * task_find_by_pid のコメント参照)。exit の親探しは 3 アーキ共通で通る道
+ * なので、ロック無しの task_find_by_pid を使う。 */
+
+extern struct task* task_list;
+
+/* 音源を持たない機械 (riscv64) の既定。x86 / aarch64 は kernel の各 arch 配下の
+ * sound.c が持つ実物が強いシンボルとして勝つ (include/sound.h に素の宣言がある) */
+__attribute__((weak)) void sound_beep_stop(void) { }
+
+void sys_exit(int status) {
+    struct task* current = get_current_task();
+
+    /* **親が居ないタスクの exit。**カーネルが直接起こした最初のユーザー
+     * タスク (bootstrap) にはこれ以上進める先が無い。x86 はここが抜けて
+     * おり、zombie のまま kernel_yield() を無限に回し続けていた */
+    if (!current || current->ppid == 0) {
+        puts("  bootstrap user exit\n");
+        arch_halt_forever();
+    }
+
+    sound_beep_stop();
+
+    for (int fd = 0; fd < MAX_FDS; fd++) {
+        if (current->fds[fd].in_use) {
+            /* **sys_close であって fs_close ではない。**riscv64 は
+             * kernel/riscv64/fs.c に fs_close を持たず sys_close だけを
+             * 出している。3 アーキで共通なのは sys_close の方 */
+            (void)sys_close(fd);
+        }
+    }
+
+    /* **自分の子を始末してから zombie になる。**入っていなかったので、
+     * 親のいない zombie が溜まっていた (2026-09-08 に実測) */
+    task_reap_orphans_of(current->pid);
+    task_mark_zombie(current, status);
+
+    {
+        struct task* parent = task_find_by_pid(current->ppid);
+        if (parent) {
+            /* SIGCHLD が SIG_IGN (ハンドラ値 1) なら pending を立てない。
+             * kernel/sys_signal.c の SIG_IGN 判定と同じ規約 */
+            if (parent->sig_handlers[LINUX_SIGCHLD] != 1ULL) {
+                parent->sig_pending |= (1ULL << LINUX_SIGCHLD);
+            }
+            if (parent->state == TASK_SLEEPING) task_wake(parent);
+        }
+    }
+
+    /* **待ち行列で寝ている親を起こす。**これが無いと親は時間切れ
+     * (TASK_CHILD_WAIT_POLL_MS) まで気づかない */
+    task_child_exit_wake();
+    while (1) kernel_yield();
+}
+
+/* aarch64 の例外ハンドラから (EL0 のフォールトで殺すとき) 呼ばれる名前。
+ * 元は linux_syscall.c の linux_bootstrap_sys_exit を直に指していた */
+void linux_task_kill_current(int status) {
+    sys_exit(status);
+}
+
+int64_t sys_wait4(int pid, int* wstatus, int options) {
+    struct task* current = get_current_task();
+    if (!current) return -LINUX_ESRCH;
+    while (1) {
+        int found_child = 0;
+        struct task* curr = task_list;
+        while (curr) {
+            if (curr->ppid == current->pid && (pid == -1 || curr->pid == pid)) {
+                found_child = 1;
+                if (curr->state == TASK_ZOMBIE) {
+                    int child_pid = curr->pid;
+                    if (wstatus) *wstatus = curr->exit_status << 8;
+                    (void)task_reap(curr);
+                    return child_pid;
+                }
+            }
+            curr = curr->next;
+        }
+        if (!found_child) return -LINUX_ECHILD;
+        /* WNOHANG: 生きている子はいるがゾンビ無し -> ブロックせず 0。
+         * これを無視すると make -j の非ブロッキング reap が子の終了まで
+         * 眠り、並列ジョブ投入が完全に直列化する (実測で確認) */
+        if (options & LINUX_WNOHANG) return 0;
+        /* **焼かずに寝る。**子の exit で起こされるか、遅くとも時間切れで
+         * 自力で起きる */
+        task_wait_child_exit(current->pid, pid, TASK_CHILD_WAIT_POLL_MS);
+    }
 }
