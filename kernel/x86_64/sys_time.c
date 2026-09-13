@@ -37,9 +37,26 @@ static uint32_t days_before_month(int year, int month) {
     return days;
 }
 
+/* 0000-01-01 からの日数 (先発グレゴリオ暦、0 年は閏年)。1970-01-01 が 719528。
+ *
+ * **閏年は「0 年〜(year-1) 年」を数える (2026-09-13 に直した)。**ここは
+ * y/4 - y/100 + y/400 と「1 年〜year 年」を数えていた。
+ *
+ *   - 平年は 0 年の分が抜けて **1 日足りない**。x86 の date が 2026-09-13 に
+ *     Sat Sep 12 を返していた (時分秒は合っていた)
+ *   - 閏年は当年の分が 0 年の分と相殺されて、たまたま正しい
+ *   - 1970-01-01 は 719527 になり、エポックより前として 0 を返していた
+ *
+ * 当年の 2 月 29 日は days_before_month が足す。
+ * 1970-01-01〜2200-12-31 の毎日をホストの datetime と突き合わせて、旧式は
+ * 84,371 日中 63,875 日で -1、この式は 0 日 */
 static uint64_t days_since_year_zero(int year, int month, int day) {
     uint64_t y = (uint64_t)year;
-    uint64_t days = y * 365ULL + y / 4ULL - y / 100ULL + y / 400ULL;
+    uint64_t days = y * 365ULL;
+    if (year > 0) {
+        uint64_t yp = y - 1ULL;
+        days += yp / 4ULL - yp / 100ULL + yp / 400ULL + 1ULL;   /* +1 は 0 年 */
+    }
     days += days_before_month(year, month);
     if (day > 0) days += (uint64_t)(day - 1);
     return days;
