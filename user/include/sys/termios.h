@@ -8,14 +8,21 @@ typedef unsigned char cc_t;
 typedef unsigned int speed_t;
 
 #ifndef NCCS
-#define NCCS 20
+#define NCCS 32
 #endif
 
+/* kernel/sys_tty.c の struct orth_termios (include/syscall.h) と
+ * バイト単位で一致させること。2026-09-14 の ioctl 統合 (別実装29組の
+ * 18組目) で c_cc[20]/c_line 無し (44バイト) から c_line + c_cc[32]
+ * (60バイト) へ変わった。ここを合わせ忘れると tcgetattr/tcsetattr
+ * (kernel 側は 60 バイト前提) が user/kilo.c や user/ttytest.c の
+ * スタック上バッファに対して範囲外書き込み/読み取りを起こす */
 struct termios {
     tcflag_t c_iflag;
     tcflag_t c_oflag;
     tcflag_t c_cflag;
     tcflag_t c_lflag;
+    cc_t c_line;
     cc_t c_cc[NCCS];
     speed_t c_ispeed;
     speed_t c_ospeed;

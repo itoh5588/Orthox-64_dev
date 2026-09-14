@@ -81,14 +81,23 @@ for _ in {1..30}; do
 done
 
 # **止まったことそのものを見る。**arch_halt_forever は cli+hlt なので、
-# メッセージが出た後は CPU 使用率が下がって QEMU プロセスは生き続ける
+# メッセージが出た後は QEMU プロセスの CPU 使用率が下がって生き続ける
 # (無限 zombie loop なら kernel_yield を回し続けて CPU 使用率が高いまま)。
-# メッセージが出てから少し待ち、その間に新しい出力が増えない
-# (=ハングでもクラッシュでもなく、狙いどおり止まっている) ことを確かめる
+# ログが増えないだけでは busy loop と区別できない (無出力の busy loop でも
+# ログは増えない) ので、/proc/$pid/stat の utime+stime (jiffies) の
+# 増分も見る。閾値は緩め (2 秒間で 0.5 秒相当=HZ が 100 の想定で 50 tick)
+# —— QEMU 自体の TCG エミュレーションのオーバーヘッドを見込む
+cpu_ticks() {
+    awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo 0
+}
+
 sleep 2
 LINES_BEFORE=$(wc -l < "$SERIAL_LOG")
+TICKS_BEFORE=$(cpu_ticks "$QEMU_PID")
 sleep 2
 LINES_AFTER=$(wc -l < "$SERIAL_LOG")
+TICKS_AFTER=$(cpu_ticks "$QEMU_PID")
+TICKS_DELTA=$((TICKS_AFTER - TICKS_BEFORE))
 
 echo "--- x86 bootstrap-exit Serial Output ---"
 cat "$SERIAL_LOG"
@@ -102,11 +111,23 @@ fi
 grep -aq "BOOTSTRAP-EXIT-PROBE-START" "$SERIAL_LOG"
 grep -aq "bootstrap user exit" "$SERIAL_LOG"
 # **戻ってきたら異常。**sys_exit の ppid==0 分岐は arch_halt_forever() を
-# 呼んで戻らない想定
-! grep -aq "BOOTSTRAP-EXIT-PROBE-RETURNED" "$SERIAL_LOG"
+# 呼んで戻らない想定。
+# `! grep ...` は set -e をすり抜ける (先頭が `!` の単純コマンドは
+# 失敗しても set -e の対象外という bash の仕様) ので、grep が見つかっても
+# スクリプトが止まらず PASS してしまう。if で明示的に判定すること
+if grep -aq "BOOTSTRAP-EXIT-PROBE-RETURNED" "$SERIAL_LOG"; then
+    echo "sys_exit が戻ってきた (ppid==0 の分岐を踏めていない)" >&2
+    exit 1
+fi
 
 if [ "$LINES_AFTER" != "$LINES_BEFORE" ]; then
     echo "bootstrap user exit の後もログが増え続けている (hlt で止まっていない可能性)" >&2
+    exit 1
+fi
+
+echo "cpu ticks (2 秒間): ${TICKS_DELTA}"
+if [ "$TICKS_DELTA" -gt 50 ]; then
+    echo "bootstrap user exit の後も CPU を使い続けている (busy loop の疑い。hlt なら閾値を大きく下回るはず)" >&2
     exit 1
 fi
 
