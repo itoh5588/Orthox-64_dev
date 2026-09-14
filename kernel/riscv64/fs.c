@@ -104,6 +104,20 @@ file_type_t fs_fd_type(const file_descriptor_t* fd) {
     return fd->file ? fd->file->type : fd->type;
 }
 
+/* x86/aarch64 共有の kernel/fs.c と同じロジック。riscv64 にだけ無く、
+ * fd_is_console (kernel/sys_tty.c) を共通化するまで誰も呼んでいなかった
+ * ため気付かれていなかった (別実装 29 組の 18 組目、ioctl の残り、
+ * 2026-09-14) */
+uint32_t fs_fd_aux0(const file_descriptor_t* fd) {
+    if (!fd) return 0;
+    return fd->file ? fd->file->aux0 : fd->aux0;
+}
+
+uint32_t fs_fd_aux1(const file_descriptor_t* fd) {
+    if (!fd) return 0;
+    return fd->file ? fd->file->aux1 : fd->aux1;
+}
+
 /* size と data も共有側に置く。fd 側は file が無いときだけ見る */
 size_t fs_fd_size(const file_descriptor_t* fd) {
     if (!fd) return 0;

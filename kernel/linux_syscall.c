@@ -148,6 +148,10 @@ static void linux_syscall_trace_leave(const arch_syscall_frame_t* frame) { (void
 #define LINUX_TIOCGPGRP            0x540FUL
 #define LINUX_TIOCSPGRP            0x5410UL
 #define LINUX_TIOCGWINSZ           0x5413UL
+#define LINUX_FIONCLEX             0x5450UL
+#define LINUX_FIOCLEX              0x5451UL
+#define LINUX_F_SETFD              2
+#define LINUX_FD_CLOEXEC           1
 
 struct linux_siginfo {
     int32_t si_signo;
@@ -155,17 +159,6 @@ struct linux_siginfo {
     int32_t si_code;
     int32_t pad;
     uint8_t payload[112];
-};
-
-struct linux_termios {
-    uint32_t c_iflag;
-    uint32_t c_oflag;
-    uint32_t c_cflag;
-    uint32_t c_lflag;
-    uint8_t c_line;
-    uint8_t c_cc[32];
-    uint32_t c_ispeed;
-    uint32_t c_ospeed;
 };
 
 // riscv64 (asm-generic) の struct stat。x86_64 レイアウトの struct kstat とは
@@ -323,23 +316,6 @@ static int linux_sys_umask(int mask) {
 
 
 
-static struct linux_termios g_linux_console_termios = {
-    .c_iflag = 0x00000002u,
-    .c_oflag = 0x00000001u,
-    .c_cflag = 0,
-    .c_lflag = 0x00000001u | 0x00000002u | 0x00000008u,
-    .c_cc = { 3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26 },
-    .c_ispeed = 115200,
-    .c_ospeed = 115200,
-};
-
-/* termios の ECHO (c_lflag bit3)。行編集 (busybox の lineedit) は raw モードに
- * して自前でエコーするので、ここが立っていないときにカーネルがエコーすると
- * 1 文字が 2 回出る。fs.c のコンソール読み取りが参照する */
-int arch_console_echo_enabled(void) {
-    return (g_linux_console_termios.c_lflag & 0x00000008u) != 0;
-}
-
 /* ---- M-9 (2026-08-31): シリアル/USB キーボードの ^C / ^\ ----------------
  *
  * termios は ISIG (c_lflag bit0) が立ち、VINTR=3 (^C) / VQUIT=28 (^\) も
@@ -350,9 +326,9 @@ int arch_console_echo_enabled(void) {
  * (aarch64/console.c) はコンソールの割り込みロックを持ったまま呼ばないこと
  * (task_wake と同じ扱い)。 */
 int linux_console_is_intr_char(uint8_t ch) {
-    if ((g_linux_console_termios.c_lflag & 0x00000001u) == 0) return 0;   /* ISIG off */
-    return ch == (uint8_t)g_linux_console_termios.c_cc[0] ||   /* VINTR */
-           ch == (uint8_t)g_linux_console_termios.c_cc[1];     /* VQUIT */
+    if ((g_console_termios.c_lflag & 0x00000001u) == 0) return 0;   /* ISIG off */
+    return ch == (uint8_t)g_console_termios.c_cc[0] ||   /* VINTR */
+           ch == (uint8_t)g_console_termios.c_cc[1];     /* VQUIT */
 }
 
 /* M-8 (2026-08-31): pid の子を pid 1 に引き取らせる。**本来の init のような
@@ -376,7 +352,7 @@ int linux_console_is_intr_char(uint8_t ch) {
 void linux_console_deliver_intr(uint8_t ch) {
     struct task* t = task_list;
     int fg = tty_pgrp_peek();
-    int sig = (ch == (uint8_t)g_linux_console_termios.c_cc[1]) ? LINUX_SIGQUIT : LINUX_SIGINT;
+    int sig = (ch == (uint8_t)g_console_termios.c_cc[1]) ? LINUX_SIGQUIT : LINUX_SIGINT;
     int victim_pids[64];
     int nvictims = 0;
     if (fg == 0) return;   /* まだ誰も TIOCSPGRP/TIOCGPGRP していない */
@@ -404,7 +380,7 @@ void linux_console_deliver_intr(uint8_t ch) {
  * カーネルの起動ログ (aarch64_uart_puts) は自前で CR を出していたので、
  * **ユーザープロセスの write だけが崩れていた**。 */
 int arch_console_onlcr_enabled(void) {
-    return (g_linux_console_termios.c_oflag & 0x00000001u) != 0;
+    return (g_console_termios.c_oflag & 0x00000001u) != 0;
 }
 
 
@@ -674,6 +650,7 @@ static int64_t linux_bootstrap_sys_ioctl(int fd, unsigned long request, uint64_t
     switch (request) {
         case LINUX_TIOCGWINSZ:
             if (!arg) return -LINUX_EFAULT;
+            if (!fd_is_console(fd)) return -LINUX_ENOTTY;
             ((struct linux_winsize*)(uintptr_t)arg)->ws_row = 25;
             ((struct linux_winsize*)(uintptr_t)arg)->ws_col = 80;
             ((struct linux_winsize*)(uintptr_t)arg)->ws_xpixel = 0;
@@ -687,13 +664,13 @@ static int64_t linux_bootstrap_sys_ioctl(int fd, unsigned long request, uint64_t
             if (!arg) return -LINUX_EFAULT;
             return sys_tcsetpgrp(fd, *(const int*)(uintptr_t)arg);
         case LINUX_TCGETS:
-            if (!arg) return -LINUX_EFAULT;
-            *(struct linux_termios*)(uintptr_t)arg = g_linux_console_termios;
-            return 0;
+            return sys_tcgetattr(fd, (struct orth_termios*)(uintptr_t)arg);
         case LINUX_TCSETS:
-            if (!arg) return -LINUX_EFAULT;
-            g_linux_console_termios = *(const struct linux_termios*)(uintptr_t)arg;
-            return 0;
+            return sys_tcsetattr(fd, 0, (const struct orth_termios*)(uintptr_t)arg);
+        case LINUX_FIOCLEX:
+            return sys_fcntl(fd, LINUX_F_SETFD, LINUX_FD_CLOEXEC);
+        case LINUX_FIONCLEX:
+            return sys_fcntl(fd, LINUX_F_SETFD, 0);
         default:
             /* コンソール以外の ioctl は無い。ENOTTY は musl/busybox が
              * 「tty ではない」と解釈して素通りできる唯一の値 */

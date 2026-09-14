@@ -170,12 +170,20 @@ struct key_event {
     uint16_t ascii;
 };
 
+/* musl の struct termios は x86_64/aarch64/riscv64 の 3 アーキとも完全に
+ * 同一 (c_line + c_cc[NCCS=32])。x86 だけ c_line が無く c_cc[20] という
+ * 別のレイアウトを持っていたのは、正しい ABI との不一致であって「アーキ差」
+ * ではなかった (別実装 29 組の 18 組目、ioctl の残り、2026-09-14 に
+ * ports/musl-install (各アーキ) 配下の include/bits/termios.h を
+ * 突き合わせて確認)。
+ * aarch64/riscv64 側 (旧 linux_termios) のレイアウトを正として統一する */
 struct orth_termios {
     uint32_t c_iflag;
     uint32_t c_oflag;
     uint32_t c_cflag;
     uint32_t c_lflag;
-    uint8_t c_cc[20];
+    uint8_t c_line;
+    uint8_t c_cc[32];
     uint32_t c_ispeed;
     uint32_t c_ospeed;
 };

@@ -33,16 +33,6 @@
 #define ORTHOX_MEM_PROGRESS 0
 #endif
 
-static struct orth_termios g_console_termios = {
-    .c_iflag = 0x00000002u,
-    .c_oflag = 0x00000001u,
-    .c_cflag = 0,
-    .c_lflag = 0x00000001u | 0x00000002u | 0x00000008u,
-    .c_cc = { 3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26 },
-    .c_ispeed = 115200,
-    .c_ospeed = 115200,
-};
-
 int sys_open(const char* path, int flags, int mode) {
     return fs_open(path, flags, mode);
 }
@@ -217,34 +207,6 @@ int64_t sys_pwrite64(int fd, const void* buf, size_t count, int64_t offset) {
     ret = fs_write(fd, buf, count);
     fs_lseek(fd, old_offset, 0);
     return ret;
-}
-
-static int fd_is_console(int fd) {
-    struct task* current = get_current_task();
-    file_type_t type;
-    if (!current) return 0;
-    if (fd < 0 || fd >= MAX_FDS) return 0;
-    if (!current->fds[fd].in_use) return 0;
-    type = fs_fd_type(&current->fds[fd]);
-    if (type == FT_CONSOLE) return 1;
-    /* /dev/tty and /dev/console (major 5) act as the console tty;
-     * other character devices such as /dev/null must stay ENOTTY. */
-    return type == FT_CHARDEV && fs_fd_aux0(&current->fds[fd]) == 5U;
-}
-
-int sys_tcgetattr(int fd, struct orth_termios* tio) {
-    if (!tio) return -EFAULT;
-    if (!fd_is_console(fd)) return -ENOTTY;
-    *tio = g_console_termios;
-    return 0;
-}
-
-int sys_tcsetattr(int fd, int optional_actions, const struct orth_termios* tio) {
-    (void)optional_actions;
-    if (!tio) return -EFAULT;
-    if (!fd_is_console(fd)) return -ENOTTY;
-    g_console_termios = *tio;
-    return 0;
 }
 
 int sys_ioctl(int fd, unsigned long request, uint64_t arg) {

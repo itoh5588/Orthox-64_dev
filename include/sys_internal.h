@@ -72,6 +72,8 @@ int sys_tcgetpgrp(int fd);
 int sys_tcsetpgrp(int fd, int pgrp);
 void tty_pgrp_set(int pgrp);
 int tty_pgrp_peek(void);
+int fd_is_console(int fd);
+extern struct orth_termios g_console_termios;
 int sys_open(const char* path, int flags, int mode);
 int sys_openat(int dirfd, const char* path, int flags, int mode);
 int64_t sys_read(int fd, void* buf, size_t count);
