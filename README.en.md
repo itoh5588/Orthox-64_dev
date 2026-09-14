@@ -53,10 +53,20 @@ Full details, macOS instructions, and the on-OS GCC 4.7.4 toolchain build are in
 
 x86-64 / aarch64 / riscv64 originally had separate syscall implementation
 lineages, so the same syscall could exist in up to 3 distinct
-implementations. Of the 60 syscalls common to all three, **58 are now
-unified into a single implementation** (only `ioctl` remains; `fstat` is
-intentionally excluded because the `struct stat` field layout differs by
-ABI across ISAs).
+implementations. Of the 60 syscalls common to all three, **59 are now
+unified into a single implementation** (`fstat` is intentionally excluded
+because the `struct stat` field layout differs by ABI across ISAs — this
+completes the unification work).
+
+The last holdout, `ioctl`, needed 4 separate pieces unified in turn:
+foreground process group (`TIOCGPGRP`/`TIOCSPGRP`), the termios struct
+itself (`TCGETS`/`TCSETS`), `FIOCLEX`/`FIONCLEX`, and the console-tty
+check (`fd_is_console`). The termios struct looked like it had genuinely
+different layouts — x86's `orth_termios` (`c_cc[20]`) vs. aarch64/riscv64
+(`c_line` + `c_cc[32]`) — but cross-checking musl's `struct termios` on
+all three ISAs showed they're bit-for-bit identical (`c_line` +
+`c_cc[NCCS=32]`); x86's kernel-side struct just hadn't matched that ABI
+in the first place.
 
 The unification work surfaced several real cross-arch bugs, which were
 fixed along the way. Notable examples:

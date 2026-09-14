@@ -53,14 +53,18 @@ make run
 
 x86-64 / aarch64 / riscv64 は元々 syscall 周りの実装系統が分かれており、
 同じ syscall が最大 3 通りに別実装されていた。共通する 60 種の syscall の
-うち、現在 **58 種を単一実装に統合済み**（`fstat` は `struct stat` の
-フィールド並びが ISA ごとに異なる ABI 差のため対象外）。
+うち、**59 種を単一実装に統合済み**（`fstat` は `struct stat` の
+フィールド並びが ISA ごとに異なる ABI 差のため対象外。これで統合対象は
+すべて完了）。
 
-残る `ioctl` は、フォアグラウンドプロセスグループ (`TIOCGPGRP` /
-`TIOCSPGRP`) を統合済み。termios 本体は x86 (`orth_termios`) と
-aarch64/riscv64 (`linux_termios`) でメモリレイアウトが異なり、うかつに
-1本化すると ABI を壊すおそれがあるため、`FIOCLEX`/`FIONCLEX` の
-アーキ差とあわせて未統合のまま残している。
+最後まで残っていた `ioctl` は、フォアグラウンドプロセスグループ
+(`TIOCGPGRP`/`TIOCSPGRP`)・termios 本体 (`TCGETS`/`TCSETS`)・
+`FIOCLEX`/`FIONCLEX`・コンソール tty の判定 (`fd_is_console`) の
+4 つの機能差を順に統合した。termios 本体は x86 (`orth_termios`,
+`c_cc[20]`) と aarch64/riscv64 (`c_line` + `c_cc[32]`) で別レイアウトに
+見えたが、3 アーキの musl の `struct termios` を突き合わせると `c_line`
++ `c_cc[NCCS=32]` で完全に同一で、x86 側がその ABI とそもそも一致して
+いなかっただけだった。
 
 統合の過程で、アーキ間の食い違いに起因する実際の不具合も複数見つかり
 修正した。代表例:
