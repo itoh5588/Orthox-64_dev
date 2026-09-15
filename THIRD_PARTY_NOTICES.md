@@ -151,6 +151,7 @@ SUCH DAMAGE.
 | CPython 3.12.3 | スクリプト言語 | PSF License | `ports/Python-3.12.3/LICENSE` |
 | zlib | 圧縮ライブラリ | zlib License | `ports/zlib-pie/` |
 | BusyBox | ユーザーランドユーティリティ | **GPL-2.0** | `ports/busybox/LICENSE` |
+| doomgeneric | DOOM移植 (`user/doomgeneric/`) | **GPL-2.0** | `user/doomgeneric/LICENSE` |
 | GNU Make 4.4.1 | ビルドツール | **GPL-3.0** | `ports/make-4.4.1/COPYING` |
 | GNU Binutils 2.26 | アセンブラ/リンカ | **GPL-3.0** | `ports/binutils-2.26/` |
 | GCC 4.7.4 | C/C++ コンパイラ | **GPL-3.0 + GCC Runtime Library Exception** | `ports/gcc-4.7.4/COPYING3`, `COPYING.RUNTIME` |
@@ -162,6 +163,14 @@ BusyBox（GPL-2.0）および GNU Make / Binutils / GCC（GPL-3.0）は、コピ
 提供（または入手方法の明示）が必要になります。Orthox-64 本体（カーネルおよび
 独自部分）のライセンスはこれらの GPL の影響を受けませんが、配布物に GPL
 バイナリを含める際は各ライセンスの義務を満たしてください。
+
+### DOOM のゲームデータ (WAD) について
+
+`rootfs/doom1.wad` は id Software が公式にシェアウェアとして無償配布した
+`doom1.wad` (The Ultimate Doom / DOOM の第1エピソード分) です。ソース
+コードではなくゲームデータであり、GPL の対象ではありません。id Software
+はこのシェアウェア版の複製・再配布を明示的に許可しています。**商用版
+(DOOM2.WAD等)はここには含めていません。**
 
 ---
 
