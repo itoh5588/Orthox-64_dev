@@ -19,11 +19,24 @@ void puthex(uint64_t v);
 #define VIRTIO_BLK_QUEUE 0
 #define VIRTIO_BLK_TIMEOUT_MS 5000ULL
 #define VIRTIO_BLK_MAX_REQUESTS 8
-#define VIRTIO_BLK_DESCS_PER_REQ 3
+/* **記述子は hdr(1) + data(可変、最大 SG_MAX_SEGS 本) + status(1) (2026-09-15:
+ * A-2)。**SG_MAX_SEGS は旧中継 1 回分 (16KB = 4 ページ) より広い運用幅を
+ * 確保しつつ、記述子予算を抑える値。8 ページ全部が物理不連続でも 1 回
+ * 32KB 運べる (連続していればもっと少ない記述子で済む) */
+#define VIRTIO_BLK_SG_MAX_SEGS 8
+#define VIRTIO_BLK_DESCS_PER_REQ (2 + VIRTIO_BLK_SG_MAX_SEGS)
 /* 中継領域 1 枠分。**xv6fs の連続読みは実測で最大 9KB だった**ので 16KB あれば
- * たいてい 1 回で運べる。足りなければ分割して回す */
+ * たいてい 1 回で運べる。足りなければ分割して回す。
+ * **A-2 以降は scatter-gather が先頭ページから解決できないときだけの
+ * フォールバック**として残す (ユーザーページがまだ物理化していない場合、
+ * memcpy が直接触れてページフォルトハンドラに解決させる従来経路が要る) */
 #define VIRTIO_BLK_BOUNCE_PAGES 4
 #define VIRTIO_BLK_BOUNCE_BYTES (VIRTIO_BLK_BOUNCE_PAGES * PAGE_SIZE)
+
+struct vblk_sg_seg {
+    uint64_t phys;
+    uint32_t len;
+};
 
 static struct virtio_queue g_vblk_q;
 static uint16_t g_vblk_iobase = 0;
@@ -36,6 +49,14 @@ static int g_vblk_msix_enabled = 0;
 static uint64_t g_vblk_capacity = 0;
 static struct wait_queue g_vblk_idle_wait;
 static int g_vblk_request_count = 0;
+/* **診断用カウンタ (2026-09-15: A-2)。**推測で進めないための証拠。
+ * direct=物理連続バッファを1発で運んだ回数、sg=scatter-gatherで運んだ
+ * チャンク数、fallback=SGで進めず中継路に委譲した回数。
+ * nativekernelbuildsmoke で fallback が A-1 当時の実測 (2056 回) より
+ * 大きく減ることを確認する */
+static uint64_t g_vblk_stat_direct = 0;
+static uint64_t g_vblk_stat_sg_chunks = 0;
+static uint64_t g_vblk_stat_bounced_fallback = 0;
 
 struct vblk_request_ctx {
     int in_use;
@@ -369,21 +390,16 @@ static uint64_t vblk_dma_phys(const void* buf) {
     return 0;
 }
 
-static int vblk_fill_descriptors(struct vblk_request_ctx* req, uint32_t type,
-                                 uint64_t sector, void* buf, uint32_t len) {
+/* **記述子組み立ての本体 (2026-09-15: A-2)。**hdr(1) → data(nsegs本、連番) →
+ * status(1) の順に連ねる。nsegs=1 なら従来どおりの3本構成になる */
+static int vblk_fill_descriptors_sg(struct vblk_request_ctx* req, uint32_t type,
+                                    uint64_t sector, const struct vblk_sg_seg* segs,
+                                    uint32_t nsegs) {
     vblk_assert_request_ctx(req);
-    KASSERT(buf != 0);
-    KASSERT(len > 0);
     KASSERT(type == VIRTIO_BLK_T_IN || type == VIRTIO_BLK_T_OUT);
+    KASSERT(nsegs >= 1 && nsegs <= VIRTIO_BLK_SG_MAX_SEGS);
     uint16_t head = req->desc_head;
-    uint16_t data = (uint16_t)(head + 1U);
-    uint16_t status = (uint16_t)(head + 2U);
-    uint64_t data_phys = vblk_dma_phys(buf);
-    if (data_phys == 0) {
-        /* ここへ来るのは vblk_request の振り分けが漏れたときだけ */
-        return -1;
-    }
-    KASSERT(data_phys != 0);
+    uint16_t status = (uint16_t)(head + 1U + nsegs);
 
     req->hdr->type = type;
     req->hdr->reserved = 0;
@@ -392,19 +408,39 @@ static int vblk_fill_descriptors(struct vblk_request_ctx* req, uint32_t type,
     g_vblk_q.desc[head].addr = req->hdr_phys;
     g_vblk_q.desc[head].len = sizeof(struct virtio_blk_req);
     g_vblk_q.desc[head].flags = VRING_DESC_F_NEXT;
-    g_vblk_q.desc[head].next = data;
+    g_vblk_q.desc[head].next = (uint16_t)(head + 1U);
 
-    g_vblk_q.desc[data].addr = data_phys;
-    g_vblk_q.desc[data].len = len;
-    g_vblk_q.desc[data].flags =
-        VRING_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VRING_DESC_F_WRITE : 0);
-    g_vblk_q.desc[data].next = status;
+    for (uint32_t i = 0; i < nsegs; i++) {
+        uint16_t idx = (uint16_t)(head + 1U + i);
+        KASSERT(segs[i].phys != 0);
+        KASSERT(segs[i].len > 0);
+        g_vblk_q.desc[idx].addr = segs[i].phys;
+        g_vblk_q.desc[idx].len = segs[i].len;
+        g_vblk_q.desc[idx].flags =
+            VRING_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VRING_DESC_F_WRITE : 0);
+        g_vblk_q.desc[idx].next = (uint16_t)(idx + 1U);
+    }
 
     g_vblk_q.desc[status].addr = req->status_phys;
     g_vblk_q.desc[status].len = 1;
     g_vblk_q.desc[status].flags = VRING_DESC_F_WRITE;
     g_vblk_q.desc[status].next = 0;
     return 0;
+}
+
+/* 単一の物理連続バッファ版。vblk_request_direct と、中継バッファ (常に
+ * 物理連続) を運ぶ vblk_request_bounced が使う */
+static int vblk_fill_descriptors(struct vblk_request_ctx* req, uint32_t type,
+                                 uint64_t sector, void* buf, uint32_t len) {
+    KASSERT(buf != 0);
+    KASSERT(len > 0);
+    uint64_t data_phys = vblk_dma_phys(buf);
+    if (data_phys == 0) {
+        /* ここへ来るのは vblk_request の振り分けが漏れたときだけ */
+        return -1;
+    }
+    struct vblk_sg_seg seg = { data_phys, len };
+    return vblk_fill_descriptors_sg(req, type, sector, &seg, 1);
 }
 
 static void vblk_submit_request(struct vblk_request_ctx* req) {
@@ -528,11 +564,151 @@ static int vblk_request_bounced(uint32_t type, uint64_t sector, void* buf, uint3
     return 0;
 }
 
+/* **物理ページが本当に書き込めるか (COW でないか) を確認する (2026-09-15:
+ * codex レビュー指摘への対応)。**
+ *
+ * READ (VIRTIO_BLK_T_IN) はデバイスが DMA でそのページへ直接書き込む。
+ * COW のページ (fork 直後、子も親もまだ書いていない区間) をそのまま渡すと、
+ * CPU の #PF を経由せずに複製前の共有ページへ直接書き込んでしまい、親
+ * プロセス側まで壊れる。中継バッファ経由の memcpy なら「書く」が CPU 命令
+ * として実行されるので kernel/x86_64/vmm.c の COW フォルトハンドラが複製
+ * してから書かせていたが、DMA は CPU 命令を経由しないのでここで別途
+ * 確認する必要がある。PRESENT かつ WRITABLE かつ COW でないときだけ 1 */
+static int vblk_user_page_hw_writable(uint64_t* pml4, uint64_t vaddr) {
+    if (!(pml4[PML4_IDX(vaddr)] & PTE_PRESENT)) return 0;
+    uint64_t* pdp = (uint64_t*)PHYS_TO_VIRT(pml4[PML4_IDX(vaddr)] & PTE_ADDR_MASK);
+    if (!(pdp[PDP_IDX(vaddr)] & PTE_PRESENT)) return 0;
+    uint64_t* pd = (uint64_t*)PHYS_TO_VIRT(pdp[PDP_IDX(vaddr)] & PTE_ADDR_MASK);
+    if (pd[PD_IDX(vaddr)] & PTE_HUGE) {
+        uint64_t e = pd[PD_IDX(vaddr)];
+        return (e & PTE_PRESENT) && (e & PTE_WRITABLE) && !(e & PTE_COW);
+    }
+    if (!(pd[PD_IDX(vaddr)] & PTE_PRESENT)) return 0;
+    uint64_t* pt = (uint64_t*)PHYS_TO_VIRT(pd[PD_IDX(vaddr)] & PTE_ADDR_MASK);
+    uint64_t e = pt[PT_IDX(vaddr)];
+    return (e & PTE_PRESENT) && (e & PTE_WRITABLE) && !(e & PTE_COW);
+}
+
+/* **ユーザーのバッファをページ単位で引き、物理的に連続する区間ごとに
+ * seg へまとめる (2026-09-15: A-2)。**
+ *
+ * vmm_get_phys が 0 を返すページ (まだ物理ページを持たない。遅延確保や
+ * スタック成長中など) や、READ で COW/読み取り専用のページに当たったら、
+ * そこで止めて呼び手に委ねる。ここで memcpy のように直接触れて解決しよう
+ * とすると、フォルトの文脈が virtio-blk の奥深くになってしまうため、
+ * 無理に解決しようとしない。
+ *
+ * 戻り値は実際にカバーできたバイト数。**呼び手 (vblk_request_sg) が複数
+ * チャンクに分けて回す前提**なので、len を使い切れなかった場合は 512
+ * バイト境界に切り詰める (2026-09-15: codex レビュー指摘)。切り詰めない
+ * と、バッファ先頭がセクタ非整列のとき次チャンクのセクタ計算がずれ、
+ * ディスク上の書き込み/読み込み位置が重複・破損する */
+static uint32_t vblk_build_user_sg(const uint8_t* buf, uint32_t len, uint32_t type,
+                                   uint64_t* pml4, struct vblk_sg_seg* segs,
+                                   uint32_t max_segs, uint32_t* nsegs_out) {
+    uint32_t consumed = 0;
+    uint32_t nsegs = 0;
+    while (consumed < len && nsegs < max_segs) {
+        uint64_t vaddr = (uint64_t)(uintptr_t)(buf + consumed);
+        uint64_t page_base = vaddr & ~((uint64_t)PAGE_SIZE - 1);
+        uint32_t off_in_page = (uint32_t)(vaddr - page_base);
+        uint64_t phys_base = vmm_get_phys(pml4, page_base);
+        uint64_t phys;
+        uint32_t seg_len;
+        if (phys_base == 0) break;
+        if (type == VIRTIO_BLK_T_IN && !vblk_user_page_hw_writable(pml4, page_base)) break;
+        seg_len = PAGE_SIZE - off_in_page;
+        if (seg_len > len - consumed) seg_len = len - consumed;
+        phys = phys_base + off_in_page;
+        if (nsegs > 0 && segs[nsegs - 1].phys + segs[nsegs - 1].len == phys) {
+            segs[nsegs - 1].len += seg_len;
+        } else {
+            segs[nsegs].phys = phys;
+            segs[nsegs].len = seg_len;
+            nsegs++;
+        }
+        consumed += seg_len;
+    }
+    if (consumed < len && consumed % 512U != 0) {
+        uint32_t aligned = consumed & ~511U;
+        uint32_t trim = consumed - aligned;
+        while (trim > 0 && nsegs > 0) {
+            if (segs[nsegs - 1].len > trim) {
+                segs[nsegs - 1].len -= trim;
+                trim = 0;
+            } else {
+                trim -= segs[nsegs - 1].len;
+                nsegs--;
+            }
+        }
+        consumed = aligned;
+    }
+    *nsegs_out = nsegs;
+    return consumed;
+}
+
+/* **DMA に使えないユーザーバッファを scatter-gather で運ぶ (2026-09-15:
+ * A-2)。**中継バッファへの memcpy を避け、ユーザーのページを直接
+ * descriptor へ連ねる。先頭ページから解決できない (vmm_get_phys が 0) 場合
+ * だけ、その場から vblk_request_bounced へ丸ごと委譲する —— memcpy が
+ * 直接ユーザーポインタを触ってページフォルトハンドラに解決させる、
+ * 従来どおりの経路に落ちる */
+static int vblk_request_sg(uint32_t type, uint64_t sector, void* buf, uint32_t len) {
+    uint8_t* cursor = (uint8_t*)buf;
+    uint32_t remaining = len;
+    uint64_t sec = sector;
+    uint64_t* pml4;
+    struct task* cur;
+
+    if (!g_vblk_ready) return -1;
+    if ((len % 512U) != 0) return -1;
+
+    cur = get_current_task();
+    pml4 = cur ? (uint64_t*)PHYS_TO_VIRT(cur->ctx.cr3) : vmm_get_kernel_pml4();
+
+    while (remaining > 0) {
+        struct vblk_sg_seg segs[VIRTIO_BLK_SG_MAX_SEGS];
+        uint32_t nsegs = 0;
+        uint32_t consumed = vblk_build_user_sg(cursor, remaining, type, pml4, segs,
+                                               VIRTIO_BLK_SG_MAX_SEGS, &nsegs);
+        struct vblk_request_ctx* req;
+        int ret = -1;
+
+        if (nsegs == 0) {
+            g_vblk_stat_bounced_fallback++;
+            return vblk_request_bounced(type, sec, cursor, remaining);
+        }
+
+        req = vblk_acquire_request();
+        if (!req) return -1;
+        if (vblk_fill_descriptors_sg(req, type, sec, segs, nsegs) == 0) {
+            vblk_submit_request(req);
+            if (vblk_wait_request(req) == 0) ret = 0;
+        }
+        vblk_release_request(req);
+        if (ret < 0) return -1;
+
+        g_vblk_stat_sg_chunks++;
+        if (((g_vblk_stat_sg_chunks + g_vblk_stat_bounced_fallback) & 0xFFU) == 0) {
+            puts("[vblk-sg] direct=0x"); puthex(g_vblk_stat_direct);
+            puts(" sg=0x"); puthex(g_vblk_stat_sg_chunks);
+            puts(" fallback=0x"); puthex(g_vblk_stat_bounced_fallback);
+            puts("\r\n");
+        }
+
+        cursor += consumed;
+        remaining -= consumed;
+        sec += consumed / 512U;
+    }
+    return 0;
+}
+
 static int vblk_request(uint32_t type, uint64_t sector, void* buf, uint32_t len) {
     if (vblk_dma_phys(buf) != 0) {
+        g_vblk_stat_direct++;
         return vblk_request_direct(type, sector, buf, len);
     }
-    return vblk_request_bounced(type, sector, buf, len);
+    return vblk_request_sg(type, sector, buf, len);
 }
 
 int virtio_blk_read(uint64_t sector, void* buf, uint32_t count) {
