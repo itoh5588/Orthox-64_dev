@@ -117,6 +117,13 @@ SD のときと同じ。**netboot では config.txt も LAN から来る**ので
 
 あとは **Pi の電源を入れ直すだけ。**
 
+**電源の入れ直しも自動化できる (2026-09-16)。**シェルが応答していれば
+`scripts/pi4/redeploy_and_smoke.sh` が `make aarch64-pi4-netboot` →
+実機のashへ`/reboot`送信 (`reboot(2)`でSoCをリセット) → 新しいプロンプト
+待ち → `tests/aarch64_pi4_serial_ash_smoke.sh` まで一気にやる。
+固まっていて応答しないときだけ、このとおり物理的に電源を入れ直す。
+詳細は `Docs/pi4-smoke-operations.md`。
+
 ### シリアル番号のディレクトリは気にしなくてよい
 
 Pi 4 のブートローダは既定で `<シリアル番号>/start4.elf` のように前置きして
