@@ -25,8 +25,14 @@ BUSYBOX=out/busybox-aarch64-musl.elf
 HELLO=out/aarch64-hello.elf
 DOOM=out/doomgeneric-aarch64.elf
 WAD=rootfs/doom1.wad
+REBOOT=out/aarch64-reboot.elf
 
 [ -f "$BUSYBOX" ] || { echo "missing $BUSYBOX ('make aarch64-busybox-musl')" >&2; exit 1; }
+# **`/reboot` を必ず入れる。**scripts/pi4/redeploy_and_smoke.sh が実機の
+# ash から叩いて再起動させるのに使う。無いと netboot 経由の再配布が
+# 「電源入れ直し」の手作業に戻ってしまう (2026-09-16、この rootfs だけ
+# 入れ忘れて redeploy_and_smoke.sh を壊した)
+[ -f "$REBOOT" ] || { echo "missing $REBOOT ('make aarch64-reboot')" >&2; exit 1; }
 
 # **64MB。** p3 は 8.4GB あるので余裕はあるが、dd する量が増えると
 # Pi 側の書き込み時間がそのまま伸びる。WAD を入れても 10MB 程度なので
@@ -48,6 +54,9 @@ for applet in ash echo cat wc uname sort ls mkdir rm rmdir sleep grep; do
 done
 
 [ -f "$HELLO" ] && cp "$HELLO" "$FSDIR/bin/hello"
+
+cp "$REBOOT" "$FSDIR/reboot"
+chmod +x "$FSDIR/reboot"
 
 # **DOOM と WAD。** 無ければ黙って飛ばす — ash だけの rootfs も作れる
 if [ -f "$DOOM" ] && [ -f "$WAD" ]; then
