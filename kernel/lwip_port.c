@@ -42,6 +42,7 @@ static uint64_t g_rx_frames = 0;
 static uint16_t g_ping_seq = 0;
 static uint16_t g_ping_sent = 0;
 static uint16_t g_ping_recv = 0;
+#define PING_REPLIES_WANTED 3
 static uint16_t g_ping_id = 0x4F58;
 static struct raw_pcb* g_icmp_pcb = 0;
 static struct udp_pcb* g_udp_echo_pcb = 0;
@@ -106,8 +107,8 @@ static uint16_t be16_to_cpu(uint16_t v) {
  * コマンドが実行されなかった。
  *
  * **ping reply と tcp probe はそのまま残す。**tests/aarch64_net_smoke.sh が
- * 判定に使っているうえ、3 秒に 2 行なので邪魔にならない。うるさいのは
- * ここだけ。
+ * 判定に使っている。ping は応答が 3 回返ったところで止まる
+ * (lwip_port_poll) ので、出続けはしない。
  *
  * 見たいときは AARCH64_VERBOSE_DIAG=1 で組む (60 秒ごとの計器と同じ口) */
 static void orthox_lwip_log_rx_type(uint16_t etype) {
@@ -555,7 +556,12 @@ void lwip_port_poll(void) {
         puts("[lwip] arp probe gw\r\n");
         (void)etharp_request(&g_netif, netif_ip4_gw(&g_netif));
     }
-    if (g_gateway_seen && now - g_last_ping_ms >= 3000) {
+    /* **応答が PING_REPLIES_WANTED 回返ったら ping をやめる。**疎通の確認は
+     * 起動時に済めば足り、3 秒ごとに 2 行出し続けると ash のプロンプトの
+     * 直後に割り込んで、シリアル越しの判定がプロンプトを見逃す
+     * (日報2026-09-18)。tests/aarch64_net_smoke.sh の判定は「3 回以上」 */
+    if (g_gateway_seen && g_ping_recv < PING_REPLIES_WANTED &&
+        now - g_last_ping_ms >= 3000) {
         g_last_ping_ms = now;
         orthox_lwip_ping_gateway();
     }
