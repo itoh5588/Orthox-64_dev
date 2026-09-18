@@ -5,6 +5,7 @@
 #   1. USB シリアルを WSL に繋ぐ (usbipd attach)
 #   2. シリアルのキャプチャを立てる  ← **Pi の電源より先に**
 #   3. Windows 側の TFTP サーバを立てる ← netboot はこれが無いと SD に退く
+#   4. WSL の dmesg を時刻付きで取り続ける ← USB シリアルが切れたときの証拠
 #
 # **何度走らせても安全。**既に立っているものは触らない。
 #
@@ -18,6 +19,7 @@ BUSID="${PI4_FTDI_BUSID:-1-8}"          # usbipd list で確認できる
 TTY="${PI4_TTY:-/dev/ttyUSB0}"
 NETBOOT_DIR="${PI4_NETBOOT_DIR:-/mnt/c/Users/itoh5/pi4-netboot}"
 LOG="$REPO/logs/pi4/serial-$(date +%Y-%m-%d).log"
+DMESG_LOG="$REPO/logs/pi4/dmesg-$(date +%Y-%m-%d).log"
 
 # **キャプチャの pid を探す。**pgrep -f "cat $TTY" は使わない —
 # その文字列をコマンドラインに含むだけの別プロセス (この判定を走らせている
@@ -27,6 +29,18 @@ capture_pid() {
     local p
     for p in $(pgrep -x cat 2>/dev/null); do
         if tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -qx -- "$TTY"; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# capture_pid と同じ理由で、名前がちょうど dmesg で -w を持つものだけを見る
+dmesg_pid() {
+    local p
+    for p in $(pgrep -x dmesg 2>/dev/null); do
+        if tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -qx -- "-w"; then
             printf '%s' "$p"
             return 0
         fi
@@ -103,6 +117,24 @@ else
         ls "$NETBOOT_DIR/root" 2>/dev/null | tr '\n' ' ' | sed 's/^/       /;s/$/\n/'
     else
         ng "立たなかった。$NETBOOT_DIR/server.err を見る"
+    fi
+fi
+
+echo "=== 4. dmesg の記録 (USB シリアルの切断調査) ==="
+# **WSL を落とすと dmesg は消える。**2026-09-16 の切断は、原因を
+# 調べる前に再起動で記録が消えて追えなくなった (日報2026-09-18)。
+# vhci_hcd の "urb->status -104" はポートを閉じるたびに出る正常な行なので、
+# それだけでは切断の証拠にならない。見るのは flowcontrol urb / disconnect
+if DM=$(dmesg_pid); then
+    ok "既に取っている (pid $DM)"
+else
+    mkdir -p "$REPO/logs/pi4"
+    nohup dmesg -w --time-format iso >> "$DMESG_LOG" 2>&1 &
+    sleep 1
+    if DM=$(dmesg_pid); then
+        ok "$DMESG_LOG に取り始めた (pid $DM)"
+    else
+        ng "dmesg -w が立たなかった ($DMESG_LOG を見る。kernel.dmesg_restrict が 1 だと読めない)"
     fi
 fi
 
