@@ -10,6 +10,9 @@
 #   - Pi 4 が Orthox-64 で起動していて、/bin/ash がプロンプトを出している
 #   - 変換器が WSL に見えている  (usbipd attach --wsl --busid 1-8)
 #
+# 受信は dev_up.sh の常時キャプチャがあればそのログから読む (無ければ
+# 自分で cat を立てて LOGs/pi4-serial-raw.log に取る)
+#
 # 使い方:
 #   tests/aarch64_pi4_serial_ash_smoke.sh
 #   ORTHOX_PI4_PORT=/dev/ttyUSB1 tests/aarch64_pi4_serial_ash_smoke.sh
@@ -56,6 +59,20 @@ fi
 # これが無いと open(2) が返らないことがある
 stty -F "$PORT" "$BAUD" cs8 -cstopb -parenb -crtscts clocal raw -echo
 
+# **dev_up.sh の常時キャプチャが動いていたら、自分では tty を読まない。**
+# 同じ tty を 2 つで開くとバイトがランダムに分かれて両方壊れる
+# (scripts/pi4/g1_configure.sh と同じ理由)。キャプチャのログを RAW として
+# 使い、**送る直前のオフセットから後ろだけ**を見る。ログは空にしない
+find_capture() {
+    local p
+    for p in $(pgrep -x cat 2>/dev/null); do
+        if tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | grep -qx -- "$PORT"; then
+            readlink -f "/proc/$p/fd/1" 2>/dev/null && return 0
+        fi
+    done
+    return 1
+}
+
 READER_PID=""
 cleanup() {
     [ -n "$READER_PID" ] && kill "$READER_PID" 2>/dev/null || true
@@ -63,10 +80,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-: > "$RAW"
 : > "$LOG"
-cat "$PORT" >> "$RAW" &
-READER_PID=$!
+if CAPTURE="$(find_capture)" && [ -n "$CAPTURE" ]; then
+    RAW="$CAPTURE"
+    echo "(dev_up.sh のキャプチャに相乗りする: $RAW)"
+else
+    : > "$RAW"
+    cat "$PORT" >> "$RAW" &
+    READER_PID=$!
+fi
 
 # --- 送受信 ----------------------------------------------------------------
 
@@ -75,15 +97,20 @@ READER_PID=$!
 #
 # **見るのは受信全体ではなく「今回送ったぶんから後ろ」だけ。**全体の末尾を見ると
 # 直前のコマンドが残したプロンプトに当たってしまい、待たずに素通りする
+#
+# **「末尾が `# `」ではなく「`# ` で始まる行がある」で見る。**プロンプトの直後に
+# カーネルの [ep0]/[lwip] の出力が同じ行で続くことがあり (起動直後に多い)、
+# 末尾一致だとその瞬間を 0.1 秒の間隔では捕まえられない (2026-09-18 に 3 回中
+# 2 回落ちた)。ここで送るコマンドとその出力に `# ` で始まる行は無い
 wait_prompt() {   # $1 = 開始オフセット, $2 = 制限秒
-    local from="$1" limit="${2:-15}" i=0 seen
+    local from="$1" limit="${2:-15}" i=0 n
     while [ "$i" -lt $(( limit * 10 )) ]; do
-        seen="$(tail -c "+$(( from + 1 ))" "$RAW" 2>/dev/null | tr -d '\r' | tail -c 8)"
-        case "$seen" in
-            *'# ')
-                sleep 0.15   # プロンプトの後ろに続くぶんを取りこぼさない
-                return 0 ;;
-        esac
+        # -q にしない。pipefail の下で grep が先に抜けると tail が SIGPIPE で落ちる
+        n="$(tail -c "+$(( from + 1 ))" "$RAW" 2>/dev/null | tr -d '\r' | grep -ac '^# ' || true)"
+        if [ "${n:-0}" -gt 0 ]; then
+            sleep 0.15   # プロンプトの後ろに続くぶんを取りこぼさない
+            return 0
+        fi
         sleep 0.1
         i=$(( i + 1 ))
     done
@@ -132,8 +159,9 @@ run_cmd_bg() {   # $1 = コマンド, $2 = 子の出力を待つ秒 (任意)
 
 # **最初に素の改行で同期する。**プロンプトが返らないなら、電源が入っていないか、
 # 何かのプログラムが前面で走っている
+SYNC_FROM="$(stat -c %s "$RAW")"
 printf '\r' > "$PORT"
-if ! wait_prompt 0 5; then
+if ! wait_prompt "$SYNC_FROM" 5; then
     echo "*** 5 秒待っても ash のプロンプトが返らない ($PORT)" >&2
     echo "*** 確認すること: Pi の電源 / Orthox が起動しているか / 別のプログラムが走っていないか" >&2
     echo "*** ここまでの受信 (空なら 1 バイトも来ていない):" >&2
