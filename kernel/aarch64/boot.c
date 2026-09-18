@@ -32,6 +32,14 @@
 static uint64_t g_uart_base = AARCH64_EARLY_UART;
 
 #define PL011_DR_OFF    0x00
+/* Data Register の上位ビット。下位 8 ビットが文字そのもの、
+ * 9〜11 ビット目に受信エラーが乗る (2026-09-16 の実機調査で発見)。
+ * `& 0xFFU` で無条件にマスクすると取りこぼしがあっても検出できない */
+#define PL011_DR_FE     (1U << 8)   /* framing error */
+#define PL011_DR_PE     (1U << 9)   /* parity error */
+#define PL011_DR_BE     (1U << 10)  /* break error */
+#define PL011_DR_OE     (1U << 11) /* overrun error */
+#define PL011_DR_ERR_MASK (PL011_DR_FE | PL011_DR_PE | PL011_DR_BE | PL011_DR_OE)
 #define PL011_FR_OFF    0x18
 #define PL011_FR_TXFF   (1U << 5)   /* 送信 FIFO が満杯 */
 #define PL011_FR_RXFE   (1U << 4)   /* 受信 FIFO が空 */
@@ -150,11 +158,38 @@ void aarch64_uart_putchar(char c) {
     aarch64_console_end();
 }
 
+/* 受信エラーフラグの延べ回数 (2026-09-18)。**カウンタだけの軽量な形** —
+ * 増分は分岐 1 回・加算 1 回で、既定ビルドでも黙って回る。実機での
+ * 文字化けが再発したときに「本当に PL011 側が化けたのか」を判別する
+ * 手がかりにする (日報2026-09-16 §4、そのときは再現せず未解決のまま) */
+static volatile uint64_t g_uart_rx_err_count;
+
+uint64_t aarch64_uart_rx_err_count(void) {
+    return g_uart_rx_err_count;
+}
+
+/* 60 秒ごとの計器から呼ぶ (kernel/aarch64/timer.c、AARCH64_VERBOSE_DIAG)。
+ * **増えていないときは何も出さない。**emmc2_io_report と同じ流儀 —
+ * 黙っている限りは「その区間ではエラーフラグが立たなかった」で読める */
+void aarch64_uart_rx_err_report(void) {
+    static uint64_t prev;
+    if (g_uart_rx_err_count == prev) return;
+    aarch64_console_begin();
+    aarch64_uart_puts("[uart] rx-err total=");
+    aarch64_uart_putdec64(g_uart_rx_err_count);
+    aarch64_uart_puts("\n");
+    aarch64_console_end();
+    prev = g_uart_rx_err_count;
+}
+
 /* 1 文字だけ取る。無ければ -1 (P3)。**待たない** —
  * 待つかどうかを決めるのは呼び出し側 (kernel/aarch64/console.c) */
 int aarch64_uart_getchar_nonblock(void) {
+    uint32_t dr;
     if (mmio_read32(g_uart_base + PL011_FR_OFF) & PL011_FR_RXFE) return -1;
-    return (int)(mmio_read32(g_uart_base + PL011_DR_OFF) & 0xFFU);
+    dr = mmio_read32(g_uart_base + PL011_DR_OFF);
+    if (dr & PL011_DR_ERR_MASK) g_uart_rx_err_count++;
+    return (int)(dr & 0xFFU);
 }
 
 /* 受信割り込みを開ける (P3)。GIC 側の有効化とは別で、**両方要る** */
