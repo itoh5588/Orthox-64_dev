@@ -919,6 +919,16 @@ $(AARCH64_FORK_PROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
 
 aarch64-fork-probe: $(AARCH64_FORK_PROBE_ELF)
 
+# fork の CoW の負荷試験 (user/cowstress.c)。4 コアで共有と写しを同時に起こす
+AARCH64_COWSTRESS_ELF = out/aarch64-cowstress.elf
+$(AARCH64_COWSTRESS_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/cowstress.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/cowstress.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-cowstress: $(AARCH64_COWSTRESS_ELF)
+
 # N-10: ソケット syscall が EL0 から使えるかの検査。musl / fork の probe と
 # 同じ作りで中身だけ差し替える
 AARCH64_SOCKET_PROBE_ELF = out/aarch64-socket-probe.elf
@@ -998,6 +1008,11 @@ aarch64-socket-smoke: $(AARCH64_SOCKET_PROBE_ELF)
 aarch64-fork-smoke: $(AARCH64_FORK_PROBE_ELF)
 	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/fork-probe
 	bash ./tests/aarch64_fork_smoke.sh
+
+# fork の CoW を 4 コアで叩く (2026-09-19)。init が /bin/cowstress
+aarch64-cowstress-smoke: $(AARCH64_COWSTRESS_ELF)
+	$(MAKE) $(AARCH64_KERNEL_ELF) AARCH64_INIT_PATH_VALUE=/bin/cowstress
+	bash ./tests/aarch64_cowstress_smoke.sh
 
 # P3-2: コンソール入力 (PL011 の受信割り込み)
 AARCH64_CONSOLE_PROBE_ELF = out/aarch64-console-probe.elf

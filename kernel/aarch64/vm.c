@@ -34,6 +34,7 @@
  * 「カウントが 0 より大きいときだけ減らす」作りなので**永久に解放されない**。
  * elf.c / task_exec.c / linux_syscall.c も pmm_alloc を使っている */
 #include "pmm.h"
+#include "vm_cow.h"
 
 extern char __kernel_start[];
 extern char __kernel_end[];
@@ -859,31 +860,23 @@ arch_address_space_t arch_vm_create_user_address_space(void) {
     return root_pa;
 }
 
-/* ページの中身を 1 枚写す。
- *
- * **物理アドレスのまま触らない。** 恒等マッピングを外した後は上位 VA を
- * 通さないと翻訳できない (P2 で kernel/linux_syscall.c が同じ形で落ちた:
- * ESR=0x96000045 / FAR に物理アドレスがそのまま出る)。
- * aarch64_vm_table_ptr が MMU の状態に応じて変換してくれる */
-/* ---- V-1 の計器: fork の写しにどれだけ使っているか ------------------------
+/* ---- V-1 の計器: fork にどれだけ使っているか ------------------------------
  *
  * **既定で切ってある。**戻すときは
  *
  *   make aarch64-pi4-netboot ... AARCH64_FORK_STATS=1
  *
- * **aarch64 は CoW が無く、fork でユーザーのページを全部その場で写す。**
- * CoW を入れるかを「効くはず」ではなく数字で決めるために作った。
+ * もとは「aarch64 は CoW が無く、fork でユーザーのページを全部その場で
+ * 写す」ときに、CoW を入れるかを数字で決めるために作った。
  *
  * 2026-08-23 に実機で測った答え: **fork の写しは全体の 0.067%** (8 本の
- * ビルド 490 秒に対し 330ms)。**CoW を入れても 49 分が 2 秒縮むだけ。**
- * このとき **「gcc は cc1 (9.7MB) を fork するたびに写す」は誤り**だと
- * 分かった。**fork が写すのは親**で、cc1 は fork の後に exec で読まれる。
- * 実測は 1 fork あたり 214 ページ = 856KB。
+ * ビルド 490 秒に対し 330ms)。CoW は速度ではなくメモリの機能と結論した。
+ * 実測は 1 fork あたり 214 ページ = 856KB。副産物の **1 ページ 38.5us**
+ * (4KB のコピーとしては 1 桁遅い) は I-cache 同期が支配的と見ている。
  *
- * **消さずに残す。**CoW を検討するときや、ページ複製のコストを疑うときに
- * また同じものを書くことになる。副産物として **1 ページ 38.5us** という
- * 数字も出ており (4KB のコピーとしては 1 桁遅い)、**S-3 の I-cache 同期が
- * 支配的**かどうかを追うときの入口にもなる。
+ * **2026-09-19 に CoW にした後の意味:** pages は「親と共有した葉の数」、
+ * ms は表を写して葉に印を付けるまでの時間。ページの写しはフォルトの
+ * 側 (kernel/vm_cow.c) に移ったので、ここには入らない。
  *
  * 時計は CNTPCT_EL0 (Pi 4 で 54MHz = 18.5ns 分解能)。arch_time_now_ms は
  * 1ms 分解能で、1 回の fork より粗いので使えない。
@@ -925,26 +918,6 @@ void aarch64_fork_stats(uint64_t* calls, uint64_t* pages, uint64_t* ms) {
 #define FORK_STAT_END(t0)     ((void)(t0))
 #endif
 
-static void aarch64_vm_copy_page(uint64_t dst_pa, uint64_t src_pa) {
-    uint64_t* d = aarch64_vm_table_ptr(dst_pa);
-    const uint64_t* s = aarch64_vm_table_ptr(src_pa);
-    for (uint64_t i = 0; i < AARCH64_PAGE_SIZE / sizeof(uint64_t); i++) d[i] = s[i];
-
-    /* **S-3: 写した先を I-cache と揃える。**
-     *
-     * aarch64 は CoW が無く、fork で**ユーザーのページを全部その場で写す**。
-     * text も新しい物理ページに書き直されるので、exec と同じ手当てが要る。
-     * gcc は cc1 / as / collect2 / ld と 4 回 fork するため、ここを外すと
-     * 9.7MB の cc1 の text が毎回そのまま危険にさらされる。
-     *
-     * **ここでは実行可能かどうかを見ない。** テーブルを写している最中で
-     * PTE の権限は上の段が持っており、判定を持ち込むと絡む。1 ページ 4KB の
-     * 同期は fork 全体の写しに比べれば小さい */
-    aarch64_sync_icache_range(d, AARCH64_PAGE_SIZE);
-
-    FORK_STAT_PAGE();   /* V-1 の計器 (既定で切ってある) */
-}
-
 /* fork 用にテーブルを 1 段ぶん写す。level は aarch64_vm_index と同じ 1..3。
  *
  * **カーネル領域を避ける処理は要らない。** riscv64 / x86 は 1 本のテーブルに
@@ -952,11 +925,15 @@ static void aarch64_vm_copy_page(uint64_t dst_pa, uint64_t src_pa) {
  * 判定が要る (kernel/riscv64/vm.c の riscv64_vm_clone_table)。AArch64 は
  * カーネルが TTBR1 に居るので、TTBR0 の中身はすべてユーザーのもの。
  *
- * ページは**その場で写す (eager copy)。** CoW はまだ無いので、fork した
- * 瞬間に親と同じだけの物理ページを食う。 */
+ * **表は写し、ページは共有する (CoW, 2026-09-19)。**葉を子へどう渡すかは
+ * 共通層 (vm_cow_share_leaf, kernel/vm_cow.c) が決める。書き込み可の葉は
+ * 親子とも読み取り専用 + 印になり、先に書いた側がフォルトで写す。
+ * 2026-09-18 までは全ページをその場で写しており (eager copy)、写した先の
+ * I-cache 同期もここでやっていた。**その同期は写す場所と一緒に
+ * vm_cow_write_fault へ移した** (日報2026-08-23 の V-2)。 */
 static int aarch64_vm_clone_table(uint64_t dst_pa, uint64_t src_pa, int level) {
     uint64_t* dst = aarch64_vm_table_ptr(dst_pa);
-    const uint64_t* src = aarch64_vm_table_ptr(src_pa);
+    uint64_t* src = aarch64_vm_table_ptr(src_pa);
 
     for (uint64_t i = 0; i < AARCH64_PTES; i++) {
         uint64_t entry = src[i];
@@ -981,43 +958,47 @@ static int aarch64_vm_clone_table(uint64_t dst_pa, uint64_t src_pa, int level) {
             continue;
         }
 
-        /* L3 = ページ本体。**属性はそのまま、物理アドレスだけ差し替える。**
-         *
-         * **pmm_alloc を使う (生の aarch64_pmm_alloc ではない)。**
-         * ユーザーページは参照カウントで管理されていて、解放側の pmm_free は
-         * カウントが 0 より大きいときしか減らさない。生で取ると refcount が
-         * 0 のままになり、arch_vm_destroy_user_address_space が呼ばれても
-         * **そのページだけ永久に返らない** */
-        {
-            uint64_t new_pa = (uint64_t)(uintptr_t)pmm_alloc(1);
-            if (!new_pa) return -1;
-            aarch64_vm_copy_page(new_pa, entry & AARCH64_PTE_ADDR_MASK);
-            dst[i] = (new_pa & AARCH64_PTE_ADDR_MASK) | (entry & ~AARCH64_PTE_ADDR_MASK);
-        }
+        /* L3 = ページ本体。参照カウントは共通層が足す。解放側
+         * (aarch64_vm_destroy_table) は pmm_free で 1 つずつ減らすので、
+         * 最後に手放した側だけが本当に返す */
+        dst[i] = vm_cow_share_leaf(&src[i], 1);
+        FORK_STAT_PAGE();   /* V-1 の計器 (既定で切ってある) */
     }
     return 0;
 }
 
-/* fork 用。親のアドレス空間を丸ごと写した新しい空間を返す。失敗なら 0。
+/* fork 用。親と同じ中身の新しい空間を返す。失敗なら 0。
  * **失敗したら途中まで作ったものを捨てる** — 半端な空間を返すと、子が
  * 穴の空いた空間で走り出して原因不明のアボートになる */
 arch_address_space_t arch_vm_clone_address_space(arch_address_space_t address_space) {
     uint64_t root_pa;
+    int rc;
 
     if (!address_space) return 0;
     root_pa = (uint64_t)arch_vm_create_user_address_space();
     if (!root_pa) return 0;
 
     /* ルートは L1 (VA 39bit / 4KB granule なので L1 が最上位)。
-     * **V-1: ここが写しの全部。**前後で時計を読む */
+     * **V-1: ここが fork の全部。**前後で時計を読む */
     {
         uint64_t t0 = FORK_STAT_T0();
-        int rc = aarch64_vm_clone_table(root_pa, (uint64_t)address_space, 1);
+        rc = aarch64_vm_clone_table(root_pa, (uint64_t)address_space, 1);
         FORK_STAT_END(t0);
-        if (rc < 0) {
-            arch_vm_destroy_user_address_space(root_pa);
-            return 0;
-        }
+    }
+
+    /* **親の葉を読み取り専用にしたので、全 CPU から古い変換を捨てる。**
+     * 途中で失敗しても、それまでに印を付けた葉はそのまま残るので同じ。
+     * arch_context_switch は TTBR0 が同じなら TLB を捨てないので、親が
+     * 以前走っていた CPU に書き込み可の変換が残っている。そこへ戻った
+     * 親は、フォルトを起こさずに子と共有中のページへ書けてしまう */
+    __asm__ volatile("dsb ishst");
+    __asm__ volatile("tlbi vmalle1is");
+    __asm__ volatile("dsb ish");
+    __asm__ volatile("isb");
+
+    if (rc < 0) {
+        arch_vm_destroy_user_address_space(root_pa);
+        return 0;
     }
     return (arch_address_space_t)root_pa;
 }

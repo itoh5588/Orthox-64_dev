@@ -142,9 +142,11 @@ aarch64_vectors:
  * 「わざと未マップの VA を読んで translation fault を確かめる」探針を
  * 入れたので、**想定内のものだけ復帰できる**ようにした。
  *
- * C 側 (aarch64_sync_exception) が 1 を返したときだけ、例外を起こした命令の
- * 次から再開する。既定は 0 = ここで止まる。想定外の同期例外を黙って
- * 読み飛ばすと原因不明の暴走になる */
+ * C 側 (aarch64_sync_exception) の戻り値で分ける:
+ *   0 = ここで止まる (既定。想定外の同期例外を黙って読み飛ばすと
+ *       原因不明の暴走になる)
+ *   1 = 例外を起こした命令の次から再開 (探針)
+ *   2 = 例外を起こした命令をやり直す (fork の CoW を片づけた, 2026-09-19) */
 vec_el1_sync:
     SAVE_ALL
     mrs     x0, esr_el1
@@ -152,9 +154,12 @@ vec_el1_sync:
     mrs     x2, far_el1
     bl      aarch64_sync_exception
     cbz     w0, 1f
+    cmp     w0, #2
+    b.eq    2f
     ldr     x1, [sp, #SAVED_ELR_OFF]
     add     x1, x1, #4          /* AArch64 の命令は 4 バイト固定 */
     str     x1, [sp, #SAVED_ELR_OFF]
+2:
     RESTORE_ALL
     eret
 1:

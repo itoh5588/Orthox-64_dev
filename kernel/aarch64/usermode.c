@@ -28,6 +28,7 @@
 #include "aarch64/task.h"
 #include "linux_syscall.h"
 #include "task.h"   /* get_current_task (S-1) */
+#include "vm_cow.h"
 
 /* SAVE_ALL が積んだフレームの並び。vectors.S と対で決まっている。
  *
@@ -48,6 +49,7 @@
 #define ESR_EC_DABT_LOW 0x24    /* 下位 EL からのデータアボート */
 #define ESR_EC_IABT_LOW 0x20    /* 下位 EL からの命令アボート */
 #define ESR_DFSC_MASK   0x3fULL
+#define ESR_ISS_WNR     (1ULL << 6)  /* データアボートが書き込みで起きた */
 
 
 /* EL1h (SP_EL1 を使う EL1) に戻るときの SPSR。DAIF は開けたまま。
@@ -347,6 +349,22 @@ void aarch64_lower_el_sync(uint64_t* frame, uint64_t esr, uint64_t far) {
         st->fault_far = far;
         frame[FRAME_ELR] += 4;
         return;
+    }
+
+    /* ---- fork の CoW: 共有中のページへ書いた (2026-09-19) --------------
+     *
+     * DFSC が 0b0011xx (permission fault) で、書き込み (WnR) のとき。
+     * 写すか書き込み可に戻すかは共通層が決める (kernel/vm_cow.c)。
+     * **ELR は進めない。**同じ命令をもう一度実行させる。
+     * CoW でなければ (本物の読み取り専用への書き込み) 下の既定の処理へ。 */
+    if (ec == ESR_EC_DABT_LOW && ((esr & ESR_DFSC_MASK) >> 2) == 0x3ULL &&
+        (esr & ESR_ISS_WNR)) {
+        uint64_t ttbr0;
+        int rc;
+        __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
+        rc = vm_cow_write_fault(ttbr0 & AARCH64_PTE_ADDR_MASK, far);
+        if (rc == VM_COW_HANDLED) return;
+        if (rc == VM_COW_NOMEM) aarch64_uart_puts("  cow: no page to copy into\n");
     }
 
     /* ---- スタックの下端なら伸ばして、落ちた命令をやり直させる ----------

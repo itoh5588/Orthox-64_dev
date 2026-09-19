@@ -1,12 +1,16 @@
 #!/bin/bash
-# P3-1: fork が aarch64 で成立するかの検査。
+# fork の CoW を 4 コアで叩く (2026-09-19)。
 #
-# ディスクの /bin/fork-probe を task_execve で読んで走らせる (P1 と同じ方針で
-# カーネルには埋め込まない)。riscv64 の riscv64_musl_smoke.sh に相当するが、
-# **fork / clone は見ない** — aarch64 はまだ実装していないので P3 の領分。
+# init を /bin/cowstress (user/cowstress.c) にして QEMU の virt を -smp 4 で
+# 起動する。worker 8 本がそれぞれ fork を繰り返し、親子が同じページを
+# 別の CPU で同時に写す。**中身が混ざらないこと** (cowstress: PASS) と、
+# カーネルが例外で止まらないことを見る。
 #
-# 実行前に probe と init パスを差し替えたカーネルが要る:
-#   make aarch64-fork-smoke  がまとめてやる
+# aarch64_fork_smoke.sh (1 回の fork で経路が通るか) の並行版。
+# 組み立ては同じで、ディスクに入れるものと判定だけが違う。
+#
+#   make aarch64-cowstress-smoke
+#   SMP_CPUS で CPU 数を変えられる (既定 4)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -24,14 +28,14 @@ if [ -z "$QEMU_BIN" ]; then
 fi
 
 KERNEL=out/kernel-aarch64.elf
-PROBE=out/aarch64-fork-probe.elf
-[ -f "$KERNEL" ] || { echo "missing $KERNEL ('make aarch64-fork-smoke')" >&2; exit 1; }
-[ -f "$PROBE" ]  || { echo "missing $PROBE ('make aarch64-fork-probe')" >&2; exit 1; }
+PROBE=out/aarch64-cowstress.elf
+[ -f "$KERNEL" ] || { echo "missing $KERNEL ('make aarch64-cowstress-smoke')" >&2; exit 1; }
+[ -f "$PROBE" ]  || { echo "missing $PROBE ('make aarch64-cowstress')" >&2; exit 1; }
 
 # **通常のスモークとは別のディスクを使う。** out/rootfs-*.img には触らない
-TEST_DISK=out/aarch64-fork-disk.img
-TEST_FSDIR=out/aarch64-fork-fs
-LOG=LOGs/aarch64-fork-serial.log
+TEST_DISK=out/aarch64-cowstress-disk.img
+TEST_FSDIR=out/aarch64-cowstress-fs
+LOG=LOGs/aarch64-cowstress-serial.log
 
 # probe が 200KB 書くので、通常のスモーク (4MB) より広く取る
 XV6FS_TEST_BLOCKS=16384          # 1KB ブロック x 16384 = 16MB
@@ -58,7 +62,7 @@ make_test_disk() {
     mkdir -p out
     rm -rf "$TEST_FSDIR"
     mkdir -p "$TEST_FSDIR/bin" "$TEST_FSDIR/tmp"
-    cp "$PROBE" "$TEST_FSDIR/bin/fork-probe"
+    cp "$PROBE" "$TEST_FSDIR/bin/cowstress"
     # **カーネルの起動時自己診断が中身まで照合する既知ファイル。**
     # 入れないと fs selftest が read file : BAD を出す (probe の失敗と
     # 紛らわしいので、ディスクの都合で BAD を出させない)
@@ -75,14 +79,14 @@ rm -f "$LOG"
     -machine virt \
     -cpu cortex-a72 \
     -m 512M \
-    -smp 1 \
+    -smp "${SMP_CPUS:-4}" \
     -nographic \
     -drive "file=$TEST_DISK,if=none,format=raw,id=vblk0" \
     -device virtio-blk-device,drive=vblk0 \
     -kernel "$KERNEL" < /dev/null > "$LOG" 2>&1 &
 QEMU_PID=$!
 
-for _ in {1..120}; do
+for _ in {1..300}; do
     if grep -aq "bootstrap user exit" "$LOG" 2>/dev/null; then
         break
     fi
@@ -92,7 +96,7 @@ kill "$QEMU_PID" 2>/dev/null || true
 wait "$QEMU_PID" 2>/dev/null || true
 QEMU_PID=""
 
-echo "--- AArch64 fork Serial Output ---"
+echo "--- AArch64 cowstress Serial Output ---"
 cat "$LOG"
 echo "----------------------------------"
 
@@ -130,41 +134,26 @@ fi
 tr -d '\r' < "$LOG" > "$LOG.nocr"
 LOG="$LOG.nocr"
 
-echo "--- P3-1 の判定 (fork) ---"
-# 起動時の自己診断が緑であること。**ここが赤いまま probe の判定に進むと、
-# probe の失敗とディスクの不備が見分けられなくなる**
+echo "--- CoW の判定 (cowstress) ---"
 must_not "aarch64-fs-BAD" "$LOG"
 must_not "aarch64-user-BAD" "$LOG"
-grep -aq "exec      : /bin/fork-probe" "$LOG"
+grep -aq "exec      : /bin/cowstress" "$LOG"
 must_not "aarch64-init-BAD" "$LOG" "task_execve が失敗した (ELF が読めていない)"
 
-grep -aqE "^FORK-START$" "$LOG"
-# 子が EL0 で走り出した = aarch64_task_fork_child_return が eret まで届いた。
-# **ここが出ないなら fork_child_return か clone を疑う** (以前は `b .` だった)
-grep -aqE "^FORK-CHILD$" "$LOG"
-# 子から親の書き込みが見える = アドレス空間が正しく写っている
-grep -aqE "^FORK-CHILD-SEES-PARENT$" "$LOG"
-grep -aqE "^FORK-CHILD-WROTE$" "$LOG"
-# 親が子を回収できた
-grep -aqE "^FORK-REAPED$" "$LOG"
-# **本命。** 子の書き込みが親に見えていないこと = 子が書いた時点で写している。
-# 共有していると fork も waitpid も成功したままデータだけが壊れるので、
-# ここを見ないと「動いた」で通り抜ける
-grep -aqE "^FORK-ISOLATED$" "$LOG"
-must_not "FORK-SHARED-BAD" "$LOG" "親子が同じ物理ページを共有している (clone が写せていない)"
-# カーネル (EL1) が read で共有中のページへ書いても写ること (CoW, 2026-09-19)。
-# 子の側で受け取れて、親の側が元のままであること
-grep -aqE "^FORK-CHILD-KWRITE$" "$LOG"
-grep -aqE "^FORK-KWRITE-ISOLATED$" "$LOG"
-must_not "FORK-KWRITE-SHARED-BAD" "$LOG" "EL1 の CoW フォルトで写せていない"
-grep -aqE "^FORK-DONE$" "$LOG"
+# 副コアが立ったこと。立っていないと並行の試験にならない
+if [ "${SMP_CPUS:-4}" -gt 1 ]; then
+    grep -aq "aarch64-smp-ok" "$LOG"
+fi
+
+grep -aqE "^cowstress: start workers=" "$LOG"
+must_not "cowstress: FAIL" "$LOG" "CoW で親子の中身が混ざった / fork・wait が失敗した"
+grep -aqE "^cowstress: PASS workers=" "$LOG"
 grep -aq "bootstrap user exit" "$LOG"
 
-# 想定外の例外を踏んでいないこと
+# 想定外の例外、CoW の写し先が取れない
 must_not "aarch64-exception-BAD" "$LOG"
+must_not "cow: no page to copy into" "$LOG"
 must_not "xv6bio: disk" "$LOG"
-# clone / fork_child_return が失敗したときにカーネルが出すもの
 must_not "vm: clone: unexpected block mapping" "$LOG"
-must_not "task: fork child has no current" "$LOG"
 
-echo "aarch64 fork smoke test: PASS"
+echo "aarch64 cowstress smoke test: PASS (smp=${SMP_CPUS:-4})"

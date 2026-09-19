@@ -18,6 +18,7 @@
 #include "syscall.h"
 #include "pmm.h"
 #include "vmm.h"
+#include "vm_cow.h"      /* EL1 の CoW フォルト */
 #include "usb.h"          /* usb_xhci_irq (A-1) */
 #include "spinlock.h"     /* コンソール出力の直列化 (SMP の P-4) */
 #include "net.h"          /* NET_CLOCK_* と net_sync_wallclock (T-7) */
@@ -1195,13 +1196,36 @@ void aarch64_irq_handler(struct aarch64_trap_frame* frame) {
  * M2 で「わざと未マップの VA を読んで fault を確かめる」探針を入れたので、
  * 想定内のものだけ復帰できるようにする。
  *
- * 戻り値 0 = 復帰しない (止まる) / 1 = 例外を起こした命令の次から再開。
+ * 戻り値 0 = 復帰しない (止まる) / 1 = 例外を起こした命令の次から再開 /
+ * 2 = 例外を起こした命令をやり直す (fork の CoW を片づけた)。
  * **既定は 0。** 想定外の例外を黙って読み飛ばすと、原因不明の暴走になる */
 int aarch64_sync_exception(uint64_t esr, uint64_t elr, uint64_t far) {
+    uint64_t ec = (esr >> 26) & 0x3fULL;
+    uint64_t dfsc = esr & 0x3fULL;
+
     if (g_aarch64_vm_expect_fault) {
         g_aarch64_vm_expect_fault = 0;
         g_aarch64_vm_fault_esr = esr;
         return 1;
+    }
+
+    /* **カーネルがユーザーのバッファへ書いて CoW のページに当たった
+     * (2026-09-19)。**read(2) などは EL1 からユーザーの VA へ直接書く。
+     * CoW の葉は AP=11 (EL0 / EL1 とも読み取り専用) なので、EL1 でも
+     * permission fault になる。
+     *
+     * EC 0x25 = 同じ EL からのデータアボート、DFSC 0b0011xx = permission
+     * fault、ISS.WnR (bit 6) = 書き込み。TTBR0 の範囲 (上位 VA より下) だけ
+     * 見る。片づいたら **同じ命令をやり直させる** (2)。CoW でなければ
+     * 従来どおり止まる */
+    if (ec == 0x25ULL && (dfsc >> 2) == 0x3ULL && (esr & (1ULL << 6)) &&
+        far < AARCH64_KERNEL_VA_OFFSET) {
+        uint64_t ttbr0;
+        int rc;
+        __asm__ volatile("mrs %0, ttbr0_el1" : "=r"(ttbr0));
+        rc = vm_cow_write_fault(ttbr0 & AARCH64_PTE_ADDR_MASK, far);
+        if (rc == VM_COW_HANDLED) return 2;
+        if (rc == VM_COW_NOMEM) aarch64_uart_puts("\n  cow: no page to copy into (EL1)");
     }
 
     aarch64_uart_puts("\n*** aarch64 sync exception ***\n");
