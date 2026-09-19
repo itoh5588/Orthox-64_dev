@@ -467,14 +467,26 @@ static int16_t linux_poll_fd_revents(int fd, int16_t events) {
             ready |= LINUX_POLLOUT;  /* シリアル出力は常に受け付ける */
             break;
         case FT_PIPE: {
-            pipe_t* pipe = (pipe_t*)f->data;
+            /* **fs_fd_data で取る (2026-09-19)。**pipe_t は open-file
+             * オブジェクト (f->file->private_data) に移っていて、aarch64 では
+             * f->data が 0。f->data で見ていたので pipe は常に POLLERR になり、
+             * pselect が空の jobs pipe を「読める」と答えて make -j が read で
+             * 寝たまま止まった (QEMU で task_list と fd 表を gdb で読んで確認) */
+            pipe_t* pipe = (pipe_t*)fs_fd_data(f);
             if (!pipe) { ready |= LINUX_POLLERR; break; }
             {
                 uint64_t flags = spin_lock_irqsave(&pipe->lock);
                 if (pipe->count > 0) ready |= LINUX_POLLIN;
                 if (pipe->count < PIPE_BUF_SIZE) ready |= LINUX_POLLOUT;
-                /* 相手側が閉じた = 自分しか参照していない */
-                if (pipe->ref_count <= 1) ready |= LINUX_POLLHUP;
+                /* **端の本数で見る。ref_count で見てはいけない (2026-09-19)。**
+                 * include/fs.h の約束どおり、EOF は writers==0、EPIPE は
+                 * readers==0 (Linux の pipe_poll と同じ)。以前は
+                 * 「ref_count <= 1 = 相手側が閉じた」としていたが、ref_count は
+                 * ページ解放の判定用で端の本数ではない。make -j の jobs pipe
+                 * (自分で両端を持つ) に POLLHUP が立ち、pselect が空の pipe を
+                 * 「読める」と答えて make が read で寝たまま止まった */
+                if (pipe->writers == 0) ready |= LINUX_POLLHUP;
+                if (pipe->readers == 0 && (events & LINUX_POLLOUT)) ready |= LINUX_POLLERR;
                 spin_unlock_irqrestore(&pipe->lock, flags);
             }
             break;
@@ -522,8 +534,9 @@ static int linux_ppoll_register_waiters(struct linux_pollfd* fds, uint64_t nfds,
         f = &current->fds[fd];
         if (f->type == FT_CONSOLE) {
             if (!arch_console_set_waiter(self)) all_registered = 0;
-        } else if (f->type == FT_PIPE && f->data) {
-            pipe_t* pipe = (pipe_t*)f->data;
+        } else if (f->type == FT_PIPE && fs_fd_data(f)) {
+            /* f->data ではなく fs_fd_data (上の linux_poll_fd_revents と同じ理由) */
+            pipe_t* pipe = (pipe_t*)fs_fd_data(f);
             uint64_t flags = spin_lock_irqsave(&pipe->lock);
             if (fds[i].events & LINUX_POLLIN) {
                 if (!fs_waitq_add(&pipe->read_wq, self)) all_registered = 0;
@@ -548,8 +561,9 @@ static void linux_ppoll_clear_waiters(struct linux_pollfd* fds, uint64_t nfds,
         f = &current->fds[fd];
         if (f->type == FT_CONSOLE) {
             arch_console_clear_waiter(self);
-        } else if (f->type == FT_PIPE && f->data) {
-            pipe_t* pipe = (pipe_t*)f->data;
+        } else if (f->type == FT_PIPE && fs_fd_data(f)) {
+            /* f->data ではなく fs_fd_data (上の linux_poll_fd_revents と同じ理由) */
+            pipe_t* pipe = (pipe_t*)fs_fd_data(f);
             uint64_t flags = spin_lock_irqsave(&pipe->lock);
             fs_waitq_remove(&pipe->read_wq, self);
             fs_waitq_remove(&pipe->write_wq, self);
@@ -574,8 +588,26 @@ static int linux_ppoll_scan(struct linux_pollfd* fds, uint64_t nfds) {
     return ready_count;
 }
 
+/* ppoll の待ちの本体。**intr_blocked が 0 でなければ、シグナルで抜ける**
+ * (pselect6 が使う)。*intr_blocked は待っている間に有効なマスクで、それで
+ * 止められていないシグナルが保留されていれば -EINTR を返す。
+ * 0 なら従来どおりシグナルでは抜けない (ppoll の sigmask 対応は別の課題) */
+static int64_t linux_ppoll_wait(struct linux_pollfd* fds, uint64_t nfds,
+                                const struct linux_timespec* timeout,
+                                const uint64_t* intr_blocked);
+
 static int64_t linux_bootstrap_sys_ppoll(struct linux_pollfd* fds, uint64_t nfds,
                                            const struct linux_timespec* timeout) {
+    return linux_ppoll_wait(fds, nfds, timeout, 0);
+}
+
+static int linux_ppoll_interrupted(const struct task* t, const uint64_t* intr_blocked) {
+    return t && intr_blocked && (t->sig_pending & ~*intr_blocked) != 0;
+}
+
+static int64_t linux_ppoll_wait(struct linux_pollfd* fds, uint64_t nfds,
+                                const struct linux_timespec* timeout,
+                                const uint64_t* intr_blocked) {
     struct task* current = get_current_task();
     uint64_t deadline = 0;
     int has_deadline = 0;
@@ -597,6 +629,9 @@ static int64_t linux_bootstrap_sys_ppoll(struct linux_pollfd* fds, uint64_t nfds
 
         ready_count = linux_ppoll_scan(fds, nfds);
         if (ready_count > 0) return ready_count;
+        /* シグナルは fd の準備より後に見る (Linux も準備できた fd があれば
+         * それを返す)。親が子の終わり (SIGCHLD) で起こされたときはここで抜ける */
+        if (linux_ppoll_interrupted(current, intr_blocked)) return -LINUX_EINTR;
         now = arch_time_now_ms();
         if (has_deadline && now >= deadline) return 0;
         if (!current) {
@@ -633,7 +668,8 @@ static int64_t linux_bootstrap_sys_ppoll(struct linux_pollfd* fds, uint64_t nfds
             task_mark_io_wait_until(current, now + LINUX_PPOLL_SLICE_MS);
         }
 
-        if (linux_ppoll_scan(fds, nfds) > 0) {
+        if (linux_ppoll_scan(fds, nfds) > 0 ||
+            linux_ppoll_interrupted(current, intr_blocked)) {
             /* task_wake() ではなく task_cancel_sleep()。あちらは runqueue へ
              * 積むので、走行中の自分が runqueue にも載って二重になる */
             task_cancel_sleep(current);
@@ -643,6 +679,118 @@ static int64_t linux_bootstrap_sys_ppoll(struct linux_pollfd* fds, uint64_t nfds
         kernel_yield();
         linux_ppoll_clear_waiters(fds, nfds, current);
     }
+}
+
+/* ---- pselect6 (2026-09-19) ------------------------------------------------
+ *
+ * **make の jobserver が使う。**make -j4 は子の終わりを jobs pipe で待つのに
+ * pselect6 を呼び、ENOSYS だと「pselect jobs pipe: Function not implemented.
+ * Stop.」で止まる (Pi 4 実機で踏んだ)。x86 は kernel/sys_fs.c の
+ * sys_pselect6 を kernel/syscall.c から呼んでいたが、aarch64 / riscv64 の
+ * この入口には振り分けが無かった。riscv64 は sys_fs.c を組んでいないので、
+ * あちらを呼ぶ形にはできない。
+ *
+ * **ppoll に載せる。**fd の集合を pollfd の並びに直して上の
+ * linux_bootstrap_sys_ppoll で待ち、結果を集合へ戻す。待ち行列で寝る仕組みを
+ * そのまま使えるので、2 つ目の待ち方を持たない (Linux も select と poll は
+ * 同じ poll_wait の上に立っている)。
+ *
+ * 戻り値は Linux と同じく「立てたビットの数」(読みと書きは別に数える)。
+ * 読みは POLLIN / POLLHUP / POLLERR、書きは POLLOUT / POLLERR で立てる。
+ * 例外の集合は扱わない (常に空で返す)。残り時間を timeout へ書き戻すことは
+ * しない。
+ *
+ * ---- シグナル (sigmask) ----
+ *
+ * **make は子の終わりを「pselect が SIGCHLD で EINTR になる」ことで知る。**
+ * 普段は SIGCHLD を止めておき、pselect の 6 番目の引数で空のマスクを渡して
+ * 待っている間だけ通す (ports/make-4.4.1/src/posixos.c:451)。シグナルで
+ * 抜けないと、子が全部終わってもトークンが pipe に戻らず、-j の枠
+ * (4 本) を使い切ったところで止まる (Pi 4 実機で踏んだ、2026-09-19)。
+ *
+ *   1. 待っている間は渡されたマスク (無ければプロセスのマスク) で見て、
+ *      それで止められていないシグナルが保留されていれば -EINTR
+ *   2. **普段は止められていて、pselect の間だけ通ったシグナルは、保留を
+ *      落とす。**Linux ではここでハンドラ (か既定の動作) が走って保留が
+ *      消える。aarch64 / riscv64 の共有層はハンドラを配送しないので、
+ *      落とさないとビットが残り、次の pselect が即座に EINTR になって
+ *      make が空回りする。make の回収は WNOHANG の waitpid で、ハンドラ
+ *      (child_handler) が走らなくても困らない (job.c の REAP_MORE)
+ *
+ * 6 番目の引数は Linux と同じく { const sigset_t* ss; size_t ss_len; } を
+ * 指す。ss_len は 8 (64 本) のときだけ受け付ける。 */
+struct linux_pselect6_sigmask {
+    const uint64_t* ss;
+    uint64_t ss_len;
+};
+
+static int64_t linux_sys_pselect6(int nfds, uint64_t* readfds, uint64_t* writefds,
+                                  uint64_t* exceptfds, const struct linux_timespec* timeout,
+                                  const struct linux_pselect6_sigmask* sigmask) {
+    struct task* current = get_current_task();
+    struct linux_pollfd pfds[MAX_FDS];
+    uint64_t n = 0;
+    uint64_t blocked;
+    int64_t rc;
+    int count = 0;
+    int nwords;
+
+    if (!current) return -LINUX_ESRCH;
+    blocked = current->sig_mask;
+    if (sigmask && sigmask->ss) {
+        if (sigmask->ss_len != sizeof(uint64_t)) return -LINUX_EINVAL;
+        blocked = *sigmask->ss;
+    }
+
+    if (nfds < 0) return -LINUX_EINVAL;
+    if (nfds > MAX_FDS) nfds = MAX_FDS;
+    nwords = (nfds + 63) / 64;
+    if (timeout && (timeout->tv_sec < 0 || timeout->tv_nsec < 0 ||
+                    timeout->tv_nsec >= 1000000000LL)) {
+        return -LINUX_EINVAL;
+    }
+
+    for (int fd = 0; fd < nfds; fd++) {
+        uint64_t bit = 1ULL << (fd & 63);
+        int want_r = readfds && (readfds[fd >> 6] & bit);
+        int want_w = writefds && (writefds[fd >> 6] & bit);
+        if (!want_r && !want_w) continue;
+        pfds[n].fd = fd;
+        pfds[n].events = (int16_t)((want_r ? LINUX_POLLIN : 0) | (want_w ? LINUX_POLLOUT : 0));
+        pfds[n].revents = 0;
+        n++;
+    }
+
+    rc = linux_ppoll_wait(pfds, n, timeout, &blocked);
+    if (rc == -LINUX_EINTR) {
+        /* 2. pselect の間だけ通ったシグナルを配送済みにする */
+        current->sig_pending &= ~(current->sig_pending & ~blocked & current->sig_mask);
+        return rc;
+    }
+    if (rc < 0) return rc;
+
+    for (int w = 0; w < nwords; w++) {
+        if (readfds) readfds[w] = 0;
+        if (writefds) writefds[w] = 0;
+        if (exceptfds) exceptfds[w] = 0;
+    }
+    for (uint64_t i = 0; i < n; i++) {
+        int fd = pfds[i].fd;
+        uint64_t bit = 1ULL << (fd & 63);
+        int16_t ev = pfds[i].events;
+        int16_t re = pfds[i].revents;
+        /* 開いていない fd を渡されたら Linux は EBADF */
+        if (re & LINUX_POLLNVAL) return -LINUX_EBADF;
+        if ((ev & LINUX_POLLIN) && (re & (LINUX_POLLIN | LINUX_POLLHUP | LINUX_POLLERR))) {
+            readfds[fd >> 6] |= bit;
+            count++;
+        }
+        if ((ev & LINUX_POLLOUT) && (re & (LINUX_POLLOUT | LINUX_POLLERR))) {
+            writefds[fd >> 6] |= bit;
+            count++;
+        }
+    }
+    return count;
 }
 
 
@@ -991,6 +1139,16 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
                                     (uint64_t)(int64_t)sys_getdents64((int)arch_syscall_arg0(frame),
                                                                       (void*)(uintptr_t)arch_syscall_arg1(frame),
                                                                       (size_t)arch_syscall_arg2(frame)));
+            return;
+        case LINUX_SYS_PSELECT6:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)linux_sys_pselect6(
+                                        (int)arch_syscall_arg0(frame),
+                                        (uint64_t*)(uintptr_t)arch_syscall_arg1(frame),
+                                        (uint64_t*)(uintptr_t)arch_syscall_arg2(frame),
+                                        (uint64_t*)(uintptr_t)arch_syscall_arg3(frame),
+                                        (const struct linux_timespec*)(uintptr_t)arch_syscall_arg4(frame),
+                                        (const struct linux_pselect6_sigmask*)(uintptr_t)arch_syscall_arg5(frame)));
             return;
         case LINUX_SYS_PPOLL:
             arch_syscall_set_return(frame,

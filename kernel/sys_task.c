@@ -317,7 +317,16 @@ void sys_exit(int status) {
             if (parent->sig_handlers[LINUX_SIGCHLD] != 1ULL) {
                 parent->sig_pending |= (1ULL << LINUX_SIGCHLD);
             }
-            if (parent->state == TASK_SLEEPING) task_wake(parent);
+            /* **IO_WAIT も起こす (2026-09-19)。**pselect6 / ppoll は
+             * task_mark_io_wait で寝るので、SLEEPING だけ見ていると
+             * SIGCHLD を立てても起きない。make -j は子の終わりを pselect の
+             * EINTR で知るので、-j の枠を使い切ったところで永久に止まった
+             * (QEMU で task_list を gdb で読み、make が IO_WAIT のまま
+             * sig_pending に SIGCHLD を持っているのを確認)。起こされた側は
+             * どれも条件を見直して寝直すので、余計に起こしても害は無い */
+            if (parent->state == TASK_SLEEPING || parent->state == TASK_IO_WAIT) {
+                task_wake(parent);
+            }
         }
     }
 

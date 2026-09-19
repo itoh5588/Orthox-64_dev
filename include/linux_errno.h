@@ -17,6 +17,9 @@
 #define LINUX_EPERM        1
 #define LINUX_ENOENT       2
 #define LINUX_ESRCH        3
+/* pselect6 がシグナルで抜けたとき (kernel/linux_syscall.c)。make の jobserver が
+ * 子の終わりをこれで知る */
+#define LINUX_EINTR        4
 #define LINUX_E2BIG        7
 #define LINUX_EBADF        9
 #define LINUX_ECHILD      10

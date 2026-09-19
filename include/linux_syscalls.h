@@ -75,6 +75,7 @@ struct linux_statfs {
 #define LINUX_SYS_WRITE            64
 #define LINUX_SYS_READV            65
 #define LINUX_SYS_WRITEV           66
+#define LINUX_SYS_PSELECT6         72
 #define LINUX_SYS_PPOLL            73
 #define LINUX_SYS_READLINKAT       78
 #define LINUX_SYS_NEWFSTATAT       79
