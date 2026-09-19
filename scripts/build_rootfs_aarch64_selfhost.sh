@@ -71,9 +71,15 @@ else
   exit 1
 fi
 
-mkdir -p "$FSDIR/proc" "$FSDIR/etc"
+mkdir -p "$FSDIR/proc" "$FSDIR/etc" "$FSDIR/tmp"
 printf '/dev/sd0 / xv6fs rw 0 0\n' > "$FSDIR/proc/mounts"
 cp "$FSDIR/proc/mounts" "$FSDIR/etc/mtab"
+
+# **実機の ash smoke が読む (tests/aarch64_pi4_serial_ash_smoke.sh)。**
+# scripts/build_pi4_rootfs.sh と同じ文字列。こちらには無く、このイメージを
+# p3 に書くと smoke が cat /etc/motd で落ちた (09-16 と同じ穴、2026-09-19)。
+# /tmp も smoke が書き込みに使う
+printf 'hello from aarch64 xv6fs rootfs\n' > "$FSDIR/etc/motd"
 
 # **カーネルが中身まで照合する既知のファイル。**
 # 「読めた」だけでは、別のブロックを返していても気づけない
@@ -86,6 +92,14 @@ if [ -f out/aarch64-hello.elf ]; then
   cp out/aarch64-hello.elf "$FSDIR/bin/hello"
 else
   echo "warning: out/aarch64-hello.elf が無い。先に make aarch64-user-bin" >&2
+fi
+
+# fork の CoW の負荷試験 (user/cowstress.c, 2026-09-19)。実機の 4 コアで回す
+if [ -f out/aarch64-cowstress.elf ]; then
+  cp out/aarch64-cowstress.elf "$FSDIR/bin/cowstress"
+  chmod +x "$FSDIR/bin/cowstress"
+else
+  echo "warning: out/aarch64-cowstress.elf が無い。先に make aarch64-cowstress" >&2
 fi
 
 cp -a "$SRCTREE" "$FSDIR/src/kernel-build"
@@ -176,7 +190,16 @@ if [ -d "$EXTRA" ]; then
   fi
   du -sh "$FSDIR" | sed 's/^/  重ねた後: /'
 else
-  echo "--- ツールチェーンは無い ($EXTRA)。ソースだけのイメージになる"
+  # **黙ってソースだけのイメージにしない (2026-09-19)。**p3 に書いてから
+  # gcc が無いと分かると、書き直しに RPi OS の起動と dd がもう一度要る。
+  # ツールチェーンは旧リポジトリ (RISCV-Orthox-64/ports/) に残っていて、
+  # 既定の場所には無かった。ソースだけでよいときは EXTRA=none を渡す
+  if [ "$EXTRA" != none ]; then
+    echo "error: ツールチェーンが無い ($EXTRA)。EXTRA=<DESTDIR のツリー> を渡すか、" >&2
+    echo "       ソースだけでよければ EXTRA=none" >&2
+    exit 1
+  fi
+  echo "--- ツールチェーンは入れない (EXTRA=none)。ソースだけのイメージになる"
 fi
 
 # ---- 動的リンクの検証用 (S-11 / DL-6) --------------------------------------

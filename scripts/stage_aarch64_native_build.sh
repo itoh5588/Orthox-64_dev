@@ -35,10 +35,16 @@ MK
 AARCH64_C_SRCS="$(srcs_of AARCH64_C_SRCS)"
 AARCH64_SHARED_C_SRCS="$(srcs_of AARCH64_SHARED_C_SRCS)"
 AARCH64_ASM_SRCS="$(srcs_of AARCH64_ASM_SRCS)"
+# **lwIP も要る (2026-09-19)。**net_socket.c / lwip_port.c が aarch64 の共有層に
+# 入ったのに、ここは lwIP を持ち込んでいなかった。実機で
+#   kernel/net_socket.c:8:22: fatal error: lwip/udp.h: No such file or directory
+# で落ちた。ホストと同じく LWIP_SRCS をそのまま組む (Makefile の AARCH64_LWIP_OBJS)
+LWIP_SRCS="$(srcs_of LWIP_SRCS)"
 
 [ -n "$AARCH64_C_SRCS" ] || { echo "error: AARCH64_C_SRCS が取り出せない" >&2; exit 1; }
 [ -n "$AARCH64_SHARED_C_SRCS" ] || { echo "error: AARCH64_SHARED_C_SRCS が取り出せない" >&2; exit 1; }
 [ -n "$AARCH64_ASM_SRCS" ] || { echo "error: AARCH64_ASM_SRCS が取り出せない" >&2; exit 1; }
+[ -n "$LWIP_SRCS" ] || { echo "error: LWIP_SRCS が取り出せない" >&2; exit 1; }
 
 rm -rf "$OUT"
 mkdir -p "$OUT/kernel/aarch64" "$OUT/include" "$OUT/scripts"
@@ -58,6 +64,11 @@ copy_srcs "$ROOT/kernel/aarch64"  "$OUT/kernel/aarch64"
   | ( cd "$ROOT/include" && xargs -0 -I{} cp --parents {} "$OUT/include/" )
 
 cp "$ROOT/scripts/kernel-aarch64.ld" "$OUT/scripts/"
+
+# lwIP: ヘッダの木と、組むソースだけ (パスはホストと同じ ports/lwip/src/...)
+mkdir -p "$OUT/ports/lwip/src"
+cp -r "$ROOT/ports/lwip/src/include" "$OUT/ports/lwip/src/"
+( cd "$ROOT" && for f in $LWIP_SRCS; do cp --parents "$f" "$OUT/"; done )
 
 # ---- ネイティブ Makefile を書き出す --------------------------------------
 # ホスト側の AARCH64_CFLAGS から **clang 専用のものだけ**を落とす:
@@ -139,7 +150,8 @@ endif
 # **12 倍。**出力の .o は md5 まで一致する。**外さないこと。**
 CFLAGS = -pipe -std=gnu1x -mgeneral-regs-only -ffreestanding \
 	 -fno-stack-protector -fno-stack-check -fno-lto -fno-pie \
-	 -mcmodel=small -O2 -I$(SRCDIR)/include $(MACHINE_DEFS)
+	 -mcmodel=small -O2 -I$(SRCDIR)/include -I$(SRCDIR)/ports/lwip/src/include \
+	 $(MACHINE_DEFS)
 
 # **リンク番地は --defsym では渡せない。**
 # GNU ld 2.42 は --defsym で定義した記号を、リンカスクリプトの
@@ -159,12 +171,15 @@ printf '\nAARCH64_SHARED_C_SRCS = \\\n'
 for f in $AARCH64_SHARED_C_SRCS; do printf '\t%s \\\n' "$f"; done | sed '$ s/ \\$//'
 printf '\nASM_SRCS = \\\n'
 for f in $AARCH64_ASM_SRCS;      do printf '\t%s \\\n' "$f"; done | sed '$ s/ \\$//'
+printf '\nLWIP_SRCS = \\\n'
+for f in $LWIP_SRCS;             do printf '\t%s \\\n' "$f"; done | sed '$ s/ \\$//'
 
 cat <<'MAKEFILE_TAIL'
 
 C_OBJS   = $(patsubst %.c,$(BUILD)/%.o,$(AARCH64_C_SRCS) $(AARCH64_SHARED_C_SRCS))
 ASM_OBJS = $(patsubst %.S,$(BUILD)/%_asm.o,$(ASM_SRCS))
-OBJS     = $(C_OBJS) $(ASM_OBJS)
+LWIP_OBJS = $(patsubst ports/lwip/src/%.c,$(BUILD)/lwip/%.o,$(LWIP_SRCS))
+OBJS     = $(C_OBJS) $(ASM_OBJS) $(LWIP_OBJS)
 
 all: $(OUTPUT)
 
@@ -192,6 +207,12 @@ $(BUILD)/%_asm.o: $(SRCDIR)/%.S
 	@$(MKDIR) -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# lwIP はホストと同じく build の下の lwip/ に分けて置く。上の $(BUILD)/%.o より
+# 語幹が短いので、make はこちらを選ぶ
+$(BUILD)/lwip/%.o: $(SRCDIR)/ports/lwip/src/%.c
+	@$(MKDIR) -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 clean:
 	$(RM) -rf $(BUILD) $(OUTPUT)
 
@@ -205,11 +226,11 @@ MAKEFILE_TAIL
 # ここで潰せるものは全部ここで潰す。
 
 missing=""
-for f in $AARCH64_C_SRCS $AARCH64_SHARED_C_SRCS $AARCH64_ASM_SRCS; do
+for f in $AARCH64_C_SRCS $AARCH64_SHARED_C_SRCS $AARCH64_ASM_SRCS $LWIP_SRCS; do
   [ -f "$OUT/$f" ] || missing="$missing $f"
 done
 [ -z "$missing" ] || { echo "★ staging に入っていないソース:$missing" >&2; exit 1; }
-echo "  ソース $(echo $AARCH64_C_SRCS $AARCH64_SHARED_C_SRCS $AARCH64_ASM_SRCS | wc -w) 本が全部揃っている"
+echo "  ソース $(echo $AARCH64_C_SRCS $AARCH64_SHARED_C_SRCS $AARCH64_ASM_SRCS $LWIP_SRCS | wc -w) 本が全部揃っている (うち lwIP $(echo $LWIP_SRCS | wc -w) 本)"
 
 [ -f "$OUT/scripts/kernel-aarch64.ld" ] || {
   echo "★ リンカスクリプトが入っていない" >&2; exit 1; }
@@ -243,7 +264,7 @@ echo "  include/ の .h $h_out 本がホストと一致"
 # 生成した Makefile が make として読めること (構文と一覧の書き出しの検算)
 n_obj="$(make --no-print-directory -C "$OUT" -f Makefile print-objs 2>/dev/null \
          --eval 'print-objs:;@echo $(words $(OBJS))' || echo 0)"
-[ "$n_obj" = "$(echo $AARCH64_C_SRCS $AARCH64_SHARED_C_SRCS $AARCH64_ASM_SRCS | wc -w)" ] || {
+[ "$n_obj" = "$(echo $AARCH64_C_SRCS $AARCH64_SHARED_C_SRCS $AARCH64_ASM_SRCS $LWIP_SRCS | wc -w)" ] || {
   echo "★ 生成した Makefile の OBJS が $n_obj 個で一覧と合わない" >&2; exit 1; }
 echo "  生成した Makefile の OBJS $n_obj 個が一覧と一致"
 
