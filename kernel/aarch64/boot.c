@@ -17,6 +17,7 @@
 #include "aarch64/vm.h"
 #include "syscall.h"
 #include "pmm.h"
+#include "pmm_core.h"   /* pmm_core_rebind */
 #include "vmm.h"
 #include "vm_cow.h"      /* EL1 の CoW フォルト */
 #include "usb.h"          /* usb_xhci_irq (A-1) */
@@ -820,6 +821,10 @@ void aarch64_boot_continue(void) {
 
     /* 例外ベクタも上位 VA に張り替える */
     aarch64_vectors_init();
+
+    /* pmm の管理情報も上位 VA から触るように引き直す。恒等マッピングを
+     * 外すまでは物理のポインタでも届くので、外す前ならどこでもよい */
+    pmm_core_rebind();
 
     __asm__ volatile("mov %0, sp" : "=r"(sp));
     aarch64_uart_puts("  high VA   : pc=");

@@ -1,39 +1,36 @@
 #include <stdint.h>
 #include <stddef.h>
-#include <stdbool.h>
 #include "pmm.h"
+#include "pmm_core.h"
 #include "limine.h"
-#include "spinlock.h"
+
+/* 配り方は共通層 (kernel/pmm_core.c)。ここは管理する範囲と管理情報の
+ * 置き場を Limine のメモリマップから決めるだけ (include/pmm_core.h)。
+ *
+ * **以前はここにビットマップ確保があり、毎回ページ 0 から 1 ビットずつ
+ * 探していた** (2026-09-19 に共通層の next-fit へ移した) */
 
 // init.c で定義されているリクエストを外部参照
 extern volatile struct limine_memmap_request memmap_request;
 extern volatile struct limine_hhdm_request hhdm_request;
 
-static uint8_t* bitmap;
-static uint16_t* ref_counts;
-static uint64_t max_pages;
-static uint64_t allocated_pages;
 static uint64_t hhdm_offset;
 static void* isa_dma_page = NULL;
-static spinlock_t g_pmm_lock;
 
-// ビットマップ操作用の補助関数
-static inline void bitmap_set(uint64_t page) {
-    bitmap[page / 8] |= (1 << (page % 8));
+/* 管理情報は USABLE 領域から切り出した物理メモリ。HHDM 越しに触る */
+void* arch_pmm_meta_ptr(uint64_t pa) {
+    return (void*)(uintptr_t)(pa + hhdm_offset);
 }
 
-static inline void bitmap_clear(uint64_t page) {
-    bitmap[page / 8] &= ~(1 << (page % 8));
-}
-
-static inline bool bitmap_test(uint64_t page) {
-    return (bitmap[page / 8] >> (page % 8)) & 1;
+/* 0 埋めは呼ぶ側 (以前の pmm_alloc も埋めていなかった) */
+void arch_pmm_after_alloc(uint64_t pa, uint64_t pages) {
+    (void)pa;
+    (void)pages;
 }
 
 void pmm_init(void) {
     struct limine_memmap_response* memmap = memmap_request.response;
     hhdm_offset = hhdm_request.response->offset;
-    spinlock_init(&g_pmm_lock);
 
     /* **管理するページ数は RAM の種別だけで決める (2026-09-19)。**
      *
@@ -64,147 +61,55 @@ void pmm_init(void) {
         }
     }
 
-    max_pages = top_address / PAGE_SIZE;
-    uint64_t bitmap_size = (max_pages + 7) / 8;
-    uint64_t ref_counts_size = max_pages * sizeof(uint16_t);
-    uint64_t total_metadata_size = bitmap_size + ref_counts_size;
+    uint64_t max_pages = top_address / PAGE_SIZE;
+    /* 参照カウント (uint16_t) の並びを揃えるため、ビットマップの後ろを
+     * 8 バイト境界にする */
+    uint64_t bitmap_size = ((max_pages + 7) / 8 + 7) & ~7ULL;
+    uint64_t total_metadata_size = bitmap_size + max_pages * sizeof(uint16_t);
+    uint64_t meta_pa = 0;
 
     // ビットマップと参照カウントを配置する場所を探す
     for (uint64_t i = 0; i < memmap->entry_count; i++) {
         struct limine_memmap_entry* entry = memmap->entries[i];
         if (entry->type == LIMINE_MEMMAP_USABLE && entry->length >= total_metadata_size) {
-            bitmap = (uint8_t*)(entry->base + hhdm_offset);
-            ref_counts = (uint16_t*)((uint64_t)bitmap + bitmap_size);
-
-            // メタデータ領域を初期化
-            for (uint64_t j = 0; j < bitmap_size; j++) bitmap[j] = 0xFF;
-            for (uint64_t j = 0; j < max_pages; j++) ref_counts[j] = 0;
-            
-            // メタデータ自身が使用する領域をスキップ
-            uint64_t pages_needed = (total_metadata_size + PAGE_SIZE - 1) / PAGE_SIZE;
-            entry->base += pages_needed * PAGE_SIZE;
-            entry->length -= pages_needed * PAGE_SIZE;
+            meta_pa = entry->base;
             break;
         }
     }
+    if (!meta_pa) return;   /* 置き場が無い。pmm は 0 ページのまま */
 
-    // メモリマップに基づき、利用可能な領域をビットマップでマーク
+    pmm_core_setup(0, max_pages, meta_pa, meta_pa + bitmap_size);
+
+    // メモリマップに基づき、利用可能な領域を空きにする
     for (uint64_t i = 0; i < memmap->entry_count; i++) {
         struct limine_memmap_entry* entry = memmap->entries[i];
         if (entry->type == LIMINE_MEMMAP_USABLE) {
-            for (uint64_t j = 0; j < entry->length; j += PAGE_SIZE) {
-                bitmap_clear((entry->base + j) / PAGE_SIZE);
-            }
+            pmm_core_mark_free(entry->base, entry->length);
         }
     }
+
+    // メタデータ自身が使用する領域を使用中に戻す
+    pmm_core_mark_used(meta_pa, total_metadata_size);
+
+    // Never hand out physical page 0. Many kernel call sites use NULL as
+    // the allocation-failure sentinel, so treating page 0 as allocatable
+    // would turn a valid allocation into a false failure.
+    pmm_core_mark_used(0, PAGE_SIZE);
 
     // Reserve one ISA-DMA-safe page early before general allocations consume
     // low memory (<16MiB and no 64KiB boundary crossing).
     uint64_t limit_page = (0x01000000ULL / PAGE_SIZE);
     if (limit_page > max_pages) limit_page = max_pages;
 
-    // Never hand out physical page 0. Many kernel call sites use NULL as
-    // the allocation-failure sentinel, so treating page 0 as allocatable
-    // would turn a valid allocation into a false failure.
-    if (max_pages > 0) {
-        bitmap_set(0);
-        ref_counts[0] = 1;
-    }
-
     for (uint64_t page = 0; page < limit_page; page++) {
-        if (bitmap_test(page)) continue;
         uint64_t phys = page * PAGE_SIZE;
         if ((phys & 0xFFFFULL) > (0x10000ULL - PAGE_SIZE)) continue;
-        bitmap_set(page);
-        ref_counts[page] = 1;
+        if (!pmm_core_reserve_page(phys)) continue;
         isa_dma_page = (void*)phys;
         break;
     }
 }
 
-void* pmm_alloc(size_t pages) {
-    uint64_t consecutive_pages = 0;
-    uint64_t start_page = 0;
-    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
-
-    for (uint64_t i = 0; i < max_pages; i++) {
-        if (!bitmap_test(i)) {
-            if (consecutive_pages == 0) start_page = i;
-            consecutive_pages++;
-            if (consecutive_pages == pages) {
-                for (uint64_t j = 0; j < pages; j++) {
-                    bitmap_set(start_page + j);
-                    ref_counts[start_page + j] = 1;
-                }
-                allocated_pages += pages;
-                spin_unlock_irqrestore(&g_pmm_lock, flags);
-                return (void*)(start_page * PAGE_SIZE);
-            }
-        } else {
-            consecutive_pages = 0;
-        }
-    }
-    spin_unlock_irqrestore(&g_pmm_lock, flags);
-    return NULL; // メモリ不足
-}
-
-void pmm_free(void* addr, size_t pages) {
-    uint64_t start_page = (uint64_t)addr / PAGE_SIZE;
-    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
-    for (uint64_t i = 0; i < pages; i++) {
-        uint64_t page = start_page + i;
-        if (page < max_pages && ref_counts[page] > 0) {
-            ref_counts[page]--;
-            if (ref_counts[page] == 0) {
-                bitmap_clear(page);
-                if (allocated_pages > 0) allocated_pages--;
-            }
-        }
-    }
-    spin_unlock_irqrestore(&g_pmm_lock, flags);
-}
-
-void pmm_incref(void* addr) {
-    uint64_t page = (uint64_t)addr / PAGE_SIZE;
-    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
-    if (page < max_pages) {
-        ref_counts[page]++;
-    }
-    spin_unlock_irqrestore(&g_pmm_lock, flags);
-}
-
-uint16_t pmm_get_ref(void* addr) {
-    uint64_t page = (uint64_t)addr / PAGE_SIZE;
-    uint16_t ref = 0;
-    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
-    if (page < max_pages) {
-        ref = ref_counts[page];
-    }
-    spin_unlock_irqrestore(&g_pmm_lock, flags);
-    return ref;
-}
-
 void* pmm_get_isa_dma_page(void) {
     return isa_dma_page;
-}
-
-uint64_t pmm_get_allocated_pages(void) {
-    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
-    uint64_t pages = allocated_pages;
-    spin_unlock_irqrestore(&g_pmm_lock, flags);
-    return pages;
-}
-
-uint64_t pmm_get_free_pages(void) {
-    uint64_t flags = spin_lock_irqsave(&g_pmm_lock);
-    uint64_t free_pages = 0;
-    for (uint64_t i = 0; i < max_pages; i++) {
-        if (!bitmap_test(i)) free_pages++;
-    }
-    spin_unlock_irqrestore(&g_pmm_lock, flags);
-    return free_pages;
-}
-
-uint64_t pmm_get_total_pages(void) {
-    return max_pages;
 }

@@ -1,44 +1,39 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "pmm.h"
+#include "pmm_core.h"
 #include "riscv64/boot.h"
 #include "riscv64/vm.h"
-#include "spinlock.h"
 #include "vmm.h"
+
+/* 配り方は共通層 (kernel/pmm_core.c)。ここは管理する範囲と管理情報の
+ * 置き場を決めるだけ (include/pmm_core.h)。
+ *
+ * **以前はここにビットマップ確保があり、毎回ページ 0 から 1 ビットずつ
+ * 探していた。**QEMU virt (512MB) の forkbench で 1 回の確保あたり平均
+ * 1,965 ページを走査し、使用中が増えるほど伸びる作りだった (2026-09-19) */
 
 extern char __kernel_end[];
 
 #define RISCV64_PMM_MAX_PAGES 131072U
 
+/* 管理情報は静的配列。riscv64 のカーネルは恒等マッピングで走るので、
+ * 配列の番地がそのまま物理アドレスになる (arch_pmm_meta_ptr) */
 static uint8_t g_riscv64_pmm_bitmap[(RISCV64_PMM_MAX_PAGES + 7U) / 8U];
 static uint16_t g_riscv64_pmm_refcounts[RISCV64_PMM_MAX_PAGES];
-static uint64_t g_riscv64_pmm_base;
-static uint64_t g_riscv64_pmm_pages;
-static void* g_riscv64_isa_dma_page;
-/*
- * ビットマップと refcount を守るロック。無いと複数 hart の pmm_alloc() が
- * 同じページを 2 度配ってしまう (ビットマップ更新が read-modify-write
- * なので、同じバイトに当たる別ページの取り合いでも壊れる)。
- * SMP=4 でアドレス空間破棄中の load page fault
- * (riscv64_vm_destroy_table が壊れた PTE を辿る) として顕在化した。
- * 静的変数のゼロ初期化 = spinlock_init 済み。
- */
-static spinlock_t g_riscv64_pmm_lock;
-
-static inline void riscv64_pmm_set(uint64_t page) {
-    g_riscv64_pmm_bitmap[page / 8U] |= (uint8_t)(1U << (page % 8U));
-}
-
-static inline void riscv64_pmm_clear(uint64_t page) {
-    g_riscv64_pmm_bitmap[page / 8U] &= (uint8_t)~(1U << (page % 8U));
-}
-
-static inline int riscv64_pmm_test(uint64_t page) {
-    return (g_riscv64_pmm_bitmap[page / 8U] >> (page % 8U)) & 1U;
-}
 
 static uint64_t riscv64_align_up_page(uint64_t value) {
     return (value + PAGE_SIZE - 1ULL) & ~(PAGE_SIZE - 1ULL);
+}
+
+void* arch_pmm_meta_ptr(uint64_t pa) {
+    return (void*)(uintptr_t)pa;
+}
+
+/* 0 埋めは呼ぶ側 (以前の pmm_alloc も埋めていなかった) */
+void arch_pmm_after_alloc(uint64_t pa, uint64_t pages) {
+    (void)pa;
+    (void)pages;
 }
 
 void pmm_init(void) {
@@ -46,14 +41,11 @@ void pmm_init(void) {
     uint64_t mem_base;
     uint64_t mem_end;
     uint64_t free_base;
+    uint64_t pages;
 
     g_hhdm_offset = 0;
-    g_riscv64_isa_dma_page = 0;
-    g_riscv64_pmm_base = 0;
-    g_riscv64_pmm_pages = 0;
-
-    for (uint64_t i = 0; i < sizeof(g_riscv64_pmm_bitmap); i++) g_riscv64_pmm_bitmap[i] = 0xffU;
-    for (uint64_t i = 0; i < RISCV64_PMM_MAX_PAGES; i++) g_riscv64_pmm_refcounts[i] = 0;
+    pmm_core_setup(0, 0, (uint64_t)(uintptr_t)g_riscv64_pmm_bitmap,
+                   (uint64_t)(uintptr_t)g_riscv64_pmm_refcounts);
 
     if (!boot || boot->memory_size == 0) return;
 
@@ -63,131 +55,20 @@ void pmm_init(void) {
     if (free_base < mem_base) free_base = mem_base;
     if (free_base >= mem_end) return;
 
-    g_riscv64_pmm_base = free_base;
-    g_riscv64_pmm_pages = (mem_end - free_base) / PAGE_SIZE;
-    if (g_riscv64_pmm_pages > RISCV64_PMM_MAX_PAGES) {
-        g_riscv64_pmm_pages = RISCV64_PMM_MAX_PAGES;
-    }
+    pages = (mem_end - free_base) / PAGE_SIZE;
+    if (pages > RISCV64_PMM_MAX_PAGES) pages = RISCV64_PMM_MAX_PAGES;
 
-    for (uint64_t page = 0; page < g_riscv64_pmm_pages; page++) {
-        riscv64_pmm_clear(page);
-    }
+    pmm_core_setup(free_base, pages, (uint64_t)(uintptr_t)g_riscv64_pmm_bitmap,
+                   (uint64_t)(uintptr_t)g_riscv64_pmm_refcounts);
+    pmm_core_mark_free(free_base, pages * PAGE_SIZE);
 
     // DTB が管理領域内にある場合はそのページを予約扱いにする
     if (boot->dtb_size != 0 && boot->dtb_pa + boot->dtb_size > free_base && boot->dtb_pa < mem_end) {
-        uint64_t dtb_start = boot->dtb_pa & ~(PAGE_SIZE - 1ULL);
-        uint64_t dtb_end = riscv64_align_up_page(boot->dtb_pa + boot->dtb_size);
-        if (dtb_start < free_base) dtb_start = free_base;
-        for (uint64_t pa = dtb_start; pa < dtb_end && pa < mem_end; pa += PAGE_SIZE) {
-            uint64_t page = (pa - free_base) / PAGE_SIZE;
-            if (page < g_riscv64_pmm_pages) riscv64_pmm_set(page);
-        }
+        pmm_core_mark_used(boot->dtb_pa, boot->dtb_size);
     }
 }
 
-void* pmm_alloc(size_t pages) {
-    uint64_t run = 0;
-    uint64_t start = 0;
-    void* result = 0;
-    uint64_t flags;
-
-    if (pages == 0 || g_riscv64_pmm_pages == 0) return 0;
-
-    flags = spin_lock_irqsave(&g_riscv64_pmm_lock);
-    for (uint64_t i = 0; i < g_riscv64_pmm_pages; i++) {
-        if (!riscv64_pmm_test(i)) {
-            if (run == 0) start = i;
-            run++;
-            if (run == pages) {
-                for (uint64_t j = 0; j < pages; j++) {
-                    uint64_t page = start + j;
-                    riscv64_pmm_set(page);
-                    g_riscv64_pmm_refcounts[page] = 1;
-                }
-                result = (void*)(uintptr_t)(g_riscv64_pmm_base + start * PAGE_SIZE);
-                break;
-            }
-        } else {
-            run = 0;
-        }
-    }
-    spin_unlock_irqrestore(&g_riscv64_pmm_lock, flags);
-
-    return result;
-}
-
-void pmm_free(void* addr, size_t pages) {
-    uint64_t base = (uint64_t)(uintptr_t)addr;
-    uint64_t flags;
-    if (!addr || pages == 0 || base < g_riscv64_pmm_base) return;
-    flags = spin_lock_irqsave(&g_riscv64_pmm_lock);
-    for (size_t i = 0; i < pages; i++) {
-        uint64_t phys = base + i * PAGE_SIZE;
-        uint64_t page = (phys - g_riscv64_pmm_base) / PAGE_SIZE;
-        if (page >= g_riscv64_pmm_pages) break;
-        if (g_riscv64_pmm_refcounts[page] > 0) {
-            g_riscv64_pmm_refcounts[page]--;
-            if (g_riscv64_pmm_refcounts[page] == 0) {
-                riscv64_pmm_clear(page);
-            }
-        }
-    }
-    spin_unlock_irqrestore(&g_riscv64_pmm_lock, flags);
-}
-
-void pmm_incref(void* addr) {
-    uint64_t phys = (uint64_t)(uintptr_t)addr;
-    uint64_t page;
-    uint64_t flags;
-    if (!addr || phys < g_riscv64_pmm_base) return;
-    page = (phys - g_riscv64_pmm_base) / PAGE_SIZE;
-    if (page >= g_riscv64_pmm_pages) return;
-    flags = spin_lock_irqsave(&g_riscv64_pmm_lock);
-    g_riscv64_pmm_refcounts[page]++;
-    spin_unlock_irqrestore(&g_riscv64_pmm_lock, flags);
-}
-
-uint16_t pmm_get_ref(void* addr) {
-    uint64_t phys = (uint64_t)(uintptr_t)addr;
-    uint64_t page;
-    uint64_t flags;
-    uint16_t ref;
-    if (!addr || phys < g_riscv64_pmm_base) return 0;
-    page = (phys - g_riscv64_pmm_base) / PAGE_SIZE;
-    if (page >= g_riscv64_pmm_pages) return 0;
-    flags = spin_lock_irqsave(&g_riscv64_pmm_lock);
-    ref = g_riscv64_pmm_refcounts[page];
-    spin_unlock_irqrestore(&g_riscv64_pmm_lock, flags);
-    return ref;
-}
-
+/* ISA DMA は x86 の話。riscv64 では使わない */
 void* pmm_get_isa_dma_page(void) {
-    return g_riscv64_isa_dma_page;
-}
-
-/* ---- 使用量の問い合わせ (共有層が使う) ----------------------------------
- *
- * kernel/linux_syscall.c の sysinfo(2) が呼ぶ。x86 は kernel/pmm.c、
- * aarch64 は kernel/aarch64/pmm.c が同じものを出しており、riscv64 だけ
- * 無かったのでリンクで落ちた。
- *
- * **ビットマップを数える。** 別に使用数のカウンタを持つと、pmm_alloc /
- * pmm_free の全経路で更新し続けなければならず、片方を足し忘れたときに
- * 「静かにずれる」形になる。ここは問い合わせの頻度が低いので数えてよい */
-uint64_t pmm_get_allocated_pages(void) {
-    uint64_t used = 0;
-    uint64_t flags = spin_lock_irqsave(&g_riscv64_pmm_lock);
-    for (uint64_t i = 0; i < g_riscv64_pmm_pages; i++) {
-        if (riscv64_pmm_test(i)) used++;
-    }
-    spin_unlock_irqrestore(&g_riscv64_pmm_lock, flags);
-    return used;
-}
-
-uint64_t pmm_get_total_pages(void) {
-    return g_riscv64_pmm_pages;
-}
-
-uint64_t pmm_get_free_pages(void) {
-    return pmm_get_total_pages() - pmm_get_allocated_pages();
+    return 0;
 }
