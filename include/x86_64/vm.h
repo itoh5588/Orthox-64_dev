@@ -10,8 +10,9 @@ typedef uint64_t arch_address_space_t;
 /* arch_vm_* API for x86_64: thin wrappers over the existing vmm_* layer.
  * address_space is a physical PML4 address (CR3 value), matching main's ctx.cr3.
  * Keeping the vmm.c implementation intact preserves main's evolved VM features
- * (CoW, memtrace, COW fault handling) while letting task/syscall code use the
- * arch-agnostic arch_vm_* surface. */
+ * (memtrace etc.) while letting task/syscall code use the arch-agnostic
+ * arch_vm_* surface. CoW itself lives in the shared kernel/vm_cow.c; this file
+ * only provides its PTE primitives (see "CoW の部品" below). */
 
 static inline arch_address_space_t arch_vm_kernel_address_space(void) {
     return (arch_address_space_t)vmm_get_kernel_pml4_phys();
@@ -83,41 +84,80 @@ static inline int arch_vm_is_user_page(arch_address_space_t address_space, uint6
     return (*pte & PTE_PRESENT) && (*pte & PTE_USER) ? 1 : 0;
 }
 
-/* **保護属性だけ変える。物理アドレスとソフトウェアのビットは残す。**
- *
- * ★ **COW のページを書き込み可にしてはいけない (x86 だけの話)。**
- * x86 の fork は COW (PTE_COW) で、aarch64 / riscv64 は fork の時点で
- * ページを写してしまうので COW が無い。そのため共通版が
- * arch_vm_map_page(as, va, phys, 新しい flags) で貼り直すと、
- * **x86 では COW のページが両プロセスから書けるようになる。**
- * ここを通せばその心配が無い —— 書き込み可にするのは COW でないときだけで、
- * COW のページは読み取り専用のまま残り、書いた瞬間に COW のフォルト処理が
- * 写してから許可する (もとの kernel/x86_64/sys_vm.c の sys_mprotect と同じ)。 */
 /* **今の保護属性を読む (2026-09-12)。**mremap が伸ばした分や移した先に
- * 元と同じ保護を引き継ぐのに要る。
- *
- * ★ **COW のページは「書けない」と読めるが、元は書けた。**そのまま読むと
- * mremap した瞬間に書き込み可を失う。PTE_COW が立っていれば writable と
- * 見なす (もとの kernel/x86_64/sys_vm.c の sys_mremap と同じ判断)。 */
+ * 元と同じ保護を引き継ぐのに要る。PTE のビットをそのまま読むだけで、
+ * CoW の印を「書けた」と読み替えるのは共通層 (vm_cow_get_page_prot) */
 static inline int arch_vm_get_page_prot(arch_address_space_t address_space, uint64_t vaddr,
                                         int* writable, int* executable) {
     uint64_t* pte = x86_user_pte(address_space, vaddr);
     if (!pte || !(*pte & PTE_PRESENT)) return -1;
-    if (writable) *writable = (*pte & (PTE_WRITABLE | PTE_COW)) != 0;
+    if (writable) *writable = (*pte & PTE_WRITABLE) != 0;
     if (executable) *executable = (*pte & PTE_NX) == 0;
     return 0;
 }
 
+/* **保護属性だけ変える。物理アドレスとソフトウェアのビットは残す。**
+ * 言われたとおりに立てる。共有中のページを書き込み可にしないのは
+ * 共通層 (vm_cow_protect_page) の仕事 */
 static inline void arch_vm_protect_page(arch_address_space_t address_space, uint64_t vaddr,
                                         int writable, int executable) {
     uint64_t* pte = x86_user_pte(address_space, vaddr);
     if (!pte || !(*pte & PTE_PRESENT)) return;
     *pte &= ~(PTE_WRITABLE | PTE_NX);
-    if (writable && !(*pte & PTE_COW)) *pte |= PTE_WRITABLE;
+    if (writable) *pte |= PTE_WRITABLE;
     if (!executable) *pte |= PTE_NX;
     __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
 }
 
+/* ---- CoW の部品 (kernel/vm_cow.c が使う。一覧は include/vm_cow.h) ---------
+ *
+ * 印は PTE_COW (bit 9, ソフトウェア用)。**2MB の葉も返す** ——
+ * sys_map_framebuffer が vmm_map_range でユーザーにフレームバッファを
+ * 2MB で張る。こちらは pmm の外なので共通層が CoW にせず共有する */
+static inline uint64_t* arch_vm_user_leaf(arch_address_space_t address_space, uint64_t vaddr,
+                                          uint64_t* pages) {
+    uint64_t* pml4 = arch_vm_address_space_root(address_space);
+    uint64_t* pdp;
+    uint64_t* pd;
+    uint64_t* pt;
+    uint64_t* e;
+
+    if (!pml4) return 0;
+    if (!(pml4[PML4_IDX(vaddr)] & PTE_PRESENT)) return 0;
+    pdp = (uint64_t*)PHYS_TO_VIRT(pml4[PML4_IDX(vaddr)] & PTE_ADDR_MASK);
+    if (!(pdp[PDP_IDX(vaddr)] & PTE_PRESENT)) return 0;
+    pd = (uint64_t*)PHYS_TO_VIRT(pdp[PDP_IDX(vaddr)] & PTE_ADDR_MASK);
+    e = &pd[PD_IDX(vaddr)];
+    if (!(*e & PTE_PRESENT)) return 0;
+    if (*e & PTE_HUGE) {
+        if (!(*e & PTE_USER)) return 0;
+        if (pages) *pages = HUGE_PAGE_SIZE / PAGE_SIZE;
+        return e;
+    }
+    pt = (uint64_t*)PHYS_TO_VIRT(*e & PTE_ADDR_MASK);
+    e = &pt[PT_IDX(vaddr)];
+    if (!(*e & PTE_PRESENT) || !(*e & PTE_USER)) return 0;
+    if (pages) *pages = 1;
+    return e;
+}
+
+static inline uint64_t arch_pte_phys(uint64_t e) { return e & PTE_ADDR_MASK; }
+static inline int arch_pte_writable(uint64_t e) { return (e & PTE_WRITABLE) != 0; }
+static inline int arch_pte_cow(uint64_t e) { return (e & PTE_COW) != 0; }
+static inline uint64_t arch_pte_mkcow(uint64_t e) { return (e & ~PTE_WRITABLE) | PTE_COW; }
+static inline uint64_t arch_pte_clear_cow(uint64_t e) { return e & ~PTE_COW; }
+static inline uint64_t arch_pte_mkwrite(uint64_t e, uint64_t phys) {
+    return (phys & PTE_ADDR_MASK) | (e & ~PTE_ADDR_MASK & ~PTE_COW) | PTE_WRITABLE;
+}
+
+/* **この CPU の invlpg で足りる。**x86 の文脈切り替え
+ * (kernel/x86_64/task_switch.S) は毎回 CR3 を書くので、いま走っていない
+ * アドレス空間の変換は他の CPU に残らない。1 つのアドレス空間を 2 つの
+ * CPU で同時に走らせること (CLONE_VM のスレッド) はしていない */
+static inline void arch_vm_flush_user_page(arch_address_space_t address_space, uint64_t vaddr) {
+    (void)address_space;
+    __asm__ volatile("invlpg (%0)" : : "r"(vaddr) : "memory");
+}
 
 /* **写像を外すだけ。物理ページは返さない (2026-09-10)。**
  *

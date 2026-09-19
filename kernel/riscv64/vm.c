@@ -18,6 +18,10 @@
 #define RISCV64_SV39_PTE_A          (1ULL << 6)
 #define RISCV64_SV39_PTE_D          (1ULL << 7)
 #define RISCV64_SV39_PTE_FLAG_MASK  0x3ffULL
+/* RSW (bit 8-9) はソフトウェア用で MMU は見ない。bit 8 を CoW の印に使う
+ * (kernel/vm_cow.c)。**FLAG_MASK に入っているので、fork の写しや
+ * update_page_flags がフラグをまとめて写すときも一緒に運ばれる** */
+#define RISCV64_SV39_PTE_SW_COW     (1ULL << 8)
 
 static uint64_t g_riscv64_kernel_root_pa;
 static uint64_t g_riscv64_last_satp;
@@ -518,10 +522,9 @@ void arch_vm_update_page_flags(arch_address_space_t address_space, uint64_t vadd
 
 /* **保護属性だけ変える (2026-09-12)。**mprotect を 3 アーキ共通にしたときの hook。
  *
- * ここは物理アドレスを取り直して貼り直すだけでよい。**x86 だけは COW の
- * ページを書き込み可にしてはいけない**ので専用の実装を持つが、
- * このアーキは fork の時点でページを写しており COW が無い
- * (arch_vm_clone_address_space)。 */
+ * ここは物理アドレスを取り直して貼り直すだけでよい。CoW の印は落ちるが、
+ * 共有中のページを書き込み可にしないのは共通層の仕事で、あちら
+ * (vm_cow_protect_page, kernel/vm_cow.c) が貼り直した後に印を立て直す。 */
 void arch_vm_protect_page(arch_address_space_t address_space, uint64_t vaddr,
                           int writable, int executable) {
     uint64_t phys = arch_vm_get_phys(address_space, vaddr);
@@ -541,4 +544,39 @@ int arch_vm_get_page_prot(arch_address_space_t address_space, uint64_t vaddr,
     if (writable) *writable = (*pte & RISCV64_SV39_PTE_W) != 0;
     if (executable) *executable = (*pte & RISCV64_SV39_PTE_X) != 0;
     return 0;
+}
+
+/* ---- CoW の部品 (include/riscv64/vm.h に一覧) ------------------------------
+ *
+ * **U の立った葉だけ返す。**下の段はカーネルの恒等写像と共有しているので、
+ * 葉を引くだけだとカーネルのページも返る (arch_vm_is_user_page と同じ注意)。
+ * ユーザーのページは 4KB でしか張らない (riscv64_vm_map_page) */
+uint64_t* arch_vm_user_leaf(arch_address_space_t address_space, uint64_t vaddr, uint64_t* pages) {
+    uint64_t* pte = riscv64_sv39_walk_leaf(riscv64_vm_root_ptr((uint64_t)address_space), vaddr);
+    if (!pte) return 0;
+    if ((*pte & (RISCV64_SV39_PTE_V | RISCV64_SV39_PTE_U)) !=
+        (RISCV64_SV39_PTE_V | RISCV64_SV39_PTE_U)) return 0;
+    if (pages) *pages = 1;
+    return pte;
+}
+
+/* この hart の sfence.vma だけ。**他の hart に残る変換は別に手当てが要る**
+ * (fork の CoW を riscv64 で有効にするとき。日報2026-09-19) */
+void arch_vm_flush_user_page(arch_address_space_t address_space, uint64_t vaddr) {
+    (void)address_space;
+    __asm__ volatile("sfence.vma %0, zero" :: "r"(vaddr) : "memory");
+}
+
+uint64_t arch_pte_phys(uint64_t e) { return riscv64_sv39_pte_phys(e); }
+int arch_pte_writable(uint64_t e) { return (e & RISCV64_SV39_PTE_W) != 0; }
+int arch_pte_cow(uint64_t e) { return (e & RISCV64_SV39_PTE_SW_COW) != 0; }
+uint64_t arch_pte_mkcow(uint64_t e) { return (e & ~RISCV64_SV39_PTE_W) | RISCV64_SV39_PTE_SW_COW; }
+uint64_t arch_pte_clear_cow(uint64_t e) { return e & ~RISCV64_SV39_PTE_SW_COW; }
+
+/* **W と一緒に D も立てる。**riscv64_vm_flags_to_pte と同じ —— D が 0 のまま
+ * 書くと、ハードウェアが D を立てない実装では store page fault になる */
+uint64_t arch_pte_mkwrite(uint64_t e, uint64_t phys) {
+    uint64_t flags = (e & RISCV64_SV39_PTE_FLAG_MASK & ~RISCV64_SV39_PTE_SW_COW) |
+                     RISCV64_SV39_PTE_W | RISCV64_SV39_PTE_D;
+    return riscv64_sv39_make_leaf_4k(phys, flags);
 }

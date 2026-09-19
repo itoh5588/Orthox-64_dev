@@ -49,7 +49,7 @@ KERNEL_C_SRCS = \
     kernel/sys_tty.c \
     kernel/irq.c kernel/bottom_half.c \
     kernel/elf.c kernel/task.c kernel/task_exec.c kernel/task_fork.c \
-    kernel/sys_mmap.c kernel/sched.c kernel/wait.c kernel/fs.c kernel/vfs.c \
+    kernel/sys_mmap.c kernel/vm_cow.c kernel/sched.c kernel/wait.c kernel/fs.c kernel/vfs.c \
     kernel/storage.c kernel/xv6bio.c kernel/xv6log.c kernel/xv6fs.c \
     kernel/net.c kernel/net_socket.c kernel/lwip_port.c \
     kernel/cstring.c kernel/cstdio.c kernel/cstdlib.c kernel/usb.c

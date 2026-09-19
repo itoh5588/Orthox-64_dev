@@ -206,6 +206,31 @@ int arch_vm_get_page_prot(arch_address_space_t address_space, uint64_t vaddr,
 void arch_vm_unmap_page(arch_address_space_t address_space, uint64_t vaddr);
 void arch_vm_update_page_flags(arch_address_space_t address_space, uint64_t vaddr, uint64_t flags);
 
+/* ---- CoW の部品 (kernel/vm_cow.c が使う。一覧は include/vm_cow.h) ---------
+ *
+ * 印は bit 55。**55〜58 はソフトウェア用で MMU は見ない** (Arm ARM の
+ * "Reserved for software use")。書き込み禁止は AP[2] (bit 7) を立てる
+ * だけで、AP[1] (bit 6, EL0 に見せる) はそのまま残る。
+ *
+ * **EL1 も書けなくなる。**AP=11 は EL0 / EL1 とも読み取り専用なので、
+ * カーネルが read(2) などでユーザーのバッファへ書くと EL1 の permission
+ * fault になる。vec_el1_sync の処理がそれを受ける */
+#define AARCH64_PTE_SW_COW      (1ULL << 55)
+#define AARCH64_PTE_AP_RDONLY   (1ULL << 7)
+
+uint64_t* arch_vm_user_leaf(arch_address_space_t address_space, uint64_t vaddr, uint64_t* pages);
+void arch_vm_flush_user_page(arch_address_space_t address_space, uint64_t vaddr);
+
+static inline uint64_t arch_pte_phys(uint64_t e) { return e & AARCH64_PTE_ADDR_MASK; }
+static inline int arch_pte_writable(uint64_t e) { return (e & AARCH64_PTE_AP_RDONLY) == 0; }
+static inline int arch_pte_cow(uint64_t e) { return (e & AARCH64_PTE_SW_COW) != 0; }
+static inline uint64_t arch_pte_mkcow(uint64_t e) { return e | AARCH64_PTE_AP_RDONLY | AARCH64_PTE_SW_COW; }
+static inline uint64_t arch_pte_clear_cow(uint64_t e) { return e & ~AARCH64_PTE_SW_COW; }
+static inline uint64_t arch_pte_mkwrite(uint64_t e, uint64_t phys) {
+    return (phys & AARCH64_PTE_ADDR_MASK) |
+           (e & ~AARCH64_PTE_ADDR_MASK & ~(AARCH64_PTE_AP_RDONLY | AARCH64_PTE_SW_COW));
+}
+
 void aarch64_vm_activate_address_space(uint64_t root_pa);
 
 /* MMU を入れる (SMP の P-4 で公開した)。**CPU 0 が組んだテーブルを共有する**

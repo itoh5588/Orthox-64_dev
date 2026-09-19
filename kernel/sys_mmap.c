@@ -30,6 +30,7 @@
 #include "task.h"
 #include "fs.h"
 #include "pmm.h"
+#include "vm_cow.h"
 #include "vmm.h"   /* PHYS_TO_VIRT。3 アーキとも g_hhdm_offset を持つ */
 #include "syscall.h"
 #include "sys_internal.h"
@@ -271,10 +272,10 @@ int sys_munmap(void* addr, size_t length) {
  * (境界でない addr は EINVAL、length 0 は成功)。musl はページ境界で呼ぶので
  * 呼び手には影響しない。
  *
- * **COW は x86 側に寄せた。**x86 の fork は COW で、共有ページを
- * 書き込み可にすると**両プロセスから同じページに書けてしまう。**
- * aarch64 / riscv64 は fork の時点でページを写すので COW が無い。
- * この差は arch_vm_protect_page に閉じ込めてある。
+ * **COW は x86 側に寄せた。**fork の CoW で共有中のページを書き込み可に
+ * すると**両プロセスから同じページに書けてしまう。**2026-09-19 に CoW を
+ * 3 アーキ共通にしたので、判断は vm_cow_protect_page (kernel/vm_cow.c) が
+ * 持つ —— 共有中なら書き込み可ではなく CoW の印に振り替える。
  *
  * icache も残した (実行可にしたのに古い命令が見えるのを防ぐ)。 */
 int sys_mprotect(void* addr, size_t length, int prot) {
@@ -305,8 +306,8 @@ int sys_mprotect(void* addr, size_t length, int prot) {
         if (!arch_vm_is_user_page(as, base + off)) return -LINUX_ENOMEM;
     }
     for (uint64_t off = 0; off < size; off += PAGE_SIZE) {
-        arch_vm_protect_page(as, base + off, (prot & PROT_WRITE) != 0,
-                             (prot & PROT_EXEC) != 0);
+        vm_cow_protect_page(as, base + off, (prot & PROT_WRITE) != 0,
+                            (prot & PROT_EXEC) != 0);
     }
     arch_syscall_flush_tlb();
     /* 実行可にしたなら、命令キャッシュを揃えないと古い中身を実行しうる */
@@ -331,8 +332,8 @@ int sys_mprotect(void* addr, size_t length, int prot) {
  *
  * **保護の引き継ぎは x86 側へ寄せた。**linux 側は移した先を必ず rw・実行不可に
  * していたので、**実行可の範囲を mremap した瞬間に実行できなくなる。**
- * 読み出しは arch_vm_get_page_prot に閉じ込めてある (x86 は COW のページを
- * 「書けた」と読む必要がある。あちらのコメントを参照)。
+ * 読み出しは vm_cow_get_page_prot (kernel/vm_cow.c)。CoW の印の立った
+ * ページは「書けた」と読む必要がある。
  *
  * **範囲の検査は linux 側 (新しいほう) へ寄せた。**先頭 1 枚しか見ないと、
  * riscv64 ではカーネルのページを縮小・移動できた (a3abd59)。
@@ -373,7 +374,7 @@ void* sys_mremap(void* old_addr, size_t old_len, size_t new_len, int flags, void
 
     /* **元の保護を引き継ぐ。**読めなければ「読み書き・実行不可」に倒す
      * (musl の realloc はヒープにしか使わないので、そこが既定) */
-    if (arch_vm_get_page_prot(as, old_base, &writable, &executable) < 0) {
+    if (vm_cow_get_page_prot(as, old_base, &writable, &executable) < 0) {
         writable = 1;
         executable = 0;
     }

@@ -61,4 +61,16 @@ int arch_vm_get_page_prot(arch_address_space_t address_space, uint64_t vaddr,
 void arch_vm_unmap_page(arch_address_space_t address_space, uint64_t vaddr);
 void arch_vm_update_page_flags(arch_address_space_t address_space, uint64_t vaddr, uint64_t flags);
 
+/* ---- CoW の部品 (kernel/vm_cow.c が使う。一覧は include/vm_cow.h) ---------
+ * PTE のビットは kernel/riscv64/vm.c の中でしか定義していないので、
+ * aarch64 / x86 と違って関数で出す */
+uint64_t* arch_vm_user_leaf(arch_address_space_t address_space, uint64_t vaddr, uint64_t* pages);
+void arch_vm_flush_user_page(arch_address_space_t address_space, uint64_t vaddr);
+uint64_t arch_pte_phys(uint64_t e);
+int arch_pte_writable(uint64_t e);
+int arch_pte_cow(uint64_t e);
+uint64_t arch_pte_mkcow(uint64_t e);
+uint64_t arch_pte_clear_cow(uint64_t e);
+uint64_t arch_pte_mkwrite(uint64_t e, uint64_t phys);
+
 #endif

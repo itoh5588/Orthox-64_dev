@@ -7,6 +7,7 @@
 #include "task.h"
 #include "spinlock.h"
 #include "limine.h"
+#include "vm_cow.h"
 
 extern volatile struct limine_hhdm_request hhdm_request;
 
@@ -244,12 +245,11 @@ uint64_t vmm_copy_pml4(uint64_t* old_pml4) {
                     continue;
                 }
 
+                /* 葉を子へ渡す形 (CoW の印・参照カウント) は共通層が決める
+                 * (kernel/vm_cow.c)。2MB はフレームバッファで、pmm の外なので
+                 * 共有のまま渡る */
                 if (old_pd[k] & PTE_HUGE) {
-                    if (old_pd[k] & PTE_WRITABLE) {
-                        old_pd[k] = (old_pd[k] & ~PTE_WRITABLE) | PTE_COW;
-                    }
-                    new_pd[k] = old_pd[k];
-                    pmm_incref((void*)(old_pd[k] & PTE_ADDR_MASK));
+                    new_pd[k] = vm_cow_share_leaf(&old_pd[k], HUGE_PAGE_SIZE / PAGE_SIZE);
                     continue;
                 }
 
@@ -264,11 +264,7 @@ uint64_t vmm_copy_pml4(uint64_t* old_pml4) {
                         continue;
                     }
 
-                    if (old_pt[l] & PTE_WRITABLE) {
-                        old_pt[l] = (old_pt[l] & ~PTE_WRITABLE) | PTE_COW;
-                    }
-                    new_pt[l] = old_pt[l];
-                    pmm_incref((void*)(old_pt[l] & PTE_ADDR_MASK));
+                    new_pt[l] = vm_cow_share_leaf(&old_pt[l], 1);
                 }
             }
         }
@@ -397,6 +393,31 @@ void vmm_page_fault_handler(struct interrupt_frame* frame) {
         for(;;) __asm__("hlt");
     }
 
+    /* **書き込みで落ちた: まず CoW か見てもらう (kernel/vm_cow.c)。**
+     * カーネルからの書き込み (read(2) がユーザーのバッファへ書く等) も
+     * ここに来る。CR0.WP を立てているので読み取り専用のページで落ちる */
+    {
+        uint64_t cr3;
+        int rc;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+        rc = vm_cow_write_fault((arch_address_space_t)(cr3 & ~(PAGE_SIZE - 1ULL)), fault_vaddr);
+        if (rc == VM_COW_HANDLED) {
+#if ORTHOX_MEM_PROGRESS
+            vmm_trace_progress_bump(current, &current->trace_cow_faults);
+#endif
+            vmm_memtrace_pf("pf-cow", fault_vaddr, frame->error_code, frame->rip);
+            return;
+        }
+        if (rc == VM_COW_NOMEM) {
+            kill_current_task_on_user_fault(frame, fault_vaddr, "cow-alloc-failed");
+            puts("#PF: CoW copy failed (out of memory) at 0x"); puthex(fault_vaddr);
+            puts(" RIP: "); puthex(frame->rip);
+            puts("\r\n");
+            for(;;) __asm__("hlt");
+        }
+    }
+
+    /* ここから先は本物の違反。どの段で外れたかを出して止める */
     uint64_t* cr3_virt;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3_virt));
     uint64_t* pml4 = (uint64_t*)PHYS_TO_VIRT(cr3_virt);
@@ -426,25 +447,7 @@ void vmm_page_fault_handler(struct interrupt_frame* frame) {
     }
     uint64_t* pd  = (uint64_t*)PHYS_TO_VIRT(pdpe & PTE_ADDR_MASK);
     
-    if (pd[PD_IDX(fault_vaddr)] & PTE_HUGE) {
-        if (pd[PD_IDX(fault_vaddr)] & PTE_COW) {
-            vmm_memtrace_pf("pf-cow-huge", fault_vaddr, frame->error_code, frame->rip);
-            void* old_page_phys = (void*)(pd[PD_IDX(fault_vaddr)] & PTE_ADDR_MASK);
-            KASSERT(pmm_get_ref(old_page_phys) > 0);
-            if (pmm_get_ref(old_page_phys) > 1) {
-                void* new_page_phys = pmm_alloc(512); // 2MB
-                for (uint64_t i = 0; i < HUGE_PAGE_SIZE; i++) {
-                    ((uint8_t*)PHYS_TO_VIRT(new_page_phys))[i] = ((uint8_t*)PHYS_TO_VIRT(old_page_phys))[i];
-                }
-                pd[PD_IDX(fault_vaddr)] = (uint64_t)new_page_phys | (pd[PD_IDX(fault_vaddr)] & ~PTE_ADDR_MASK & ~PTE_COW) | PTE_WRITABLE;
-                pmm_free(old_page_phys, 512);
-            } else {
-                pd[PD_IDX(fault_vaddr)] = (pd[PD_IDX(fault_vaddr)] & ~PTE_COW) | PTE_WRITABLE;
-            }
-            __asm__ volatile("invlpg (%0)" : : "r"(fault_vaddr) : "memory");
-            return;
-        }
-    } else {
+    if (!(pd[PD_IDX(fault_vaddr)] & PTE_HUGE)) {
         if (!(pd[PD_IDX(fault_vaddr)] & PTE_PRESENT)) {
             kill_current_task_on_user_fault(frame, fault_vaddr, "pde-not-present");
             puts("#PF: Unexpected page fault at 0x"); puthex(fault_vaddr);
@@ -454,33 +457,6 @@ void vmm_page_fault_handler(struct interrupt_frame* frame) {
             dump_fault_cpu_state();
             puts("\r\n");
             for(;;) __asm__("hlt");
-        }
-        uint64_t* pt = (uint64_t*)PHYS_TO_VIRT(pd[PD_IDX(fault_vaddr)] & PTE_ADDR_MASK);
-        uint64_t* pte = &pt[PT_IDX(fault_vaddr)];
-
-        if (*pte & PTE_COW) {
-#if ORTHOX_MEM_PROGRESS
-            vmm_trace_progress_bump(current, &current->trace_cow_faults);
-#endif
-            vmm_memtrace_pf("pf-cow", fault_vaddr, frame->error_code, frame->rip);
-            void* old_page_phys = (void*)(*pte & PTE_ADDR_MASK);
-            KASSERT(pmm_get_ref(old_page_phys) > 0);
-            if (pmm_get_ref(old_page_phys) > 1) {
-                void* new_page_phys = pmm_alloc(1);
-                if (!new_page_phys) {
-                    kill_current_task_on_user_fault(frame, fault_vaddr, "cow-alloc-failed");
-                    for(;;) __asm__("hlt");
-                }
-                for (int i = 0; i < 4096; i++) {
-                    ((uint8_t*)PHYS_TO_VIRT(new_page_phys))[i] = ((uint8_t*)PHYS_TO_VIRT(old_page_phys))[i];
-                }
-                *pte = (uint64_t)new_page_phys | (*pte & ~PTE_ADDR_MASK & ~PTE_COW) | PTE_WRITABLE;
-                pmm_free(old_page_phys, 1);
-            } else {
-                *pte = (*pte & ~PTE_COW) | PTE_WRITABLE;
-            }
-            __asm__ volatile("invlpg (%0)" : : "r"(fault_vaddr) : "memory");
-            return;
         }
     }
 

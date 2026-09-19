@@ -1427,16 +1427,42 @@ uint64_t aarch64_vm_map_fb_user(arch_address_space_t as, uint64_t uva) {
 
 /* **保護属性だけ変える (2026-09-12)。**mprotect を 3 アーキ共通にしたときの hook。
  *
- * ここは物理アドレスを取り直して貼り直すだけでよい。**x86 だけは COW の
- * ページを書き込み可にしてはいけない**ので専用の実装を持つが、
- * このアーキは fork の時点でページを写しており COW が無い
- * (arch_vm_clone_address_space)。 */
+ * ここは物理アドレスを取り直して貼り直すだけでよい。CoW の印は落ちるが、
+ * 共有中のページを書き込み可にしないのは共通層の仕事で、あちら
+ * (vm_cow_protect_page, kernel/vm_cow.c) が貼り直した後に印を立て直す。 */
 void arch_vm_protect_page(arch_address_space_t address_space, uint64_t vaddr,
                           int writable, int executable) {
     uint64_t phys = arch_vm_get_phys(address_space, vaddr);
     if (!phys) return;
     arch_vm_map_page(address_space, vaddr, phys & ~(uint64_t)(PAGE_SIZE - 1),
                      aarch64_vm_user_page_attr(writable, executable));
+}
+
+/* CoW の部品 (include/aarch64/vm.h に一覧)。**EL0 に見せている L3 の葉だけ**
+ * 返す。ユーザーにブロックは張らない (aarch64_vm_map_fb_user も 4KB) */
+uint64_t* arch_vm_user_leaf(arch_address_space_t address_space, uint64_t vaddr, uint64_t* pages) {
+    uint64_t l2_pa, l3_pa;
+    uint64_t* e;
+
+    if (!address_space) return 0;
+    l2_pa = aarch64_vm_walk_existing(address_space, vaddr, 1);
+    if (!l2_pa) return 0;
+    l3_pa = aarch64_vm_walk_existing(l2_pa, vaddr, 2);
+    if (!l3_pa) return 0;
+    e = &aarch64_vm_table_ptr(l3_pa)[aarch64_vm_index(vaddr, 3)];
+    if ((*e & AARCH64_PTE_VALID) == 0 || (*e & (1ULL << 6)) == 0) return 0;
+    if (pages) *pages = 1;
+    return e;
+}
+
+/* **全 CPU から捨てる (vaae1is = Inner Shareable へ放送)。**
+ * arch_context_switch (kernel/aarch64/task.c) は TTBR0 が同じなら TLB を捨てずに
+ * 済ませるので、このアドレス空間で以前走っていた CPU に古い変換が残って
+ * いる。自分の CPU だけ捨てると、そこへ戻ったプロセスが古い変換で
+ * 共有中のページへ書ける */
+void arch_vm_flush_user_page(arch_address_space_t address_space, uint64_t vaddr) {
+    (void)address_space;
+    aarch64_vm_flush_va(vaddr);
 }
 
 /* **今の保護属性を読む (2026-09-12)。**mremap を 3 アーキ共通にしたときの hook。
