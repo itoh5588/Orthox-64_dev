@@ -930,6 +930,14 @@ $(AARCH64_COWSTRESS_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
 
 aarch64-cowstress: $(AARCH64_COWSTRESS_ELF)
 
+# fork の速さの計測 (user/forkbench.c)。3 アーキで同じソース
+AARCH64_FORKBENCH_ELF = out/aarch64-forkbench.elf
+$(AARCH64_FORKBENCH_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/forkbench.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/forkbench.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
 # N-10: ソケット syscall が EL0 から使えるかの検査。musl / fork の probe と
 # 同じ作りで中身だけ差し替える
 AARCH64_SOCKET_PROBE_ELF = out/aarch64-socket-probe.elf
@@ -1228,6 +1236,12 @@ RISCV64_COWSTRESS_ELF = out/riscv64-cowstress.elf
 $(RISCV64_COWSTRESS_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/cowstress.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
 	@mkdir -p $(@D)
 	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/cowstress.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+# fork の速さの計測 (user/forkbench.c)。aarch64 と同じソース
+RISCV64_FORKBENCH_ELF = out/riscv64-forkbench.elf
+$(RISCV64_FORKBENCH_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/forkbench.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/forkbench.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
 
 $(RISCV64_PREEMPT_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_preempt_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
 	@mkdir -p $(@D)
