@@ -93,7 +93,11 @@ void riscv64_task_prepare_kernel_resume(struct arch_task_context* ctx,
 }
 
 void riscv64_task_fork_child_return(void) {
-    struct task* current = get_current_task();
+    struct task* current;
+    /* 初めて走る子は schedule() の続きを通らないので、ここで前のタスクの
+     * on_cpu を落とす (kernel/task.c の task_reap) */
+    task_finish_switch();
+    current = get_current_task();
     if (!current) {
         riscv64_wait_forever();
     }

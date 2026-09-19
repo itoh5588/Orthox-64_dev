@@ -118,6 +118,7 @@ enum task_migration_reason {
 static enum task_migration_reason task_migration_reason_locked(struct task* t);
 
 static void idle_task_entry(void) {
+    task_finish_switch();
     task_idle_loop(0);
 }
 
@@ -510,6 +511,9 @@ static int task_reap_locked(struct task* t) {
     struct task** link;
     if (!t) return -1;
     if (t->state != TASK_ZOMBIE && t->state != TASK_DEAD) return -1;
+    /* 降りきっていない。task_reap が待ってから来るので、ここに来るのは
+     * 待たずに呼んだときだけ。解放せずに断る */
+    if (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) return -1;
     KASSERT(!task_is_idle_task(t));
     task_assert_stack_aligned(t->kstack_top);
     task_assert_address_space_owned(t);
@@ -553,6 +557,22 @@ void task_bind_cpu_local(uint32_t cpu_id, struct task* current, struct task* idl
     struct cpu_local* cpu = get_cpu_local_by_id(cpu_id);
     if (!cpu) return;
     init_cpu_local(cpu, cpu_id, current, idle, kernel_stack);
+    /* 起動時にこの CPU で走っているタスク。schedule を通らずに載っている */
+    if (current) current->on_cpu = 1;
+}
+
+/* **切り替えを終えた CPU で、降りたタスクの on_cpu を落とす。**
+ * schedule() の arch_context_switch の後と、初めて走るタスクの入口
+ * (idle / task_main / fork の子の復帰先) で呼ぶ。ここに来た時点で、
+ * 降りたタスクのスタックと ctx はもう使っていない */
+void task_finish_switch(void) {
+    struct cpu_local* cpu = get_cpu_local();
+    struct task* prev;
+    if (!cpu) return;
+    prev = cpu->switched_from;
+    if (!prev) return;
+    cpu->switched_from = 0;
+    __atomic_store_n(&prev->on_cpu, 0, __ATOMIC_RELEASE);
 }
 
 void task_install_cpu_local(uint32_t cpu_id) {
@@ -634,7 +654,9 @@ static struct arch_task_user_state task_user_state(const struct task* t) {
 }
 
 void task_main(void) {
-    struct task* t = get_current_task();
+    struct task* t;
+    task_finish_switch();
+    t = get_current_task();
     struct arch_task_user_state state = task_user_state(t);
     arch_task_sync_user_state(&t->ctx, &state);
     arch_task_enter_initial_user(&state, &t->ctx, &t->os_stack_ptr);
@@ -884,9 +906,56 @@ struct task* task_find_by_pid(int pid) {
     return 0;
 }
 
+/* wait4 用。親 parent_pid の子 (pid が -1 なら誰でも) を探し、zombie が
+ * 居ればそれを返す。*found_child には子が 1 人でも居たかを入れる。
+ *
+ * **task_list はロックの中で辿る (2026-09-19)。**以前の wait4 はロック無しで
+ * 辿っており、別の hart の親が自分の子を回収すると、task_reap_locked が
+ * そのノードを外して next を 0 にしてから解放するので、ちょうどその上に
+ * いた巡回はそこで打ち切られ (解放済みも読み)、自分の子を見落として
+ * ECHILD を返した (cowstress 4 hart で "FAIL waitpid")。
+ * 返したタスクを回収できるのは親だけなので、ロックを放した後も消えない */
+struct task* task_find_zombie_child(int parent_pid, int pid, int* found_child) {
+    struct task* zombie = 0;
+    int found = 0;
+    uint64_t flags = spin_lock_irqsave(&g_task_lock);
+    for (struct task* t = task_list; t; t = t->next) {
+        if (t->ppid != parent_pid || (pid != -1 && t->pid != pid)) continue;
+        found = 1;
+        if (t->state == TASK_ZOMBIE) {
+            zombie = t;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&g_task_lock, flags);
+    if (found_child) *found_child = found;
+    return zombie;
+}
+
+/* **CPU から降りきるまで待ってから回収する (2026-09-19)。**
+ *
+ * zombie は task_mark_zombie の後も、schedule() がロックを放してから
+ * arch_context_switch を終えるまで、自分のカーネルスタックと task 構造体
+ * (ctx にレジスタを保存する) を使っている。以前はここで待たずに解放して
+ * おり、別の hart の親が wait4 で拾うと、**走行中のスタック・task 構造体・
+ * ページテーブルが解放されて使い回されうる。**riscv64 の cowstress (4 hart)
+ * で、割り込みの窓 (kernel/riscv64/entry.S / trap.S) を塞いだ後もこれだけで
+ * 30 回中 2 回止まり、うち 1 回は 2 つの hart がカーネルの中で不正な番地を
+ * 読んで落ちていた。ここも直した後 (wait4 の巡回をロックの中へ移したものと
+ * 合わせて) は 60 回続けて止まらなかった。
+ *
+ * zombie は必ずすぐ降りる (sys_exit は kernel_yield を回し、走らせるものが
+ * 無ければ idle へ切り替わる) ので、待つのは切り替え 1 回ぶん。
+ * **ロックの外で待つ。**降りる側の schedule() が同じロックを取る */
 int task_reap(struct task* t) {
     int ret;
-    uint64_t flags = spin_lock_irqsave(&g_task_lock);
+    uint64_t flags;
+    if (t) {
+        while (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) {
+            __asm__ volatile("" ::: "memory");
+        }
+    }
+    flags = spin_lock_irqsave(&g_task_lock);
     ret = task_reap_locked(t);
     spin_unlock_irqrestore(&g_task_lock, flags);
     return ret;

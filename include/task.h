@@ -74,6 +74,9 @@ struct cpu_local {
     volatile int resched_pending;
     uint32_t runq_count;
     uint32_t kernel_lock_depth;
+    /* 直前にこの CPU から降りたタスク。切り替えを終えた側 (次のタスク) が
+     * task_finish_switch で on_cpu を落とす。訳は task.c の task_reap */
+    struct task* switched_from;
 };
 
 /* task_context is now provided by the arch layer (arch_task_context). */
@@ -150,6 +153,10 @@ struct task {
     struct task* wait_next;
     struct wait_queue* wait_queue;
     uint8_t on_runq;
+    /* **いまどこかの CPU の上にいる (切り替えの途中を含む)。**schedule が
+     * 載せるときに立て、降りたタスクの切り替えが終わってから次のタスクの
+     * 側で落とす (Linux の on_cpu)。立っている間は回収しない */
+    volatile uint32_t on_cpu;
 };
 
 void task_init(void);
@@ -157,6 +164,8 @@ void task_set_cpu_count(uint32_t cpu_count);
 uint32_t task_get_cpu_count(void);
 int task_get_runq_stats(struct orth_runq_stat* out, uint32_t max_count);
 struct cpu_local* get_cpu_local_by_id(uint32_t cpu_id);
+void task_finish_switch(void);
+struct task* task_find_zombie_child(int parent_pid, int pid, int* found_child);
 void task_bind_cpu_local(uint32_t cpu_id, struct task* current, struct task* idle,
                          uint64_t kernel_stack);
 void task_install_cpu_local(uint32_t cpu_id);

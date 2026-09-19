@@ -274,6 +274,9 @@ void aarch64_task_fork_child_return(void) {
      * 書き替えられてから eret に至る余地が残る。eret が SPSR から EL0 の
      * PSTATE を復元するので、ここで閉じてもユーザーには開いて降りる */
     __asm__ volatile("msr daifset, #2" ::: "memory");
+    /* 初めて走る子は schedule() の続きを通らないので、ここで前のタスクの
+     * on_cpu を落とす (kernel/task.c の task_reap) */
+    task_finish_switch();
     current = get_current_task();
     if (!current) {
         /* **黙って先へ進めない。** 進めると、子が親の続きをカーネル権限で

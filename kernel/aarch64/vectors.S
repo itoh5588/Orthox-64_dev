@@ -72,6 +72,14 @@
 #define SAVED_ELR_OFF (16 * 15 + 8)
 
 .macro RESTORE_ALL
+    /* **戻す前に IRQ を閉じる (2026-09-19)。**elr_el1 を書いた後に IRQ が
+     * 入ると ELR が上書きされ、eret が別の番地へ戻る。ここへ IRQ が開いた
+     * まま来ることがある: DAIF は切り替えで保存されず、schedule() はロックを
+     * 放して (開けて) から切り替えるので、syscall の途中で開けていたタスクの
+     * 状態のまま、IRQ の出口で降りていたタスクが再開される。riscv64 では
+     * 同じ穴で sepc が上書きされ、ユーザーがカーネルの番地へ飛んだ
+     * (kernel/riscv64/trap.S)。eret が SPSR から PSTATE を戻すので閉じても害は無い */
+    msr     daifset, #2
     ldp     x1, x2,   [sp, #16 * 16]
     msr     spsr_el1, x1
     msr     sp_el0, x2          /* 書き戻すので、C がフレームで変えられる */

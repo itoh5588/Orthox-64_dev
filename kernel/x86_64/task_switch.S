@@ -80,6 +80,13 @@ call_app:
 
 .global fork_child_entry
 fork_child_entry:
+    # 初めて走る子は schedule() の続きを通らないので、ここで前のタスクの
+    # on_cpu を落とす (kernel/task.c の task_reap)。レジスタは下で積んだ
+    # ものを戻すので呼び出しで壊れてよい。スタックは 16 バイトに揃えて呼ぶ
+    mov %rsp, %rbx
+    and $-16, %rsp
+    call task_finish_switch
+    mov %rbx, %rsp
     pop %r15
     pop %r14
     pop %r13

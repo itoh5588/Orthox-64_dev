@@ -1155,6 +1155,13 @@ static void riscv64_first_user_task_bootstrap_continue(void) {
     }
     riscv64_user_map_selftest();
     riscv64_fork_selftest();
+    /* **副 hart は自己テストの後で起こす (2026-09-19)。**fork の自己テストは
+     * task_fork で本物の子を作り、実行待ちに積んだまま中身を調べてから
+     * 回収する。副 hart が先に起きていると子を拾って走らせ (最初のユーザー
+     * プログラムの 2 つ目として動く)、走行中のまま回収されて止まったり、
+     * 回収に失敗したりした。hart 0 は自己テストの途中で切り替えないので、
+     * 副 hart が居なければ子は走らない */
+    riscv64_smp_start_secondaries();
     riscv64_mark_user_handoff_started();
     task_main();
 }
@@ -1168,8 +1175,8 @@ static void riscv64_first_user_task_bootstrap(void) {
         riscv64_uart_puts("  first user task bootstrap failed: no current task\n");
         return;
     }
-    // 副 hart は idle タスクを作れる状態 (task_init 後) で起動する
-    riscv64_smp_start_secondaries();
+    // 副 hart は idle タスクを作れる状態 (task_init 後) で起動する。
+    // 起こすのは自己テストの後 (riscv64_first_user_task_bootstrap_continue)
     riscv64_run_on_stack(current->kstack_top, riscv64_first_user_task_bootstrap_continue);
 }
 

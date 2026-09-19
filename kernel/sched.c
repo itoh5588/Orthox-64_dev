@@ -50,6 +50,10 @@ void schedule(void) {
 
     if (!current_task) return;
 
+    /* 入口で呼び忘れた経路があっても、次の schedule() で必ず落ちる
+     * (ここは降りたタスクとは別のスタックの上) */
+    task_finish_switch();
+
     flags = task_lock_irqsave();
     next = task_runq_pop_locked_internal(cpu);
     if (!next) {
@@ -77,8 +81,14 @@ void schedule(void) {
     if (next->timeslice_ticks <= 0) next->timeslice_ticks = TASK_TIMESLICE_TICKS;
     cpu->kernel_stack = next->kstack_top;
     arch_task_prepare_schedule_switch(cpu->cpu_id, next->kstack_top, cpu, next->user_fs_base);
+    /* **prev の on_cpu は切り替えが終わるまで落とさない。**ロックを放した
+     * 後も、prev のスタックの上で arch_context_switch が prev->ctx へ
+     * 書く。落とすのは次のタスクの側 (task_finish_switch) */
+    next->on_cpu = 1;
+    cpu->switched_from = prev;
     task_unlock_irqrestore(flags);
     arch_context_switch(&next->ctx, &prev->ctx);
+    task_finish_switch();
 }
 
 /*

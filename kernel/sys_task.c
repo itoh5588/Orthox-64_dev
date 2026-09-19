@@ -347,18 +347,14 @@ int64_t sys_wait4(int pid, int* wstatus, int options) {
     if (!current) return -LINUX_ESRCH;
     while (1) {
         int found_child = 0;
-        struct task* curr = task_list;
-        while (curr) {
-            if (curr->ppid == current->pid && (pid == -1 || curr->pid == pid)) {
-                found_child = 1;
-                if (curr->state == TASK_ZOMBIE) {
-                    int child_pid = curr->pid;
-                    if (wstatus) *wstatus = curr->exit_status << 8;
-                    (void)task_reap(curr);
-                    return child_pid;
-                }
-            }
-            curr = curr->next;
+        /* 探すのはロックの中 (task_find_zombie_child)。wstatus への書き込み
+         * (CoW のフォルトが起きうる) と回収はロックの外 */
+        struct task* zombie = task_find_zombie_child(current->pid, pid, &found_child);
+        if (zombie) {
+            int child_pid = zombie->pid;
+            if (wstatus) *wstatus = zombie->exit_status << 8;
+            (void)task_reap(zombie);
+            return child_pid;
         }
         if (!found_child) return -LINUX_ECHILD;
         /* WNOHANG: 生きている子はいるがゾンビ無し -> ブロックせず 0。

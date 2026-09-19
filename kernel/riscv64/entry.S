@@ -51,6 +51,7 @@ riscv64_run_on_stack:
     jr a1
 
 riscv64_activate_address_space_and_enter_user:
+    csrci sstatus, 2           # SIE を閉じる (訳は riscv64_enter_user_from_frame)
     srli t0, a0, 12
     li t1, 8
     slli t1, t1, 60
@@ -61,6 +62,18 @@ riscv64_activate_address_space_and_enter_user:
     j riscv64_enter_user_from_frame
 
 riscv64_enter_user_from_frame:
+    # **ユーザーのレジスタを積む前に割り込みを閉じる (2026-09-19)。**
+    # カーネルは実行中も割り込みを受ける (riscv64_interrupts_enable)。ここを
+    # 開けたまま sp をユーザーの値にした後で割り込みが入ると、入口は
+    # 「カーネルから来た」(SPP=1) と見て今の sp = ユーザーのスタックに
+    # trap frame を積む。fork の子や exec の最初の遷移はここを通る。
+    # cowstress (4 hart) で、ユーザーのスタックがカーネルの番地で上書き
+    # されて飛ぶ / CoW の読み取り専用のスタックに積もうとして入口ごと
+    # フォルトし続ける、として出た。aarch64 は同じ穴を P3-4 で塞いである
+    # (aarch64_task_fork_child_return の msr daifset)。
+    # sret の直前に sstatus をフレームの値で書き戻すので、ユーザーには
+    # 開いて降りる
+    csrci sstatus, 2           # SIE
     ld ra,   0(a0)
     ld sp,   8(a0)
     ld gp,  16(a0)
