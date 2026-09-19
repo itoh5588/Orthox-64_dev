@@ -3,6 +3,7 @@
 #include "riscv64/boot.h"
 #include "riscv64/csr.h"
 #include "riscv64/vm.h"
+#include "vm_cow.h"
 
 #define RISCV64_SATP_MODE_SV39      (8ULL << 60)
 #define RISCV64_SATP_PPN_MASK       ((1ULL << 44) - 1ULL)
@@ -163,7 +164,11 @@ static uint64_t* riscv64_sv39_walk_create(uint64_t* root, uint64_t virt_addr) {
     return &table[riscv64_sv39_vpn_index(virt_addr, 0)];
 }
 
-static int riscv64_vm_clone_table(uint64_t* dst, const uint64_t* src, const uint64_t* kernel, int level) {
+/* fork 用に表を写す。**表は写し、ユーザーのページは共有する (CoW, 2026-09-19)。**
+ * U の葉を子へどう渡すかは共通層 (vm_cow_share_leaf, kernel/vm_cow.c) が
+ * 決める。書き込み可の葉は親子とも読み取り専用 + 印になり、先に書いた側が
+ * store page fault で写す。写した先の命令フェッチとの同期もあちらに移った */
+static int riscv64_vm_clone_table(uint64_t* dst, uint64_t* src, const uint64_t* kernel, int level) {
     for (int i = 0; i < 512; i++) {
         uint64_t entry = src[i];
         uint64_t kernel_entry = kernel ? kernel[i] : 0;
@@ -176,7 +181,7 @@ static int riscv64_vm_clone_table(uint64_t* dst, const uint64_t* src, const uint
         }
         if (!riscv64_sv39_pte_is_leaf(entry)) {
             uint64_t* dst_child = riscv64_vm_alloc_table();
-            const uint64_t* src_child = (const uint64_t*)(uintptr_t)riscv64_sv39_pte_phys(entry);
+            uint64_t* src_child = (uint64_t*)(uintptr_t)riscv64_sv39_pte_phys(entry);
             const uint64_t* kernel_child = 0;
             if (!dst_child) return -1;
             dst[i] = riscv64_sv39_make_nonleaf((uint64_t)(uintptr_t)dst_child);
@@ -189,10 +194,7 @@ static int riscv64_vm_clone_table(uint64_t* dst, const uint64_t* src, const uint
         }
 
         if (entry & RISCV64_SV39_PTE_U) {
-            void* new_page = pmm_alloc(1);
-            if (!new_page) return -1;
-            riscv64_vm_memcpy_page((uint64_t)(uintptr_t)new_page, riscv64_sv39_pte_phys(entry));
-            dst[i] = riscv64_sv39_make_leaf_4k((uint64_t)(uintptr_t)new_page, entry & RISCV64_SV39_PTE_FLAG_MASK);
+            dst[i] = vm_cow_share_leaf(&src[i], 1);
         } else {
             dst[i] = entry;
         }
@@ -224,13 +226,6 @@ static void riscv64_vm_destroy_table(uint64_t* table, const uint64_t* kernel, in
     if (free_self) {
         pmm_free(table, 1);
     }
-}
-
-void riscv64_vm_memcpy_page(uint64_t dst_phys, uint64_t src_phys) {
-    riscv64_memcpy((void*)(uintptr_t)dst_phys, (const void*)(uintptr_t)src_phys, RISCV64_PAGE_SIZE);
-    /* **S-3: 写した先を命令フェッチと揃える** (aarch64 の
-     * aarch64_vm_copy_page と対。include/riscv64/vm.h の注記も参照) */
-    riscv64_sync_icache_range((void*)(uintptr_t)dst_phys, RISCV64_PAGE_SIZE);
 }
 
 uint64_t riscv64_vm_create_address_space(void) {
@@ -477,7 +472,12 @@ arch_address_space_t arch_vm_clone_address_space(arch_address_space_t address_sp
     uint64_t* src = riscv64_vm_root_ptr((uint64_t)address_space);
     uint64_t* dst = riscv64_vm_root_ptr(riscv64_vm_create_address_space());
     if (!dst) return 0;
-    if (riscv64_vm_clone_table(dst, src, riscv64_vm_root_ptr(g_riscv64_kernel_root_pa), 2) < 0) {
+    int rc = riscv64_vm_clone_table(dst, src, riscv64_vm_root_ptr(g_riscv64_kernel_root_pa), 2);
+    /* **親の葉を読み取り専用にしたので、この hart の TLB を捨てる。**
+     * 途中で失敗しても、それまでに印を付けた葉は残るので同じ。
+     * ほかの hart は要らない (arch_vm_flush_user_page の注記) */
+    riscv64_sfence_vma();
+    if (rc < 0) {
         riscv64_vm_destroy_address_space((uint64_t)(uintptr_t)dst);
         return 0;
     }
@@ -560,8 +560,12 @@ uint64_t* arch_vm_user_leaf(arch_address_space_t address_space, uint64_t vaddr, 
     return pte;
 }
 
-/* この hart の sfence.vma だけ。**他の hart に残る変換は別に手当てが要る**
- * (fork の CoW を riscv64 で有効にするとき。日報2026-09-19) */
+/* **この hart の sfence.vma で足りる。**arch_context_switch
+ * (kernel/riscv64/entry.S) はユーザーのタスクへ切り替えるたびに satp を書いて
+ * sfence.vma zero, zero で丸ごと捨てるので、いま走っていないアドレス空間の
+ * 変換は他の hart に残っていても、そこで走り出す前に消える。1 つの
+ * アドレス空間を 2 つの hart で同時に走らせること (CLONE_VM のスレッド) は
+ * していない。x86 の invlpg と同じ理屈 (include/x86_64/vm.h) */
 void arch_vm_flush_user_page(arch_address_space_t address_space, uint64_t vaddr) {
     (void)address_space;
     __asm__ volatile("sfence.vma %0, zero" :: "r"(vaddr) : "memory");

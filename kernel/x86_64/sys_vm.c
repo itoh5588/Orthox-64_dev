@@ -91,12 +91,11 @@ int sys_madvise(void* addr, size_t len, int advice) {
 }
 
 /* **sys_mprotect は kernel/sys_mmap.c へ移した (2026-09-12)。**
- * COW を保つ部分は include/x86_64/vm.h の arch_vm_protect_page に移してある
- * (aarch64 / riscv64 は fork でページを写すので COW が無い) */
+ * COW を保つ部分は、2026-09-19 に 3 アーキ共通の vm_cow_protect_page
+ * (kernel/vm_cow.c) へ移した */
 
 /* **sys_mremap は kernel/sys_mmap.c へ移した (2026-09-12)。**
- * 保護を引き継ぐ部分は include/x86_64/vm.h の arch_vm_get_page_prot に
- * 移してある (COW のページを「書けた」と読む判断もあちら) */
+ * COW のページを「書けた」と読む判断は vm_cow_get_page_prot (kernel/vm_cow.c) */
 
 /* **sys_mmap / sys_munmap は kernel/sys_mmap.c へ移した (2026-09-11)。**
  * aarch64 / riscv64 の linux_syscall.c 側と 2 実装あったものを 1 つにした。

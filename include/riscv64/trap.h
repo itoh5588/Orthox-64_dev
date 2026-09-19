@@ -28,6 +28,8 @@ typedef riscv64_trap_frame_t arch_interrupt_frame_t;
 #define RISCV64_SCAUSE_ECALL_U   8ULL
 #define RISCV64_SCAUSE_ECALL_S   9ULL
 #define RISCV64_SCAUSE_BREAKPOINT 3ULL
+/* store/AMO page fault。fork の CoW で共有中のページへ書いたとき (kernel/vm_cow.c) */
+#define RISCV64_SCAUSE_STORE_PAGE_FAULT 15ULL
 #define RISCV64_SCAUSE_STIMER    (RISCV64_SCAUSE_INTERRUPT | 5ULL)
 #define RISCV64_SCAUSE_SSOFT     (RISCV64_SCAUSE_INTERRUPT | 1ULL)
 #define RISCV64_SCAUSE_SEXT      (RISCV64_SCAUSE_INTERRUPT | 9ULL)

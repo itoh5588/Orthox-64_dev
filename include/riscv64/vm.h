@@ -22,7 +22,6 @@ uint64_t riscv64_vm_clone_kernel_address_space(void);
 void riscv64_vm_destroy_address_space(uint64_t root_pa);
 uint64_t riscv64_vm_bootstrap_alloc_page(void);
 void riscv64_vm_bootstrap_free_page(uint64_t phys_addr);
-void riscv64_vm_memcpy_page(uint64_t dst_phys, uint64_t src_phys);
 void riscv64_vm_map_page(uint64_t root_pa, uint64_t virt_addr, uint64_t phys_addr, uint64_t flags);
 void riscv64_vm_map_range(uint64_t root_pa, uint64_t virt_addr, uint64_t phys_addr, uint64_t size, uint64_t flags);
 uint64_t riscv64_vm_get_phys(uint64_t root_pa, uint64_t virt_addr);
@@ -31,7 +30,8 @@ void riscv64_vm_update_page_flags(uint64_t root_pa, uint64_t virt_addr, uint64_t
 
 /* ---- 命令キャッシュの同期 (S-3) ------------------------------------------
  *
- * **aarch64 と同じ場所から呼ぶ** (exec のセグメント写しと fork のページ写し)。
+ * **aarch64 と同じ場所から呼ぶ** (exec のセグメント写しと、fork の CoW で
+ * 書き込みフォルトが写したページ。後者は共通層の kernel/vm_cow.c が呼ぶ)。
  * RISC-V はデータ側は一貫しているので、要るのは命令フェッチの同期だけ。
  *
  * `fence rw, rw` で書いたバイトを見えるようにしてから `fence.i` を出す。

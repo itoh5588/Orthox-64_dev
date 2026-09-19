@@ -1222,6 +1222,12 @@ $(RISCV64_MUSL_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/ri
 
 riscv64-musl-probe: $(RISCV64_MUSL_PROBE_ELF)
 
+# fork の CoW の負荷試験 (user/cowstress.c)。aarch64 と同じソース
+RISCV64_COWSTRESS_ELF = out/riscv64-cowstress.elf
+$(RISCV64_COWSTRESS_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/cowstress.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/cowstress.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
 $(RISCV64_PREEMPT_PROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_preempt_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
 	@mkdir -p $(@D)
 	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/riscv64_preempt_probe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
@@ -1296,6 +1302,11 @@ riscv64-smoke: $(RISCV64_KERNEL_ELF)
 riscv64-musl-smoke: $(RISCV64_MUSL_PROBE_ELF)
 	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_MUSL_PROBE_ELF)
 	bash ./tests/riscv64_musl_smoke.sh
+
+# fork の CoW を 4 hart で叩く (2026-09-19)。cowstress を最初のタスクにする
+riscv64-cowstress-smoke: $(RISCV64_COWSTRESS_ELF)
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_COWSTRESS_ELF)
+	bash ./tests/riscv64_cowstress_smoke.sh
 
 # CPU を占有し続ける子の裏で親が復帰できるか = タイマープリエンプションの検証
 riscv64-preempt-smoke: $(RISCV64_PREEMPT_PROBE_ELF)

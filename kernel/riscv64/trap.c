@@ -9,6 +9,7 @@
 #include "net.h"
 #include "spinlock.h"
 #include "task.h"
+#include "vm_cow.h"
 
 extern void riscv64_trap_entry(void);
 
@@ -246,6 +247,22 @@ void riscv64_trap_dispatch(riscv64_trap_frame_t* frame) {
         }
         riscv64_trap_rearm_current_kernel_stack();
         return;
+    }
+
+    /* **fork の CoW: 共有中のページへ書いた (2026-09-19)。**
+     * scause 15 = store/AMO page fault。U モードからでも、カーネルが
+     * read(2) などで SUM を立ててユーザーのバッファへ書いた S モードからでも
+     * 来る。写すか書き込み可に戻すかは共通層 (kernel/vm_cow.c) が決める。
+     * **sepc は進めない。**同じ命令をもう一度実行させる。
+     * CoW でなければ (本物の違反) 従来どおり出して止まる */
+    if (frame->scause == RISCV64_SCAUSE_STORE_PAGE_FAULT) {
+        int rc = vm_cow_write_fault((arch_address_space_t)riscv64_vm_current_address_space(),
+                                    frame->stval);
+        if (rc == VM_COW_HANDLED) {
+            riscv64_trap_rearm_current_kernel_stack();
+            return;
+        }
+        if (rc == VM_COW_NOMEM) riscv64_uart_puts("riscv64 trap: cow: no page to copy into\n");
     }
 
     riscv64_trap_print_frame(frame);

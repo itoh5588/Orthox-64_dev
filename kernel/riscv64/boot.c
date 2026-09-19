@@ -12,6 +12,7 @@
 #include "riscv64/trap.h"
 #include "riscv64/virtio_blk_mmio.h"
 #include "riscv64/vm.h"
+#include "vm_cow.h"
 #include "elf64.h"
 #include "storage.h"
 #include "xv6fs.h"
@@ -441,9 +442,25 @@ static void riscv64_vm_clone_selftest(void) {
         return;
     }
 
+    /* **複製は CoW (2026-09-19)。**直後は同じページを共有し、子が書くと
+     * (ここではフォルトの代わりに vm_cow_write_fault を直接呼ぶ) 子だけ
+     * 別のページになる。以前は「複製の直後に物理が違うこと」を見ていた */
     child_phys = riscv64_vm_get_phys(child, virt) & ~(PAGE_SIZE - 1ULL);
     parent_phys = riscv64_vm_get_phys(parent, virt) & ~(PAGE_SIZE - 1ULL);
-    if (!child_phys || !parent_phys || child_phys == parent_phys) {
+    if (!child_phys || !parent_phys || child_phys != parent_phys) {
+        riscv64_uart_puts("  vm clone selftest: page not shared after clone\n");
+        riscv64_vm_destroy_address_space(child);
+        riscv64_vm_destroy_address_space(parent);
+        return;
+    }
+    if (vm_cow_write_fault((arch_address_space_t)child, virt) != VM_COW_HANDLED) {
+        riscv64_uart_puts("  vm clone selftest: cow fault not handled\n");
+        riscv64_vm_destroy_address_space(child);
+        riscv64_vm_destroy_address_space(parent);
+        return;
+    }
+    child_phys = riscv64_vm_get_phys(child, virt) & ~(PAGE_SIZE - 1ULL);
+    if (!child_phys || child_phys == parent_phys) {
         riscv64_uart_puts("  vm clone selftest: isolated page missing\n");
         riscv64_vm_destroy_address_space(child);
         riscv64_vm_destroy_address_space(parent);
@@ -1023,10 +1040,27 @@ static void riscv64_fork_selftest(void) {
         return;
     }
 
+    /* **fork は CoW (2026-09-19)。**以前は「親子の物理ページが違うこと」を
+     * 正解として見ていたが、それは全ページをその場で写していた頃の挙動。
+     * 今は fork の直後は同じページを共有し、書いた側が写す。共通層
+     * (kernel/vm_cow.c) の 2 つの経路 —— 共有中なら写す / 最後の 1 人なら
+     * 写さずに書き込み可へ戻す —— を、フォルトの代わりに直接呼んで確かめる */
+    child_phys = arch_vm_get_phys(arch_task_context_get_address_space(&child->ctx), base) &
+                 ~(PAGE_SIZE - 1ULL);
+    if (!child_phys || child_phys != parent_phys) {
+        riscv64_uart_puts("  fork selftest: page not shared after fork\n");
+        goto cleanup_child;
+    }
+
+    /* 子が書いた: 共有中なので写す */
+    if (vm_cow_write_fault(arch_task_context_get_address_space(&child->ctx), base) != VM_COW_HANDLED) {
+        riscv64_uart_puts("  fork selftest: child cow fault not handled\n");
+        goto cleanup_child;
+    }
     child_phys = arch_vm_get_phys(arch_task_context_get_address_space(&child->ctx), base) &
                  ~(PAGE_SIZE - 1ULL);
     if (!child_phys || child_phys == parent_phys) {
-        riscv64_uart_puts("  fork selftest: address space not cloned\n");
+        riscv64_uart_puts("  fork selftest: child page not copied\n");
         goto cleanup_child;
     }
     if (((volatile uint8_t*)(uintptr_t)child_phys)[0] != 'F' ||
@@ -1038,6 +1072,14 @@ static void riscv64_fork_selftest(void) {
     ((volatile uint8_t*)(uintptr_t)child_phys)[1] = '1';
     if (((volatile uint8_t*)(uintptr_t)parent_phys)[1] != '0') {
         riscv64_uart_puts("  fork selftest: parent page mutated\n");
+        goto cleanup_child;
+    }
+
+    /* 親が書いた: もう共有していないので写さずに書き込み可へ戻す */
+    if (vm_cow_write_fault(arch_task_context_get_address_space(&current->ctx), base) != VM_COW_HANDLED ||
+        (arch_vm_get_phys(arch_task_context_get_address_space(&current->ctx), base) &
+         ~(PAGE_SIZE - 1ULL)) != parent_phys) {
+        riscv64_uart_puts("  fork selftest: parent cow fault should reuse the page\n");
         goto cleanup_child;
     }
     if (child->ppid != current->pid || child->pid != child_pid || child->kstack_top == 0) {
