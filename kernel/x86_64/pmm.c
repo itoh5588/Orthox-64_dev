@@ -35,9 +35,30 @@ void pmm_init(void) {
     hhdm_offset = hhdm_request.response->offset;
     spinlock_init(&g_pmm_lock);
 
+    /* **管理するページ数は RAM の種別だけで決める (2026-09-19)。**
+     *
+     * 以前は全項目の終わりの最大を取っていた。QEMU の pc は予約領域
+     * (種別 RESERVED) を 0xfd00000000 から 12GB 置くので、終わりが 1TiB に
+     * なり max_pages = 2^28。-m 2G でもビットマップ 32MB + 参照カウント
+     * 512MB = 544MB (RAM の 27%) を最初の USABLE 領域の先頭に取り、
+     * pmm_alloc は毎回その 544MB 分のビットを先頭から舐めていた
+     * (計測で 1 回平均 141,660 ページ、CoW フォルト 1 回が約 660us)。
+     *
+     * 予約・フレームバッファ・MMIO は pmm が配らないページなので、範囲に
+     * 入れる理由がない。範囲の外のページは pmm_get_ref が 0 を返し、
+     * pmm_incref / pmm_free も無視する —— 以前も参照カウント 0 のまま
+     * だったので、vm_cow の「pmm が持たないページは共有のまま渡す」は
+     * 変わらない */
     uint64_t top_address = 0;
     for (uint64_t i = 0; i < memmap->entry_count; i++) {
         struct limine_memmap_entry* entry = memmap->entries[i];
+        if (entry->type != LIMINE_MEMMAP_USABLE &&
+            entry->type != LIMINE_MEMMAP_ACPI_RECLAIMABLE &&
+            entry->type != LIMINE_MEMMAP_ACPI_NVS &&
+            entry->type != LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE &&
+            entry->type != LIMINE_MEMMAP_EXECUTABLE_AND_MODULES) {
+            continue;
+        }
         if (entry->base + entry->length > top_address) {
             top_address = entry->base + entry->length;
         }
