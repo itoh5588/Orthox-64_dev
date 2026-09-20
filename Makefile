@@ -345,7 +345,32 @@ $(DOOM_MUSL_ELF): FORCE
 	$(MAKE) -C user/doomgeneric/doomgeneric LIBC_IMPL=musl OUTPUT=doomgeneric.elf
 	cp user/doomgeneric/doomgeneric/doomgeneric.elf $(DOOM_MUSL_ELF)
 
-busybox-ash-musl:
+# **busybox への手入れを当ててから組む (2026-09-20)。**
+# ports/busybox/ は親リポジトリの .gitignore の外 —— upstream の clone を
+# そのまま置いてあるので、こちらの手入れは ports/busybox-orthox.patch に
+# しか残らない。**そのパッチがどこからも当てられていなかった**
+# (日報2026-07-31 の積み残し) ため、clone し直すと ash / test / lineedit の
+# PTR_HACK などが黙って外れる。busybox を組む前に必ず通す。
+# **何度走らせても安全** —— 既に当たっていれば何もしない
+BUSYBOX_PATCH = $(abspath ports/busybox-orthox.patch)
+.PHONY: busybox-patch
+busybox-patch:
+	@if [ ! -d ports/busybox/.git ]; then \
+	    echo "*** ports/busybox が無い。upstream を clone すること" >&2; \
+	    exit 1; \
+	fi
+	@if git -C ports/busybox apply --reverse --check "$(BUSYBOX_PATCH)" >/dev/null 2>&1; then \
+	    echo "busybox: 手入れは当たっている"; \
+	elif git -C ports/busybox apply --check "$(BUSYBOX_PATCH)" >/dev/null 2>&1; then \
+	    git -C ports/busybox apply "$(BUSYBOX_PATCH)" && echo "busybox: 手入れを当てた"; \
+	else \
+	    echo "*** busybox: 手入れが当たらない。手で確かめること" >&2; \
+	    echo "***   git -C ports/busybox apply --check $(BUSYBOX_PATCH)" >&2; \
+	    echo "*** 一部だけ当たっている場合は、当たっていない hunk を見ること" >&2; \
+	    exit 1; \
+	fi
+
+busybox-ash-musl: busybox-patch
 	$(MAKE) -C $(CURDIR) LIBC_IMPL=musl __busybox_ash_musl
 
 busybox-ash-musl-install:
@@ -1157,12 +1182,12 @@ AARCH64_BB_RANLIB ?= $(shell if [ -x $(AARCH64_CROSS_BIN)/aarch64-linux-musl-ran
 AARCH64_BB_STRIP ?= $(shell if [ -x $(AARCH64_CROSS_BIN)/aarch64-linux-musl-strip ]; then printf %s $(AARCH64_CROSS_BIN)/aarch64-linux-musl-strip; else printf llvm-strip; fi)
 AARCH64_BUSYBOX_ASH_MUSL_ELF = out/busybox-aarch64-musl.elf
 
-aarch64-busybox-musl: $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+aarch64-busybox-musl: $(AARCH64_MUSL_SYSROOT)/lib/libc.a busybox-patch
 	@mkdir -p out
 	ORTHOS_CC=$(abspath $(AARCH64_MUSL_CC_DRIVER)) \
 	ORTHOS_SYSROOT=$(abspath $(AARCH64_MUSL_SYSROOT)) \
 	ORTHOS_INCLUDEDIR=$(abspath $(AARCH64_MUSL_SYSROOT))/include \
-	ORTHOS_EXTRA_CFLAGS="-DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_LINEEDIT_PTR_HACK=1 -DORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS=1" \
+	ORTHOS_EXTRA_CFLAGS="-DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_LINEEDIT_PTR_HACK=1 -DORTHOX_BUSYBOX_PTR_TO_GLOBALS_HACK=1 -DORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS=1" \
 	ORTHOS_AR="$(AARCH64_BB_AR)" \
 	ORTHOS_RANLIB="$(AARCH64_BB_RANLIB)" \
 	ORTHOS_STRIP="$(AARCH64_BB_STRIP)" \
@@ -1305,12 +1330,12 @@ riscv64-user-bin: $(RISCV64_USER_BIN_ELFS)
 
 RISCV64_BUSYBOX_ASH_MUSL_ELF = out/busybox-riscv64-musl.elf
 
-riscv64-busybox-musl: $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+riscv64-busybox-musl: $(RISCV64_MUSL_SYSROOT)/lib/libc.a busybox-patch
 	@mkdir -p out
 	ORTHOS_CC=$(abspath $(RISCV64_MUSL_CC_DRIVER)) \
 	ORTHOS_SYSROOT=$(abspath $(RISCV64_MUSL_SYSROOT)) \
 	ORTHOS_INCLUDEDIR=$(abspath $(RISCV64_MUSL_SYSROOT))/include \
-	ORTHOS_EXTRA_CFLAGS="-DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_LINEEDIT_PTR_HACK=1 -DORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS=1" \
+	ORTHOS_EXTRA_CFLAGS="-DORTHOX_BUSYBOX_ASH_PTR_HACK=1 -DORTHOX_BUSYBOX_TEST_PTR_HACK=1 -DORTHOX_BUSYBOX_LINEEDIT_PTR_HACK=1 -DORTHOX_BUSYBOX_PTR_TO_GLOBALS_HACK=1 -DORTHOX_BUSYBOX_ASH_NO_NORETURN_ALIAS=1" \
 	ORTHOS_AR="$(RISCV64_LLVM_AR)" ORTHOS_RANLIB="$(RISCV64_LLVM_RANLIB)" \
 	ORTHOS_STRIP="$(shell if [ -x /opt/homebrew/opt/llvm/bin/llvm-strip ]; then printf /opt/homebrew/opt/llvm/bin/llvm-strip; else printf llvm-strip; fi)" \
 	./ports/build_busybox_ash.sh $(abspath ports/busybox) $(abspath $(RISCV64_BUSYBOX_ASH_MUSL_ELF))
