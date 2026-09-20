@@ -32,7 +32,18 @@ switch_context:
     pop %r12
     pop %rbx
     pop %rbp
-    andq $~0x100, (%rsp)
+    # **切り替え先には割り込みを閉じて戻す (2026-09-20)。**
+    # 0x100 は TF、**IF は 0x200**。以前は $~0x100 だけで TF しか落として
+    # おらず、IF は next の保存値 (idle の初期 ctx は 0x202) のまま popfq で
+    # 戻っていた。すると直後の ret の命令境界で resched IPI が入り、割り込みの
+    # 入口 (kernel/x86_64/idt.c) が BKL を取りに行く。降りたタスクの on_cpu を
+    # 落とすのは戻り先の task_finish_switch なので、その BKL を
+    # wait4 -> task_reap が握って on_cpu を待っていると噛み合って止まる
+    # (2026-09-19 の日報 §8。実測: 止まった CPU の記録が int_no=48、
+    # 割り込まれた RIP がちょうどこの ret)。
+    # 開け直すのは戻った側 —— schedule() の irq_restore、idle は
+    # arch_task_idle_wait_once の sti、fork の子と task_main は iretq
+    andq $~0x300, (%rsp)
     popfq
     ret
 

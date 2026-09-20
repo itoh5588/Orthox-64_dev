@@ -32,6 +32,7 @@ int task_execve(arch_syscall_frame_t* frame, const char* path, char* const argv[
 void task_set_comm_from_path(struct task* t, const char* path);
 uint64_t task_lock_irqsave(void);
 void task_unlock_irqrestore(uint64_t flags);
+void task_unlock_keep_irq(void);
 int task_next_pid_locked(void);
 struct task* task_alloc_struct(void);
 int task_free_struct(struct task* t);

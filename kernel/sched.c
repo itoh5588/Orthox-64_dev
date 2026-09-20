@@ -86,9 +86,23 @@ void schedule(void) {
      * 書く。落とすのは次のタスクの側 (task_finish_switch) */
     next->on_cpu = 1;
     cpu->switched_from = prev;
-    task_unlock_irqrestore(flags);
+    /* **ロックは放すが、割り込みはここで開けない (2026-09-20)。**
+     * switched_from を書いてから task_finish_switch が prev の on_cpu を
+     * 落とすまでの間に割り込まれると、割り込みの入口 (x86 は
+     * kernel/x86_64/idt.c の interrupt_dispatch) が BKL を取りに行く。
+     * その BKL を wait4 -> task_reap が握って on_cpu が落ちるのを待って
+     * いると、落とす役目の CPU が BKL 待ちで止まったまま噛み合う
+     * (2026-09-19 の日報 §8 の x86 デッドロック)。
+     * **切り替えの区間は入口から出口まで閉じたままにする。**ここで閉じ、
+     * 切り替え先へは各 arch の切り替えが閉じたまま戻し (x86 は
+     * kernel/x86_64/task_switch.S)、開け直すのは戻った側。切り替え先が
+     * この続きに戻らない場合 (初めて走るタスク) は、それぞれの入口が
+     * 自分で開ける —— idle は arch_task_idle_wait_once の sti、
+     * fork の子と task_main はユーザーへ降りる iretq */
+    task_unlock_keep_irq();
     arch_context_switch(&next->ctx, &prev->ctx);
     task_finish_switch();
+    irq_restore(flags);
 }
 
 /*

@@ -68,6 +68,12 @@ void task_unlock_irqrestore(uint64_t flags) {
     spin_unlock_irqrestore(&g_task_lock, flags);
 }
 
+/* **ロックだけ放して、割り込みは開けない。**schedule() が切り替えの区間で使う。
+ * 訳は kernel/sched.c の arch_context_switch の手前のコメント */
+void task_unlock_keep_irq(void) {
+    spin_unlock(&g_task_lock);
+}
+
 int task_next_pid_locked(void) {
     return next_pid++;
 }
