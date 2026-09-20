@@ -805,6 +805,96 @@ def _max_mtime_in_image() -> int:
     return min(hi, MTIME_MAX - 1)
 
 
+def _bitmap_get(b: int) -> int:
+    """既存イメージで、データブロック b が使用中かを返す。"""
+    sec = bmapstart + b // (BSIZE * 8)
+    off = (b % (BSIZE * 8)) // 8
+    return (image[sec * BSIZE + off] >> (b % 8)) & 1
+
+
+def _bitmap_set(b: int, used: bool) -> None:
+    sec = bmapstart + b // (BSIZE * 8)
+    off = (b % (BSIZE * 8)) // 8
+    idx = sec * BSIZE + off
+    if used:
+        image[idx] |= (1 << (b % 8))
+    else:
+        image[idx] &= ~(1 << (b % 8)) & 0xff
+
+
+def _alloc_block_in_image() -> int:
+    """**既存イメージ用のブロック確保。**
+
+    作るときの _alloc_block は freeblock を単調に増やすだけなので、出来上がった
+    イメージには使えない (どこまで使ったかを持っていない)。こちらはビットマップの
+    空きを探して印を付ける。**渡す前に中身を消す** —— 前に使われていたときの
+    バイトが、サイズを見ない読み手に見えてしまうため。
+    """
+    for b in range(nmeta, FSSIZE):
+        if not _bitmap_get(b):
+            _bitmap_set(b, True)
+            wsect(b, bytes(BSIZE))
+            return b
+    raise RuntimeError(f"空きブロックが無い (FSSIZE={FSSIZE})")
+
+
+def write_file_in_image(img_path: str, fs_path: str, host_path: str) -> int:
+    """**大きさが変わってもよいファイルの入れ替え (2026-09-20)。**
+
+    --replace は「割り当て済みブロックに収まる」ときだけの保守的な操作で、
+    1 ブロックでも増えると断る。busybox を新しくするような、**少しだけ大きく
+    なる差し替え**ができなかった (実測: 437,152 -> 438,464 バイトで 2 ブロック
+    足りず、Pi4 実機の /bin/awk を直せなかった)。
+
+    既存のブロックはそのまま使い回す —— iappend は addrs[fbn] == 0 のときだけ
+    確保するので、size を 0 に戻してから書けば先頭からの上書きになり、
+    **足りない分だけ**ビットマップから確保される。
+    **縮むときは余ったブロックを inode に残したままにする** (size より後ろは
+    読まれない)。確保済みのまま放置するので使える容量は減るが、
+    ビットマップと inode の食い違いは起こさない方を採った。
+    """
+    global _alloc_block
+
+    if _load_image(img_path) != 0:
+        return 1
+
+    inum = _lookup_path(fs_path)
+    if inum is None:
+        return 1
+
+    din = rinode(inum)
+    if din['type'] != T_FILE:
+        print(f"ERROR: {fs_path!r} is not a regular file (type={din['type']})", file=sys.stderr)
+        return 1
+
+    data = Path(host_path).read_bytes()
+    old_size = din['size']
+    old_blocks = len(_allocated_file_blocks(din))
+
+    din['size'] = 0
+    winode(inum, din)
+
+    saved_alloc = _alloc_block
+    _alloc_block = _alloc_block_in_image
+    try:
+        iappend(inum, data)
+    finally:
+        _alloc_block = saved_alloc
+
+    din = rinode(inum)
+    # 中身を替えたら時刻も進める (訳は replace_file_in_image と同じ)
+    if din.get('mtime', 0) or IPB != _V1_IPB:
+        din['mtime'] = min(max(_max_mtime_in_image() + 1,
+                               int(Path(host_path).stat().st_mtime)),
+                           MTIME_MAX)
+    winode(inum, din)
+    Path(img_path).write_bytes(image)
+    new_blocks = len(_allocated_file_blocks(din))
+    print(f"Wrote {len(data):,} bytes (was {old_size:,}): {host_path} -> {fs_path} in {img_path}")
+    print(f"  blocks: {old_blocks} -> {new_blocks}  (mtime={din.get('mtime', 0)})")
+    return 0
+
+
 def replace_file_in_image(img_path: str, fs_path: str, host_path: str) -> int:
     """既存 regular file の割り当て済みブロック内で内容だけを差し替える。
 
@@ -1142,6 +1232,12 @@ def main() -> int:
             print("usage: build_rootfs_xv6fs.py --replace FS_PATH HOST_FILE IMG_FILE", file=sys.stderr)
             return 1
         return replace_file_in_image(sys.argv[4], sys.argv[2], sys.argv[3])
+
+    if len(sys.argv) >= 2 and sys.argv[1] == '--write':
+        if len(sys.argv) != 5:
+            print("usage: build_rootfs_xv6fs.py --write FS_PATH HOST_FILE IMG_FILE", file=sys.stderr)
+            return 1
+        return write_file_in_image(sys.argv[4], sys.argv[2], sys.argv[3])
 
     if len(sys.argv) >= 2 and sys.argv[1] == '--ls':
         if len(sys.argv) != 4:
