@@ -30,7 +30,7 @@ if ! command -v xorriso >/dev/null 2>&1; then
     echo "xorriso not found" >&2
     exit 1
 fi
-for f in kernel.elf user/sh.elf rootfs.img iso/limine.conf; do
+for f in kernel.elf user/sh.elf rootfs-lite.img iso/limine.conf; do
     [ -f "$f" ] || { echo "missing $f" >&2; exit 1; }
 done
 
@@ -42,31 +42,16 @@ rm -f "$SERIAL_LOG"
 
 # **起動時の /etc/bootcmd を無害なものへ差し替える (2026-09-12)。**
 #
-# この台本はシェルに文字を打ち込んで判定する。ところがイメージ既定の
-# bootcmd は **OS 内でカーネルを丸ごと組む** (/etc/native_kernel_build_smoke.sh)
-# ので、/kbuild が空だと数分かかり、打ち込む前に持ち時間が尽きる
-# (Makefile の rootfs.img の注意書きを参照)。
-#
-# xv6fs を組み直さずにイメージの中身だけ差し替えられるので、それを使う。
-# **終わったら必ず戻す** —— x86-kernel-smoke は既定の bootcmd に依存している
-BOOTCMD_BACKUP_ORTH="$(mktemp)"
-BOOTCMD_NEUTRAL_ORTH="$(mktemp)"
-IMAGE_PATCHED_ORTH=0
-printf 'echo bootcmd-ready\n' > "${BOOTCMD_NEUTRAL_ORTH}"
-if python3 scripts/build_rootfs_xv6fs.py --extract /etc/bootcmd "${BOOTCMD_BACKUP_ORTH}" rootfs.img >/dev/null 2>&1 \
-   && python3 scripts/build_rootfs_xv6fs.py --replace /etc/bootcmd "${BOOTCMD_NEUTRAL_ORTH}" rootfs.img >/dev/null 2>&1; then
-    IMAGE_PATCHED_ORTH=1
-fi
-restore_bootcmd_orth() {
-    if [ "${IMAGE_PATCHED_ORTH}" = "1" ]; then
-        python3 scripts/build_rootfs_xv6fs.py --replace /etc/bootcmd "${BOOTCMD_BACKUP_ORTH}" rootfs.img >/dev/null 2>&1 || true
-        IMAGE_PATCHED_ORTH=0
-    fi
-    rm -f "${BOOTCMD_BACKUP_ORTH}" "${BOOTCMD_NEUTRAL_ORTH}"
-}
-
+# **rootfs は軽い方 (rootfs-lite.img) を使う (2026-09-20)。**この台本は
+# シェルに文字を打ち込んで判定するので、イメージ既定の bootcmd
+# (/etc/native_kernel_build_smoke.sh = OS 内でカーネルを丸ごと組む) が走ると
+# 打ち込む前に持ち時間が尽きる。**以前は rootfs.img の /etc/bootcmd を
+# 一時的に差し替えて戻していたが、軽い方は最初から空なので要らない**
+# (訳は Makefile の ROOTFS_LITE_IMG の定義)。共有のイメージを書き換えなく
+# なったぶん、途中で落ちても rootfs.img が中途半端に残らない。
+# ブートも縮む —— Limine は ISO を丸ごと読むので、320MB の rootfs.img では
+# 53.6 秒、96MB の軽い方では 16 秒
 cleanup() {
-    restore_bootcmd_orth
     kill "${QEMU_PID:-0}" 2>/dev/null || true
     wait "${QEMU_PID:-0}" 2>/dev/null || true
     rm -rf "$WORK"
@@ -76,7 +61,7 @@ trap cleanup EXIT
 mkdir -p "$WORK/iso_root/boot/limine" "$WORK/iso_root/EFI/BOOT"
 cp kernel.elf "$WORK/iso_root/boot/kernel.elf"
 cp user/sh.elf "$WORK/iso_root/boot/sh.elf"
-cp rootfs.img "$WORK/iso_root/boot/rootfs.img"
+cp rootfs-lite.img "$WORK/iso_root/boot/rootfs.img"
 cp iso/limine.conf "$WORK/iso_root/boot/limine/limine.conf"
 cp Limine/limine-bios.sys Limine/limine-bios-cd.bin Limine/limine-uefi-cd.bin \
    "$WORK/iso_root/boot/limine/"

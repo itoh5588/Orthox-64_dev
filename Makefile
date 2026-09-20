@@ -1672,7 +1672,7 @@ x86-kernel-smoke: $(KERNEL_ELF)
 	bash ./tests/x86_kernel_smoke.sh
 
 # 失敗系の syscall が正しい errno を返すかの検証 (-1 は EPERM として顕在化する)
-x86-errno-smoke: $(KERNEL_ELF)
+x86-errno-smoke: $(KERNEL_ELF) $(ROOTFS_LITE_IMG)
 	bash ./tests/x86_errno_smoke.sh
 
 # fork の CoW を 4 CPU で叩く (aarch64-cowstress-smoke / riscv64-cowstress-smoke の x86 版)。
@@ -1684,7 +1684,7 @@ x86-cowstress-smoke: $(KERNEL_ELF) $(COWSTRESS_ELF) $(ROOTFS_LITE_IMG)
 
 # pipe / FIFO の端ごとの本数 (EOF は writers==0 / EPIPE は readers==0)。
 # rootfs.img に /bin/pipeend_probe.elf が要る (make rootfs.img で入る)
-x86-pipe-end-smoke: $(KERNEL_ELF)
+x86-pipe-end-smoke: $(KERNEL_ELF) $(ROOTFS_LITE_IMG)
 	bash ./tests/x86_pipe_end_smoke.sh
 
 run: $(ISO)
