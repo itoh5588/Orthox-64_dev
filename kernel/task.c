@@ -919,6 +919,70 @@ struct task* task_find_by_pid(int pid) {
     return found;
 }
 
+/* **pgid の書き換え。巡回も書き換えもロックの中 (2026-09-20)。**
+ * 訳は下の task_signal_pid と同じ —— 見つけた相手を、ロックを放してから
+ * 触ると、その隙に回収されうる。戻り値: 0 = 書けた / -1 = 居ない */
+int task_set_pgid(int pid, int pgid) {
+    int ret = -1;
+    uint64_t flags = spin_lock_irqsave(&g_task_lock);
+    for (struct task* t = task_list; t; t = t->next) {
+        if (t->pid != pid) continue;
+        t->pgid = pgid;
+        ret = 0;
+        break;
+    }
+    spin_unlock_irqrestore(&g_task_lock, flags);
+    return ret;
+}
+
+/* **pid 1 つへのシグナル配送。巡回も zombie 化もロックの中 (2026-09-20)。**
+ *
+ * kernel/sys_proc.c の sys_kill が、**BKL を持っているだけで task_list を
+ * 辿っていた。**BKL は task_list を守るロックではない (守るのは g_task_lock)
+ * ので、別の CPU が回収でノードを外すと巡回が壊れる。31429f9 で他の 6 か所を
+ * 移したときに、ここだけ残していた。
+ *
+ * 見つける・シグナルを立てる・zombie にする・親に知らせる、を**ひと続きの
+ * ロックの中で**やる。間でロックを放すと、その隙に相手が回収されうる。
+ *
+ *   sig == 0        存在確認だけ (POSIX の kill(pid, 0))
+ *   terminate != 0  zombie にして、親に parent_sig を立てる
+ *
+ * 戻り値: 0 = 対象が居た / -1 = 居ない */
+int task_signal_pid(int pid, int sig, int terminate, int exit_status, int parent_sig) {
+    int ret = -1;
+    uint64_t flags = spin_lock_irqsave(&g_task_lock);
+    for (struct task* t = task_list; t; t = t->next) {
+        if (t->pid != pid) continue;
+        ret = 0;
+        if (sig > 0 && sig < 64) {
+            /* SIG_IGN (ハンドラ値 1) なら pending を立てない。
+             * 規約は kernel/sys_signal.c と同じ */
+            if (!(sig < 32 && t->sig_handlers[sig] == 1ULL)) {
+                t->sig_pending |= (1ULL << sig);
+                if (t->state == TASK_SLEEPING) (void)task_wake_locked_internal(t);
+            }
+            if (terminate) {
+                (void)task_mark_zombie_locked(t, exit_status);
+                if (t->ppid > 0 && parent_sig > 0 && parent_sig < 64) {
+                    for (struct task* p = task_list; p; p = p->next) {
+                        if (p->pid != t->ppid) continue;
+                        if (!(parent_sig < 32 && p->sig_handlers[parent_sig] == 1ULL)) {
+                            p->sig_pending |= (1ULL << parent_sig);
+                            if (p->state == TASK_SLEEPING)
+                                (void)task_wake_locked_internal(p);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        break;
+    }
+    spin_unlock_irqrestore(&g_task_lock, flags);
+    return ret;
+}
+
 /* Ctrl-C / Ctrl-\ の配送。プロセスグループ pgid の全員 (exclude_pid を除く)
  * に sig の保留を立てて zombie にする。落とした pid を pids に最大 max 個
  * 入れ、全体の数を返す。**巡回も zombie 化もロックの中** (以前は各 arch の

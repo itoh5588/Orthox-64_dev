@@ -45,56 +45,29 @@ int sys_set_robust_list(const void* head, size_t len) {
 }
 
 
-static struct task* find_task_by_pid_locked(int pid) {
-    if (!kernel_lock_held()) {
-        puts("[warn] find_task_by_pid_locked without BKL\r\n");
-        return 0;
-    }
-    struct task* t = task_list;
-    while (t) {
-        if (t->pid == pid) return t;
-        t = t->next;
-    }
-    return 0;
-}
-
-static void task_signal_add_locked(struct task* t, int sig) {
-    if (!kernel_lock_held()) {
-        puts("[warn] task_signal_add_locked without BKL\r\n");
-        return;
-    }
-    if (!t || sig <= 0 || sig >= 64) return;
-    if (sig < 32 && t->sig_handlers[sig] == 1ULL) return;
-    t->sig_pending |= (1ULL << sig);
-    if (t->state == TASK_SLEEPING) {
-        task_wake(t);
-    }
-}
-
-
+/* **task_list は kernel/task.c の task_signal_pid に任せる (2026-09-20)。**
+ *
+ * 以前はここで BKL を持っているかだけを見て task_list を辿っていた。
+ * **BKL は task_list を守るロックではない** —— 守るのは g_task_lock で、
+ * 別の CPU が回収でノードを外すと巡回が壊れる。31429f9 で他の 6 か所を
+ * ロックの中へ移したとき、ここだけ残っていた (日報2026-09-19 §9-7)。
+ *
+ * 見つける・立てる・zombie にする・親に知らせるの間でロックを放さないので、
+ * その隙に相手が回収される窓も無くなる。 */
 int sys_kill(int pid, int sig) {
     struct task* current = get_current_task();
-    struct task* t = 0;
-    if (sig == 0) {
-        if (pid > 0) return find_task_by_pid_locked(pid) ? 0 : -LINUX_ESRCH;
-        return 0;
+
+    if (pid == 0) {
+        /* 自分自身。task_list を辿らないので、そのまま立てる */
+        if (!current) return -LINUX_ESRCH;
+        pid = current->pid;
     }
-    if (pid > 0) {
-        t = find_task_by_pid_locked(pid);
-    } else if (pid == 0 && current) {
-        t = current;
-    }
-    if (!t) return -LINUX_ESRCH;
-    task_signal_add_locked(t, sig);
-    if (sig == 2 || sig == 15 || sig == 9) {
-        task_mark_zombie(t, 128 + sig);
-        if (t->ppid > 0) {
-            struct task* parent = find_task_by_pid_locked(t->ppid);
-            if (parent) task_signal_add_locked(parent, LINUX_SIGCHLD);
-        }
-        return 0;
-    }
-    return 0;
+    if (pid <= 0) return 0;
+
+    /* 終わらせる種類かどうかは従来どおり (SIGINT / SIGTERM / SIGKILL) */
+    int terminate = (sig == 2 || sig == 15 || sig == 9);
+    int ret = task_signal_pid(pid, sig, terminate, 128 + sig, LINUX_SIGCHLD);
+    return (ret == 0) ? 0 : -LINUX_ESRCH;
 }
 
 int sys_getpgrp(void) {
@@ -108,10 +81,9 @@ int sys_setpgid(int pid, int pgid) {
     if (!current) return -LINUX_ESRCH;
     if (pid == 0) pid = current->pid;
     if (pgid == 0) pgid = pid;
-    target = find_task_by_pid_locked(pid);
-    if (!target) return -LINUX_ESRCH;
-    target->pgid = pgid;
-    return 0;
+    (void)target;
+    /* **巡回も書き換えもロックの中** (訳は sys_kill の上のコメント) */
+    return (task_set_pgid(pid, pgid) == 0) ? 0 : -LINUX_ESRCH;
 }
 
 int sys_setsid(void) {
