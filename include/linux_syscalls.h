@@ -117,6 +117,10 @@ struct linux_statfs {
 #define LINUX_SYS_GETRUSAGE        165
 #define LINUX_SYS_UMASK            166
 #define LINUX_SYS_SYSINFO          179
+/* generic ABI (aarch64 / riscv64) の番号。**x86_64 は別物** —— そちらは
+ * include/syscall.h の SYS_SCHED_YIELD (24) / SYS_KILL (62) が持つ */
+#define LINUX_SYS_SCHED_YIELD      124
+#define LINUX_SYS_KILL             129
 #define LINUX_SYS_GETPID           172
 #define LINUX_SYS_GETPPID          173
 #define LINUX_SYS_GETUID           174

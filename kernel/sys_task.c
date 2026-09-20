@@ -51,6 +51,15 @@ int sys_futex(volatile int* uaddr, int op, int val) {
 /* ---- set_tid_address ------------------------------------------------------
  * **場所は憶えない。**返すのは自分の tid だけ。current が 0 になるのは
  * カーネル内部の異常で、ここには来ない */
+/* **CPU を明け渡す。3 アーキ共通 (2026-09-20)。**
+ * 以前は kernel/x86_64/sys_time.c にあり、aarch64 / riscv64 では
+ * 番号が繋がっておらず ENOSYS だった (日報2026-09-19 §9-5)。
+ * 中身は kernel_yield() だけで、アーキに依るものが無い */
+int sys_sched_yield(void) {
+    kernel_yield();
+    return 0;
+}
+
 int sys_set_tid_address(int* tidptr) {
     struct task* current = get_current_task();
     (void)tidptr;

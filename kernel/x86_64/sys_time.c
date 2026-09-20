@@ -127,11 +127,6 @@ int sys_gettimeofday(struct linux_timeval* tv) {
     return 0;
 }
 
-int sys_sched_yield(void) {
-    kernel_yield();
-    return 0;
-}
-
 int sys_sleep_ms(uint64_t ms) {
     struct task* current = get_current_task();
     if (!current) return -LINUX_ESRCH;

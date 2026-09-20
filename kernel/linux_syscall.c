@@ -1065,6 +1065,17 @@ static void linux_bootstrap_syscall_dispatch(arch_syscall_frame_t* frame) {
         case LINUX_SYS_GETPID:
             arch_syscall_set_return(frame, sys_getpid());
             return;
+        case LINUX_SYS_SCHED_YIELD:
+            arch_syscall_set_return(frame, (uint64_t)(int64_t)sys_sched_yield());
+            return;
+        /* **kill も 3 アーキ共通にした (2026-09-20)。**実装は
+         * kernel/sys_proc.c にあり、task_list の巡回は kernel/task.c の
+         * task_signal_pid がロックの中でやる */
+        case LINUX_SYS_KILL:
+            arch_syscall_set_return(frame,
+                                    (uint64_t)(int64_t)sys_kill((int)arch_syscall_arg0(frame),
+                                                                (int)arch_syscall_arg1(frame)));
+            return;
         /* **機械のリセット。** 焼き直しのたびに電源を抜かなくて済むように
          * 入れた。Linux と同じで魔法の数を 2 つ揃えないと効かない —
          * **誤爆で機械が落ちるのが一番困る**ので、この検査は削らないこと。

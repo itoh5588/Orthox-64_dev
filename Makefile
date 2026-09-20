@@ -254,6 +254,7 @@ RISCV64_C_SRCS = kernel/riscv64/boot.c kernel/riscv64/bootstrap_user.c kernel/ri
 RISCV64_SHARED_C_SRCS = kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c \
 	kernel/linux_syscall.c kernel/sys_mmap.c kernel/vm_cow.c kernel/pmm_core.c kernel/sys_rlimit.c kernel/sys_uname.c \
 	kernel/sys_task.c kernel/sys_random.c kernel/sys_signal.c kernel/sys_iov.c \
+	kernel/sys_proc.c \
 	kernel/sys_access.c \
 	kernel/sys_lseek.c \
 	kernel/sys_tty.c \
@@ -430,6 +431,7 @@ AARCH64_SHARED_C_SRCS = kernel/usb.c \
 	kernel/fs.c kernel/elf.c kernel/task_exec.c kernel/task_fork.c \
 	kernel/linux_syscall.c kernel/sys_fs.c kernel/sys_mmap.c kernel/vm_cow.c kernel/pmm_core.c kernel/sys_rlimit.c \
 	kernel/sys_uname.c kernel/sys_task.c kernel/sys_random.c kernel/sys_signal.c \
+	kernel/sys_proc.c \
 	kernel/sys_iov.c kernel/sys_access.c kernel/sys_lseek.c kernel/sys_tty.c \
 	kernel/net.c kernel/net_socket.c kernel/lwip_port.c kernel/cstdlib.c
 AARCH64_ASM_SRCS = kernel/aarch64/start.S kernel/aarch64/vectors.S \
@@ -971,6 +973,27 @@ $(AARCH64_COWSTRESS_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
 	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
 		$(BUILD_DIR)/aarch64-musl/user/cowstress.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
 
+# sched_yield が通るかだけを見る試験 (user/yieldprobe.c)。番号が
+# x86_64 (24) と generic ABI (124) で違うので、繋ぎ忘れると ENOSYS になる
+AARCH64_YIELDPROBE_ELF = out/aarch64-yieldprobe.elf
+$(AARCH64_YIELDPROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/yieldprobe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/yieldprobe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-yieldprobe: $(AARCH64_YIELDPROBE_ELF)
+
+# sys_kill の試験 (user/killprobe.c)
+AARCH64_KILLPROBE_ELF = out/aarch64-killprobe.elf
+$(AARCH64_KILLPROBE_ELF): $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/killprobe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(AARCH64_MUSL_LDFLAGS) $(BUILD_DIR)/aarch64-musl/user/crt0.o \
+		$(BUILD_DIR)/aarch64-musl/user/killprobe.o $(AARCH64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+aarch64-killprobe: $(AARCH64_KILLPROBE_ELF)
+
 aarch64-cowstress: $(AARCH64_COWSTRESS_ELF)
 
 # fork の速さの計測 (user/forkbench.c)。3 アーキで同じソース
@@ -1279,6 +1302,14 @@ RISCV64_COWSTRESS_ELF = out/riscv64-cowstress.elf
 $(RISCV64_COWSTRESS_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/cowstress.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
 	@mkdir -p $(@D)
 	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/cowstress.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+# sched_yield が通るかだけを見る試験 (user/yieldprobe.c)。aarch64 と同じソース
+RISCV64_YIELDPROBE_ELF = out/riscv64-yieldprobe.elf
+$(RISCV64_YIELDPROBE_ELF): $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/yieldprobe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a
+	@mkdir -p $(@D)
+	$(LD) $(RISCV64_MUSL_LDFLAGS) $(BUILD_DIR)/riscv64-musl/user/crt0.o $(BUILD_DIR)/riscv64-musl/user/yieldprobe.o $(RISCV64_MUSL_SYSROOT)/lib/libc.a -o $@
+
+riscv64-yieldprobe: $(RISCV64_YIELDPROBE_ELF)
 
 # fork の速さの計測 (user/forkbench.c)。aarch64 と同じソース
 RISCV64_FORKBENCH_ELF = out/riscv64-forkbench.elf
