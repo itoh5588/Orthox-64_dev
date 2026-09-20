@@ -183,6 +183,24 @@ ISO = orthos.iso
 ROOTFS_IMG = rootfs.img
 XV6FS_IMG  = rootfs-xv6.img
 ROOTFS_FILES = $(shell find rootfs -type f 2>/dev/null)
+
+# **smoke 用の軽い rootfs (2026-09-20)。**ゲスト内カーネルビルドを使わない
+# x86 smoke 専用。狙いはブートの短縮 —— Limine は ISO を CD-ROM 経由で
+# 丸ごと読むので、**イメージの大きさがそのままブート時間になる**
+# (実測 約 6.4 MB/s。320MB で 53.6 秒、96MB で 16.1 秒)。
+# rootfs.img が 320MB あるのは /kbuild でのゲスト内ビルドの置き場のためで、
+# 材料の rootfs/ 自体は 60MB しかない。cowstress にはその余裕は要らない。
+#
+# ★ **その代わり /etc/bootcmd を空にする。**作りたてのイメージの /kbuild は
+# 空なので、bootcmd (native_kernel_build_smoke.sh) を残すとフルビルドが
+# 始まって 244 秒かかる (実測。rootfs.img 版は /kbuild が温まっていて 0.2 秒)。
+# user/sh.c の try_run_bootcmd は読めた長さが 0 なら何もせずに戻る。
+ROOTFS_LITE_IMG = rootfs-lite.img
+$(ROOTFS_LITE_IMG): $(ROOTFS_FILES)
+	XV6FS_FSSIZE=98304 python3 scripts/build_rootfs_xv6fs.py rootfs $(ROOTFS_LITE_IMG) | tail -3
+	@mkdir -p $(BUILD_DIR)
+	@: > $(BUILD_DIR)/empty-bootcmd
+	python3 scripts/build_rootfs_xv6fs.py --replace /etc/bootcmd $(BUILD_DIR)/empty-bootcmd $(ROOTFS_LITE_IMG)
 ROOTFS_REBUILD ?= 1
 ROOTFS_VBLK_ARGS = -drive if=none,id=rootfs,file=$(ROOTFS_IMG),format=raw -device virtio-blk-pci,drive=rootfs
 
@@ -1658,8 +1676,10 @@ x86-errno-smoke: $(KERNEL_ELF)
 	bash ./tests/x86_errno_smoke.sh
 
 # fork の CoW を 4 CPU で叩く (aarch64-cowstress-smoke / riscv64-cowstress-smoke の x86 版)。
-# cowstress は Limine のモジュールで渡すので rootfs.img は作り直さない
-x86-cowstress-smoke: $(KERNEL_ELF) $(COWSTRESS_ELF)
+# cowstress は Limine のモジュールで渡す。**rootfs は軽い方 (ROOTFS_LITE_IMG) を
+# 使う** —— ブートが 53.6 秒から 16 秒に縮む (訳は ROOTFS_LITE_IMG の定義)。
+# rootfs.img (320MB) には触らないので、/kbuild のキャッシュも消えない
+x86-cowstress-smoke: $(KERNEL_ELF) $(COWSTRESS_ELF) $(ROOTFS_LITE_IMG)
 	bash ./tests/x86_cowstress_smoke.sh
 
 # pipe / FIFO の端ごとの本数 (EOF は writers==0 / EPIPE は readers==0)。

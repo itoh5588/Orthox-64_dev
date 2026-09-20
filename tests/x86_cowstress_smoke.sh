@@ -9,8 +9,12 @@
 # aarch64 版は tests/aarch64_cowstress_smoke.sh、riscv64 版は
 # tests/riscv64_cowstress_smoke.sh。
 #
-# **rootfs.img は作り直さない。**作り直すと /kbuild が消え、ブート時の
-# bootcmd がフルビルドになる (Makefile の x86-*-smoke 手前のコメント)。
+# **rootfs は軽い方 (rootfs-lite.img) を使う (2026-09-20)。**Limine は ISO を
+# CD-ROM 経由で丸ごと読むので、イメージの大きさがそのままブート時間になる
+# (実測 約 6.4 MB/s)。320MB の rootfs.img だとブートだけで 53.6 秒かかるが、
+# 96MB の軽い方なら 16 秒で済む。**軽い方は /etc/bootcmd が空なので、
+# ゲスト内カーネルビルドは走らない** (cowstress には要らない。訳は Makefile の
+# ROOTFS_LITE_IMG の定義)。rootfs.img 自体には触らないので /kbuild も消えない。
 # cowstress は Limine のモジュールとして ISO に足し、カーネルがモジュールを
 # パスの末尾一致でファイルとして見せるのを使って /boot/cowstress.elf で
 # 起動する。ISO はここで組む (x86_kernel_smoke.sh と同じ手順)。
@@ -30,7 +34,7 @@ for tool in qemu-system-x86_64 xorriso; do
         exit 1
     fi
 done
-for f in kernel.elf user/sh.elf user/cowstress.elf rootfs.img iso/limine.conf; do
+for f in kernel.elf user/sh.elf user/cowstress.elf rootfs-lite.img iso/limine.conf; do
     if [ ! -f "$f" ]; then
         echo "missing $f" >&2
         exit 1
@@ -53,7 +57,7 @@ trap cleanup EXIT
 mkdir -p "$WORK/iso_root/boot/limine" "$WORK/iso_root/EFI/BOOT"
 cp kernel.elf "$WORK/iso_root/boot/kernel.elf"
 cp user/sh.elf "$WORK/iso_root/boot/sh.elf"
-cp rootfs.img "$WORK/iso_root/boot/rootfs.img"
+cp rootfs-lite.img "$WORK/iso_root/boot/rootfs.img"
 cp user/cowstress.elf "$WORK/iso_root/boot/cowstress.elf"
 # カーネルはモジュールを名前の末尾一致で探す (kernel/x86_64/init.c の
 # find_module_by_suffix) ので、足すだけで sh.elf / rootfs.img には響かない
@@ -70,8 +74,7 @@ xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
     -efi-boot-part --efi-boot-image --protective-msdos-label \
     "$WORK/iso_root" -o "$ISO" >/dev/null 2>&1
 
-# シェルへの入力。ブート時の bootcmd (OS 内のカーネルビルド) が終わるのを
-# ログで待ってから流す
+# シェルへの入力。シェルが起動するのをログで待ってから流す
 wait_log() {   # $1 = 拡張正規表現, $2 = 秒
     for _ in $(seq 1 "$2"); do
         if grep -aqE -- "$1" "$SERIAL_LOG" 2>/dev/null; then
@@ -82,7 +85,9 @@ wait_log() {   # $1 = 拡張正規表現, $2 = 秒
     return 1
 }
 (
-    wait_log "native-kernel-build-end" 120 || true
+    # **待つのはシェルの起動 (2026-09-20)。**軽い rootfs は /etc/bootcmd が
+    # 空でゲスト内ビルドを走らせないので、native-kernel-build-end は出ない
+    wait_log "Welcome to Orthox-64 Shell" 120 || true
     sleep 2
     printf '/boot/cowstress.elf 8 50\n'
     wait_log "cowstress: (PASS|FAIL)" 300 || true
