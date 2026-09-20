@@ -76,7 +76,6 @@ void    arch_random_fill(void* buf, size_t len);
 
 /* uname(2) が返す文字列 */
 const char* arch_uname_machine(void);
-const char* arch_uname_version(void);
 
 /* ユーザーのページテーブルを書き替えた後の TLB 破棄 (mmap / munmap / brk) */
 void arch_syscall_flush_tlb(void);

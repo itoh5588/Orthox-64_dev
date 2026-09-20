@@ -40,7 +40,6 @@ void arch_fs_refresh_size(file_descriptor_t* f) {
 }
 
 const char* arch_uname_machine(void) { return "aarch64"; }
-const char* arch_uname_version(void) { return "Orthox-64 aarch64"; }
 
 /* ユーザーのページテーブルを書き替えた後。**TTBR0 側だけで足りる**が、
  * ASID を使っていないので全部捨てている (日報の未実施表) */

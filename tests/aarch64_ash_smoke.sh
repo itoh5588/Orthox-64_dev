@@ -100,6 +100,11 @@ rm -f "$LOG"
     sleep 2
     # 組み込み applet (fork せずに済む経路)
     printf 'uname -m\n'
+    sleep 2
+    # **版の名乗り。**3 アーキで 1 組にそろえてある (include/version.h)。
+    # 2026-09-20 まで aarch64 / riscv64 は "Orthox-64 <isa>" を返しており、
+    # **版を上げても変わらなかった**ので、ここで見張る
+    printf 'uname -v\n'
     sleep 3
     # **外部 exec。** fork + execve でディスクの ELF を読む
     printf '/bin/echo external-exec-ok\n'
@@ -197,6 +202,7 @@ grep -aq "interactive-ok"  "$LOG"
 grep -aq "^/"              "$LOG"          # pwd
 grep -aq "val=42"          "$LOG"          # 変数展開
 grep -aq "^aarch64$"       "$LOG"          # uname -m
+grep -aq "^Orthox-64 kernel [0-9]" "$LOG"   # uname -v (版が入っていること)
 
 # fork + execve でディスクの ELF を読む
 grep -aq "external-exec-ok" "$LOG"

@@ -1,4 +1,4 @@
-#include "linux_syscall.h"   /* arch_uname_machine / arch_uname_version の宣言 */
+#include "linux_syscall.h"   /* arch_uname_machine の宣言 */
 #include "version.h"
 
 /* **x86 が uname で名乗る値。**
@@ -12,4 +12,3 @@
  * 値は変えていない。x86 の uname は今までどおり machine=x86_64 /
  * version=ORTHOX_KERNEL_VERSION を返す */
 const char* arch_uname_machine(void) { return "x86_64"; }
-const char* arch_uname_version(void) { return ORTHOX_KERNEL_VERSION; }

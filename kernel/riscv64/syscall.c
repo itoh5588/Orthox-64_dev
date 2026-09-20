@@ -32,7 +32,6 @@ void arch_fs_refresh_size(file_descriptor_t* f) {
 }
 
 const char* arch_uname_machine(void) { return "riscv64"; }
-const char* arch_uname_version(void) { return "Orthox-64 riscv64"; }
 
 /* 例外ハンドラ (trap.c) から呼ばれる名前。共有層へ渡すだけ */
 void riscv64_syscall_dispatch(arch_syscall_frame_t* frame) {

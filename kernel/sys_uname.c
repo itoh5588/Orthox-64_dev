@@ -22,7 +22,7 @@
 #include <stddef.h>
 #include "linux_abi.h"       /* struct linux_utsname */
 #include "linux_errno.h"
-#include "linux_syscall.h"   /* arch_uname_machine / arch_uname_version */
+#include "linux_syscall.h"   /* arch_uname_machine */
 #include "sys_internal.h"
 #include "version.h"
 
@@ -44,7 +44,12 @@ int sys_uname(struct linux_utsname* buf) {
     utsname_set(buf->sysname,    sizeof(buf->sysname),    ORTHOX_UNAME_SYSNAME);
     utsname_set(buf->nodename,   sizeof(buf->nodename),   ORTHOX_UNAME_NODENAME);
     utsname_set(buf->release,    sizeof(buf->release),    ORTHOX_KERNEL_RELEASE);
-    utsname_set(buf->version,    sizeof(buf->version),    arch_uname_version());
+    /* **version は共通 (2026-09-20)。**以前はアーキ側の arch_uname_version が
+     * 答えていて、x86 だけ ORTHOX_KERNEL_VERSION、aarch64 / riscv64 は
+     * "Orthox-64 <isa>" を返していた。**版番号が入っておらず、0.7.0 に
+     * 上げても uname -v が変わらなかった。**ISA は machine が答えるので、
+     * version に入れる理由も無い (include/version.h の「名乗りは 1 組だけ」) */
+    utsname_set(buf->version,    sizeof(buf->version),    ORTHOX_KERNEL_VERSION);
     utsname_set(buf->machine,    sizeof(buf->machine),    arch_uname_machine());
     utsname_set(buf->domainname, sizeof(buf->domainname), ORTHOX_UNAME_DOMAINNAME);
     return 0;

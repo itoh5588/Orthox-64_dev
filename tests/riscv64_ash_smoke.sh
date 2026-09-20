@@ -113,6 +113,9 @@ fi
     printf 'echo xargs-in | xargs echo\n'
     sleep 4
     printf 'uname -m\n'
+    sleep 2
+    # **版の名乗り。**訳は tests/aarch64_ash_smoke.sh の同じ所
+    printf 'uname -v\n'
     sleep 3
     # CONFIG_FEATURE_SH_MATH: 算術展開
     printf 'i=6; echo math=$((i*7+0))\n'
@@ -239,6 +242,7 @@ if [ -f "$ROOTFS_IMG" ]; then
     grep -aq "^/etc/motd$" "$SERIAL_LOG"       # realpath (readlinkat が EINVAL を返すこと)
     grep -aq "xargs-in" "$SERIAL_LOG"          # xargs = vfork + exec
     grep -aq "^riscv64$" "$SERIAL_LOG"         # uname -m
+    grep -aq "^Orthox-64 kernel [0-9]" "$SERIAL_LOG"  # uname -v (版が入っていること)
     grep -aq "math=42" "$SERIAL_LOG"           # $((...)) = FEATURE_SH_MATH
     grep -aq "subst=ab-ef" "$SERIAL_LOG"       # ${var/from/to} = ASH_BASH_COMPAT
     grep -aq "slice=cd" "$SERIAL_LOG"          # ${v:2:2} = ASH_BASH_COMPAT

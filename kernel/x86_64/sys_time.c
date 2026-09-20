@@ -6,7 +6,7 @@
 #include "arch_time.h"   /* arch_rtc_seconds */
 #include "version.h"
 #include "linux_errno.h"
-#include "linux_syscall.h"   /* arch_uname_machine / arch_uname_version */
+#include "linux_syscall.h"   /* arch_uname_machine */
 
 
 static inline void outb_u8(uint16_t port, uint8_t value) {
