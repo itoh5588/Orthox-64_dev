@@ -1,6 +1,6 @@
 # Orthox-64 (development repository)
 
-This is the **development snapshot** of Orthox-64. The book's reference implementation lives in a separate, frozen repository.
+This is the **development snapshot** of Orthox-64 (currently **v0.7.0**). The book's reference implementation lives in a separate, frozen repository.
 
 **Orthox-64 is a hobby operating system that compiles its own kernel from within itself** — using a GCC toolchain ported to run natively on the OS — and boots a real userland: Python 3.12 with NumPy, BusyBox, a TCP/IP stack with HTTPS, and DOOM. **It runs on three ISAs: x86-64, aarch64 and RISC-V (riscv64).**
 
@@ -21,7 +21,7 @@ Japanese main README: [README.md](README.md)
 - **Self-hosting:** Compiles and boots its own kernel entirely within the running OS, using a natively-ported GCC 4.7.4 / Binutils 2.26 toolchain (see the table above).
 - **Dynamic userland:** Full dynamic linking via musl's dynamic linker — `.so` loading, `dlopen`/`dlsym`, TLS, C++ runtime support. Python 3.12 imports and runs NumPy 1.26.4.
 - **Networking:** `virtio-net` + `lwIP` IPv4 stack (DHCP / DNS / ICMP / UDP / TCP / sockets), BusyBox `httpd`, and a BearSSL HTTPS client.
-- **SMP:** 4-CPU bring-up in QEMU, LAPIC timer, per-CPU run queue, validated blocking-wakeup paths.
+- **SMP:** 4-CPU bring-up on all three ISAs, per-CPU run queues, validated blocking-wakeup paths. **fork is copy-on-write on all three**, with the policy in shared code and the PTE/TLB work in the arch layer.
 - **DOOM** (`doomgeneric`) runs.
 
 ## Quick Start
@@ -78,6 +78,23 @@ fixed along the way. Notable examples:
 - x86's RTC (`clock_gettime(CLOCK_REALTIME)`) miscounted leap years and
   was off by one day on every non-leap year
 
+## Unifying Memory Management and Context Switching
+
+Following the syscall work, **fork's copy-on-write and the physical page allocator** also moved into shared code across the three ISAs. The split follows Linux: **policy in the shared layer, PTE manipulation and TLB invalidation in the arch layer**.
+
+- `kernel/vm_cow.c` — deciding which pages to share on fork, and resolving write faults
+- `kernel/pmm_core.c` — bitmap, refcounts, and the search. Each arch just hands over its ranges and where to keep the metadata
+
+Results (Raspberry Pi 4 hardware, median per fork, n=1000):
+
+| | copy every page | copy-on-write |
+|---|---|---|
+| fork → child exits immediately | 2.46 ms | **0.25 ms** |
+| fork → child exits (4 MB working set) | 11.18 ms | **0.61 ms** |
+| fork → parent writes later (same) | 11.23 ms | **1.13 ms** |
+
+Alongside this, a series of **bugs that only surfaced under repeated fork/exit on SMP** were tracked down and fixed: interrupts left enabled on the kernel-entry and trap-exit paths, `task_list` walked without the lock, zombies reaped before they had left their CPU, and a context-switch exit that cleared the trap flag (`TF`, bit 8) where it meant to clear the interrupt flag (`IF`, bit 9) — the last one causing a deadlock.
+
 ## Raspberry Pi 4 (aarch64) Port
 
 The kernel has been **ported to aarch64**. **On 15 August 2026 it booted on real Raspberry Pi 4 hardware for the first time**, and **on 23 August 2026 the self-hosting loop was closed on the real hardware.**
@@ -88,7 +105,7 @@ The kernel has been **ported to aarch64**. **On 15 August 2026 it booted on real
 
 Orthox running on a Raspberry Pi 4 **builds its own kernel from source and boots the result.**
 
-- The in-OS GCC 4.7.4 and Binutils compile and link the kernel — 41 C files and 5 assembly files, 24,227 lines — in **about 50 minutes**.
+- The in-OS GCC 4.7.4 and Binutils compile and link the kernel — 41 C files and 5 assembly files, 24,227 lines. It took **about 50 minutes** when this first worked (2026-08-23); with `-pipe` and a parallel build it now takes **46 seconds with `make -j4`** (measured 2026-09-19).
 - The resulting kernel boots: USB, the SD card, and the shell all come up.
 - **Building again under that kernel produces a byte-for-byte identical image** (217,088 bytes) — a **stable fixed point**, verified.
 
