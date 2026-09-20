@@ -189,10 +189,8 @@ static void pc_sample(uint32_t cpu, const struct task *t,
  * 親 2 人が wait4 で空回りしている一方、肝心の「終わらない子」は
  * 眠っていて 1 度も標本に出なかった。**眠っている者を見る手段が要る。**
  *
- * 60 秒ごとに task_list を舐めて pid / ppid / 状態 / 名前を出す。
- * 走査は BKL 下ではないので、**繋ぎ替えの最中に踏まないよう上限を置く**
- * (壊れたリストで無限に回るより、途中で切るほうがまし)。 */
-extern struct task* task_list;   /* kernel/task.c。他所と同じ形で引く */
+ * 60 秒ごとに pid / ppid / 状態 / 名前を出す。task のロックの中で写して
+ * (task_snapshot) からロックの外で出す。出すのは先頭の TASKS_MAX_SHOWN 個 */
 
 #define TASKS_MAX_SHOWN 24
 
@@ -217,24 +215,25 @@ void aarch64_pmm_scan_report(void);
 void xv6log_commit_report(void);
 
 static void tasks_report(void) {
-    struct task *t = task_list;
-    int n = 0;
+    /* ロックの中で写してから出す (task_snapshot)。以前はロック無しで
+     * task_list を辿り、壊れたリストで回らないよう上限だけ置いていた */
+    struct task_snapshot snap[TASKS_MAX_SHOWN];
+    int more = 0;
+    int n = task_snapshot(snap, TASKS_MAX_SHOWN, &more);
 
-    if (!t) return;
+    if (n == 0) return;
     aarch64_uart_puts("[tasks]");
-    while (t && n < TASKS_MAX_SHOWN) {
+    for (int i = 0; i < n; i++) {
         aarch64_uart_puts("  ");
-        aarch64_uart_putdec64((uint64_t)(int64_t)t->pid);
+        aarch64_uart_putdec64((uint64_t)(int64_t)snap[i].pid);
         aarch64_uart_puts("<");
-        aarch64_uart_putdec64((uint64_t)(int64_t)t->ppid);
+        aarch64_uart_putdec64((uint64_t)(int64_t)snap[i].ppid);
         aarch64_uart_puts(" ");
-        aarch64_uart_puts(task_state_name(t->state));
+        aarch64_uart_puts(task_state_name(snap[i].state));
         aarch64_uart_puts(" ");
-        aarch64_uart_puts(t->comm[0] ? t->comm : "?");
-        t = t->next;
-        n++;
+        aarch64_uart_puts(snap[i].comm[0] ? snap[i].comm : "?");
     }
-    if (t) aarch64_uart_puts("  ...");
+    if (more) aarch64_uart_puts("  ...");
     aarch64_uart_puts("\n");
 }
 

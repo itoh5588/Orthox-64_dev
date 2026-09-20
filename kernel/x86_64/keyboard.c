@@ -3,7 +3,6 @@
 #include "task.h"
 
 void puts(const char *s);
-extern struct task* task_list;
 
 #define KB_PORT 0x60
 #define KB_BUF_SIZE 256
@@ -82,16 +81,11 @@ static char keyboard_ascii_from_scancode(uint8_t code, uint8_t extended) {
 }
 
 static void send_sigint_to_foreground_pgrp(void) {
-    struct task* t = task_list;
     extern int sys_tcgetpgrp(int fd);
     int fg = sys_tcgetpgrp(0);
-    while (t) {
-        if (t->pgid == fg && t->pid != 1) {
-            t->sig_pending |= (1ULL << 2);
-            task_mark_zombie(t, 130);
-        }
-        t = t->next;
-    }
+    /* 巡回も zombie 化もロックの中 (task_kill_pgrp)。以前はここでロック
+     * 無しで task_list を辿っていた */
+    (void)task_kill_pgrp(fg, 1, 2, 130, 0, 0);
 }
 
 static void wake_kb_waiter(void) {

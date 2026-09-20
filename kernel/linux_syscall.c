@@ -23,7 +23,6 @@ static task_context_t* g_linux_fallback_current_context;
 extern int task_fork(arch_task_exec_frame_t* frame);
 extern int task_execve(arch_task_exec_frame_t* frame, const char* path,
                        char* const argv[], char* const envp[]);
-extern struct task* task_list;
 
 /* シグナル番号は include/linux_abi.h に出した (2026-09-09)。
  * **x86 側 (sys_proc.c) が SIGCHLD に 20 を使っていた**ので、置き場を
@@ -350,21 +349,16 @@ int linux_console_is_intr_char(uint8_t ch) {
  * 見失う。落とした pid を控えておいて、1 巡目が終わってから 2 巡目で
  * それぞれの子を片付ける。 */
 void linux_console_deliver_intr(uint8_t ch) {
-    struct task* t = task_list;
     int fg = tty_pgrp_peek();
     int sig = (ch == (uint8_t)g_console_termios.c_cc[1]) ? LINUX_SIGQUIT : LINUX_SIGINT;
     int victim_pids[64];
-    int nvictims = 0;
+    int nvictims;
     if (fg == 0) return;   /* まだ誰も TIOCSPGRP/TIOCGPGRP していない */
 
-    while (t) {
-        if (t->pgid == fg && t->pid != 1) {
-            t->sig_pending |= (1ULL << sig);
-            task_mark_zombie(t, 128 + sig);
-            if (nvictims < 64) victim_pids[nvictims++] = t->pid;
-        }
-        t = t->next;
-    }
+    /* 1 巡目はロックの中 (task_kill_pgrp)。以前はここでロック無しで
+     * task_list を辿っていた */
+    nvictims = task_kill_pgrp(fg, 1, sig, 128 + sig, victim_pids, 64);
+    if (nvictims > 64) nvictims = 64;
 
     for (int i = 0; i < nvictims; i++) {
         task_reap_orphans_of(victim_pids[i]);

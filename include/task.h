@@ -166,6 +166,15 @@ int task_get_runq_stats(struct orth_runq_stat* out, uint32_t max_count);
 struct cpu_local* get_cpu_local_by_id(uint32_t cpu_id);
 void task_finish_switch(void);
 struct task* task_find_zombie_child(int parent_pid, int pid, int* found_child);
+int task_kill_pgrp(int pgid, int exclude_pid, int sig, int exit_status,
+                   int* pids, int max);
+struct task_snapshot {
+    int pid;
+    int ppid;
+    task_state_t state;
+    char comm[16];
+};
+int task_snapshot(struct task_snapshot* out, int max, int* more);
 void task_bind_cpu_local(uint32_t cpu_id, struct task* current, struct task* idle,
                          uint64_t kernel_stack);
 void task_install_cpu_local(uint32_t cpu_id);

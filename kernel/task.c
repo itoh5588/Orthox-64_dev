@@ -826,20 +826,25 @@ int task_wake(struct task* t) {
  *
  * だったので、実装をここへ出して両方から呼ぶことにした。
  *
- * **ロックは取らない。**呼び手 (exit の途中) が task_list を歩く既存の作りに
- * 合わせてある。中で呼ぶ task_reap() は自分でロックを取る。 */
+ * **task_list はロックの中で辿る (2026-09-19)。**以前はロック無しで辿って
+ * おり、aarch64 / riscv64 の syscall は BKL を取らないので、別の hart の
+ * 回収でノードが外れて解放されると巡回が壊れた (wait4 と同じ穴。
+ * task_find_zombie_child の注記)。
+ *
+ * 生きている子はロックの中で pid 1 へ付け替える。zombie の子は 1 人ずつ
+ * ロックの中で見つけ、ロックの外で回収する (task_reap は降りきるまで待つ
+ * ので、ロックを持ったまま呼べない)。zombie になるのも task のロックの中
+ * なので、付け替えと取りこぼしは起きない */
 void task_reap_orphans_of(int pid) {
-    struct task* t = task_list;
-    while (t) {
-        struct task* next = t->next;
-        if (t->ppid == pid) {
-            if (t->state == TASK_ZOMBIE) {
-                (void)task_reap(t);
-            } else {
-                t->ppid = 1;
-            }
-        }
-        t = next;
+    uint64_t flags = spin_lock_irqsave(&g_task_lock);
+    for (struct task* t = task_list; t; t = t->next) {
+        if (t->ppid == pid && t->state != TASK_ZOMBIE) t->ppid = 1;
+    }
+    spin_unlock_irqrestore(&g_task_lock, flags);
+
+    for (;;) {
+        struct task* z = task_find_zombie_child(pid, -1, 0);
+        if (!z || task_reap(z) < 0) break;
     }
 }
 
@@ -866,17 +871,11 @@ static struct wait_queue g_child_exit_wq;
 
 struct task_child_wait { int ppid; int want; };
 
+/* 待ち行列のロックの中から呼ばれる。task のロックを取る順序
+ * (待ち行列 -> task) は wait_event が task_mark_io_wait を呼ぶのと同じ */
 static int task_child_zombie_ready(void* arg) {
     struct task_child_wait* w = (struct task_child_wait*)arg;
-    struct task* t = task_list;
-    while (t) {
-        if (t->ppid == w->ppid && (w->want == -1 || t->pid == w->want) &&
-            t->state == TASK_ZOMBIE) {
-            return 1;
-        }
-        t = t->next;
-    }
-    return 0;
+    return task_find_zombie_child(w->ppid, w->want, 0) != 0;
 }
 
 /* 子が終わった。**親を特定せずに全部起こす** —— 起こされた側は述語で
@@ -902,14 +901,64 @@ void task_wait_child_exit(int ppid, int want, uint64_t timeout_ms) {
  * は BKL を取らずに割り込みだけ開けて処理する (kernel/aarch64/usermode.c,
  * kernel/riscv64/trap.c) ので、そちらの経路で使うにはロック無しの版が要る。
  * exit の親探しはどちらの経路からも呼ばれるので、ロック無しのこちらを使う
- * (2026-09-13、別実装 29 組の exit/wait4 を畳んだときに用意した) */
+ * (2026-09-13、別実装 29 組の exit/wait4 を畳んだときに用意した)。
+ *
+ * **巡回は task のロックの中でする (2026-09-19)。**ロック無しだと、別の hart
+ * の回収でノードが外れて巡回が壊れる。返したポインタが生きている保証は
+ * 呼び手の側の事情による (exit の親探しなら、子が居る間は親は回収されない) */
 struct task* task_find_by_pid(int pid) {
-    struct task* t = task_list;
-    while (t) {
-        if (t->pid == pid) return t;
-        t = t->next;
+    struct task* found = 0;
+    uint64_t flags = spin_lock_irqsave(&g_task_lock);
+    for (struct task* t = task_list; t; t = t->next) {
+        if (t->pid == pid) {
+            found = t;
+            break;
+        }
     }
-    return 0;
+    spin_unlock_irqrestore(&g_task_lock, flags);
+    return found;
+}
+
+/* Ctrl-C / Ctrl-\ の配送。プロセスグループ pgid の全員 (exclude_pid を除く)
+ * に sig の保留を立てて zombie にする。落とした pid を pids に最大 max 個
+ * 入れ、全体の数を返す。**巡回も zombie 化もロックの中** (以前は各 arch の
+ * 呼び手がロック無しで task_list を辿っていた。task_find_zombie_child の注記) */
+int task_kill_pgrp(int pgid, int exclude_pid, int sig, int exit_status,
+                   int* pids, int max) {
+    int n = 0;
+    uint64_t flags = spin_lock_irqsave(&g_task_lock);
+    for (struct task* t = task_list; t; t = t->next) {
+        if (t->pgid != pgid || t->pid == exclude_pid) continue;
+        if (t->state == TASK_ZOMBIE || t->state == TASK_DEAD) continue;
+        t->sig_pending |= (1ULL << sig);
+        (void)task_mark_zombie_locked(t, exit_status);
+        if (pids && n < max) pids[n] = t->pid;
+        n++;
+    }
+    spin_unlock_irqrestore(&g_task_lock, flags);
+    return n;
+}
+
+/* 診断用。task_list の先頭から max 個をロックの中で写す。**出力はロックの
+ * 外で** (UART に出している間ずっと割り込みを止めないため)。*more には
+ * 写しきれなかったタスクが居たかを入れる */
+int task_snapshot(struct task_snapshot* out, int max, int* more) {
+    int n = 0;
+    uint64_t flags = spin_lock_irqsave(&g_task_lock);
+    struct task* t = task_list;
+    for (; t && n < max; t = t->next, n++) {
+        out[n].pid = t->pid;
+        out[n].ppid = t->ppid;
+        out[n].state = t->state;
+        for (int i = 0; i < (int)sizeof(out[n].comm) - 1; i++) {
+            out[n].comm[i] = t->comm[i];
+            if (!t->comm[i]) break;
+        }
+        out[n].comm[sizeof(out[n].comm) - 1] = 0;
+    }
+    if (more) *more = (t != 0);
+    spin_unlock_irqrestore(&g_task_lock, flags);
+    return n;
 }
 
 /* wait4 用。親 parent_pid の子 (pid が -1 なら誰でも) を探し、zombie が
@@ -953,6 +1002,8 @@ struct task* task_find_zombie_child(int parent_pid, int pid, int* found_child) {
  * zombie は必ずすぐ降りる (sys_exit は kernel_yield を回し、走らせるものが
  * 無ければ idle へ切り替わる) ので、待つのは切り替え 1 回ぶん。
  * **ロックの外で待つ。**降りる側の schedule() が同じロックを取る */
+/* ★一時的な計器 (2026-09-20)。on_cpu が落ちない相手と、そのとき各 CPU が
+ * 何を載せているかを吐く。原因が分かったら消す */
 int task_reap(struct task* t) {
     int ret;
     uint64_t flags;
