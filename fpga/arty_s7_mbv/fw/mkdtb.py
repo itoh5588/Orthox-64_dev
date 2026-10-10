@@ -12,6 +12,7 @@ CPU_HZ = 50_000_000
 DDR_BASE, DDR_SIZE = 0x80000000, 0x10000000
 UART_BASE, UART_SIZE = 0x40600000, 0x10000
 INTC_BASE, INTC_SIZE = 0x41200000, 0x10000
+SD_BASE, SD_SIZE = 0x40800000, 0x10000
 INTC_PHANDLE = 1
 
 
@@ -65,6 +66,10 @@ TREE = ("", [
             ("#interrupt-cells", u32(2)),
             ("xlnx,num-intr-inputs", u32(2)),
             ("phandle", u32(INTC_PHANDLE)),
+        ], []),
+        ("sd@40800000", [                       # rtl/sd_axi.vhd, Pmod JD
+            ("compatible", s("orthox,sd-spi-axi")),
+            ("reg", reg64(SD_BASE, SD_SIZE)),
         ], []),
         ("serial@40600000", [
             ("compatible", s("xlnx,xps-uartlite-1.00.a")),
@@ -123,6 +128,10 @@ if __name__ == "__main__":
     out = sys.argv[1] if len(sys.argv) > 1 else "board.dtb"
     # NO_WFI=1 adds orthox,no-wfi for a bitstream whose WFI never returns
     # (MicroBlaze V with Wakeup tied low; build.tcl now ties it high).
+    # SD_INSTALL=1 makes Orthox copy the initrd onto the SD card (LBA 0 on)
+    # before mounting it. This overwrites the card.
+    if os.environ.get("SD_INSTALL") == "1":
+        TREE[2][0][1].append(("orthox,sd-install-initrd", b""))
     if os.environ.get("NO_WFI") == "1":
         TREE[2][1][2][0][1].append(("orthox,no-wfi", b""))
     if len(sys.argv) == 4:
