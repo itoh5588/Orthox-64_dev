@@ -1,0 +1,53 @@
+
+fw: Orthox MicroBlaze V firmware
+  misa   : 0x800000000014112d
+  mimpid : 0x0000000000000001
+  time   : 0x00000000091b4f6d
+  time+  : 0x00000000091b4f89
+  menvcfg: 0x0000000000000000
+  medeleg: 0x000000000000b1ff
+  mideleg: 0x0000000000000220
+  dtb    : 0x0000000000000428
+  kernel : 0x0000000080200000
+  bss    : 0x0000000080220000
+fw: entering S-m
+Orthox riscv64 early boot
+  hart: 0x0000000000000000
+  dtb : 0x0000000000000428
+  dtb size: 0x000000000000033f
+  uart   : 0x0000000040600000 (uartlite)
+  timebase: 0x0000000002faf080
+  memory : 0x0000000080000000..0x0000000090000000
+  vm activate: 0x0000000080760000
+    text->phys: 0x0000000080200000
+    sp  ->phys: 0x00000000806efc50
+    uart->phys: 0x0000000040600000
+  sv39 satp enabled
+  sv39 root: 0x0000000080760000
+  kernel: 0x0000000080200000..0x0000000080760000
+  vm selftest passed
+  vm clone selftest passed
+  user stack selftest passed
+  user frame selftest passed
+  user frame sync selftest passed
+  trap vector installed
+  sbi timer armed
+  plic: none, console rx polled on timer
+Task system initialized.
+  virtio-blk (mmio): not in dtb
+SOK
+  syscall dispatch selftest passed
+  fs syscall selftest passed
+riscv64 supervisor timer interrupt
+  user map selftest passed
+  fork selftest passed
+[smp] cpus detected: 0x0000000000000001
+[smp] cpus online: 0x0000000000000001
+  enter user ctx root: 0x0000000080803000
+  enter user kernel : 0xriscv64 timer interrupt after user handoff
+0000000080760000
+riscv64 user hello
+pid: 0x0000000000000001
+cwd: /
+riscv64 user done
+  bootstrap user exit
