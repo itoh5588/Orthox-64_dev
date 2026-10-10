@@ -25,7 +25,11 @@ log="$here/build/uart.log"
 : > "$log"
 timeout "$secs" cat /dev/ttyUSB1 > "$log" &
 cat_pid=$!
-xsdb "$here/run.tcl" "${BIT:-$here/../build/mbv_soc.bit}" "$here/build/fw.elf" "$kernel" \
+if [ -z "${BIT:-}" ]; then
+    BIT=$here/../build/mbv_soc_fw.bit
+    [ -f "$BIT" ] || BIT=$here/../build/mbv_soc.bit
+fi
+xsdb "$here/run.tcl" "$BIT" "$here/build/fw.elf" "$kernel" \
     "$bss_start" "$bss_end" "$zs" "$ze" "$rootfs" "${INITRD_START:-}" 2>&1 | grep -E '^(fw|kernel|bss|rootfs|running)|rror'
 if [ -n "$input" ]; then
     sleep "${INPUT_DELAY:-20}"

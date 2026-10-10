@@ -47,7 +47,9 @@ struct fw_frame {
 extern const char fw_dtb[], fw_dtb_end[];
 
 /* Kernel .bss range, written by the JTAG loader (run.tcl) after loading the
- * ELF; the loader does not clear NOBITS sections. 0..0 means nothing to do. */
+ * ELF; the loader does not clear NOBITS sections. It also tells us a kernel
+ * is there: when the firmware starts from the bitstream's BRAM contents
+ * (power-on, no JTAG) it is still 0 and DDR holds no kernel. */
 volatile uint64_t fw_zero_start __attribute__((section(".data"))) = 0;
 volatile uint64_t fw_zero_end __attribute__((section(".data"))) = 0;
 
@@ -191,6 +193,11 @@ void fw_main(void) {
     putkv("  mideleg: ", csr_read(mideleg));
     putkv("  dtb    : ", (uint64_t)(uintptr_t)fw_dtb);
     putkv("  kernel : ", KERNEL_ENTRY);
+    if (fw_zero_end == 0) {
+        puts("fw: no kernel loaded; load one over JTAG (fw/run.sh)\n");
+        for (;;) {
+        }
+    }
     if (fw_zero_end > fw_zero_start) {
         putkv("  bss    : ", fw_zero_start);
         for (uint64_t p = fw_zero_start; p < fw_zero_end; p += 8) *(volatile uint64_t*)p = 0;

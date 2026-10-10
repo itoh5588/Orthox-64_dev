@@ -26,6 +26,8 @@ The design places boot BRAM at `0x00000000`, 256 MiB DDR3 at `0x80000000`, and U
 fw/run.sh ../../out/kernel-riscv64-ash.elf 300 ../../out/rootfs-riscv64-ram.img [input.txt]
 ```
 
+`fw/embed.sh` puts the firmware into the boot BRAM contents of the bitstream with `updatemem` (using the `build/mbv_soc.mmi` that `build.tcl` writes) and produces `build/mbv_soc_fw.bit`. With it the firmware starts by itself after configuration and waits when no kernel has been loaded; `fw/run.sh` uses this bitstream when it exists (override with `BIT=`).
+
 A JTAG load of an 8 MiB image takes about 75 s. `xsdb` does not clear `.bss`, so the firmware clears the range the loader writes into `fw_zero_start`/`fw_zero_end`.
 
 `build.tcl` sets `C_USE_SLEEP=1` and ties the CPU `Wakeup` inputs high. With `Wakeup` low, WFI never returns and the hart cannot be halted from the debugger. Setting `NO_WFI=1` when building the firmware adds `orthox,no-wfi` to the device tree, which makes Orthox avoid WFI on older bitstreams.

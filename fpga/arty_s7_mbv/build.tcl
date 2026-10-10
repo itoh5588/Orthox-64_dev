@@ -145,4 +145,6 @@ report_timing_summary -file [file join $build_dir route_timing.rpt]
 report_drc -file [file join $build_dir route_drc.rpt]
 report_clock_networks -file [file join $build_dir route_clocks.rpt]
 write_bitstream -force [file join $build_dir mbv_soc.bit]
+# BRAM layout for updatemem (fw/embed.sh puts the firmware into the bitstream).
+write_mem_info -force [file join $build_dir mbv_soc.mmi]
 close_project
