@@ -338,7 +338,7 @@ void riscv64_vm_activate_address_space(uint64_t root_pa) {
         riscv64_uart_puthex64(riscv64_vm_get_phys(root_pa, sp));
         riscv64_uart_puts("\n");
         riscv64_uart_puts("    uart->phys: 0x");
-        riscv64_uart_puthex64(riscv64_vm_get_phys(root_pa, RISCV64_QEMU_VIRT_UART0_BASE));
+        riscv64_uart_puthex64(riscv64_vm_get_phys(root_pa, riscv64_boot_info()->uart_base));
         riscv64_uart_puts("\n");
     }
 #else
@@ -392,8 +392,8 @@ void riscv64_vm_init(void) {
                          RISCV64_VM_PAGE_R | RISCV64_VM_PAGE_W | RISCV64_VM_PAGE_G);
 
     riscv64_vm_map_range(g_riscv64_kernel_root_pa,
-                         RISCV64_QEMU_VIRT_UART0_BASE,
-                         RISCV64_QEMU_VIRT_UART0_BASE,
+                         boot->uart_base,
+                         boot->uart_base,
                          RISCV64_PAGE_SIZE,
                          RISCV64_VM_PAGE_R | RISCV64_VM_PAGE_W | RISCV64_VM_PAGE_G);
     riscv64_vm_map_range(g_riscv64_kernel_root_pa,
@@ -406,6 +406,14 @@ void riscv64_vm_init(void) {
                          RISCV64_QEMU_VIRT_PLIC_BASE,
                          0x400000ULL,
                          RISCV64_VM_PAGE_R | RISCV64_VM_PAGE_W | RISCV64_VM_PAGE_G);
+
+    if (boot && boot->intc_base) {
+        riscv64_vm_map_range(g_riscv64_kernel_root_pa,
+                             boot->intc_base,
+                             boot->intc_base,
+                             RISCV64_PAGE_SIZE,
+                             RISCV64_VM_PAGE_R | RISCV64_VM_PAGE_W | RISCV64_VM_PAGE_G);
+    }
 
     if (boot && boot->dtb_pa && boot->dtb_size) {
         riscv64_vm_map_range(g_riscv64_kernel_root_pa,

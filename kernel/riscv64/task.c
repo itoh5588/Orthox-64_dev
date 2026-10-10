@@ -113,7 +113,7 @@ void riscv64_task_enter_initial_user_context(const struct arch_task_context* ctx
     uint64_t kernel_sp;
     if (!ctx) {
         for (;;) {
-            __asm__ volatile("wfi");
+            riscv64_wfi();
         }
     }
     root_pa = ctx->root_pa;

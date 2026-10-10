@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include "riscv64/csr.h"
+#include "riscv64/axi_intc.h"
 #include "riscv64/boot.h"
 #include "riscv64/plic.h"
 #include "riscv64/sbi.h"
@@ -32,7 +33,8 @@ static struct riscv64_trap_scratch* riscv64_trap_scratch_self(void) {
     return &g_riscv64_trap_scratch[hart];
 }
 
-static uint64_t g_riscv64_timer_interval = 1000000ULL;
+/* 0 のときは最初の arm で timebase の 1/10 (100ms) に決める */
+static uint64_t g_riscv64_timer_interval;
 static uint64_t g_riscv64_timer_ticks;
 static uint64_t g_riscv64_last_timer_deadline;
 /*
@@ -61,7 +63,9 @@ static void riscv64_trap_rearm_current_kernel_stack(void) {
 /* 戻り値は SBI のエラー。全 hart が呼ぶのでグローバルに溜めず呼び出し元へ返す */
 static long riscv64_timer_arm_next(void) {
     uint64_t now = riscv64_read_time();
-    uint64_t deadline = now + g_riscv64_timer_interval;
+    uint64_t deadline;
+    if (g_riscv64_timer_interval == 0) g_riscv64_timer_interval = riscv64_timebase_hz() / 10ULL;
+    deadline = now + g_riscv64_timer_interval;
     riscv64_sbi_ret_t ret = riscv64_sbi_set_timer(deadline);
     g_riscv64_last_timer_deadline = deadline;
     return ret.error;
@@ -192,6 +196,20 @@ void riscv64_trap_dispatch(riscv64_trap_frame_t* frame) {
         return;
     }
 
+    if (frame->scause == RISCV64_SCAUSE_SEXT && !riscv64_has_plic()) {
+        riscv64_axi_intc_handle();
+        if (riscv64_log_once(&g_riscv64_logged_first_uart_irq)) {
+            riscv64_uart_puts("riscv64 axi intc interrupt\n");
+        }
+        if ((frame->sstatus & RISCV64_SSTATUS_SPP) == 0 && !kernel_lock_held()) {
+            if (task_consume_resched()) {
+                kernel_yield();
+            }
+        }
+        riscv64_trap_rearm_current_kernel_stack();
+        return;
+    }
+
     if (frame->scause == RISCV64_SCAUSE_SEXT) {
         /* PLIC から 1 件受け取って処理し、完了を返す。
          * claim が 0 を返すのは他 hart に取られた場合 (何もしないのが正しい) */
@@ -228,6 +246,11 @@ void riscv64_trap_dispatch(riscv64_trap_frame_t* frame) {
     if (frame->scause == RISCV64_SCAUSE_STIMER) {
         __atomic_fetch_add(&g_riscv64_timer_ticks, 1ULL, __ATOMIC_RELAXED);
         (void)riscv64_timer_arm_next();
+        /* 外部割り込みコントローラの無い基板では UART 受信割り込みが来ないので、
+         * ここで拾う。PLIC / AXI INTC がある基板ではやらない (故障を隠すため) */
+        if (!riscv64_has_plic() && !riscv64_has_axi_intc() && riscv64_current_hart_index() == 0) {
+            riscv64_console_poll_input();
+        }
         riscv64_handle_timer_interrupt();
         if (riscv64_log_once(&g_riscv64_logged_first_timer)) {
             riscv64_uart_puts("riscv64 supervisor timer interrupt\n");

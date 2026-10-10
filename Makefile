@@ -250,7 +250,7 @@ SRCS = $(X86_64_SRCS) $(SYSCALL_SRCS) $(CORE_SRCS)
 RISCV64_C_SRCS = kernel/riscv64/boot.c kernel/riscv64/bootstrap_user.c kernel/riscv64/elf.c \
 	kernel/riscv64/entry.c kernel/riscv64/fs.c kernel/riscv64/net_socket.c kernel/riscv64/plic.c kernel/riscv64/pmm.c \
 	kernel/riscv64/runtime.c kernel/riscv64/smp.c kernel/riscv64/task.c kernel/riscv64/trap.c kernel/riscv64/syscall.c \
-	kernel/riscv64/virtio_blk_mmio.c kernel/riscv64/vm.c
+	kernel/riscv64/axi_intc.c kernel/riscv64/ramdisk.c kernel/riscv64/virtio_blk_mmio.c kernel/riscv64/vm.c
 RISCV64_SHARED_C_SRCS = kernel/task.c kernel/task_exec.c kernel/task_fork.c kernel/sched.c \
 	kernel/linux_syscall.c kernel/sys_mmap.c kernel/vm_cow.c kernel/pmm_core.c kernel/sys_rlimit.c kernel/sys_uname.c \
 	kernel/sys_task.c kernel/sys_random.c kernel/sys_signal.c kernel/sys_iov.c \

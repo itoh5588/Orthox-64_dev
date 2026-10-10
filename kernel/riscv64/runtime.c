@@ -37,10 +37,11 @@ void net_poll(void) {
 
 uint64_t arch_time_now_ms(void) {
     /*
-     * QEMU virt/OpenSBI exposes the platform timer at 10 MHz.
+     * The time CSR rate comes from /cpus/timebase-frequency (10 MHz on QEMU
+     * virt, the 50 MHz CPU clock on the Arty S7 MicroBlaze V).
      * Bootstrap and smoke only need a monotonic millisecond clock.
      */
-    return riscv64_read_time() / 10000ULL;
+    return riscv64_read_time() / (riscv64_timebase_hz() / 1000ULL);
 }
 
 uint64_t arch_time_cpu_ms(uint32_t cpu_id) {
@@ -285,7 +286,7 @@ void kernel_panic(const char* file, int line, const char* func, const char* expr
     puthex((uint64_t)(uint32_t)line);
     puts("\r\nHALTING...\r\n");
     for (;;) {
-        __asm__ volatile("wfi" ::: "memory");
+        riscv64_wfi();
     }
 }
 

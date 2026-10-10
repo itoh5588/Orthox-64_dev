@@ -5,7 +5,9 @@
 #include "riscv64/dtb.h"
 #include "riscv64/elf.h"
 #include "riscv64/entry.h"
+#include "riscv64/axi_intc.h"
 #include "riscv64/plic.h"
+#include "riscv64/ramdisk.h"
 #include "linux_syscalls.h"
 #include "riscv64/syscall.h"
 #include "riscv64/task.h"
@@ -28,6 +30,7 @@ extern void task_main(void);
 
 static volatile riscv64_boot_info_t g_riscv64_boot_info;
 static volatile int g_riscv64_user_handoff_started;
+volatile int g_riscv64_no_wfi;
 
 #ifndef RISCV64_BOOTSTRAP_ARG0
 #define RISCV64_BOOTSTRAP_ARG0 "pwd"
@@ -84,8 +87,26 @@ static uint64_t riscv64_boot_stack_top(void) {
 #define RISCV64_UART_LSR_RX_READY    0x01U
 #define RISCV64_UART_LSR_TX_IDLE     0x20U
 
+/* AXI UART Lite: 32 ビットレジスタ。ボーレートは合成時に固定 (115200) */
+#define RISCV64_UARTLITE_RX     0x0U
+#define RISCV64_UARTLITE_TX     0x4U
+#define RISCV64_UARTLITE_STAT   0x8U
+#define RISCV64_UARTLITE_CTRL   0xCU
+#define RISCV64_UARTLITE_STAT_RX_VALID 0x01U
+#define RISCV64_UARTLITE_STAT_TX_FULL  0x08U
+#define RISCV64_UARTLITE_CTRL_RST_FIFOS 0x03U
+#define RISCV64_UARTLITE_CTRL_INTR_EN   0x10U
+
+static inline volatile uint32_t* riscv64_uartlite_reg(uint32_t off) {
+    return (volatile uint32_t*)(uintptr_t)(g_riscv64_boot_info.uart_base + off);
+}
+
+static inline int riscv64_uart_is_uartlite(void) {
+    return g_riscv64_boot_info.uart_kind == RISCV64_UART_KIND_UARTLITE;
+}
+
 static inline volatile uint8_t* riscv64_uart0_regs(void) {
-    return (volatile uint8_t*)(uintptr_t)RISCV64_QEMU_VIRT_UART0_BASE;
+    return (volatile uint8_t*)(uintptr_t)g_riscv64_boot_info.uart_base;
 }
 
 static uint32_t riscv64_align_up4(uint32_t value) {
@@ -140,7 +161,11 @@ static void riscv64_dtb_scan(uint64_t dtb_pa) {
     uint32_t off = 0;
     int depth = 0;
     int candidate_uart = 0;
+    uint32_t candidate_uart_kind = RISCV64_UART_KIND_NS16550;
     int candidate_virtio = 0;
+    int candidate_intc = 0;
+    int candidate_has_irq = 0;
+    uint32_t candidate_irq = 0;
     int candidate_memory = 0;
     uint64_t candidate_reg = 0;
     uint64_t candidate_size = 0;
@@ -165,6 +190,8 @@ static void riscv64_dtb_scan(uint64_t dtb_pa) {
             depth++;
             candidate_uart = 0;
             candidate_virtio = 0;
+            candidate_intc = 0;
+            candidate_has_irq = 0;
             candidate_memory = 0;
             candidate_reg = 0;
             candidate_size = 0;
@@ -175,7 +202,16 @@ static void riscv64_dtb_scan(uint64_t dtb_pa) {
         if (token == RISCV64_FDT_END_NODE) {
             if (candidate_uart && candidate_reg != 0) {
                 g_riscv64_boot_info.uart_base = candidate_reg;
+                g_riscv64_boot_info.uart_kind = candidate_uart_kind;
                 g_riscv64_boot_info.flags |= RISCV64_BOOT_FLAG_UART_FROM_DTB;
+                if (candidate_has_irq) {
+                    g_riscv64_boot_info.uart_irq = candidate_irq;
+                    g_riscv64_boot_info.flags |= RISCV64_BOOT_FLAG_UART_IRQ;
+                }
+            }
+            if (candidate_intc && candidate_reg != 0) {
+                g_riscv64_boot_info.intc_base = candidate_reg;
+                g_riscv64_boot_info.flags |= RISCV64_BOOT_FLAG_INTC_FOUND;
             }
             if (candidate_virtio && candidate_reg != 0) {
                 if (g_riscv64_boot_info.first_virtio_mmio_base == 0) {
@@ -192,6 +228,8 @@ static void riscv64_dtb_scan(uint64_t dtb_pa) {
             if (depth > 0) depth--;
             candidate_uart = 0;
             candidate_virtio = 0;
+            candidate_intc = 0;
+            candidate_has_irq = 0;
             candidate_memory = 0;
             candidate_reg = 0;
             candidate_size = 0;
@@ -215,6 +253,18 @@ static void riscv64_dtb_scan(uint64_t dtb_pa) {
                 if (riscv64_dtb_compatible_has((const char*)data, len, "ns16550a") ||
                     riscv64_dtb_compatible_has((const char*)data, len, "ns16550")) {
                     candidate_uart = 1;
+                    candidate_uart_kind = RISCV64_UART_KIND_NS16550;
+                }
+                if (riscv64_dtb_compatible_has((const char*)data, len, "xlnx,xps-uartlite-1.00.a")) {
+                    candidate_uart = 1;
+                    candidate_uart_kind = RISCV64_UART_KIND_UARTLITE;
+                }
+                if (riscv64_dtb_compatible_has((const char*)data, len, "xlnx,xps-intc-1.00.a")) {
+                    candidate_intc = 1;
+                }
+                if (riscv64_dtb_compatible_has((const char*)data, len, "riscv,plic0") ||
+                    riscv64_dtb_compatible_has((const char*)data, len, "sifive,plic-1.0.0")) {
+                    g_riscv64_boot_info.flags |= RISCV64_BOOT_FLAG_PLIC_FOUND;
                 }
                 if (riscv64_dtb_compatible_has((const char*)data, len, "virtio,mmio")) {
                     candidate_virtio = 1;
@@ -223,6 +273,21 @@ static void riscv64_dtb_scan(uint64_t dtb_pa) {
                 if (len >= 7U && riscv64_str_eq((const char*)data, "memory")) {
                     candidate_memory = 1;
                 }
+            } else if (depth >= 1 && riscv64_str_eq(prop_name, "interrupts") && len >= 4U) {
+                /* 最初のセルが入力番号 (QEMU の PLIC も AXI INTC も同じ) */
+                candidate_irq = riscv64_dtb_read_be32(data);
+                candidate_has_irq = 1;
+            } else if (depth >= 1 && riscv64_str_eq(prop_name, "orthox,no-wfi")) {
+                g_riscv64_no_wfi = 1;
+            } else if (depth >= 1 && riscv64_str_eq(prop_name, "linux,initrd-start")) {
+                g_riscv64_boot_info.initrd_start =
+                    len >= 8U ? riscv64_dtb_read_be64(data) : riscv64_dtb_read_be32(data);
+            } else if (depth >= 1 && riscv64_str_eq(prop_name, "linux,initrd-end")) {
+                g_riscv64_boot_info.initrd_end =
+                    len >= 8U ? riscv64_dtb_read_be64(data) : riscv64_dtb_read_be32(data);
+            } else if (depth >= 1 && riscv64_str_eq(prop_name, "timebase-frequency")) {
+                if (len >= 8U) g_riscv64_boot_info.timebase_hz = riscv64_dtb_read_be64(data);
+                else if (len >= 4U) g_riscv64_boot_info.timebase_hz = riscv64_dtb_read_be32(data);
             } else if (depth >= 1 && riscv64_str_eq(prop_name, "reg")) {
                 candidate_reg = riscv64_dtb_reg_base(data, len);
                 candidate_size = riscv64_dtb_reg_size(data, len);
@@ -276,6 +341,12 @@ void riscv64_boot_capture(uint64_t hart_id, uint64_t dtb_pa) {
     g_riscv64_boot_info.memory_base = 0;
     g_riscv64_boot_info.memory_size = 0;
     g_riscv64_boot_info.uart_base = RISCV64_QEMU_VIRT_UART0_BASE;
+    g_riscv64_boot_info.uart_kind = RISCV64_UART_KIND_NS16550;
+    g_riscv64_boot_info.timebase_hz = RISCV64_QEMU_VIRT_TIMEBASE_HZ;
+    g_riscv64_boot_info.initrd_start = 0;
+    g_riscv64_boot_info.initrd_end = 0;
+    g_riscv64_boot_info.intc_base = 0;
+    g_riscv64_boot_info.uart_irq = 0;
     g_riscv64_boot_info.first_virtio_mmio_base = 0;
     g_riscv64_boot_info.dtb_size = riscv64_dtb_total_size(dtb_pa);
     g_riscv64_boot_info.virtio_mmio_count = 0;
@@ -290,6 +361,20 @@ const riscv64_boot_info_t* riscv64_boot_info(void) {
     return (const riscv64_boot_info_t*)&g_riscv64_boot_info;
 }
 
+uint64_t riscv64_timebase_hz(void) {
+    uint64_t hz = g_riscv64_boot_info.timebase_hz;
+    return hz ? hz : RISCV64_QEMU_VIRT_TIMEBASE_HZ;
+}
+
+int riscv64_has_plic(void) {
+    return (g_riscv64_boot_info.flags & RISCV64_BOOT_FLAG_PLIC_FOUND) != 0;
+}
+
+int riscv64_has_axi_intc(void) {
+    uint32_t need = RISCV64_BOOT_FLAG_INTC_FOUND | RISCV64_BOOT_FLAG_UART_IRQ;
+    return (g_riscv64_boot_info.flags & need) == need;
+}
+
 void riscv64_mark_user_handoff_started(void) {
     g_riscv64_user_handoff_started = 1;
 }
@@ -301,6 +386,11 @@ int riscv64_user_handoff_started(void) {
 void riscv64_uart_init(void) {
     volatile uint8_t* uart = riscv64_uart0_regs();
 
+    if (riscv64_uart_is_uartlite()) {
+        *riscv64_uartlite_reg(RISCV64_UARTLITE_CTRL) = RISCV64_UARTLITE_CTRL_RST_FIFOS;
+        g_riscv64_boot_info.flags |= RISCV64_BOOT_FLAG_UART_READY;
+        return;
+    }
     uart[RISCV64_UART_IER] = 0x00U;
     uart[RISCV64_UART_LCR] = RISCV64_UART_LCR_DLAB;
     uart[RISCV64_UART_RHR] = 0x03U;
@@ -313,6 +403,12 @@ void riscv64_uart_init(void) {
 
 void riscv64_uart_putchar(char ch) {
     volatile uint8_t* uart = riscv64_uart0_regs();
+    if (riscv64_uart_is_uartlite()) {
+        while (*riscv64_uartlite_reg(RISCV64_UARTLITE_STAT) & RISCV64_UARTLITE_STAT_TX_FULL) {
+        }
+        *riscv64_uartlite_reg(RISCV64_UARTLITE_TX) = (uint8_t)ch;
+        return;
+    }
     while ((uart[RISCV64_UART_LSR] & RISCV64_UART_LSR_TX_IDLE) == 0) {
     }
     uart[RISCV64_UART_THR] = (uint8_t)ch;
@@ -321,11 +417,19 @@ void riscv64_uart_putchar(char ch) {
 /* 受信割り込み (ERBFI) を有効にする。PLIC 側の有効化とセットで意味を持つ */
 void riscv64_uart_enable_rx_interrupt(void) {
     volatile uint8_t* uart = riscv64_uart0_regs();
+    if (riscv64_uart_is_uartlite()) {
+        *riscv64_uartlite_reg(RISCV64_UARTLITE_CTRL) = RISCV64_UARTLITE_CTRL_INTR_EN;
+        return;
+    }
     uart[RISCV64_UART_IER] |= 0x01U;
 }
 
 int riscv64_uart_getchar_nonblock(void) {
     volatile uint8_t* uart = riscv64_uart0_regs();
+    if (riscv64_uart_is_uartlite()) {
+        if ((*riscv64_uartlite_reg(RISCV64_UARTLITE_STAT) & RISCV64_UARTLITE_STAT_RX_VALID) == 0) return -1;
+        return (int)(*riscv64_uartlite_reg(RISCV64_UARTLITE_RX) & 0xffU);
+    }
     if ((uart[RISCV64_UART_LSR] & RISCV64_UART_LSR_RX_READY) == 0) return -1;
     return (int)uart[RISCV64_UART_RHR];
 }
@@ -354,7 +458,7 @@ void riscv64_uart_puthex64(uint64_t value) {
 
 void riscv64_wait_forever(void) {
     for (;;) {
-        __asm__ volatile("wfi");
+        riscv64_wfi();
     }
 }
 
@@ -1110,6 +1214,32 @@ static void riscv64_storage_bootstrap(void) {
     uint64_t capacity;
 
     storage_init();
+    /* DTB で initrd を渡されたら、それを rootfs として使う (記憶装置の無い基板) */
+    if (g_riscv64_boot_info.initrd_end > g_riscv64_boot_info.initrd_start &&
+        riscv64_ramdisk_init(g_riscv64_boot_info.initrd_start,
+                             g_riscv64_boot_info.initrd_end - g_riscv64_boot_info.initrd_start) == 0) {
+        riscv64_uart_puts("  ramdisk: capacity 0x");
+        riscv64_uart_puthex64(riscv64_ramdisk_sectors());
+        riscv64_uart_puts(" sectors\n");
+        if (storage_register_device("rd0", 512, riscv64_ramdisk_sectors(),
+                                    riscv64_ramdisk_storage_read,
+                                    riscv64_ramdisk_storage_write, 0, 0) < 0) {
+            riscv64_uart_puts("  rd0 register failed\n");
+            return;
+        }
+        if (xv6fs_mount_storage("rd0") == 0) {
+            riscv64_uart_puts("  xv6fs mounted on rd0\n");
+        } else {
+            riscv64_uart_puts("  rd0 is not xv6fs\n");
+        }
+        return;
+    }
+    /* virtio-mmio のスロットは QEMU virt の固定番地を直接読む。DTB に
+     * virtio,mmio が無い基板では、そこを読むとアクセス例外になる */
+    if ((g_riscv64_boot_info.flags & RISCV64_BOOT_FLAG_VIRTIO_MMIO_FOUND) == 0) {
+        riscv64_uart_puts("  virtio-blk (mmio): not in dtb\n");
+        return;
+    }
     if (riscv64_virtio_blk_mmio_init() < 0) {
         riscv64_uart_puts("  virtio-blk (mmio): not found\n");
         return;
@@ -1198,7 +1328,11 @@ void riscv64_early_main(uint64_t hart_id, uint64_t dtb_pa) {
         riscv64_uart_puts("\n");
         riscv64_uart_puts("  uart   : 0x");
         riscv64_uart_puthex64(g_riscv64_boot_info.uart_base);
+        riscv64_uart_puts(riscv64_uart_is_uartlite() ? " (uartlite)\n" : " (ns16550)\n");
+        riscv64_uart_puts("  timebase: 0x");
+        riscv64_uart_puthex64(riscv64_timebase_hz());
         riscv64_uart_puts("\n");
+        if (g_riscv64_no_wfi) riscv64_uart_puts("  idle   : no wfi (dtb orthox,no-wfi)\n");
         if (g_riscv64_boot_info.flags & RISCV64_BOOT_FLAG_VIRTIO_MMIO_FOUND) {
             riscv64_uart_puts("  virtio0: 0x");
             riscv64_uart_puthex64(g_riscv64_boot_info.first_virtio_mmio_base);
@@ -1209,6 +1343,13 @@ void riscv64_early_main(uint64_t hart_id, uint64_t dtb_pa) {
             riscv64_uart_puthex64(g_riscv64_boot_info.memory_base);
             riscv64_uart_puts("..0x");
             riscv64_uart_puthex64(g_riscv64_boot_info.memory_base + g_riscv64_boot_info.memory_size);
+            riscv64_uart_puts("\n");
+        }
+        if (g_riscv64_boot_info.initrd_end > g_riscv64_boot_info.initrd_start) {
+            riscv64_uart_puts("  initrd : 0x");
+            riscv64_uart_puthex64(g_riscv64_boot_info.initrd_start);
+            riscv64_uart_puts("..0x");
+            riscv64_uart_puthex64(g_riscv64_boot_info.initrd_end);
             riscv64_uart_puts("\n");
         }
     } else {
@@ -1226,10 +1367,26 @@ void riscv64_early_main(uint64_t hart_id, uint64_t dtb_pa) {
     riscv64_timer_init();
     /* UART 受信を PLIC 経由の外部割り込みで拾う (boot hart のコンテキストのみ
      * 有効にする。複数 hart で claim を取り合っても得が無い) */
-    riscv64_plic_init_global();
-    riscv64_plic_init_hart();
-    riscv64_plic_enable_irq(RISCV64_IRQ_UART0);
-    riscv64_uart_enable_rx_interrupt();
+    if (riscv64_has_plic()) {
+        riscv64_plic_init_global();
+        riscv64_plic_init_hart();
+        riscv64_plic_enable_irq(RISCV64_IRQ_UART0);
+        riscv64_uart_enable_rx_interrupt();
+    } else if (riscv64_has_axi_intc()) {
+        /* Arty S7 MicroBlaze V: AXI INTC は M 外部割り込みに入り、fw が
+         * SEIP として渡してくる (axi_intc.h) */
+        riscv64_axi_intc_init(g_riscv64_boot_info.intc_base, g_riscv64_boot_info.uart_irq);
+        riscv64_uart_enable_rx_interrupt();
+        riscv64_uart_puts("  axi intc: 0x");
+        riscv64_uart_puthex64(g_riscv64_boot_info.intc_base);
+        riscv64_uart_puts(" uart irq 0x");
+        riscv64_uart_puthex64(g_riscv64_boot_info.uart_irq);
+        riscv64_uart_puts("\n");
+    } else {
+        /* 外部割り込みコントローラが無い。受信はタイマー割り込みで
+         * ポーリングする (trap.c) */
+        riscv64_uart_puts("  no irq controller, console rx polled on timer\n");
+    }
     riscv64_interrupts_enable();
     riscv64_first_user_task_bootstrap();
     riscv64_wait_forever();

@@ -62,6 +62,12 @@ void pmm_init(void) {
                    (uint64_t)(uintptr_t)g_riscv64_pmm_refcounts);
     pmm_core_mark_free(free_base, pages * PAGE_SIZE);
 
+    // initrd (RAM ディスク) は rootfs として使い続けるので配らない
+    if (boot->initrd_end > boot->initrd_start &&
+        boot->initrd_end > free_base && boot->initrd_start < mem_end) {
+        pmm_core_mark_used(boot->initrd_start, boot->initrd_end - boot->initrd_start);
+    }
+
     // DTB が管理領域内にある場合はそのページを予約扱いにする
     if (boot->dtb_size != 0 && boot->dtb_pa + boot->dtb_size > free_base && boot->dtb_pa < mem_end) {
         pmm_core_mark_used(boot->dtb_pa, boot->dtb_size);

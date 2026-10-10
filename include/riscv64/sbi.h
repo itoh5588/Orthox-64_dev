@@ -7,6 +7,10 @@
 #define RISCV64_SBI_EXT_BASE 0x10UL
 #define RISCV64_SBI_EXT_IPI  0x735049UL   /* "sPI" */
 #define RISCV64_SBI_EXT_HSM  0x48534DUL   /* "HSM" */
+/* Arty S7 MicroBlaze V の自作 fw (fpga/arty_s7_mbv/fw/sbi.c) だけが持つ。
+ * fw 固有の拡張番号域 0x0A000000..0x0AFFFFFF */
+#define RISCV64_SBI_EXT_ORTHOX_EXTIRQ 0x0A4F5258UL
+#define RISCV64_SBI_FID_EXTIRQ_COMPLETE 0UL
 
 #define RISCV64_SBI_FID_SET_TIMER  0UL
 #define RISCV64_SBI_FID_SEND_IPI   0UL
@@ -40,6 +44,12 @@ static inline riscv64_sbi_ret_t riscv64_sbi_ecall(uint64_t ext,
                      : "memory");
     riscv64_sbi_ret_t ret = { (long)a0, (long)a1 };
     return ret;
+}
+
+/* fw が M 外部割り込みから立てた SEIP を下ろし、MEIE を開け直す */
+static inline riscv64_sbi_ret_t riscv64_sbi_extirq_complete(void) {
+    return riscv64_sbi_ecall(RISCV64_SBI_EXT_ORTHOX_EXTIRQ, RISCV64_SBI_FID_EXTIRQ_COMPLETE,
+                             0, 0, 0, 0, 0, 0);
 }
 
 static inline riscv64_sbi_ret_t riscv64_sbi_set_timer(uint64_t stime_value) {

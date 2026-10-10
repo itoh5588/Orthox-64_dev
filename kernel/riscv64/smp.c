@@ -175,9 +175,9 @@ void riscv64_smp_start_secondaries(void) {
         }
     }
 
-    /* 全 hart が idle に入るまで待つ (最大 ~2 秒。QEMU virt の timebase は 10MHz) */
+    /* 全 hart が idle に入るまで待つ (最大 ~2 秒) */
     {
-        uint64_t deadline = riscv64_read_time() + 20000000ULL;
+        uint64_t deadline = riscv64_read_time() + 2ULL * riscv64_timebase_hz();
         while (smp_get_started_cpu_count() < found &&
                riscv64_read_time() < deadline) {
             __asm__ volatile("nop" ::: "memory");
