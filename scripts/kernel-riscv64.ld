@@ -21,11 +21,13 @@ SECTIONS
     .data : ALIGN(0x1000) {
         __data_start = .;
         *(.data .data.*)
+        *(.sdata .sdata.*)
         __data_end = .;
     }
 
     .bss : ALIGN(0x1000) {
         __bss_start = .;
+        *(.sbss .sbss.*)
         *(.bss .bss.*)
         *(COMMON)
         __bss_end = .;
