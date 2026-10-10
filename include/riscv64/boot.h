@@ -28,6 +28,7 @@ typedef struct riscv64_boot_info {
     uint64_t initrd_start;   /* DTB /chosen linux,initrd-start (0 = 無し) */
     uint64_t initrd_end;
     uint64_t intc_base;      /* AXI INTC (0 = 無し) */
+    uint64_t sd_base;        /* SD カード SPI コントローラ (0 = 無し) */
     uint32_t uart_irq;       /* コンソール UART の INTC 入力番号 */
     uint32_t dtb_size;
     uint32_t virtio_mmio_count;
@@ -42,6 +43,9 @@ typedef struct riscv64_boot_info {
 #define RISCV64_BOOT_FLAG_PLIC_FOUND (1U << 4)
 #define RISCV64_BOOT_FLAG_INTC_FOUND (1U << 5)
 #define RISCV64_BOOT_FLAG_UART_IRQ   (1U << 6)
+/* /chosen orthox,sd-install-initrd: 起動時に initrd を SD カードの先頭へ
+ * 書き写してから SD をマウントする (カードの中身を上書きする。明示指定のみ) */
+#define RISCV64_BOOT_FLAG_SD_INSTALL (1U << 7)
 
 /*
  * DTB の cpu ノードに orthox,no-wfi があれば wfi を使わない。

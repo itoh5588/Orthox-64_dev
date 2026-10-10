@@ -407,6 +407,14 @@ void riscv64_vm_init(void) {
                          0x400000ULL,
                          RISCV64_VM_PAGE_R | RISCV64_VM_PAGE_W | RISCV64_VM_PAGE_G);
 
+    if (boot && boot->sd_base) {
+        riscv64_vm_map_range(g_riscv64_kernel_root_pa,
+                             boot->sd_base,
+                             boot->sd_base,
+                             RISCV64_PAGE_SIZE,
+                             RISCV64_VM_PAGE_R | RISCV64_VM_PAGE_W | RISCV64_VM_PAGE_G);
+    }
+
     if (boot && boot->intc_base) {
         riscv64_vm_map_range(g_riscv64_kernel_root_pa,
                              boot->intc_base,

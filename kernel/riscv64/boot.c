@@ -8,6 +8,7 @@
 #include "riscv64/axi_intc.h"
 #include "riscv64/plic.h"
 #include "riscv64/ramdisk.h"
+#include "riscv64/sd_axi.h"
 #include "linux_syscalls.h"
 #include "riscv64/syscall.h"
 #include "riscv64/task.h"
@@ -164,6 +165,7 @@ static void riscv64_dtb_scan(uint64_t dtb_pa) {
     uint32_t candidate_uart_kind = RISCV64_UART_KIND_NS16550;
     int candidate_virtio = 0;
     int candidate_intc = 0;
+    int candidate_sd = 0;
     int candidate_has_irq = 0;
     uint32_t candidate_irq = 0;
     int candidate_memory = 0;
@@ -191,6 +193,7 @@ static void riscv64_dtb_scan(uint64_t dtb_pa) {
             candidate_uart = 0;
             candidate_virtio = 0;
             candidate_intc = 0;
+            candidate_sd = 0;
             candidate_has_irq = 0;
             candidate_memory = 0;
             candidate_reg = 0;
@@ -213,6 +216,9 @@ static void riscv64_dtb_scan(uint64_t dtb_pa) {
                 g_riscv64_boot_info.intc_base = candidate_reg;
                 g_riscv64_boot_info.flags |= RISCV64_BOOT_FLAG_INTC_FOUND;
             }
+            if (candidate_sd && candidate_reg != 0) {
+                g_riscv64_boot_info.sd_base = candidate_reg;
+            }
             if (candidate_virtio && candidate_reg != 0) {
                 if (g_riscv64_boot_info.first_virtio_mmio_base == 0) {
                     g_riscv64_boot_info.first_virtio_mmio_base = candidate_reg;
@@ -229,6 +235,7 @@ static void riscv64_dtb_scan(uint64_t dtb_pa) {
             candidate_uart = 0;
             candidate_virtio = 0;
             candidate_intc = 0;
+            candidate_sd = 0;
             candidate_has_irq = 0;
             candidate_memory = 0;
             candidate_reg = 0;
@@ -262,6 +269,9 @@ static void riscv64_dtb_scan(uint64_t dtb_pa) {
                 if (riscv64_dtb_compatible_has((const char*)data, len, "xlnx,xps-intc-1.00.a")) {
                     candidate_intc = 1;
                 }
+                if (riscv64_dtb_compatible_has((const char*)data, len, "orthox,sd-spi-axi")) {
+                    candidate_sd = 1;
+                }
                 if (riscv64_dtb_compatible_has((const char*)data, len, "riscv,plic0") ||
                     riscv64_dtb_compatible_has((const char*)data, len, "sifive,plic-1.0.0")) {
                     g_riscv64_boot_info.flags |= RISCV64_BOOT_FLAG_PLIC_FOUND;
@@ -277,6 +287,8 @@ static void riscv64_dtb_scan(uint64_t dtb_pa) {
                 /* 最初のセルが入力番号 (QEMU の PLIC も AXI INTC も同じ) */
                 candidate_irq = riscv64_dtb_read_be32(data);
                 candidate_has_irq = 1;
+            } else if (depth >= 1 && riscv64_str_eq(prop_name, "orthox,sd-install-initrd")) {
+                g_riscv64_boot_info.flags |= RISCV64_BOOT_FLAG_SD_INSTALL;
             } else if (depth >= 1 && riscv64_str_eq(prop_name, "orthox,no-wfi")) {
                 g_riscv64_no_wfi = 1;
             } else if (depth >= 1 && riscv64_str_eq(prop_name, "linux,initrd-start")) {
@@ -346,6 +358,7 @@ void riscv64_boot_capture(uint64_t hart_id, uint64_t dtb_pa) {
     g_riscv64_boot_info.initrd_start = 0;
     g_riscv64_boot_info.initrd_end = 0;
     g_riscv64_boot_info.intc_base = 0;
+    g_riscv64_boot_info.sd_base = 0;
     g_riscv64_boot_info.uart_irq = 0;
     g_riscv64_boot_info.first_virtio_mmio_base = 0;
     g_riscv64_boot_info.dtb_size = riscv64_dtb_total_size(dtb_pa);
@@ -1208,12 +1221,56 @@ cleanup_child:
     (void)riscv64_test_user_unmap_page(base, "  fork selftest");
 }
 
+/* initrd の中身を SD カードの LBA 0 から書き写す。/chosen に
+ * orthox,sd-install-initrd があるときだけ呼ぶ (カードの中身を上書きする) */
+static void riscv64_sd_install_initrd(void) {
+    uint64_t start = g_riscv64_boot_info.initrd_start;
+    uint64_t sectors = (g_riscv64_boot_info.initrd_end - start) / 512ULL;
+    if (g_riscv64_boot_info.initrd_end <= start) {
+        riscv64_uart_puts("  sd install: no initrd\n");
+        return;
+    }
+    if (sectors > riscv64_sd_axi_sectors()) {
+        riscv64_uart_puts("  sd install: initrd larger than the card\n");
+        return;
+    }
+    riscv64_uart_puts("  sd install: writing initrd to sd0 ");
+    for (uint64_t lba = 0; lba < sectors; lba++) {
+        if (riscv64_sd_axi_storage_write(0, lba, (const void*)(uintptr_t)(start + lba * 512ULL), 1) < 0) {
+            riscv64_uart_puts("\n  sd install: write failed at lba 0x");
+            riscv64_uart_puthex64(lba);
+            riscv64_uart_puts("\n");
+            return;
+        }
+        if ((lba & 2047ULL) == 2047ULL) riscv64_uart_putchar('.');   /* 1 MiB ごと */
+    }
+    riscv64_uart_puts(" done, 0x");
+    riscv64_uart_puthex64(sectors);
+    riscv64_uart_puts(" sectors\n");
+}
+
 // virtio-blk (mmio) を storage 層に登録し xv6fs rootfs をマウントする。
 // sleeplock (wait_queue) を使うため task_init 後に呼ぶこと。
 static void riscv64_storage_bootstrap(void) {
     uint64_t capacity;
 
     storage_init();
+    /* SD カードがあり xv6fs が入っていれば、それを rootfs にする。
+     * 入っていなければ initrd (RAM ディスク) へ回る */
+    if (g_riscv64_boot_info.sd_base &&
+        riscv64_sd_axi_init(g_riscv64_boot_info.sd_base) == 0 &&
+        storage_register_device("sd0", 512, riscv64_sd_axi_sectors(),
+                                riscv64_sd_axi_storage_read,
+                                riscv64_sd_axi_storage_write, 0, 0) == 0) {
+        if (g_riscv64_boot_info.flags & RISCV64_BOOT_FLAG_SD_INSTALL) {
+            riscv64_sd_install_initrd();
+        }
+        if (xv6fs_mount_storage("sd0") == 0) {
+            riscv64_uart_puts("  xv6fs mounted on sd0\n");
+            return;
+        }
+        riscv64_uart_puts("  sd0 is not xv6fs\n");
+    }
     /* DTB で initrd を渡されたら、それを rootfs として使う (記憶装置の無い基板) */
     if (g_riscv64_boot_info.initrd_end > g_riscv64_boot_info.initrd_start &&
         riscv64_ramdisk_init(g_riscv64_boot_info.initrd_start,
