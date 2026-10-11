@@ -141,7 +141,15 @@ static void idt_build_once(void) {
     idt_set_gate(20, isr20, 1, IDT_GATE_INTERRUPT);
     idt_set_gate(21, isr21, 1, IDT_GATE_INTERRUPT);
 
-    idt_set_gate(INT_VECTOR_TIMER,    isr32, 1, IDT_GATE_INTERRUPT);
+    /* **タイマと resched IPI は IST を使わない (2026-10-11)。** 出口で
+     * ユーザーを取り上げる (interrupt_dispatch) ので、割り込みのフレームは
+     * そのタスクのカーネルスタック (TSS.rsp0) に積まれなければならない。
+     * IST は CPU ごとに 1 本なので、そこで切り替えると同じ CPU の次の割り込みが
+     * 前のタスクの iretq フレームを上書きする (kernel/syscall.c の
+     * 「iretq frame corruption」はおそらくこれ)。カーネルは IF=0 で走り、
+     * 割り込みを開けるのは idle の sti; hlt (自分のスタック) だけなので、
+     * カーネルモードで受けても困らない */
+    idt_set_gate(INT_VECTOR_TIMER,    isr32, 0, IDT_GATE_INTERRUPT);
     idt_set_gate(INT_VECTOR_KEYBOARD, isr33, 0, IDT_GATE_INTERRUPT);
     idt_set_gate(34,                  isr34, 0, IDT_GATE_INTERRUPT);
     idt_set_gate(35,                  isr35, 0, IDT_GATE_INTERRUPT);
@@ -157,7 +165,7 @@ static void idt_build_once(void) {
     idt_set_gate(45,                  isr45, 0, IDT_GATE_INTERRUPT);
     idt_set_gate(46,                  isr46, 0, IDT_GATE_INTERRUPT);
     idt_set_gate(47,                  isr47, 0, IDT_GATE_INTERRUPT);
-    idt_set_gate(INT_VECTOR_RESCHED,  isr48, 1, IDT_GATE_INTERRUPT);
+    idt_set_gate(INT_VECTOR_RESCHED,  isr48, 0, IDT_GATE_INTERRUPT);
     idt_set_gate(49,                  isr49, 0, IDT_GATE_INTERRUPT);
     idt_set_gate(50,                  isr50, 0, IDT_GATE_INTERRUPT);
     idt_set_gate(51,                  isr51, 0, IDT_GATE_INTERRUPT);
@@ -185,6 +193,18 @@ void idt_init_cpu(uint32_t cpu_id) {
 
 void idt_init(void) {
     idt_init_cpu(0);
+}
+
+/* **ユーザーから来た割り込みの出口で取り上げる (2026-10-11)。**
+ * 以前は resched の印を見るのが syscall の出口 (kernel/syscall.c) と idle
+ * だけで、syscall をしない計算ループは CPU を握ったままだった
+ * (x86_fp_probe で、どのワーカーも 1 度も取り上げられないのを実測)。
+ * riscv64 (trap.c) と aarch64 (task.c) は割り込みの出口でも見ている。
+ * カーネルモードで受けた割り込み (idle の hlt) では切り替えない —— idle は
+ * 自分のループで印を見る。kernel_yield は BKL を放してから schedule() する */
+static void x86_preempt_user(struct interrupt_frame* frame) {
+    if ((frame->cs & 3) != 3) return;
+    if (task_consume_resched()) kernel_yield();
 }
 
 void interrupt_dispatch(struct interrupt_frame* frame) {
@@ -234,6 +254,7 @@ void interrupt_dispatch(struct interrupt_frame* frame) {
 #endif
         task_on_timer_tick();
         lapic_eoi();
+        x86_preempt_user(frame);
         kernel_lock_exit();
         return;
     }
@@ -284,6 +305,7 @@ void interrupt_dispatch(struct interrupt_frame* frame) {
             puts(buf);
         }
         lapic_eoi();
+        x86_preempt_user(frame);
         kernel_lock_exit();
         return;
     }

@@ -398,8 +398,11 @@ void syscall_dispatch(arch_syscall_frame_t* frame) {
             frame->rax = (uint64_t)-38;
             break;
     }
-    // Timer IRQ sets resched pending; perform context switch at syscall boundary,
-    // not in interrupt return path, to avoid iretq frame corruption.
+    // Timer IRQ sets resched pending; switch at the syscall boundary too.
+    // ユーザーを計算中に取り上げるのは割り込みの出口 (kernel/x86_64/idt.c の
+    // x86_preempt_user)。以前ここに「iretq frame corruption を避けるため割り込み
+    // の出口では切り替えない」とあったのは、タイマが CPU ごとの IST で受けて
+    // いたため (2026-10-11 に IST をやめた)
     if (task_consume_resched()) {
         kernel_yield();
     }

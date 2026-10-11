@@ -2,7 +2,7 @@
  * 扱われるかの検査 (2026-10-11)。riscv64 の user/riscv64-bin/fpprobe.c、
  * aarch64 の user/aarch64_fp_probe.c の x86_64 版。
  *
- *   /boot/x86_fp_probe.elf [nproc] [rounds] [spin]     既定 6 12 20000000
+ *   /boot/x86_fp_probe.elf [nproc] [rounds] [spin] [yield]   既定 6 12 20000000 0
  *
  * **これは落ちないバグを探す検査。** 保存していなければ、fork も write も
  * 成功したまま計算結果だけが静かに変わる。見るのは 3 つ:
@@ -13,10 +13,11 @@
  *    残っていなければならない。空回りの中で 65536 回ごとに rdtsc を読み、
  *    塊 1 つの時間の最大が最短の 3 倍を超えた周を「取り上げられた」と数える
  *    (0 なら切り替えを跨いでおらず、検査になっていない)。
- *    **x86 はタイマでユーザーを取り上げない** (resched を見るのは syscall の
- *    出口と idle だけ。2026-10-11 時点)。そこで塊ごとに **asm から直接
- *    sched_yield (24) を呼んで** 切り替えを起こす。カーネルが正しければ
- *    syscall を跨いでも xmm は変わらない (変わるのは rax/rcx/r11 だけ)。
+ *    既定では syscall をしない純粋な計算ループで、**タイマによる取り上げ**
+ *    に任せる (2026-10-11 に x86 で割り込みの出口の取り上げを入れるまでは、
+ *    1 度も取り上げられなかった)。yield=1 にすると塊ごとに **asm から直接
+ *    sched_yield (24) を呼ぶ**。カーネルが正しければ syscall を跨いでも
+ *    xmm は変わらない (変わるのは rax/rcx/r11 だけ)。
  * 2. **fork の引き継ぎ** (FP-INHERIT): xmm0-xmm15 と MXCSR に値を入れて
  *    **asm から直接 fork の syscall を呼び**、子に同じ値が見えること。
  *    SysV ABI では xmm は全部 caller-saved なので、libc の fork() を挟むと
@@ -50,8 +51,11 @@ static void fill(uint64_t* v, int id) {
 
 /* xmm0-15 と MXCSR に入れ、spin 回まわってから読み戻す。
  * *max_gap / *min_gap に、65536 回の塊 1 つにかかった rdtsc の最大と最短 */
+static int g_yield;
+
 static uint32_t sse_hold(const uint64_t* want, uint64_t* got, uint32_t mxcsr_in, uint64_t spin,
                          uint64_t* max_gap, uint64_t* min_gap) {
+    uint64_t do_yield = (uint64_t)g_yield;
     uint32_t mxcsr_out = 0, mxcsr_def = MXCSR_DEFAULT;
     uint64_t prev, now, d, i, gap = 0, gmin = ~0ULL;
 
@@ -77,8 +81,11 @@ static uint32_t sse_hold(const uint64_t* want, uint64_t* got, uint32_t mxcsr_in,
                      "jae 2f\n\t"
                      "mov %%rax, %[mn]\n\t"
                      "2: mov %[t], %[p]\n\t"
+                     "test %[y], %[y]\n\t"
+                     "jz 5f\n\t"
                      "mov $24, %%eax\n\t"          /* sched_yield */
                      "syscall\n\t"
+                     "5:\n\t"
                      "dec %[n]\n\t"
                      "jnz 1b\n\t"
                      XMM_LIST(ST)
@@ -86,7 +93,8 @@ static uint32_t sse_hold(const uint64_t* want, uint64_t* got, uint32_t mxcsr_in,
                      "ldmxcsr %[md]\n\t"     /* 丸めモードを戻す: 後の C の計算に効かせない */
                      : [n] "+r"(spin), [p] "=&r"(prev), [t] "=&r"(now), [m] "+r"(gap),
                        [i] "=&r"(i), [mo] "=m"(mxcsr_out), "=&d"(d), [mn] "+r"(gmin)
-                     : [w] "r"(want), [g] "r"(got), [mi] "m"(mxcsr_in), [md] "m"(mxcsr_def)
+                     : [w] "r"(want), [g] "r"(got), [mi] "m"(mxcsr_in), [md] "m"(mxcsr_def),
+                       [y] "r"(do_yield)
                      : "memory", "rax", "rcx", "r11", XMM_LIST(CLOB) "cc");
     *max_gap = gap;
     *min_gap = gmin;
@@ -218,10 +226,12 @@ int main(int argc, char** argv) {
     if (argc > 1) nproc = atoi(argv[1]);
     if (argc > 2) rounds = atoi(argv[2]);
     if (argc > 3) spin = strtoull(argv[3], 0, 0);
+    if (argc > 4) g_yield = atoi(argv[4]);
     if (nproc < 1) nproc = 1;
 
     expect = series(20000);
-    printf("FP-START nproc=%d rounds=%d spin=%llu\n", nproc, rounds, (unsigned long long)spin);
+    printf("FP-START nproc=%d rounds=%d spin=%llu yield=%d\n", nproc, rounds,
+           (unsigned long long)spin, g_yield);
     fflush(stdout);
 
     if ((rc = check_inherit()) != 0) fails++;

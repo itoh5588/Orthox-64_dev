@@ -34,7 +34,9 @@ SERIAL_LOG=LOGs/x86-fp-serial-smp$SMP_CPUS.log
 WORK="$(mktemp -d)"
 ISO="$WORK/x86-fp-smoke.iso"
 NPROC="${FP_NPROC:-$((SMP_CPUS * 2 + 2))}"
-ARGS="$NPROC ${FP_ROUNDS:-12} ${FP_SPIN:-2000000}"
+# 既定は yield しない計算ループ = タイマによる取り上げに任せる (FP_YIELD=1 で
+# 塊ごとに sched_yield)。1 本が持ち時間 (5 ティック = 50 ms) を何度も超える長さにする
+ARGS="$NPROC ${FP_ROUNDS:-12} ${FP_SPIN:-20000000} ${FP_YIELD:-0}"
 rm -f "$SERIAL_LOG" "$SERIAL_LOG.nocr"
 
 cleanup() {
