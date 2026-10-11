@@ -105,6 +105,7 @@ static void putkv(const char* key, uint64_t v) {
 /* SD card (fpga/arty_s7_mbv/rtl/sd_axi.vhd), polled. */
 #define SD_OP_INIT  1
 #define SD_OP_READ  4
+#define SD_OP_MREAD 5           /* CMD18, up to 8 blocks into the buffer at 0x1000 */
 #define SD_OP_WRITE 6
 
 static volatile uint32_t* sd_reg(uint32_t off) {
@@ -133,6 +134,18 @@ static uint32_t sd_read(uint64_t lba, void* buf) {
     return 0;
 }
 
+/* nb (1..8) blocks from lba with one CMD18 */
+static uint32_t sd_read_multi(uint64_t lba, uint32_t nb, void* buf) {
+    uint32_t* w = buf;
+    uint32_t st;
+
+    *sd_reg(0x4) = (uint32_t)lba;
+    *sd_reg(0x10) = nb;
+    if ((st = sd_run(SD_OP_MREAD)) != 0) return st;
+    for (uint32_t i = 0; i < nb * 128; i++) w[i] = *sd_reg(0x1000 + 4 * i);
+    return 0;
+}
+
 static uint32_t sd_write(uint64_t lba, const void* buf) {
     const uint32_t* w = buf;
 
@@ -146,7 +159,10 @@ static uint32_t sd_init(void) {
 
     if ((*sd_reg(0x0) & 0x10) == 0) return 0xfe00;     /* no card */
     for (int i = 0; i < 3; i++) {
-        if ((st = sd_run(SD_OP_INIT)) == 0) return 0;
+        if ((st = sd_run(SD_OP_INIT)) == 0) {
+            *sd_reg(0x8) = 1;           /* SPI 12.5 MHz (see kernel/riscv64/sd_axi.c) */
+            return 0;
+        }
     }
     return st;
 }
@@ -235,8 +251,9 @@ static uint64_t load_kernel(void) {
     n = h->size;
     sum = h->sum;
     t0 = csr_read(time);
-    for (uint64_t i = 0; i < (n + 511) / 512; i++) {
-        if ((st = sd_read(KIMG_LBA + 1 + i, p + 512 * i)) != 0) {
+    for (uint64_t i = 0, nsec = (n + 511) / 512; i < nsec; i += 8) {
+        uint32_t nb = nsec - i < 8 ? (uint32_t)(nsec - i) : 8;
+        if ((st = sd_read_multi(KIMG_LBA + 1 + i, nb, p + 512 * i)) != 0) {
             putkv("  sd read: ", st);
             return 0;
         }

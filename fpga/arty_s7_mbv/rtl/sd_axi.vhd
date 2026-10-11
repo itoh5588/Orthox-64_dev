@@ -2,19 +2,31 @@
 -- Copyright (c) 2026 Akio Itoh
 --
 -- AXI4-Lite front end for the SD card SPI controller (sdspi_ctl/sdspi_phy).
--- Single block reads and writes; the CPU polls BUSY.
+-- Single or multi-block reads (CMD18) and writes (CMD25), up to 8 blocks;
+-- the CPU polls BUSY.
 --
 -- Registers (byte offsets, 32-bit):
 --   0x000 ctrl/stat  w: bits 2:0 operation, started at once if not busy
 --                       (1 init, 2 CID, 3 CSD, 4 read block, 6 write block)
+--                       (1 init, 2 CID, 3 CSD, 4 read block, 5 read NBLK
+--                       blocks, 6 write block, 7 write NBLK blocks)
 --                    r: bit0 busy, bit1 init ok, bit2 SD v2, bit3 block
 --                       addressing (SDHC/SDXC), bit4 card present,
 --                       bits 15:8 error code, 23:16 last R1, 31:24 last token
 --   0x004 lba        rw block number
---   0x008 fdiv       rw SPI phase length - 1 after init (>= 2)
+--   0x008 fdiv       rw SPI phase length - 1 after init (>= 1)
 --   0x00C resp       r  last R3/R7 response (OCR after init)
---   0x400-0x5FF rbuf r  last block read (or CID/CSD), little-endian words
+--   0x010 nblk       rw blocks for op 5 and 7 (1..8; 0 means 1)
+--   0x400-0x5FF rbuf r  first block read (or CID/CSD), little-endian words
 --   0x600-0x7FF wbuf rw data for the next block write, little-endian words
+--   0x1000-0x1FFF    r  all 8 read blocks (block n at 0x1000 + 512 n)
+--   0x2000-0x2FFF    w  all 8 write blocks (block n at 0x2000 + 512 n;
+--                       0x600 is block 0)
+--
+-- A multi-block read fills the buffer in order: the controller only gives
+-- the word index inside a block, so the block number is counted here (it
+-- steps after the last word of a block and is cleared by each operation).
+-- Up to 8 blocks fit, so HOLD is never needed.
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -55,8 +67,8 @@ architecture syn of sd_axi is
 
   constant MSEC_DIV : natural := CLK_HZ / 1000;
 
-  type word_ram is array (0 to 127) of std_logic_vector(15 downto 0);
-  type wbuf_ram is array (0 to 127) of std_logic_vector(31 downto 0);
+  type word_ram is array (0 to 1023) of std_logic_vector(15 downto 0);
+  type wbuf_ram is array (0 to 1023) of std_logic_vector(31 downto 0);
 
   signal RESET    : std_logic;
   signal R_MSEC   : natural range 0 to MSEC_DIV - 1 := 0;
@@ -66,12 +78,16 @@ architecture syn of sd_axi is
   signal R_GO     : std_logic := '0';
   signal R_LBA    : std_logic_vector(31 downto 0) := (others => '0');
   signal R_FDIV   : std_logic_vector(7 downto 0) := x"02";
+  signal R_NBLK   : std_logic_vector(15 downto 0) := (others => '0');
+  signal R_BLK    : unsigned(2 downto 0) := (others => '0');  -- block being filled
 
   signal BUSY, INITOK, V2, HC : std_logic;
   signal ERR, R1, TOKEN       : std_logic_vector(7 downto 0);
   signal RESP                 : std_logic_vector(31 downto 0);
   signal BUF_WE               : std_logic;
   signal BUF_ADDR, WBUF_ADDR  : std_logic_vector(7 downto 0);
+  signal WBLK                 : std_logic_vector(2 downto 0);
+  signal WBUF_IDX             : unsigned(9 downto 0);
   signal BUF_DI, WBUF_DATA    : std_logic_vector(15 downto 0);
   signal PHY_DIV, PHY_TXD, PHY_RXD : std_logic_vector(7 downto 0);
   signal PHY_START, PHY_DONE  : std_logic;
@@ -93,12 +109,12 @@ begin
     generic map (SLOWDIV => SLOWDIV)
     port map (
       CLK => s_axi_aclk, RESET => RESET, CE_MSEC => CE_MSEC,
-      OP => R_OP, GO => R_GO, LBA => R_LBA, NBLK => x"0000", HOLD => '0',
+      OP => R_OP, GO => R_GO, LBA => R_LBA, NBLK => R_NBLK, HOLD => '0',
       ABORT => '0', FASTDIV => R_FDIV,
       BUSY => BUSY, INITOK => INITOK, V2 => V2, HC => HC,
       ERR => ERR, R1 => R1, TOKEN => TOKEN, RESP => RESP,
       BUF_WE => BUF_WE, BUF_ADDR => BUF_ADDR, BUF_DI => BUF_DI,
-      WBUF_ADDR => WBUF_ADDR, WBUF_DATA => WBUF_DATA,
+      WBUF_ADDR => WBUF_ADDR, WBUF_DATA => WBUF_DATA, WBLK => WBLK,
       O_CS_N => sd_cs_n, PHY_DIV => PHY_DIV, PHY_START => PHY_START,
       PHY_TXD => PHY_TXD, PHY_RXD => PHY_RXD, PHY_DONE => PHY_DONE);
 
@@ -108,10 +124,11 @@ begin
       TXD => PHY_TXD, RXD => PHY_RXD, DONE => PHY_DONE, BUSY => open,
       O_SCLK => sd_sclk, O_MOSI => sd_mosi, I_MISO => sd_miso);
 
-  -- write data: 16-bit word WBUF_ADDR out of the 32-bit wbuf words (async read)
-  WBUF_DATA <= WBUF(to_integer(unsigned(WBUF_ADDR(7 downto 1))))(15 downto 0)
-               when WBUF_ADDR(0) = '0' else
-               WBUF(to_integer(unsigned(WBUF_ADDR(7 downto 1))))(31 downto 16);
+  -- write data: 16-bit word WBUF_ADDR of block WBLK out of the 32-bit wbuf
+  -- words (async read)
+  WBUF_IDX  <= unsigned(WBLK) & unsigned(WBUF_ADDR(7 downto 1));
+  WBUF_DATA <= WBUF(to_integer(WBUF_IDX))(15 downto 0) when WBUF_ADDR(0) = '0' else
+               WBUF(to_integer(WBUF_IDX))(31 downto 16);
 
   proc_msec: process (s_axi_aclk)
   begin
@@ -129,13 +146,20 @@ begin
   end process proc_msec;
 
   proc_rbuf: process (s_axi_aclk)
+    variable i : natural range 0 to 1023;
   begin
     if rising_edge(s_axi_aclk) then
-      if BUF_WE = '1' then
+      i := to_integer(R_BLK & unsigned(BUF_ADDR(7 downto 1)));
+      if R_GO = '1' then
+        R_BLK <= (others => '0');
+      elsif BUF_WE = '1' then
         if BUF_ADDR(0) = '0' then
-          RBUF_LO(to_integer(unsigned(BUF_ADDR(7 downto 1)))) <= BUF_DI;
+          RBUF_LO(i) <= BUF_DI;
         else
-          RBUF_HI(to_integer(unsigned(BUF_ADDR(7 downto 1)))) <= BUF_DI;
+          RBUF_HI(i) <= BUF_DI;
+        end if;
+        if BUF_ADDR = x"FF" then          -- last word of the block
+          R_BLK <= R_BLK + 1;
         end if;
       end if;
     end if;
@@ -162,7 +186,11 @@ begin
           R_WREADY <= '0';
           R_BVALID <= '1';
           a := unsigned(s_axi_awaddr);
-          if a(11 downto 9) = "011" then                 -- 0x600-0x7FF wbuf
+          if a(15 downto 12) = "0010" then               -- 0x2000-0x2FFF: 8 blocks
+            WBUF(to_integer(a(11 downto 2))) <= s_axi_wdata;
+          elsif a(15 downto 12) /= "0000" then
+            null;                                         -- read buffer
+          elsif a(11 downto 9) = "011" then              -- 0x600-0x7FF: block 0
             WBUF(to_integer(a(8 downto 2))) <= s_axi_wdata;
           else
             case to_integer(a(11 downto 0)) is
@@ -173,6 +201,7 @@ begin
                 end if;
               when 16#004# => R_LBA <= s_axi_wdata;
               when 16#008# => R_FDIV <= s_axi_wdata(7 downto 0);
+              when 16#010# => R_NBLK <= s_axi_wdata(15 downto 0);
               when others => null;
             end case;
           end if;
@@ -187,7 +216,7 @@ begin
   -- AXI4-Lite read: raise ARREADY, then present the data on R
   proc_read: process (s_axi_aclk)
     variable a : unsigned(15 downto 0);
-    variable i : natural range 0 to 127;
+    variable i : natural range 0 to 1023;
   begin
     if rising_edge(s_axi_aclk) then
       if s_axi_aresetn = '0' then
@@ -201,11 +230,18 @@ begin
           R_ARREADY <= '0';
           R_RVALID <= '1';
           a := unsigned(s_axi_araddr);
-          i := to_integer(a(8 downto 2));
-          if a(11 downto 9) = "010" then                 -- 0x400-0x5FF rbuf
+          if a(15 downto 12) = "0001" then               -- 0x1000-0x1FFF: 8 blocks
+            i := to_integer(a(11 downto 2));
+          else                                           -- 0x400-0x5FF: block 0
+            i := to_integer(a(8 downto 2));
+          end if;
+          if a(15 downto 12) = "0001" or
+             (a(15 downto 12) = "0000" and a(11 downto 9) = "010") then
             R_RDATA <= RBUF_HI(i) & RBUF_LO(i);
+          elsif a(15 downto 12) /= "0000" then
+            R_RDATA <= (others => '0');
           elsif a(11 downto 9) = "011" then              -- 0x600-0x7FF wbuf
-            R_RDATA <= WBUF(i);
+            R_RDATA <= WBUF(to_integer(a(8 downto 2)));
           else
             case to_integer(a(11 downto 0)) is
               when 16#000# =>
@@ -214,6 +250,7 @@ begin
               when 16#004# => R_RDATA <= R_LBA;
               when 16#008# => R_RDATA <= x"000000" & R_FDIV;
               when 16#00C# => R_RDATA <= RESP;
+              when 16#010# => R_RDATA <= x"0000" & R_NBLK;
               when others  => R_RDATA <= (others => '0');
             end case;
           end if;

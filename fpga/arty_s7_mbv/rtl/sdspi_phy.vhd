@@ -10,7 +10,9 @@
 -- SCLK is a fabric register; each phase lasts DIV+1 CLK cycles.  MISO passes
 -- two synchronizer flops, so the value taken when a bit ends (at the falling
 -- edge) was on the pin two cycles earlier, well inside the high phase for
--- DIV >= 2.  DIV = 2 gives 12.5 MHz at 75 MHz.
+-- DIV >= 2.  DIV = 2 gives 12.5 MHz at 75 MHz.  DIV = 1 (12.5 MHz at 50 MHz,
+-- Orthox) samples at the rising edge itself, still a full phase after the
+-- card changed MISO on the falling edge, which is the SPI mode 0 sample point.
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -21,7 +23,7 @@ entity sdspi_phy is
   port (
     CLK : in std_logic;
     RESET : in std_logic;
-    DIV : in std_logic_vector(7 downto 0);                      -- phase length - 1 (>= 2)
+    DIV : in std_logic_vector(7 downto 0);                      -- phase length - 1 (>= 1)
     START : in std_logic;                   -- start byte transfer
     TXD : in std_logic_vector(7 downto 0);                      -- byte to send (msb first)
     RXD : out std_logic_vector(7 downto 0);                     -- byte received

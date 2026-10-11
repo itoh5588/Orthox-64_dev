@@ -5,7 +5,8 @@
 -- with the w11 slvtypes subtypes replaced by plain std_logic(_vector).
 --
 -- SD card SPI command controller: card initialization, block reads and
--- single block writes.  The card is only written by op_write.
+-- single or multi-block writes.  The card is only written by op_write and
+-- op_mwrite.
 --
 -- Operations (OP, started by GO while not BUSY):
 --   op_init  power-up clocks, CMD0, CMD8, CMD55+ACMD41, CMD58, CMD16 (SDSC)
@@ -16,6 +17,11 @@
 --   op_write CMD24, 512 bytes from WBUF (word WBUF_ADDR, little-endian) to
 --            block LBA; data response and busy end are checked, then the
 --            card status by CMD13
+--   op_mwrite CMD25, NBLK blocks (0 means 1) to LBA on; WBLK tells which
+--            block of the caller's buffer is being sent.  Each block is
+--            checked like op_write, then the stop token and its busy end,
+--            then CMD13 (2026-10-11, Orthox).  On an error the controller
+--            only releases CS; the caller should initialize the card again.
 -- The data words leave on BUF_* as little-endian 16-bit words (PDP-11 byte
 -- order), BUF_ADDR is the word index inside the block.  While HOLD is set
 -- no new data byte is clocked in, so a slow consumer never loses data.
@@ -60,6 +66,7 @@ entity sdspi_ctl is
     BUF_DI : out std_logic_vector(15 downto 0);
     WBUF_ADDR : out std_logic_vector(7 downto 0);               -- write data: word index
     WBUF_DATA : in std_logic_vector(15 downto 0);               -- write data: word (async read)
+    WBLK : out std_logic_vector(2 downto 0);                    -- op_mwrite: block being sent
     O_CS_N : out std_logic;
     PHY_DIV : out std_logic_vector(7 downto 0);
     PHY_START : out std_logic;
@@ -76,6 +83,7 @@ architecture syn of sdspi_ctl is
   constant op_csd : std_logic_vector(2 downto 0) := "011";
   constant op_read : std_logic_vector(2 downto 0) := "100";
   constant op_mread : std_logic_vector(2 downto 0) := "101";
+  constant op_mwrite : std_logic_vector(2 downto 0) := "111";
   constant op_write : std_logic_vector(2 downto 0) := "110";
 
   constant err_noresp : std_logic_vector(7 downto 0) := x"01";
@@ -101,7 +109,7 @@ architecture syn of sdspi_ctl is
     s_i_cmd0, s_i_cmd0_chk, s_i_cmd8_chk, s_i_cmd55_chk, s_i_cmd41_chk,
     s_i_cmd58_chk, s_i_cmd16_chk, s_rd_chk,
     s_w_gap, s_w_tok, s_w_data, s_w_crc, s_w_resp, s_w_busy, s_w_status,
-    s_w_chk, s_done);
+    s_w_chk, s_w_stop, s_w_stop_gap, s_w_stop_busy, s_done);
 
   type regs_type is record
     state : state_type;
@@ -130,6 +138,8 @@ architecture syn of sdspi_ctl is
     stopping : std_logic;                   -- CMD12 being sent
     nleft : unsigned(15 downto 0);      -- blocks still to read
     wr : std_logic;                         -- CMD24: data phase follows R1
+    mw : std_logic;                         -- CMD25 running
+    wblk : unsigned(2 downto 0);        -- CMD25: block of WBUF being sent
   end record regs_type;
 
   constant regs_init : regs_type := (
@@ -137,7 +147,7 @@ architecture syn of sdspi_ctl is
     (others => '0'), (others => '0'), (others => '0'), (others => '0'),
     (others => '0'), (others => '0'), (others => '0'),
     '0', '0', '0', '0', (others => '0'), x"ff", x"ff", (others => '0'),
-    '0', '0', (others => '0'), '0');
+    '0', '0', (others => '0'), '0', '0', (others => '0'));
 
   signal R_REGS : regs_type := regs_init;
   signal N_REGS : regs_type := regs_init;
@@ -261,6 +271,8 @@ begin
           n.multi := '0';
           n.stopping := '0';
           n.wr := '0';
+          n.mw := '0';
+          n.wblk := (others => '0');
           case OP is
             when op_init =>
               n.initok := '0';
@@ -280,6 +292,23 @@ begin
                   command(24, LBA, '0', 0, s_done);
                 else
                   command(24, LBA(22 downto 0) & "000000000", '0', 0, s_done);
+                end if;
+              end if;
+            when op_mwrite =>
+              if r.initok = '0' then
+                n.err := err_noinit;
+                n.busy := '0';
+              else
+                n.wr := '1';
+                n.mw := '1';
+                n.nleft := unsigned(NBLK);
+                if NBLK = x"0000" then
+                  n.nleft := x"0001";
+                end if;
+                if r.hc = '1' then
+                  command(25, LBA, '0', 0, s_done);
+                else
+                  command(25, LBA(22 downto 0) & "000000000", '0', 0, s_done);
                 end if;
               end if;
             when op_cid | op_csd | op_read | op_mread =>
@@ -469,8 +498,12 @@ begin
           n.state := s_w_tok;
         end if;
 
-      when s_w_tok =>                   -- start block token
-        xfer(x"fe");
+      when s_w_tok =>                   -- start block token (CMD25: fc)
+        if r.mw = '1' then
+          xfer(x"fc");
+        else
+          xfer(x"fe");
+        end if;
         if bdone then
           n.cnt := (others => '0');
           n.crc := (others => '0');
@@ -533,6 +566,41 @@ begin
         xfer(x"ff");
         if bdone then
           if rx /= x"00" then
+            if r.mw = '1' and r.nleft > 1 then  -- next block of CMD25
+              n.nleft := r.nleft - 1;
+              n.wblk := r.wblk + 1;
+              n.cnt := (others => '0');
+              n.state := s_w_gap;
+            elsif r.mw = '1' then
+              n.state := s_w_stop;
+            else
+              n.ret := s_w_status;
+              n.state := s_c_end;
+            end if;
+          elsif r.tmo >= 1000 then
+            fail(err_wbusy);
+          end if;
+        end if;
+
+      -- CMD25 end: stop token, one byte (Nbr), then busy ---------------------
+      when s_w_stop =>
+        xfer(x"fd");
+        if bdone then
+          n.state := s_w_stop_gap;
+        end if;
+
+      when s_w_stop_gap =>
+        xfer(x"ff");
+        if bdone then
+          n.tmo := (others => '0');
+          n.state := s_w_stop_busy;
+        end if;
+
+      when s_w_stop_busy =>
+        xfer(x"ff");
+        if bdone then
+          if rx /= x"00" then
+            n.mw := '0';
             n.ret := s_w_status;
             n.state := s_c_end;
           elsif r.tmo >= 1000 then
@@ -695,6 +763,7 @@ begin
       when s_done =>
         n.busy := '0';
         n.multi := '0';
+        n.mw := '0';
         n.stopping := '0';
         n.state := s_idle;
 
@@ -703,8 +772,12 @@ begin
     idiv := std_logic_vector(to_unsigned(SLOWDIV, 8));
     if r.fast = '1' then
       idiv := FASTDIV;
-      if unsigned(FASTDIV) < 2 then
-        idiv := x"02";
+      -- >= 1 (2026-10-11, was >= 2): at DIV = 1 the PHY still samples MISO
+      -- at the rising edge, two cycles (40 ns at 50 MHz) after the card
+      -- changed it on the falling edge (see sdspi_phy).  DIV = 0 would sample
+      -- at the change itself.
+      if unsigned(FASTDIV) < 1 then
+        idiv := x"01";
       end if;
     end if;
 
@@ -722,6 +795,7 @@ begin
     BUF_ADDR <= std_logic_vector(r.cnt(8 downto 1));
     BUF_DI <= rx & r.lowbyte;
     WBUF_ADDR <= std_logic_vector(r.cnt(8 downto 1));
+    WBLK <= std_logic_vector(r.wblk);
     O_CS_N <= r.cs_n;
     PHY_DIV <= idiv;
     PHY_START <= istart;
