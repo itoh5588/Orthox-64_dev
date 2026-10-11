@@ -7,6 +7,8 @@
 #define RISCV64_SSTATUS_SPIE  (1UL << 5)
 #define RISCV64_SSTATUS_SPP   (1UL << 8)
 #define RISCV64_SSTATUS_SUM   (1UL << 18)
+#define RISCV64_SSTATUS_FS    (3UL << 13)
+#define RISCV64_SSTATUS_FS_INITIAL (1UL << 13)
 
 #define RISCV64_SIE_SSIE      (1UL << 1)
 #define RISCV64_SIE_STIE      (1UL << 5)
@@ -24,6 +26,16 @@ static inline uint64_t riscv64_read_sstatus(void) {
 
 static inline void riscv64_write_sstatus(uint64_t value) {
     __asm__ volatile("csrw sstatus, %0" : : "r"(value));
+}
+
+/* **F/D 命令を S/U で使えるようにする (段階 7)。** FS=Off のままだと
+ * arch_context_switch の fsd/fld が不正命令で落ちる。OpenSBI (QEMU) は
+ * 起動時に立てるが、自作 fw や副 hart に頼らず hart ごとに自分で立てる */
+static inline void riscv64_fp_enable(void) {
+    uint64_t sstatus = riscv64_read_sstatus();
+    if ((sstatus & RISCV64_SSTATUS_FS) == 0) {
+        riscv64_write_sstatus(sstatus | RISCV64_SSTATUS_FS_INITIAL);
+    }
 }
 
 static inline uint64_t riscv64_read_stvec(void) {

@@ -31,7 +31,22 @@ struct arch_task_context {
     uint64_t sched_s10;
     uint64_t sched_s11;
     riscv64_trap_frame_t user_frame;
+    /* **F/D レジスタ (段階 7)。** arch_context_switch (entry.S) が f0-f31 と
+     * fcsr を退避・復元する。オフセットは entry.S の RISCV64_CTX_FP と合わせる */
+    uint64_t fp[32];
+    uint64_t fcsr;
 };
+
+#define RISCV64_CTX_FP   416
+#define RISCV64_CTX_FCSR (RISCV64_CTX_FP + 32 * 8)
+_Static_assert(__builtin_offsetof(struct arch_task_context, fp) == RISCV64_CTX_FP,
+               "entry.S の RISCV64_CTX_FP と合わない");
+_Static_assert(__builtin_offsetof(struct arch_task_context, fcsr) == RISCV64_CTX_FCSR,
+               "entry.S の RISCV64_CTX_FCSR と合わない");
+
+/* 走っている hart の f0-f31/fcsr を ctx へ / ctx から (entry.S) */
+void riscv64_fp_save(struct arch_task_context* ctx);
+void riscv64_fp_restore(const struct arch_task_context* ctx);
 
 typedef riscv64_trap_frame_t arch_task_exec_frame_t;
 
@@ -90,8 +105,13 @@ static inline uint64_t arch_task_read_current_stack_pointer(void) {
     return sp;
 }
 
+/* 新しいタスクと exec 後の像の FP を 0 から始める (aarch64 の P3-3 と同じ)。
+ * **前のタスクの f0-f31 を引き継がせない** (誤動作だけでなく漏洩になる)。
+ * fcsr = 0 は丸め RNE・例外フラグなしで、musl が期待する初期状態 */
 static inline void arch_task_context_init_fp_state(struct arch_task_context* ctx) {
-    (void)ctx;
+    if (!ctx) return;
+    for (int i = 0; i < 32; i++) ctx->fp[i] = 0;
+    ctx->fcsr = 0;
 }
 
 static inline void arch_task_context_init_kernel_entry(struct arch_task_context* ctx,
@@ -120,8 +140,9 @@ static inline void arch_task_context_init_kernel_entry(struct arch_task_context*
 
 static inline void arch_task_context_copy_fp_state(struct arch_task_context* dst,
                                                    const struct arch_task_context* src) {
-    (void)dst;
-    (void)src;
+    if (!dst || !src) return;
+    for (int i = 0; i < 32; i++) dst->fp[i] = src->fp[i];
+    dst->fcsr = src->fcsr;
 }
 
 static inline uint64_t arch_task_prepare_kernel_entry(struct arch_task_context* ctx,
@@ -179,6 +200,10 @@ static inline void arch_task_commit_execve(struct arch_task_context* ctx,
     (void)tls_base;
     arch_task_prepare_execve_frame(frame, state);
     riscv64_task_store_user_frame(ctx, frame);
+    // **生のレジスタも 0 にする。** exec は切り替えを通らずに trap 出口から
+    // 新しい像へ降りるので、ctx を 0 にしただけでは前の像の f0-f31 が見える
+    // (呼び出し元の task_execve が init_fp_state で ctx を 0 にしてある)
+    riscv64_fp_restore(ctx);
     // syscall 経由の execve では trap 出口がそのまま sret するため、
     // ここで新しいアドレス空間へ切り替えておく (カーネルはグローバルマップ)
     arch_task_context_activate_address_space(ctx);
@@ -199,7 +224,11 @@ static inline void arch_task_commit_fork_child(struct arch_task_context* child_c
     arch_task_exec_frame_t* child_frame = arch_task_exec_frame_on_kstack(child_kstack_top);
     if (child_ctx) child_ctx->kernel_sp = child_kstack_top;
     arch_task_prepare_fork_child_context(child_ctx, child_frame, parent_frame);
-    arch_task_context_copy_fp_state(child_ctx, parent_ctx);
+    // **FP は生のレジスタから取る。** ここは親の fork の syscall の中で、
+    // カーネルは FP を使わないので f0-f31 には親のユーザーの値が入っている。
+    // parent_ctx->fp は「親が最後に切り替わったときの値」で古い
+    (void)parent_ctx;
+    riscv64_fp_save(child_ctx);
 }
 
 static inline void arch_task_prepare_initial_user_context(struct arch_task_context* ctx,

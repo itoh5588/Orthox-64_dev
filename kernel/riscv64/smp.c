@@ -89,6 +89,7 @@ void smp_send_resched_ipi(uint32_t cpu_id) {
 /* 副 hart のエントリ (start.S の riscv64_secondary_start から呼ばれる)。
  * sp はブートスタックの自 hart スライス、tp は cpu index が設定済み。 */
 void riscv64_secondary_main(uint64_t cpu_index_arg) {
+    riscv64_fp_enable();
     uint32_t cpu_index = (uint32_t)cpu_index_arg;
     struct task* idle;
 

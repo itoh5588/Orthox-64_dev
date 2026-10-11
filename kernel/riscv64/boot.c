@@ -1370,6 +1370,7 @@ static void riscv64_first_user_task_bootstrap(void) {
 void riscv64_early_main(uint64_t hart_id, uint64_t dtb_pa) {
     riscv64_boot_capture(hart_id, dtb_pa);
     riscv64_uart_init();
+    riscv64_fp_enable();
 
     riscv64_uart_puts("\nOrthox riscv64 early boot\n");
     riscv64_uart_puts("  hart: 0x");

@@ -3,6 +3,12 @@
 .globl riscv64_enter_user_from_frame
 .globl riscv64_run_on_stack
 .globl riscv64_activate_address_space_and_enter_user
+.globl riscv64_fp_save
+.globl riscv64_fp_restore
+
+# struct arch_task_context の fp[] / fcsr (riscv64/task.h の _Static_assert で照合)
+.equ RISCV64_CTX_FP,   416
+.equ RISCV64_CTX_FCSR, 416 + 32 * 8
 
 arch_context_switch:
     sd ra,  16(a1)
@@ -19,6 +25,21 @@ arch_context_switch:
     sd s9, 104(a1)
     sd s10, 112(a1)
     sd s11, 120(a1)
+
+    # **F/D レジスタも持ち越す (段階 7)。** ユーザーは lp64d で FP を使う
+    # (musl も)。保存しないと 2 本以上が並んだ瞬間に互いの f0-f31 を踏み合い、
+    # 落ちずに計算結果だけ壊れる。ここは別のプロセスへ移る場所なので、
+    # 呼び出し規約の callee-saved (fs0-fs11) だけでなく 32 本すべてと fcsr。
+    # カーネル自身は FP 命令を使わない (objdump で 0 件) ので、syscall や
+    # 割り込みの入口では退避しなくてよい
+    mv t2, a0
+    mv a0, a1
+    mv t3, ra
+    call riscv64_fp_save
+    mv a0, t2
+    call riscv64_fp_restore
+    mv ra, t3
+    mv a0, t2
 
     ld t0,   0(a0)
     beqz t0, .Lswitch_regs
@@ -44,6 +65,80 @@ arch_context_switch:
     ld s9, 104(a0)
     ld s10, 112(a0)
     ld s11, 120(a0)
+    ret
+
+riscv64_fp_save:
+    fsd f0, RISCV64_CTX_FP + 0(a0)
+    fsd f1, RISCV64_CTX_FP + 8(a0)
+    fsd f2, RISCV64_CTX_FP + 16(a0)
+    fsd f3, RISCV64_CTX_FP + 24(a0)
+    fsd f4, RISCV64_CTX_FP + 32(a0)
+    fsd f5, RISCV64_CTX_FP + 40(a0)
+    fsd f6, RISCV64_CTX_FP + 48(a0)
+    fsd f7, RISCV64_CTX_FP + 56(a0)
+    fsd f8, RISCV64_CTX_FP + 64(a0)
+    fsd f9, RISCV64_CTX_FP + 72(a0)
+    fsd f10, RISCV64_CTX_FP + 80(a0)
+    fsd f11, RISCV64_CTX_FP + 88(a0)
+    fsd f12, RISCV64_CTX_FP + 96(a0)
+    fsd f13, RISCV64_CTX_FP + 104(a0)
+    fsd f14, RISCV64_CTX_FP + 112(a0)
+    fsd f15, RISCV64_CTX_FP + 120(a0)
+    fsd f16, RISCV64_CTX_FP + 128(a0)
+    fsd f17, RISCV64_CTX_FP + 136(a0)
+    fsd f18, RISCV64_CTX_FP + 144(a0)
+    fsd f19, RISCV64_CTX_FP + 152(a0)
+    fsd f20, RISCV64_CTX_FP + 160(a0)
+    fsd f21, RISCV64_CTX_FP + 168(a0)
+    fsd f22, RISCV64_CTX_FP + 176(a0)
+    fsd f23, RISCV64_CTX_FP + 184(a0)
+    fsd f24, RISCV64_CTX_FP + 192(a0)
+    fsd f25, RISCV64_CTX_FP + 200(a0)
+    fsd f26, RISCV64_CTX_FP + 208(a0)
+    fsd f27, RISCV64_CTX_FP + 216(a0)
+    fsd f28, RISCV64_CTX_FP + 224(a0)
+    fsd f29, RISCV64_CTX_FP + 232(a0)
+    fsd f30, RISCV64_CTX_FP + 240(a0)
+    fsd f31, RISCV64_CTX_FP + 248(a0)
+    frcsr t0
+    sd t0, RISCV64_CTX_FCSR(a0)
+    ret
+
+riscv64_fp_restore:
+    fld f0, RISCV64_CTX_FP + 0(a0)
+    fld f1, RISCV64_CTX_FP + 8(a0)
+    fld f2, RISCV64_CTX_FP + 16(a0)
+    fld f3, RISCV64_CTX_FP + 24(a0)
+    fld f4, RISCV64_CTX_FP + 32(a0)
+    fld f5, RISCV64_CTX_FP + 40(a0)
+    fld f6, RISCV64_CTX_FP + 48(a0)
+    fld f7, RISCV64_CTX_FP + 56(a0)
+    fld f8, RISCV64_CTX_FP + 64(a0)
+    fld f9, RISCV64_CTX_FP + 72(a0)
+    fld f10, RISCV64_CTX_FP + 80(a0)
+    fld f11, RISCV64_CTX_FP + 88(a0)
+    fld f12, RISCV64_CTX_FP + 96(a0)
+    fld f13, RISCV64_CTX_FP + 104(a0)
+    fld f14, RISCV64_CTX_FP + 112(a0)
+    fld f15, RISCV64_CTX_FP + 120(a0)
+    fld f16, RISCV64_CTX_FP + 128(a0)
+    fld f17, RISCV64_CTX_FP + 136(a0)
+    fld f18, RISCV64_CTX_FP + 144(a0)
+    fld f19, RISCV64_CTX_FP + 152(a0)
+    fld f20, RISCV64_CTX_FP + 160(a0)
+    fld f21, RISCV64_CTX_FP + 168(a0)
+    fld f22, RISCV64_CTX_FP + 176(a0)
+    fld f23, RISCV64_CTX_FP + 184(a0)
+    fld f24, RISCV64_CTX_FP + 192(a0)
+    fld f25, RISCV64_CTX_FP + 200(a0)
+    fld f26, RISCV64_CTX_FP + 208(a0)
+    fld f27, RISCV64_CTX_FP + 216(a0)
+    fld f28, RISCV64_CTX_FP + 224(a0)
+    fld f29, RISCV64_CTX_FP + 232(a0)
+    fld f30, RISCV64_CTX_FP + 240(a0)
+    fld f31, RISCV64_CTX_FP + 248(a0)
+    ld t0, RISCV64_CTX_FCSR(a0)
+    fscsr t0
     ret
 
 riscv64_run_on_stack:

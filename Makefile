@@ -319,7 +319,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: aarch64-socket-probe aarch64-socket-smoke aarch64-httpsfetch aarch64-https-smoke aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-usb-kbd-smoke aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-netboot aarch64-pi4-smoke aarch64-pi4-qemu-boot aarch64-pi4-sd-smoke aarch64-smp-load riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke x86-cowstress-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-straddle-probe riscv64-straddle-smoke x86-straddle-probe x86-straddle-smoke x86-bootstrap-exit-probe x86-bootstrap-exit-smoke aarch64-straddle-probe aarch64-straddle-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: aarch64-socket-probe aarch64-socket-smoke aarch64-httpsfetch aarch64-https-smoke aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-usb-kbd-smoke aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-netboot aarch64-pi4-smoke aarch64-pi4-qemu-boot aarch64-pi4-sd-smoke aarch64-smp-load riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke x86-cowstress-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-straddle-probe riscv64-straddle-smoke x86-straddle-probe x86-straddle-smoke x86-bootstrap-exit-probe x86-bootstrap-exit-smoke aarch64-straddle-probe aarch64-straddle-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 riscv64-fp-smoke ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -1525,6 +1525,13 @@ riscv64-ash-run: riscv64-busybox-musl riscv64-rootfs
 riscv64-ash-smoke: riscv64-busybox-musl riscv64-rootfs
 	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_BUSYBOX_ASH_MUSL_ELF) RISCV64_BOOTSTRAP_ARG0_VALUE=sh
 	bash ./tests/riscv64_ash_smoke.sh
+
+# 段階 7: F/D レジスタがタスク切り替えを跨いで保たれるか (user/riscv64-bin/fpprobe.c)。
+# 1 hart と 4 hart の両方
+riscv64-fp-smoke: riscv64-busybox-musl riscv64-rootfs
+	$(MAKE) riscv64-kernel RISCV64_BOOTSTRAP_USER_SRC_ELF=$(RISCV64_BUSYBOX_ASH_MUSL_ELF) RISCV64_BOOTSTRAP_ARG0_VALUE=sh
+	SMP_CPUS=1 bash ./tests/riscv64_fp_smoke.sh
+	SMP_CPUS=4 bash ./tests/riscv64_fp_smoke.sh
 
 # 同じ ash smoke を 4 hart で。コンソール入力 / virtio-blk / pmm の排他が
 # 効いているかの検証 (どれか 1 つでも欠けると入力の文字落ちやページフォルトになる)
