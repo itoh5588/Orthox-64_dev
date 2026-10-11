@@ -182,6 +182,20 @@ void task_idle_loop(int poll_network) {
          * 制御転送は 1 回 ms 単位かかる。ここは通常のタスク文脈で、
          * 中で 500ms に 1 回に絞っている (kernel/usb.c) */
         usb_hotplug_poll();
+        /* **走れるタスクがいるなら眠らずに譲る (2026-10-11)。**
+         * x86 の起動タスク (pid 1) は idle_task にならないままこのループを回す
+         * (kernel/x86_64/init.c、kernel/x86_64/pcstat.c のコメント) ので、
+         * 普通のタスクとして runqueue に入っている。sched_yield で CPU を
+         * 渡されると、hlt で眠って持ち時間 (5 ティック) が尽きるまで返さず、
+         * CPU 0 では sched_yield 1 回が getpid の約 6 万倍かかっていた。
+         * 本物の idle タスクにとっても、積まれたタスクを待たせないだけで害は無い */
+        {
+            struct cpu_local* cpu = task_this_cpu();
+            if (cpu && cpu->runq_count > 0) {
+                kernel_yield();
+                continue;
+            }
+        }
         arch_task_idle_wait_once();
         bottom_half_run();
         if (task_consume_resched()) {
