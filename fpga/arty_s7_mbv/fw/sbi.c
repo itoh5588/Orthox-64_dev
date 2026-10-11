@@ -361,7 +361,12 @@ void fw_main(void) {
     putkv("  time   : ", t0);
     putkv("  time+  : ", t1);
 
-    /* Sstc: let S-mode own stimecmp, and start with no timer pending. */
+    /* Sstc: let S-mode own stimecmp, and start with no timer pending.
+     * On MicroBlaze V (2025.2, C_USE_SSTC=1) menvcfg.STCE is hardwired to 0
+     * (writing all ones reads back 0x71: only FIOM and CBIE/CBCFE stick),
+     * yet Sstc acts as enabled: stimecmp raises STIP and S-mode can read
+     * and write it without a trap (checked on the board, 2026-10-11).
+     * Orthox arms the timer through SBI TIME, so either way works. */
     csr_write(0x30A, csr_read(0x30A) | MENVCFG_STCE);
     csr_write(0x14D, ~0UL);
     putkv("  menvcfg: ", csr_read(0x30A));
