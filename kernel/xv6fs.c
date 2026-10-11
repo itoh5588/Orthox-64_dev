@@ -839,6 +839,22 @@ int xv6fs_readi(struct xv6fs_inode *ip, void *dst, uint32_t off, uint32_t n) {
             }
             if (run > 1 && !xv6bio_range_cached(ip->dev, addr, run) &&
                 xv6bio_rw_run(ip->dev, addr, run, dst, 0) == 0) {
+                /* 次からはキャッシュに当たるように (xv6bio_fill_cache の訳) */
+                xv6bio_fill_cache(ip->dev, addr, run, dst);
+                m = run * XV6FS_BSIZE;
+                continue;
+            }
+            /* **区間がキャッシュに載っていたら、区間ごとキャッシュから読む
+             * (2026-10-11)。** 以前は 1 ブロックだけ読んで次の周で区間を数え
+             * 直していたので、載っている大きなファイルを読むと bmap_lookup が
+             * ブロック数の 2 乗回まわった (busybox 376 ブロックで約 7 万回、
+             * Arty S7 の exec 1 回 0.9 秒の大半) */
+            if (run > 1) {
+                for (uint32_t i = 0; i < run; i++) {
+                    bp = xv6bread(ip->dev, addr + i);
+                    memcpy((uint8_t *)dst + (size_t)i * XV6FS_BSIZE, bp->data, XV6FS_BSIZE);
+                    xv6brelse(bp);
+                }
                 m = run * XV6FS_BSIZE;
                 continue;
             }

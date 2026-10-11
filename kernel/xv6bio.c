@@ -15,6 +15,7 @@
  *   NBUF 128 に増量
  */
 
+#include "string.h"
 #include "xv6fs.h"
 #include "storage.h"
 #include "kassert.h"
@@ -200,6 +201,29 @@ static struct xv6buf *bget(uint32_t dev, uint32_t blockno) {
 
     KASSERT(0 && "xv6bio bget no free buffers");
     return (struct xv6buf *)0; /* unreachable */
+}
+
+/* **まとめて直接読んだ区間をキャッシュにも入れる (2026-10-11)。**
+ *
+ * xv6fs_readi の P-5 は連続区間をキャッシュを通さずに 1 コマンドで読む。
+ * virtio では速いが、**読んだものがキャッシュに残らない**ので、同じファイルを
+ * 何度読んでも毎回ディスクまで行く。Arty S7 の SD (0.5 MB/s、1 ブロックずつ) では
+ * exec のたびに busybox 376 KB を読み直し、fork+exec 1 回が 0.74 秒かかった
+ * (PC 標本の 45% が SD の読み出し待ち)。
+ *
+ * 読んだ後で 1 ブロックずつ枠を取り、**まだ中身の無い枠にだけ**写す。
+ * 区間は読む前に xv6bio_range_cached で空と確かめてあるが、読んでいる間に
+ * 書き込み側が新しい中身を載せたなら、そちらを残す */
+void xv6bio_fill_cache(uint32_t dev, uint32_t blockno, uint32_t nblocks, const void *data) {
+    const uint8_t *src = (const uint8_t *)data;
+    for (uint32_t i = 0; i < nblocks; i++) {
+        struct xv6buf *b = bget(dev, blockno + i);
+        if (!b->valid) {
+            memcpy(b->data, src + (size_t)i * XV6FS_BSIZE, XV6FS_BSIZE);
+            b->valid = 1;
+        }
+        xv6brelse(b);
+    }
 }
 
 /* ブロックを読み込んでバッファを返す。呼び出し元は xv6brelse で解放すること。 */

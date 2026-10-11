@@ -277,6 +277,9 @@ int  xv6bio_rw_run(uint32_t dev, uint32_t blockno, uint32_t nblocks,
 
 /* 区間にキャッシュ済み (有効な) ブロックが 1 つでもあれば 1 を返す。 */
 int  xv6bio_range_cached(uint32_t dev, uint32_t blockno, uint32_t nblocks);
+/* まとめて直接読んだ区間をキャッシュにも入れる (2026-10-11)。読んでいる間に
+ * 新しい中身が載ったブロックは上書きしない */
+void xv6bio_fill_cache(uint32_t dev, uint32_t blockno, uint32_t nblocks, const void *data);
 
 /* ------------------------------------------------------------------ */
 /* xv6log API                                                          */
