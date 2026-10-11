@@ -135,3 +135,61 @@ aarch64_context_switch:
 
     /* x30 に入っている場所へ「戻る」。新しいタスクなら入口へ飛ぶ */
     ret
+
+/* 走っている CPU の FP/SIMD を ctx へ (2026-10-11)。
+ *
+ *   void aarch64_fp_save(aarch64_context_t* ctx)     x0 = ctx
+ *
+ * fork の子へ親の「いまの」FP を渡すのに使う。上の切り替えと同じ並び */
+.globl aarch64_fp_save
+aarch64_fp_save:
+    mrs     x9, fpcr
+    str     x9, [x0, #AARCH64_CTX_FPCR]
+    mrs     x9, fpsr
+    str     x9, [x0, #AARCH64_CTX_FPSR]
+    add     x9, x0, #AARCH64_CTX_V0
+    stp     q0, q1, [x9, #16 * 0]
+    stp     q2, q3, [x9, #16 * 2]
+    stp     q4, q5, [x9, #16 * 4]
+    stp     q6, q7, [x9, #16 * 6]
+    stp     q8, q9, [x9, #16 * 8]
+    stp     q10, q11, [x9, #16 * 10]
+    stp     q12, q13, [x9, #16 * 12]
+    stp     q14, q15, [x9, #16 * 14]
+    stp     q16, q17, [x9, #16 * 16]
+    stp     q18, q19, [x9, #16 * 18]
+    stp     q20, q21, [x9, #16 * 20]
+    stp     q22, q23, [x9, #16 * 22]
+    stp     q24, q25, [x9, #16 * 24]
+    stp     q26, q27, [x9, #16 * 26]
+    stp     q28, q29, [x9, #16 * 28]
+    stp     q30, q31, [x9, #16 * 30]
+    ret
+
+/* ctx の FP/SIMD を走っている CPU へ。exec で 0 にした ctx を読み込むのに使う
+ *
+ *   void aarch64_fp_restore(const aarch64_context_t* ctx)     x0 = ctx */
+.globl aarch64_fp_restore
+aarch64_fp_restore:
+    ldr     x9, [x0, #AARCH64_CTX_FPCR]
+    msr     fpcr, x9
+    ldr     x9, [x0, #AARCH64_CTX_FPSR]
+    msr     fpsr, x9
+    add     x9, x0, #AARCH64_CTX_V0
+    ldp     q0, q1, [x9, #16 * 0]
+    ldp     q2, q3, [x9, #16 * 2]
+    ldp     q4, q5, [x9, #16 * 4]
+    ldp     q6, q7, [x9, #16 * 6]
+    ldp     q8, q9, [x9, #16 * 8]
+    ldp     q10, q11, [x9, #16 * 10]
+    ldp     q12, q13, [x9, #16 * 12]
+    ldp     q14, q15, [x9, #16 * 14]
+    ldp     q16, q17, [x9, #16 * 16]
+    ldp     q18, q19, [x9, #16 * 18]
+    ldp     q20, q21, [x9, #16 * 20]
+    ldp     q22, q23, [x9, #16 * 22]
+    ldp     q24, q25, [x9, #16 * 24]
+    ldp     q26, q27, [x9, #16 * 26]
+    ldp     q28, q29, [x9, #16 * 28]
+    ldp     q30, q31, [x9, #16 * 30]
+    ret

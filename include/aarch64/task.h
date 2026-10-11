@@ -122,6 +122,10 @@ static inline uint64_t aarch64_daif_for_new_task(void) {
 
 /* 次に走らせるものへ切り替える。**戻ってきたときは自分の番** */
 void aarch64_context_switch(aarch64_context_t* next, aarch64_context_t* prev);
+/* 走っている CPU の v0-v31/fpcr/fpsr を ctx へ / ctx から (switch.S)。
+ * fork と exec が切り替えを通らずに FP を扱うときに使う (2026-10-11) */
+void aarch64_fp_save(aarch64_context_t* ctx);
+void aarch64_fp_restore(const aarch64_context_t* ctx);
 
 void aarch64_task_init(void);
 int  aarch64_task_create(void (*entry)(void), uint64_t ttbr0);
@@ -367,6 +371,10 @@ static inline void arch_task_commit_execve(struct arch_task_context* ctx,
     (void)tls_base;
     arch_task_prepare_execve_frame(frame, state);
     aarch64_task_store_user_frame(ctx, frame);
+    /* **生のレジスタも 0 にする (2026-10-11)。** exec は切り替えを通らずに
+     * 例外の出口から新しい像へ降りるので、呼び出し元 (task_execve) が
+     * init_fp_state で ctx を 0 にしただけでは、前の像の v0-v31 が見える */
+    if (ctx) aarch64_fp_restore(&ctx->regs);
     /* svc 経由の execve は例外の出口がそのまま eret するので、ここで
      * 新しいアドレス空間へ切り替えておく。**カーネルは TTBR1 なので
      * TTBR0 を差し替えても自分の足元は動かない** */
@@ -389,7 +397,14 @@ static inline void arch_task_commit_fork_child(struct arch_task_context* child_c
     arch_task_exec_frame_t* child_frame = arch_task_exec_frame_on_kstack(child_kstack_top);
     if (child_ctx) child_ctx->kernel_sp = child_kstack_top;
     arch_task_prepare_fork_child_context(child_ctx, child_frame, parent_frame);
-    arch_task_context_copy_fp_state(child_ctx, parent_ctx);
+    /* **FP も生のレジスタから取る (2026-10-11)。** 下の TLS と同じ理由で、
+     * parent_ctx->regs.v は「親が最後に切り替わったときの値」で古い。
+     * カーネルは -mgeneral-regs-only で FP を使わないので、fork の syscall の
+     * 中の v0-v31/fpcr/fpsr は親のユーザーの値そのもの。
+     * fp-probe の FP-INHERIT が、fork 直前に親が入れた値が子に届かないのを
+     * 実測で捉えた (riscv64 の段階 7 で同じ穴に気づいた) */
+    (void)parent_ctx;
+    if (child_ctx) aarch64_fp_save(&child_ctx->regs);
     /* **TLS は生のレジスタから取る。** ここは fork の syscall の中で、
      * **親がいま走っている**ので TPIDR_EL0 に親の値が入っている。
      *

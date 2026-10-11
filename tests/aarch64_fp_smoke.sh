@@ -145,6 +145,11 @@ grep -aqE "^FP-CHILD-OK$" "$LOG"
 must_not "FP-PARENT-CLOBBERED" "$LOG" "親の FP に子の値が現れた (switch.S が退避していない)"
 must_not "FP-CHILD-CLOBBERED" "$LOG" "子の FP に親の値が現れた (switch.S が退避していない)"
 must_not "FP-CHILD-BAD" "$LOG"
+# fork 直前の親の値を子が引き継ぐこと / exec 後に前の像の値が見えないこと
+must_not "FP-INHERIT-BAD" "$LOG" "子に親の古い FP が写った (fork が ctx の古い値を写している)"
+grep -aqE "^FP-INHERIT-OK$" "$LOG"
+must_not "FP-EXEC-LEAKED" "$LOG" "exec 後に前の像の FP が見えた"
+grep -aqE "^FP-EXEC-OK$" "$LOG"
 grep -aqE "^FP-DONE$" "$LOG"
 grep -aq "bootstrap user exit" "$LOG"
 

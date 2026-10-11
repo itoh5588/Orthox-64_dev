@@ -20,6 +20,14 @@
  *
  * fork して親子が別の値を d8/d9 に入れ、**互いに走り続けながら**繰り返し
  * 照合する。保存していなければ、切り替わった瞬間に相手の値が見える。
+ *
+ * ---- fork の引き継ぎと exec (2026-10-11) ---------------------------------
+ *
+ * 上の検査は fork の**後**で値を入れるので、「子が親の FP を引き継ぐか」は
+ * 見ていない。fork は親の続きなので、**fork の直前に親が入れた値が子に
+ * 見えなければならない** (FP-INHERIT)。riscv64 の段階 7 で、ctx に残った
+ * 「最後に切り替わったときの値」を写すと古くなることが分かったので足した。
+ * exec の後に前の像の値が見えないこと (FP-EXEC) も見る。
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -58,15 +66,67 @@ static void spin(volatile uint64_t n) {
     while (n--) __asm__ volatile("" ::: "memory");
 }
 
+/* fork 直前に親が入れた値を、子が引き継いでいるか */
+static int check_inherit(void) {
+    const uint64_t a = 0x1A1A1A1A1A1A1A1AULL, b = 0x2B2B2B2B2B2B2B2BULL;
+    uint64_t got_a, got_b;
+    int status = 0;
+    pid_t pid;
+
+    fp_set(a, b);
+    pid = fork();
+    if (pid < 0) return 30;
+    if (pid == 0) {
+        fp_get(&got_a, &got_b);
+        if (got_a != a || got_b != b) {
+            write_all(1, "FP-INHERIT-BAD\n", 15);
+            _exit(31);
+        }
+        write_all(1, "FP-INHERIT-OK\n", 14);
+        _exit(0);
+    }
+    if (waitpid(pid, &status, 0) < 0) return 32;
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : 33;
+}
+
+/* exec 直後の像: 前の像が d8/d9 に置いた目印が見えないこと */
+static int after_exec(void) {
+    uint64_t got_a, got_b;
+    fp_get(&got_a, &got_b);
+    if (got_a == 0x7E7E7E7E7E7E7E7EULL || got_b == 0x7E7E7E7E7E7E7E7EULL) {
+        write_all(1, "FP-EXEC-LEAKED\n", 15);
+        return 40;
+    }
+    write_all(1, "FP-EXEC-OK\n", 11);
+    return 0;
+}
+
+static int check_exec(void) {
+    int status = 0;
+    pid_t pid = fork();
+    if (pid < 0) return 41;
+    if (pid == 0) {
+        fp_set(0x7E7E7E7E7E7E7E7EULL, 0x7E7E7E7E7E7E7E7EULL);
+        execl("/bin/fp-probe", "fp-probe", "--after-exec", (char*)0);
+        _exit(42);
+    }
+    if (waitpid(pid, &status, 0) < 0) return 43;
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : 44;
+}
+
 #define ROUNDS   40
 #define SPIN_N   200000
 
-int main(void) {
+int main(int argc, char** argv) {
     pid_t pid;
-    int status = 0;
+    int status = 0, rc;
     uint64_t want_a, want_b, got_a, got_b;
 
+    if (argc > 1 && argv[1][0] == '-') return after_exec();
     if (write_all(1, "FP-START\n", 9) < 0) return 10;
+    /* 戻り値で落とさず、判定は台本の must_not に任せる (後の検査も走らせる) */
+    if ((rc = check_inherit()) != 0 && rc != 33) return rc;
+    if ((rc = check_exec()) != 0 && rc != 44) return rc;
 
     pid = fork();
     if (pid < 0) return 11;
