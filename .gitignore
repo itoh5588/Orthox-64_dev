@@ -77,6 +77,7 @@ kernel-output.img
 
 # Private / internal files (root-level only; book-reader/ keeps its own CLAUDE.md)
 /CLAUDE.md
+MICROBLAZEV_ARTY_S7_50_PLAN.md
 RISCV-virt-Porting-Plan.md
 AArch64-virt-Porting-Plan.md
 SMP-Design.md

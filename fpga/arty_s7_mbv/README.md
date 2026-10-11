@@ -41,5 +41,4 @@ A JTAG load of an 8 MiB image takes about 75 s. `xsdb` does not clear `.bss`, so
 
 `build.tcl` sets `C_USE_SLEEP=1` and ties the CPU `Wakeup` inputs high. With `Wakeup` low, WFI never returns and the hart cannot be halted from the debugger. Setting `NO_WFI=1` when building the firmware adds `orthox,no-wfi` to the device tree, which makes Orthox avoid WFI on older bitstreams.
 
-See `../../MICROBLAZEV_ARTY_S7_50_PLAN.md` for results and open items.
 
