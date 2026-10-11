@@ -319,7 +319,7 @@ DEPS = $(OBJS:.o=.d) \
        $(USER_BUILD_DIR)/wadstdio_test.d $(USER_BUILD_DIR)/udpecho.d $(USER_BUILD_DIR)/udpnb.d \
        $(USER_BUILD_DIR)/vblkstress.d
 
-.PHONY: aarch64-socket-probe aarch64-socket-smoke aarch64-httpsfetch aarch64-https-smoke aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-usb-kbd-smoke aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-netboot aarch64-pi4-smoke aarch64-pi4-qemu-boot aarch64-pi4-sd-smoke aarch64-smp-load riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke x86-cowstress-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-straddle-probe riscv64-straddle-smoke x86-straddle-probe x86-straddle-smoke x86-bootstrap-exit-probe x86-bootstrap-exit-smoke aarch64-straddle-probe aarch64-straddle-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 riscv64-fp-smoke ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
+.PHONY: aarch64-socket-probe aarch64-socket-smoke aarch64-httpsfetch aarch64-https-smoke aarch64-doom aarch64-doom-run aarch64-doom-vnc aarch64-usb-kbd-smoke aarch64-busybox-musl aarch64-ash-smoke aarch64-kernel8 aarch64-pi4-boot aarch64-pi4-netboot aarch64-pi4-smoke aarch64-pi4-qemu-boot aarch64-pi4-sd-smoke aarch64-smp-load riscv64-path-test all clean run x86-kernel-smoke x86-errno-smoke x86-cowstress-smoke x86-fp-smoke riscv64-kernel riscv64-syscall-audit riscv64-user-bin riscv64-run riscv64-smoke riscv64-sleep-probe riscv64-sleep-smoke riscv64-errno-probe riscv64-errno-smoke riscv64-straddle-probe riscv64-straddle-smoke x86-straddle-probe x86-straddle-smoke x86-bootstrap-exit-probe x86-bootstrap-exit-smoke aarch64-straddle-probe aarch64-straddle-smoke riscv64-musl-sysroot riscv64-musl-probe riscv64-musl-smoke riscv64-preempt-probe riscv64-preempt-smoke riscv64-smp-smoke riscv64-busybox-musl riscv64-ash-run riscv64-ash-smoke riscv64-ash-smoke-smp4 riscv64-fp-smoke ac97run ac97smoke doom doomac97smoke musltoolchainsmoke muslforkprobesmoke muslexecprobesmoke muslforkexecwaitsmoke muslbusyboxsmoke muslbusyboxenvshowsmoke dynlinkrealappsmoke vmsyscallsmoke timesyscallsmoke signalsyscallsmoke ftruncsavesmoke preadpwritesmoke xv6sparsesmoke xv6reclaimsmoke xv6largewritesmoke virtionetirqsmoke virtioblkinflightsmoke virtioq35smoke irqbottomhalfstresssmoke irqbottomhalfsmpstresssmoke finalsmokesuite smprun smp4run netrun usb usb-img doommsulrun doommuslrun toolchain toolchain-musl user/doomgeneric.elf busybox-ash busybox-ash-musl busybox-ash-musl-install __busybox_ash_musl __busybox_ash_musl_install nativekernelbuildsmoke nativekernelbootsmoke pythonnumpysmoke
 
 all: $(ISO)
 
@@ -1744,6 +1744,13 @@ x86-errno-smoke: $(KERNEL_ELF) $(ROOTFS_LITE_IMG)
 # rootfs.img (320MB) には触らないので、/kbuild のキャッシュも消えない
 x86-cowstress-smoke: $(KERNEL_ELF) $(COWSTRESS_ELF) $(ROOTFS_LITE_IMG)
 	bash ./tests/x86_cowstress_smoke.sh
+
+# SSE レジスタが切り替え / fork / exec を跨いで正しく扱われるか (user/x86_fp_probe.c)。
+# riscv64-fp-smoke / aarch64-fp-smoke の x86 版。1 CPU と 4 CPU の両方
+X86_FP_PROBE_ELF = user/x86_fp_probe.elf
+x86-fp-smoke: $(KERNEL_ELF) $(X86_FP_PROBE_ELF) $(ROOTFS_LITE_IMG)
+	SMP_CPUS=1 bash ./tests/x86_fp_smoke.sh
+	SMP_CPUS=4 bash ./tests/x86_fp_smoke.sh
 
 # pipe / FIFO の端ごとの本数 (EOF は writers==0 / EPIPE は readers==0)。
 # rootfs.img に /bin/pipeend_probe.elf が要る (make rootfs.img で入る)

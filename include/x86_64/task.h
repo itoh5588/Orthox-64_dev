@@ -95,8 +95,13 @@ static inline uint64_t arch_task_read_current_stack_pointer(void) {
     return sp;
 }
 
+/* 新しいタスクと exec 後の像の FP/SSE を既定値から始める。
+ * **領域全体を 0 にしてから** FCW と MXCSR を入れる (2026-10-11)。以前は
+ * 数バイトを書くだけで、exec は使い回しの ctx に対して呼ばれるので
+ * 前の像の xmm0-15 が残っていた (aarch64 の P3-3 と同じく漏洩になる) */
 static inline void arch_task_context_init_fp_state(struct arch_task_context* ctx) {
     if (!ctx) return;
+    for (int i = 0; i < 512; i++) ctx->fxsave_area[i] = 0;
     ctx->fxsave_area[0] = 0x7f;
     ctx->fxsave_area[1] = 0x03;
     ctx->fxsave_area[24] = 0x80;
@@ -173,7 +178,12 @@ static inline void arch_task_commit_execve(struct arch_task_context* ctx,
                                            uint64_t tls_base) {
     arch_task_prepare_execve_frame(frame, state);
     arch_task_activate_user_context(ctx, tls_base);
-    __asm__ volatile("fninit");
+    /* **生のレジスタも既定値にする (2026-10-11)。** exec は切り替えを通らずに
+     * 割り込みの出口から新しい像へ降りるので、ここで読み込まないと前の像の
+     * xmm0-15 と MXCSR が見える。以前の fninit は x87 しか初期化しない。
+     * 呼び出し元 (task_execve) が init_fp_state で ctx を既定値にしてある */
+    if (ctx) __asm__ volatile("fxrstor %0" : : "m"(ctx->fxsave_area));
+    else __asm__ volatile("fninit");
 }
 
 static inline void arch_task_prepare_fork_child_context(struct arch_task_context* ctx,
@@ -210,7 +220,13 @@ static inline void arch_task_commit_fork_child(struct arch_task_context* child_c
                                                const arch_task_exec_frame_t* parent_frame) {
     arch_task_exec_frame_t* child_frame = arch_task_exec_frame_on_kstack(child_kstack_top);
     arch_task_prepare_fork_child_context(child_ctx, child_frame, parent_frame);
-    arch_task_context_copy_fp_state(child_ctx, parent_ctx);
+    /* **FP/SSE は生のレジスタから取る (2026-10-11)。** parent_ctx の fxsave
+     * 領域は「親が最後に切り替わったときの値」で古い。カーネルは -mno-sse で
+     * FP/SSE を使わないので、fork の syscall の中のレジスタは親のユーザーの
+     * 値そのもの。x86_fp_probe の FP-INHERIT が実測で捉えた
+     * (riscv64 の段階 7 で同じ穴に気づき、aarch64 と合わせて直した) */
+    (void)parent_ctx;
+    if (child_ctx) __asm__ volatile("fxsave %0" : "=m"(child_ctx->fxsave_area));
 }
 
 static inline void arch_task_prepare_initial_user_context(struct arch_task_context* ctx,
