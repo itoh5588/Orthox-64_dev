@@ -246,6 +246,22 @@ void riscv64_trap_dispatch(riscv64_trap_frame_t* frame) {
     if (frame->scause == RISCV64_SCAUSE_STIMER) {
         __atomic_fetch_add(&g_riscv64_timer_ticks, 1ULL, __ATOMIC_RELAXED);
         (void)riscv64_timer_arm_next();
+#ifdef RISCV64_PC_SAMPLE
+        /* **PC の標本 (性能調査用、普段は入れない)。** タイマのたびに割り込まれた
+         * 番地を 1 行出す。ホストで nm の表に引き当てて関数ごとに数える。
+         *   make riscv64-kernel RISCV64_CFLAGS_EXTRA=-DRISCV64_PC_SAMPLE ...
+         * 割り込みを開けているカーネル区間 (syscall の中) も拾える */
+        riscv64_uart_puts((frame->sstatus & RISCV64_SSTATUS_SPP) ? "PCS K " : "PCS U ");
+        riscv64_uart_puthex64(frame->sepc);
+        {
+            extern uint64_t g_riscv64_sd_sectors_read;
+            riscv64_uart_puts(" ra ");
+            riscv64_uart_puthex64(frame->ra);
+            riscv64_uart_puts(" sd ");
+            riscv64_uart_puthex64(g_riscv64_sd_sectors_read);
+        }
+        riscv64_uart_puts("\n");
+#endif
         /* 外部割り込みコントローラの無い基板では UART 受信割り込みが来ないので、
          * ここで拾う。PLIC / AXI INTC がある基板ではやらない (故障を隠すため) */
         if (!riscv64_has_plic() && !riscv64_has_axi_intc() && riscv64_current_hart_index() == 0) {

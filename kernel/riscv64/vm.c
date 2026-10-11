@@ -1,3 +1,4 @@
+#include "string.h"
 #include <stdint.h>
 #include "pmm.h"
 #include "riscv64/boot.h"
@@ -48,15 +49,14 @@ static uint64_t riscv64_align_up(uint64_t value) {
     return (value + RISCV64_PAGE_SIZE - 1ULL) & RISCV64_PAGE_MASK;
 }
 
+/* 共通の memset/memcpy (kernel/cstring.c、8 バイト単位) へ (2026-10-11)。
+ * fork のたびにページテーブルを作って写すので、1 バイトずつだと重かった */
 static void riscv64_memzero(void* ptr, uint64_t size) {
-    uint8_t* p = (uint8_t*)ptr;
-    while (size--) *p++ = 0;
+    memset(ptr, 0, size);
 }
 
 static void riscv64_memcpy(void* dst, const void* src, uint64_t size) {
-    uint8_t* out = (uint8_t*)dst;
-    const uint8_t* in = (const uint8_t*)src;
-    while (size--) *out++ = *in++;
+    memcpy(dst, src, size);
 }
 
 static uint64_t riscv64_vm_satp_value(uint64_t root_pa) {
@@ -408,10 +408,13 @@ void riscv64_vm_init(void) {
                          RISCV64_VM_PAGE_R | RISCV64_VM_PAGE_W | RISCV64_VM_PAGE_G);
 
     if (boot && boot->sd_base) {
+        /* 3 ページ: レジスタと 1 ブロックの窓 (0x000-0xFFF)、8 ブロックの
+         * 読み出しバッファ (0x1000-0x1FFF) と書き込みバッファ (0x2000-0x2FFF)
+         * (2026-10-11) */
         riscv64_vm_map_range(g_riscv64_kernel_root_pa,
                              boot->sd_base,
                              boot->sd_base,
-                             RISCV64_PAGE_SIZE,
+                             3 * RISCV64_PAGE_SIZE,
                              RISCV64_VM_PAGE_R | RISCV64_VM_PAGE_W | RISCV64_VM_PAGE_G);
     }
 

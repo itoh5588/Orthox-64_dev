@@ -8,13 +8,18 @@
 #define SD_LBA  0x004U
 #define SD_FDIV 0x008U
 #define SD_RESP 0x00CU
+#define SD_NBLK 0x010U
 #define SD_RBUF 0x400U
+#define SD_MBUF 0x1000U   /* 8 ブロックの読み出しバッファ (block n は +512n) */
+#define SD_MWBUF 0x2000U  /* 8 ブロックの書き込みバッファ (block n は +512n) */
 #define SD_WBUF 0x600U
 
 #define SD_OP_INIT  1U
 #define SD_OP_CSD   3U
 #define SD_OP_READ  4U
+#define SD_OP_MREAD 5U    /* CMD18: SD_NBLK ブロック (最大 SD_MREAD_MAX) */
 #define SD_OP_WRITE 6U
+#define SD_OP_MWRITE 7U   /* CMD25: SD_NBLK ブロック (最大 SD_MREAD_MAX) */
 
 #define SD_STAT_BUSY    0x01U
 #define SD_STAT_INITOK  0x02U
@@ -23,6 +28,19 @@
 #define SD_STAT_ERR(s)  (((s) >> 8) & 0xffU)
 
 #define SD_SECTOR 512U
+
+/* **まとめて読むブロック数の上限 (2026-10-11)。** CMD17 は 1 ブロックごとに
+ * カードの応答待ち (実測で 0.5 ms 前後) が掛かる。CMD18 なら 1 コマンドに 1 回。
+ * 8 はコントローラ (fpga/arty_s7_mbv/rtl/sd_axi.vhd) のバッファの大きさ。
+ * 古い bitstream (op 5 も 0x1000 の窓も無い) では 1 にすること */
+#define SD_MREAD_MAX 8U
+
+/* 初期化後の SPI の分周 (1 相の長さ - 1)。50 MHz で 1 なら 12.5 MHz。
+ * sdspi_phy は MISO を 2 段の同期 FF に通して High の終わりで取るので、実際に
+ * 見るのは立ち上がり付近のピン = カードが値を変えた立ち下がりの 40 ns 後で、
+ * 出力遅延 (最大 14 ns) に間に合う。0 (25 MHz) は変わり目に当たるので使えない。
+ * リセット時の既定は 2 (8.3 MHz)。2026-10-11 に 1 にして実機で照合した */
+#define SD_FASTDIV 1U
 
 static uint64_t g_sd_base;
 static uint64_t g_sd_sectors;
@@ -86,6 +104,7 @@ int riscv64_sd_axi_init(uint64_t base) {
         riscv64_uart_puts("\n");
         return -1;
     }
+    *sd_reg(SD_FDIV) = SD_FASTDIV;
     err = sd_run(SD_OP_CSD);
     if (err != 0) {
         riscv64_uart_puts("  sd: CSD read failed, err 0x");
@@ -108,37 +127,109 @@ uint64_t riscv64_sd_axi_sectors(void) {
     return g_sd_sectors;
 }
 
+#ifdef RISCV64_PC_SAMPLE
+uint64_t g_riscv64_sd_sectors_read;  /* PC 標本と一緒に出す (trap.c) */
+#endif
+
 int riscv64_sd_axi_storage_read(void* ctx, uint64_t lba, void* buf, size_t count) {
     uint8_t* dst = (uint8_t*)buf;
     (void)ctx;
-    for (size_t n = 0; n < count; n++) {
-        if (lba + n >= g_sd_sectors) return -1;
-        *sd_reg(SD_LBA) = (uint32_t)(lba + n);
-        if (sd_run(SD_OP_READ) != 0) return -1;
-        for (uint32_t i = 0; i < SD_SECTOR; i += 4) {
-            uint32_t w = *sd_reg(SD_RBUF + i);
-            dst[i] = (uint8_t)w;
-            dst[i + 1] = (uint8_t)(w >> 8);
-            dst[i + 2] = (uint8_t)(w >> 16);
-            dst[i + 3] = (uint8_t)(w >> 24);
+#ifdef RISCV64_PC_SAMPLE
+    g_riscv64_sd_sectors_read += count;
+#endif
+    if (lba + count > g_sd_sectors || lba + count < lba) return -1;
+    while (count > 0) {
+        size_t nb = count < SD_MREAD_MAX ? count : SD_MREAD_MAX;
+        uint32_t words = (uint32_t)(nb * SD_SECTOR / 4U);
+        *sd_reg(SD_LBA) = (uint32_t)lba;
+        if (nb == 1) {
+            if (sd_run(SD_OP_READ) != 0) return -1;
+        } else {
+            *sd_reg(SD_NBLK) = (uint32_t)nb;
+            if (sd_run(SD_OP_MREAD) != 0) return -1;
         }
-        dst += SD_SECTOR;
+        /* **揃っていれば語のまま書く (2026-10-11)。** D キャッシュはライトスルー
+         * で、1 回の書き込みごとに DDR まで行く。バイトに分けると 512 回、
+         * 語なら 128 回 (送り先は xv6fs のブロックやページなので普通は揃う) */
+        if (((uintptr_t)dst & 3U) == 0) {
+            uint32_t* w = (uint32_t*)dst;
+            for (uint32_t i = 0; i < words; i++) w[i] = *sd_reg(SD_MBUF + 4U * i);
+        } else {
+            for (uint32_t i = 0; i < words * 4U; i += 4) {
+                uint32_t w = *sd_reg(SD_MBUF + i);
+                dst[i] = (uint8_t)w;
+                dst[i + 1] = (uint8_t)(w >> 8);
+                dst[i + 2] = (uint8_t)(w >> 16);
+                dst[i + 3] = (uint8_t)(w >> 24);
+            }
+        }
+        dst += nb * SD_SECTOR;
+        lba += nb;
+        count -= nb;
     }
     return 0;
 }
 
-int riscv64_sd_axi_storage_write(void* ctx, uint64_t lba, const void* buf, size_t count) {
-    const uint8_t* src = (const uint8_t*)buf;
-    (void)ctx;
+/* 1 ブロック (CMD24) ずつ書く。CMD25 が失敗したときの退き先 */
+static int sd_write_single(uint64_t lba, const uint8_t* src, size_t count) {
     for (size_t n = 0; n < count; n++) {
-        if (lba + n >= g_sd_sectors) return -1;
-        for (uint32_t i = 0; i < SD_SECTOR; i += 4) {
-            *sd_reg(SD_WBUF + i) = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8) |
-                                   ((uint32_t)src[i + 2] << 16) | ((uint32_t)src[i + 3] << 24);
+        if (((uintptr_t)src & 3U) == 0) {
+            const uint32_t* w = (const uint32_t*)src;
+            for (uint32_t i = 0; i < SD_SECTOR / 4U; i++) *sd_reg(SD_WBUF + 4U * i) = w[i];
+        } else {
+            for (uint32_t i = 0; i < SD_SECTOR; i += 4) {
+                *sd_reg(SD_WBUF + i) = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8) |
+                                       ((uint32_t)src[i + 2] << 16) | ((uint32_t)src[i + 3] << 24);
+            }
         }
         *sd_reg(SD_LBA) = (uint32_t)(lba + n);
         if (sd_run(SD_OP_WRITE) != 0) return -1;
         src += SD_SECTOR;
+    }
+    return 0;
+}
+
+/* **8 ブロックまで CMD25 でまとめて書く (2026-10-11)。** CMD24 は 1 ブロック
+ * ごとにカードの書き込み待ちが掛かり、Arty S7 で 0.07 MB/s しか出なかった。
+ * xv6fs のログは連続区間をまとめて渡してくる (kernel/xv6log.c)。
+ * CMD25 が途中で失敗するとカードが受信の途中に残りうるので、初期化し直して
+ * そのまとまりだけ 1 ブロックずつ書き直す */
+int riscv64_sd_axi_storage_write(void* ctx, uint64_t lba, const void* buf, size_t count) {
+    const uint8_t* src = (const uint8_t*)buf;
+    (void)ctx;
+    if (lba + count > g_sd_sectors || lba + count < lba) return -1;
+    while (count > 0) {
+        size_t nb = count < SD_MREAD_MAX ? count : SD_MREAD_MAX;
+        if (nb == 1) {
+            if (sd_write_single(lba, src, 1) != 0) return -1;
+        } else {
+            uint32_t words = (uint32_t)(nb * SD_SECTOR / 4U);
+            uint32_t err;
+            if (((uintptr_t)src & 3U) == 0) {
+                const uint32_t* w = (const uint32_t*)src;
+                for (uint32_t i = 0; i < words; i++) *sd_reg(SD_MWBUF + 4U * i) = w[i];
+            } else {
+                for (uint32_t i = 0; i < words * 4U; i += 4) {
+                    *sd_reg(SD_MWBUF + i) = (uint32_t)src[i] | ((uint32_t)src[i + 1] << 8) |
+                                            ((uint32_t)src[i + 2] << 16) |
+                                            ((uint32_t)src[i + 3] << 24);
+                }
+            }
+            *sd_reg(SD_LBA) = (uint32_t)lba;
+            *sd_reg(SD_NBLK) = (uint32_t)nb;
+            err = sd_run(SD_OP_MWRITE);
+            if (err != 0) {
+                riscv64_uart_puts("  sd: CMD25 failed, err 0x");
+                riscv64_uart_puthex64(err);
+                riscv64_uart_puts(", retrying block by block\n");
+                if (sd_run(SD_OP_INIT) != 0) return -1;
+                *sd_reg(SD_FDIV) = SD_FASTDIV;
+                if (sd_write_single(lba, src, nb) != 0) return -1;
+            }
+        }
+        src += nb * SD_SECTOR;
+        lba += nb;
+        count -= nb;
     }
     return 0;
 }

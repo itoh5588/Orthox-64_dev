@@ -23,12 +23,17 @@ void riscv64_task_set_cpu_local_impl(struct cpu_local* cpu) {
     g_riscv64_cpu_local[hart] = cpu;
 }
 
+/* **8 バイトずつ写す (2026-10-11)。** syscall のたびに
+ * arch_syscall_sync_current_user_frame から呼ばれる。以前は 1 バイトずつで
+ * 288 回まわり、Arty S7 の getpid 1 回 1,715 命令のうち約 1,150 命令がここだった。
+ * フレームは uint64_t だけからなるので 8 バイト境界にそろっている */
 static void riscv64_task_copy_frame(arch_task_exec_frame_t* dst,
                                     const arch_task_exec_frame_t* src) {
-    const uint8_t* in = (const uint8_t*)src;
-    uint8_t* out = (uint8_t*)dst;
+    const volatile uint64_t* in = (const volatile uint64_t*)src;
+    uint64_t* out = (uint64_t*)dst;
+    _Static_assert(sizeof(*dst) % sizeof(uint64_t) == 0, "trap frame is not 8-byte words");
     if (!dst || !src) return;
-    for (uint64_t i = 0; i < sizeof(*dst); i++) {
+    for (uint64_t i = 0; i < sizeof(*dst) / sizeof(uint64_t); i++) {
         out[i] = in[i];
     }
 }
