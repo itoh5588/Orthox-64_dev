@@ -1,0 +1,59 @@
+
+fw: Orthox MicroBlaze V firmware
+  misa   : 0x800000000014112d
+  mimpid : 0x0000000000000001
+  time   : 0x0000000000056b60
+  time+  : 0x0000000000056b6d
+  menvcfg: 0x0000000000000000
+  medeleg: 0x000000000000b1ff
+  mideleg: 0x0000000000000220
+  dtb    : 0x00000000000009b0
+fw: loading the kernel from SD
+  bytes  : 0x00000000000b14d0
+  ms     : 0x00000000000005ef
+  kernel : 0x0000000080200000
+fw: entering S-mode
+
+Orthox riscv64 early boot
+  hart: 0x0000000000000000
+  dtb : 0x00000000000009b0
+  dtb size: 0x00000000000004b6
+  uart   : 0x0000000040600000 (uartlite)
+  timebase: 0x0000000002faf080
+  memory : 0x0000000080000000..0x0000000090000000
+  vm activate: 0x00000000807c0000
+    text->phys: 0x0000000080200000
+    sp  ->phys: 0x000000008074fc40
+    uart->phys: 0x0000000040600000
+  sv39 satp enabled
+  sv39 root: 0x00000000807c0000
+  kernel: 0x0000000080200000..0x00000000807c0000
+  vm selftest passed
+  vm clone selftest passed
+  user stack selftest passed
+  user frame selftest passed
+  user frame sync selftest passed
+  trap vector installed
+  sbi timer armed
+  axi intc: 0x0000000041200000 uart irq 0x0000000000000000
+riscv64 axi intc interrupt
+Task system initialized.
+  sd: SDHC/SDXC, OCR 0x00000000c0ff8000, 0x0000000003a0e000 sectors
+xv6fs: mounted sd0  size=8192 inodes=8192 log@2
+xv6fs: mtime epoch from 1790670633 sec
+  xv6fs mounted on sd0
+SOK
+  syscall dispatch selftest passed
+  fs syscall selftest passed
+riscv64 supervisor timer interrupt
+  user map selftest passed
+  fork selftest passed
+[smp] cpus detected: 0x0000000000000001
+[smp] cpus online: 0x0000000000000001
+  enter user ctx root: 0x0000000080885000
+  enter user kernel : 0x00000000807c0000
+
+
+BusyBox v1.27.0.git (2026-09-20 17:30:16 JST) built-in shell (ash)
+
+# riscv64 timer interrupt after user handoff

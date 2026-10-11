@@ -26,7 +26,16 @@ The design places boot BRAM at `0x00000000`, 256 MiB DDR3 at `0x80000000`, and U
 fw/run.sh ../../out/kernel-riscv64-ash.elf 300 ../../out/rootfs-riscv64-ram.img [input.txt]
 ```
 
-`fw/embed.sh` puts the firmware into the boot BRAM contents of the bitstream with `updatemem` (using the `build/mbv_soc.mmi` that `build.tcl` writes) and produces `build/mbv_soc_fw.bit`. With it the firmware starts by itself after configuration and waits when no kernel has been loaded; `fw/run.sh` uses this bitstream when it exists (override with `BIT=`).
+`fw/embed.sh` puts the firmware into the boot BRAM contents of the bitstream with `updatemem` (using the `build/mbv_soc.mmi` that `build.tcl` writes) and produces `build/mbv_soc_fw.bit`. With it the firmware starts by itself after configuration; when no kernel has been loaded over JTAG it reads one from the SD card, and waits if there is none. `fw/run.sh` uses this bitstream when it exists (override with `BIT=`).
+
+Booting with no JTAG (power on):
+
+```sh
+fw/install-kernel.sh ../../out/kernel-riscv64-ash.elf   # kernel ELF -> SD LBA 0x200000, then boots it
+vivado -mode batch -nolog -nojournal -source flash.tcl -tclargs build/mbv_soc_fw.bit [backup.bin]
+```
+
+`install-kernel.sh` stages the ELF file in DDR and the firmware writes it to the card (one header sector with a magic, the size and a checksum, then the file). At boot the firmware reads it back (about 1.5 s for 726 KB) and lays out the `PT_LOAD` segments, zeroing `.bss`. `flash.tcl` writes the bitstream to the MT25QL128 configuration flash (SPIx1; the MODE jumper JP1 must be on), optionally reading the whole flash back to `backup.bin` first. The rootfs is the xv6fs on the same card (LBA 0, see `SD_INSTALL=1`).
 
 A JTAG load of an 8 MiB image takes about 75 s. `xsdb` does not clear `.bss`, so the firmware clears the range the loader writes into `fw_zero_start`/`fw_zero_end`.
 
