@@ -1,3 +1,4 @@
+#include "string.h"
 #include <stdint.h>
 #include <stddef.h>
 #include "kassert.h"
@@ -595,10 +596,9 @@ task_context_t* task_current_context(void) {
     return t ? &t->ctx : 0;
 }
 
+/* 共通の memset (kernel/cstring.c、8 バイト単位) へ (2026-10-11) */
 static void* kernel_memset(void* s, int c, size_t n) {
-    unsigned char* p = s;
-    while (n--) *p++ = (unsigned char)c;
-    return s;
+    return memset(s, c, n);
 }
 
 static void kernel_strcpy(char* dst, const char* src, size_t size) {

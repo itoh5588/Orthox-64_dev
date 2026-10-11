@@ -1,3 +1,4 @@
+#include "string.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -9,26 +10,16 @@
 extern void puts(const char *s);
 extern void puthex(uint64_t v);
 
-static int memcmp(const void* s1, const void* s2, size_t n) {
-    const unsigned char *p1 = s1, *p2 = s2;
-    while (n--) {
-        if (*p1 != *p2) return *p1 - *p2;
-        p1++; p2++;
-    }
-    return 0;
-}
+/* memcmp は共通の kernel/cstring.c を使う (string.h) */
 
+/* 共通の memcpy (kernel/cstring.c、8 バイト単位) へ (2026-10-11) */
 static void* kernel_memcpy(void* dest, const void* src, size_t n) {
-    char* d = dest;
-    const char* s = src;
-    while (n--) *d++ = *s++;
-    return dest;
+    return memcpy(dest, src, n);
 }
 
+/* 共通の memset (kernel/cstring.c、8 バイト単位) へ (2026-10-11) */
 static void* kernel_memset(void* s, int c, size_t n) {
-    unsigned char* p = s;
-    while (n--) *p++ = (unsigned char)c;
-    return s;
+    return memset(s, c, n);
 }
 
 // ELF フラグから VMM フラグへの変換

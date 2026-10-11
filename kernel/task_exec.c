@@ -1,3 +1,4 @@
+#include "string.h"
 #include <stdint.h>
 #include <stddef.h>
 #include "task_internal.h"
@@ -72,10 +73,9 @@ extern void puthex(uint64_t v);
 extern int fs_get_file_data(const char* path, void** data, size_t* size);
 extern void fs_free_exec_buffer(const char* path, void* data, size_t size);
 
+/* 共通の memset (kernel/cstring.c、8 バイト単位) へ (2026-10-11) */
 static void* kernel_memset(void* s, int c, size_t n) {
-    unsigned char* p = s;
-    while (n--) *p++ = (unsigned char)c;
-    return s;
+    return memset(s, c, n);
 }
 
 #if ORTHOX_MEM_PROGRESS || ORTHOX_MEM_TRACE

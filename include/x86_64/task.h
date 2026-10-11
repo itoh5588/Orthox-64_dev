@@ -182,7 +182,9 @@ static inline void arch_task_commit_execve(struct arch_task_context* ctx,
      * 割り込みの出口から新しい像へ降りるので、ここで読み込まないと前の像の
      * xmm0-15 と MXCSR が見える。以前の fninit は x87 しか初期化しない。
      * 呼び出し元 (task_execve) が init_fp_state で ctx を既定値にしてある */
-    if (ctx) __asm__ volatile("fxrstor %0" : : "m"(ctx->fxsave_area));
+    /* 番地はレジスタで渡す。"m"(配列) はゲスト内の古い gcc が
+     * "memory input 0 is not directly addressable" で通さない */
+    if (ctx) __asm__ volatile("fxrstor (%0)" : : "r"(ctx->fxsave_area) : "memory");
     else __asm__ volatile("fninit");
 }
 
@@ -226,7 +228,7 @@ static inline void arch_task_commit_fork_child(struct arch_task_context* child_c
      * 値そのもの。x86_fp_probe の FP-INHERIT が実測で捉えた
      * (riscv64 の段階 7 で同じ穴に気づき、aarch64 と合わせて直した) */
     (void)parent_ctx;
-    if (child_ctx) __asm__ volatile("fxsave %0" : "=m"(child_ctx->fxsave_area));
+    if (child_ctx) __asm__ volatile("fxsave (%0)" : : "r"(child_ctx->fxsave_area) : "memory");
 }
 
 static inline void arch_task_prepare_initial_user_context(struct arch_task_context* ctx,
